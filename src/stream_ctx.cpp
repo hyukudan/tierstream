@@ -261,6 +261,15 @@ void Ctx::cleanup() {
     ra_sweep_locked();
   }
   stop_workers();
+  // Workers are joined: break the entry <-> job references (a close without ss_end never reconciled them).
+  for (auto& s : L_)
+    for (auto& e : s.ra)
+      if (e) {
+        e->producer.reset();
+        e->child.reset();
+        e.reset();
+      }
+  ra_jobs_.clear();
   if (!be_) return;
   try {
     be_->stream_sync(nullptr);
