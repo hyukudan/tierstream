@@ -1,0 +1,10 @@
+strix-stream
+Copyright (c) 2026 hyukudan. Licensed under the MIT License (see LICENSE).
+
+Third-party code: none.
+
+Every source file in this repository is original code written for this project. The XXH64 hash in src/xxh64.cpp is
+an independent implementation written from the published algorithm description.
+
+If a file ported from another project is added, that file keeps its original copyright and license header, and the
+original notice is reproduced in full in this file under a heading naming the file.

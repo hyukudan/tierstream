@@ -1,0 +1,243 @@
+/*
+ * strix-stream C ABI (v1).
+ *
+ * Model-generic weight streaming for engines that hold a model larger than the device: a descriptor says which
+ * placeable units (expert slices, layer blobs) exist and where their bytes live; the library keeps a resident set in
+ * device memory, streams the rest from a pinned host tier or from files read unbuffered through a staging ring, and
+ * gives the engine one pointer table per layer to read weights through.
+ *
+ * Threading: one context is driven by one engine thread (every ss_* call on a context from the same thread, or
+ * externally serialized). The library runs its own reader threads.
+ *
+ * Exactness: the library never changes bytes. A unit's bytes on the device are identical whether it is resident,
+ * landed from the pinned tier or read from a file. Which slot holds a unit, and when it landed, is visible to the
+ * engine only through the pointer table; kernels must give the same bits whatever the table says (design.md §4).
+ */
+#ifndef STRIX_STREAM_SS_H
+#define STRIX_STREAM_SS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(_WIN32) && defined(SS_BUILD_SHARED)
+#define SS_API __declspec(dllexport)
+#elif defined(_WIN32) && defined(SS_USE_SHARED)
+#define SS_API __declspec(dllimport)
+#else
+#define SS_API
+#endif
+
+#define SS_ABI_VERSION 1
+
+typedef enum ss_status {
+  SS_OK = 0,
+  SS_E_INVALID = 1,     /* bad argument or call order */
+  SS_E_DESC = 2,        /* descriptor parse / validation error */
+  SS_E_IO = 3,          /* file open / read error */
+  SS_E_NOMEM = 4,       /* device or host allocation failed */
+  SS_E_BACKEND = 5,     /* CUDA / HIP runtime error */
+  SS_E_CAPACITY = 6,    /* plan or ring cannot hold what a layer needs */
+  SS_E_HASH = 7,        /* landed bytes differ from the descriptor hash */
+  SS_E_UNSUPPORTED = 8  /* backend not compiled in, or feature not in this backend */
+} ss_status;
+
+/* Last error message of the calling thread (static storage, valid until the next failing call on that thread). */
+SS_API const char* ss_last_error(void);
+SS_API int ss_abi_version(void);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Descriptor (design.md §2). Opaque; loaded from a desc-v1 JSON manifest or built by an adapter through the JSON
+ * text. The descriptor carries engine bytes per unit (what the engine stores), not necessarily file bytes.
+ * ------------------------------------------------------------------------------------------------------------- */
+typedef struct ss_desc ss_desc;
+
+SS_API ss_status ss_desc_from_json(const char* json_text, size_t len, ss_desc** out);
+SS_API ss_status ss_desc_from_file(const char* path, ss_desc** out);
+/* Same as ss_desc_from_file; the name the prefill adapters use (spec-rtx-prefill §6.4). Model-file readers (GGUF,
+ * safetensors) live in the adapters / hyperloom and emit desc-v1; the library only reads the manifest. */
+SS_API ss_status ss_desc_from_model(const char* manifest_path, ss_desc** out);
+SS_API void ss_desc_free(ss_desc* d);
+SS_API int ss_desc_n_layers(const ss_desc* d);
+/* Units of a layer (experts for a routed layer, 1 for a layer blob, 0 for a layer that only has fixed bytes). */
+SS_API int ss_desc_layer_units(const ss_desc* d, int layer);
+SS_API uint64_t ss_desc_unit_bytes(const ss_desc* d, int layer);
+/* Canonical JSON (sorted keys, no whitespace): what hyperloom's vramplan adapter reads. Caller frees with ss_free. */
+SS_API ss_status ss_desc_to_json(const ss_desc* d, char** out_json, size_t* out_len);
+SS_API void ss_free(void* p);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Planner (design.md §5): which units are resident, which stream from the pinned tier, which from disk. Same rule as
+ * hyperloom vramplan's third tier: fixed device bytes, margin max(margin_gib, margin_fraction x cap), stream slots
+ * whenever anything streams, then units by order (prefix | ranked by benefit/byte, ties in model order); a
+ * non-resident unit takes the pinned tier while host budget lasts (best benefit/byte first) if its tiers allow it,
+ * else disk.
+ * ------------------------------------------------------------------------------------------------------------- */
+typedef enum ss_tier { SS_TIER_RESIDENT = 0, SS_TIER_PINNED = 1, SS_TIER_DISK = 2, SS_TIER_PAIR = 3 } ss_tier;
+
+typedef struct ss_budget {
+  uint64_t device_bytes;       /* device memory the library and the engine's fixed bytes may use (the cap) */
+  uint64_t host_pinned_bytes;  /* pinned host the library may lock for the pinned tier (0 = no pinned tier) */
+  uint64_t workspace_bytes;    /* engine workspaces/state already sized by the engine for this request class */
+  double margin_gib;           /* default 2.0 */
+  double margin_fraction;      /* default 0.03 */
+  /* Persistent decode slots per routed layer beyond the planned residents (0 = none; the dynamic resident set). */
+  uint32_t dynamic_slots_per_layer;
+  /* Slots per stream ring (one ring per streamed unit size; unit-sized device slots shared by every layer of that
+   * size for transient units). 0 = descriptor ring_slots, else 2 x the most units of a layer of that size. */
+  uint32_t ring_slots;
+} ss_budget;
+
+typedef struct ss_plan ss_plan;
+
+SS_API void ss_budget_defaults(ss_budget* b);
+/* benefit: optional per-unit benefit (global unit order, see ss_desc_unit_index), NULL = descriptor benefit. */
+SS_API ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benefit, size_t n_benefit,
+                              ss_plan** out);
+/* Tiers decided elsewhere (one ss_tier per unit in global order, or a plan-v1 JSON's "tiers"): same totals and
+ * capacity checks as ss_plan_make. This is how an engine runs the placement hyperloom planned. */
+SS_API ss_status ss_plan_from_tiers(const ss_desc* d, const ss_budget* b, const uint8_t* tiers, size_t n,
+                                    ss_plan** out);
+SS_API ss_status ss_plan_from_json(const ss_desc* d, const ss_budget* b, const char* plan_json, size_t len,
+                                   ss_plan** out);
+SS_API void ss_plan_free(ss_plan* p);
+SS_API ss_tier ss_plan_unit_tier(const ss_plan* p, int layer, int unit);
+typedef struct ss_plan_totals {
+  uint64_t fixed_bytes, margin_bytes, resident_bytes, dynamic_bytes, ring_bytes, peak_device_bytes;
+  uint64_t pinned_bytes, disk_bytes;
+  uint64_t n_resident, n_pinned, n_disk;
+} ss_plan_totals;
+SS_API void ss_plan_get_totals(const ss_plan* p, ss_plan_totals* out);
+SS_API ss_status ss_plan_to_json(const ss_plan* p, char** out_json, size_t* out_len);
+/* Global unit index: layer-major, ascending unit id inside a layer (the order of per-unit arrays in this ABI). */
+SS_API int64_t ss_desc_unit_index(const ss_desc* d, int layer, int unit);
+SS_API int64_t ss_desc_total_units(const ss_desc* d);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Context: one engine's streaming state on one device.
+ * ------------------------------------------------------------------------------------------------------------- */
+typedef enum ss_backend_kind {
+  SS_BACKEND_CPU = 0,   /* host memory as "device" (tests, CPU engines); unified */
+  SS_BACKEND_CUDA = 1,  /* discrete GPU: resident pool + ring in VRAM, H2D copy stream */
+  SS_BACKEND_HIP = 2    /* Strix Halo unified memory: slots are host-mapped, file reads land in place */
+} ss_backend_kind;
+
+typedef enum ss_policy {
+  SS_POLICY_LRU = 0,     /* least recently used among unpinned residents; hits refresh recency */
+  SS_POLICY_SCORED = 1   /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency */
+} ss_policy;
+
+typedef struct ss_options {
+  ss_backend_kind backend;
+  int device;                     /* CUDA/HIP device ordinal */
+  ss_policy policy;
+  uint32_t lookahead_budget;      /* speculative units per layer (default 2; 0 = off) */
+  uint32_t reader_threads;        /* file reader threads (default 2) */
+  uint32_t staging_buffers;       /* staging ring buffers (default 4) */
+  uint64_t staging_bytes;         /* bytes per staging buffer (default 256 MiB; >= largest unit + 2 x align) */
+  uint64_t copy_piece_bytes;      /* H2D pieces (default 64 MiB) */
+  int verify_hash;                /* 1 = check xxh64 of every unit's bytes on the host side before it lands */
+  int fill_residents;             /* 1 = load resident units at open (default 1) */
+  uint32_t score_window;          /* routes in the frequency window (default 16) */
+  int pin_planned;                /* 1 = planner residents are never evicted (prefill); 0 = they seed the dynamic set */
+  int direct_io;                  /* 1 = unbuffered file reads (default); falls back to buffered if the FS refuses */
+  uint32_t group_units;           /* misses per landing group in ss_acquire_groups (default 0 = one group) */
+} ss_options;
+
+typedef struct ss_ctx ss_ctx;
+
+SS_API void ss_options_defaults(ss_options* o);
+/* Opens the sources named by the descriptor, allocates the resident pool, ring and pinned tier per the plan, fills
+ * residents and the pinned tier. plan may be NULL (made from budget with descriptor benefits). */
+SS_API ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan, const ss_options* opt,
+                         ss_ctx** out);
+SS_API void ss_close(ss_ctx* c);
+
+/* Optional warm seed: make these units resident now (usage profile), ranked best first, within the dynamic slots. */
+SS_API ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n);
+
+/* One forward (a prefill request or a decode step). rows_per_layer may be NULL (all layers run); else
+ * rows_per_layer[L] == 0 marks a layer the forward skips (e.g. a cone). */
+SS_API ss_status ss_begin(ss_ctx* c, const uint32_t* rows_per_layer, int n_layers);
+
+/* Routes of layer L for this forward: n ids (rows x top_k, any order, duplicates allowed, -1 ignored). Host ids. */
+SS_API ss_status ss_layer_routes(ss_ctx* c, int layer, const int32_t* ids, int n);
+/* Device ids: the library copies them back on its copy stream (async) and reads them at ss_acquire. */
+SS_API ss_status ss_layer_routes_dev(ss_ctx* c, int layer, const int32_t* ids_dev, int n, void* engine_stream);
+/* The whole layer is needed (layer-major prefill of a streamed layer, or a dense blob). */
+SS_API ss_status ss_layer_all(ss_ctx* c, int layer);
+
+typedef enum ss_prefetch_kind {
+  SS_PREFETCH_CERTAIN = 0,      /* will be used by this forward: issue now, admission as a demand */
+  SS_PREFETCH_SPECULATIVE = 1   /* predicted (router lookahead): budgeted, only while no demand is waiting */
+} ss_prefetch_kind;
+/* Ranked predicted ids (best first). Residents are skipped; a later demand for an in-flight unit claims it. */
+SS_API ss_status ss_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n, ss_prefetch_kind kind);
+/* Whole-layer prefetch (layer-major prefill: issue layer L+k's streamed part during layer L). */
+SS_API ss_status ss_prefetch_layer(ss_ctx* c, int layer);
+
+/* Lookahead helper (host): rows x n_experts scores of layer L+1's router applied to layer L's input; per row its
+ * top_k, union ordered by (best rank, best score, id). Writes up to max_out ids, returns the count in *n_out. */
+SS_API ss_status ss_lookahead_select(const float* scores, int rows, int n_experts, int top_k, int32_t* out,
+                                     int max_out, int* n_out);
+
+/* Layer view. table_dev[u] = device address of unit u's bytes (0 when u is not available this forward); table_host
+ * is the same table in host memory. Groups: group 0 = units already resident when routes were given; groups 1..n
+ * land in order. ss_acquire waits for everything; ss_acquire_groups returns at once and the engine gates each
+ * group with ss_group_wait before reading it (hits first, misses as they land). */
+typedef struct ss_group {
+  const int32_t* units;  /* ascending unit ids of this group */
+  int n_units;
+} ss_group;
+typedef struct ss_layer_view {
+  const uint64_t* table_dev;   /* device pointer to n_units uint64 addresses (a device array) */
+  const uint64_t* table_host;  /* host copy */
+  int n_units;
+  const ss_group* groups;
+  int n_groups;
+} ss_layer_view;
+
+/* The engine stream waits (device-side) for every unit of L routed this forward; returns the view. */
+SS_API ss_status ss_acquire(ss_ctx* c, int layer, void* engine_stream, ss_layer_view* out);
+SS_API ss_status ss_acquire_groups(ss_ctx* c, int layer, void* engine_stream, ss_layer_view* out);
+SS_API ss_status ss_group_wait(ss_ctx* c, int layer, int group, void* engine_stream);
+/* Recorded on the engine stream after the last kernel that reads layer L's units: slots may be reused after it. */
+SS_API ss_status ss_release(ss_ctx* c, int layer, void* engine_stream);
+SS_API ss_status ss_end(ss_ctx* c);
+
+/* Byte check (tests): copies unit (L, u)'s landed bytes back and compares them with the source and the descriptor
+ * hash. Only valid between ss_acquire and ss_release of L. */
+SS_API ss_status ss_check_unit(ss_ctx* c, int layer, int unit);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Stats (design.md §7). Counters since open (or since ss_stats_reset); per layer and total.
+ * ------------------------------------------------------------------------------------------------------------- */
+typedef struct ss_layer_stats {
+  uint64_t routed;          /* distinct routed units seen (per forward, summed) */
+  uint64_t hits;            /* routed units found resident */
+  uint64_t admitted;        /* misses that took a persistent slot */
+  uint64_t transient;       /* misses served from the stream ring */
+  uint64_t evicted;
+  uint64_t prefetched;      /* routed units already issued by a certain prefetch of this forward */
+  uint64_t spec_issued, spec_used, spec_dropped;
+  uint64_t bytes_pinned;    /* bytes copied from the pinned tier */
+  uint64_t bytes_disk;      /* bytes read from files */
+  uint64_t wait_ns;         /* host time spent inside ss_acquire waiting for reads to be issued / to land */
+} ss_layer_stats;
+
+SS_API ss_status ss_stats_layer(const ss_ctx* c, int layer, ss_layer_stats* out);
+SS_API ss_status ss_stats_total(const ss_ctx* c, ss_layer_stats* out);
+SS_API void ss_stats_reset(ss_ctx* c);
+/* Called at ss_end with the totals of that forward. */
+typedef void (*ss_stats_hook)(void* user, const ss_layer_stats* forward_total, const ss_layer_stats* per_layer,
+                              int n_layers);
+SS_API void ss_set_stats_hook(ss_ctx* c, ss_stats_hook hook, void* user);
+SS_API ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len);
+
+#ifdef __cplusplus
+}
+#endif
+#endif /* STRIX_STREAM_SS_H */
