@@ -588,6 +588,13 @@ TEST(plan_blob_tiers_32_16_12_and_plan_json_roundtrip) {
   CHECK_EQ(json_u64(*p.doc.find("resources")->find("disk_bytes"), "d"), 12 * 2 * GiB);
   // The exclusive tier mode compiles into the budget; its refusals name the conflicting field.
   {
+    // host_spare_units came after recipe-v1: unset, the canonical recipe (and its effective hash) is unchanged.
+    RecipeStack c0(kLab, "lab.toml");
+    CHECK(json_write(c0.effective_json()).find("host_spare_units") == std::string::npos);
+    RecipeStack c1(kLab, "lab.toml");
+    c1.set("routes.prefill_long.placement.rtx.host_spare_units", "3", "--set");
+    CHECK(json_write(c1.effective_json()).find("\"host_spare_units\":3") != std::string::npos);
+    CHECK(c0.effective_sha256() != c1.effective_sha256());
     RecipeStack x(kLab, "lab.toml");
     x.set("routes.prefill_long.placement.rtx.tier_mode", "\"exclusive\"", "--set");
     x.set("routes.prefill_long.placement.rtx.host_spare_units", "3", "--set");

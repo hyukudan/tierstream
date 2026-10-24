@@ -579,7 +579,10 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
   j->dst_release_ev = L_[size_t(layer)].release_ev;
   j->host_src = pinned_of_[size_t(gidx(layer, unit))];
   j->from_pinned = j->host_src != nullptr;
-  if (excl_ && j->from_pinned) j->src_wait_ev = wb_pending_[size_t(gidx(layer, unit))];
+  if (excl_ && j->from_pinned) {
+    j->src_wait_ev = wb_pending_[size_t(gidx(layer, unit))];
+    if (j->src_wait_ev) ++xst_.rereads;
+  }
   if (!be_->unified()) {
     if (!ev_pool_.empty()) {
       j->done_ev = ev_pool_.back();
@@ -672,7 +675,6 @@ void* Ctx::write_back(int layer, const Admission& a) {
 }
 
 void Ctx::fetch_admitted(int layer, const Admission& a, bool spec) {
-  xst_.deferred += uint64_t(a.deferred);
   void* ev = excl_ && !a.evicted.empty() ? write_back(layer, a) : nullptr;
   for (size_t k = 0; k < a.admitted.size(); ++k) {
     void* wait = nullptr;  // only a write into a victim's slot waits for the victims' write-back
@@ -906,6 +908,7 @@ void Ctx::ingest_routes(int layer, const int32_t* ids, int n) {
   st.routed += s.routed.size();
   st.hits += s.hits.size();
   Admission a = s.rs->admit(to_admit, busy, true, eviction_cap(layer, false));
+  xst_.deferred += uint64_t(a.deferred);
   fetch_admitted(layer, a, false);
   for (int32_t u : a.transient)
     if (!fetch_into_ring(layer, u, false)) {
@@ -980,6 +983,7 @@ void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {
     // A speculative read uses only the ring unless spec_persistent: it never evicts a resident on a guess.
     Admission a =
         speculative && !o_.spec_persistent ? Admission{} : s.rs->admit({u}, busy, true, eviction_cap(layer, speculative));
+    xst_.deferred += uint64_t(a.deferred);  // counted for every admission, also one that admitted nothing
     if (!a.admitted.empty()) {
       fetch_admitted(layer, a, speculative);
       st.evicted += a.evicted.size();
@@ -1295,6 +1299,7 @@ Json Ctx::stats_json() const {
     x["writebacks"] = Json::number(xst_.writebacks);
     x["writeback_bytes"] = Json::number(xst_.writeback_bytes);
     x["deferred"] = Json::number(xst_.deferred);
+    x["rereads"] = Json::number(xst_.rereads);
     x["promoted"] = Json::number(xst_.promoted);
     x["free_blocks"] = Json::number(xst_.free_blocks);
     x["min_free_blocks"] = Json::number(xst_.min_free_blocks);
@@ -1302,6 +1307,11 @@ Json Ctx::stats_json() const {
     j["exclusive"] = x;
   }
   return j;
+}
+
+void Ctx::test_gate_writeback(void* ev) {
+  require(excl_ && !be_->unified(), SS_E_INVALID, "test_gate_writeback: exclusive mode on a discrete device only");
+  be_->stream_wait(wb_stream_, ev);
 }
 
 ss_exclusive_stats Ctx::exclusive_stats() const {

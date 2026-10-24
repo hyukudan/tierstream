@@ -20,8 +20,10 @@
 
 using sstest::Fixture;
 
-// Test hook (capi.cpp, not in ss.h): the exclusive tier mode's ownership check between forwards.
+// Test hooks (capi.cpp, not in ss.h): the exclusive tier mode's ownership check between forwards, and a gate the
+// write-back stream waits for before its next copies.
 extern "C" ss_status ss_test_check_exclusive(ss_ctx* c);
+extern "C" ss_status ss_test_gate_writeback(ss_ctx* c, void* event);
 
 namespace {
 
@@ -286,6 +288,86 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
 TEST(cuda_decode_lru_async) { decode_variant("lru", SS_POLICY_LRU, 0, false); }
 TEST(cuda_decode_scored_async) { decode_variant("scored", SS_POLICY_SCORED, 0, false); }
 TEST(cuda_decode_lru_spec_persistent_backed) { decode_variant("lru-specp-backed", SS_POLICY_LRU, 1, true); }
+// Deterministic same-forward hazards (Sol sol-8 #3). Layer 2: residents 0-3 (LRU ties -> lowest id is the victim),
+// pinned 4-7. The write-back stream is gated behind a ~20 ms spin on another stream, so every write-back of the forward
+// is still pending when the copies that depend on it are issued:
+//   persistent: certain prefetch 5 evicts 0 (written back into a spare), then the routes name 0 again: 0 is admitted
+//     from that block (its copy must wait for the write-back) into the slot of another victim (whose write-back must
+//     land before 0 overwrites it); 5 lands in 0's old slot (after 0's write-back read it).
+//   ring (one spare): prefetch 5 takes the only spare for 0; the routes {0, 6}: no block left, both deferred to the
+//     ring, 0 read from the block its pending write-back fills.
+// A missing wait reads a block before it is written (stale spare bytes) or overwrites a slot before it is written
+// back: the device checksums of 0 and 5 (now and in the next forward) catch both.
+void exclusive_same_forward(const char* name, uint32_t spares) {
+  Fixture fx(std::string("cuda-") + name);
+  Gpu gpu;
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 32;
+  r.b.host_pinned_bytes = 4 << 20;
+  r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
+  r.b.host_spare_units = spares;
+  plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.pin_planned = 0;
+  r.o.verify_hash = 1;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  cudaStream_t gate_s = nullptr;
+  cudaEvent_t gate = nullptr;
+  CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
+  CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+  spin<<<1, 1, 0, gate_s>>>(40000000);  // ~20 ms
+  CU(cudaEventRecord(gate, gate_s));
+  CHECK_OK(ss_test_gate_writeback(r.c, gate));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t pre[1] = {5};
+  CHECK_OK(ss_prefetch(r.c, 2, pre, 1, SS_PREFETCH_CERTAIN));
+  std::vector<int32_t> ids = spares == 1 ? std::vector<int32_t>{0, 6} : std::vector<int32_t>{0, 5};
+  CHECK_OK(ss_layer_routes(r.c, 2, ids.data(), int(ids.size())));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
+  gpu.check(v, fx, 2, ids, false);
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  ss_exclusive_stats x{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK(cudaEventQuery(gate) == cudaErrorNotReady);  // the write-backs were still gated when everything was issued
+  CHECK(x.rereads >= 1);
+  if (spares == 1) {
+    CHECK_EQ(x.writebacks, uint64_t(1));
+    CHECK_EQ(x.deferred, uint64_t(2));
+  } else {
+    CHECK_EQ(x.writebacks, uint64_t(2));
+    CHECK_EQ(x.deferred, uint64_t(0));
+  }
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  // The next forward reads 0, 5 (and the other victim) from wherever they live now.
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  std::vector<int32_t> all = {0, 1, 2, 3, 5};
+  CHECK_OK(ss_layer_routes(r.c, 2, all.data(), int(all.size())));
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
+  gpu.check(v, fx, 2, all);
+  for (int32_t u : all) CHECK_OK(ss_check_unit(r.c, 2, u));
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  gpu.verify();
+  std::printf("  %s: write-backs %llu rereads %llu deferred %llu\n", name, (unsigned long long)x.writebacks,
+              (unsigned long long)x.rereads, (unsigned long long)x.deferred);
+  cudaStreamSynchronize(gate_s);
+  cudaEventDestroy(gate);
+  cudaStreamDestroy(gate_s);
+}
+
+TEST(cuda_exclusive_same_forward_persistent) { exclusive_same_forward("x-same-persistent", 0); }
+TEST(cuda_exclusive_same_forward_ring) { exclusive_same_forward("x-same-ring", 1); }
+
 TEST(cuda_exclusive_lru_async) { decode_variant("x-lru", SS_POLICY_LRU, 0, false, true, 0); }
 TEST(cuda_exclusive_scored_spec_persistent_async) { decode_variant("x-scored-specp", SS_POLICY_SCORED, 1, false, true, 0); }
 TEST(cuda_exclusive_one_spare_async) { decode_variant("x-one", SS_POLICY_LRU, 0, false, true, 1); }

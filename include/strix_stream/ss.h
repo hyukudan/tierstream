@@ -311,6 +311,7 @@ typedef struct ss_exclusive_stats {
   uint64_t promoted;          /* units whose pinned block was freed by a promotion into a device slot */
   uint64_t free_blocks;       /* free pinned blocks now (all sizes) */
   uint64_t min_free_blocks;   /* fewest free blocks at any forward start since open */
+  uint64_t rereads;           /* copies out of a block whose write-back of the same forward had to land first */
 } ss_exclusive_stats;
 SS_API ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size);
 static inline ss_status ss_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* out) {

@@ -73,6 +73,8 @@ class Ctx {
   // Exclusive tier mode, between forwards (tests): every unit in a slot XOR a block XOR only its file, every block
   // owned exactly once (a unit or a free list). Throws SS_E_INVALID naming the first broken rule.
   void check_exclusive() const;
+  // Tests: the write-back stream waits for this event before its next copies (makes a pending write-back certain).
+  void test_gate_writeback(void* ev);
 
  private:
   enum Loc : int8_t { None = 0, Persistent = 1, Ring = 2 };

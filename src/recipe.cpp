@@ -756,6 +756,9 @@ Json recipe_to_json(const Recipe& r) {
       for (size_t k = 0; k < fields.size(); ++k) {
         const PlacementField& f = fields[k];
         if (std::string(f.key) == "workspace_gib" && !p.has_workspace) continue;
+        // Added after recipe-v1 shipped: written only when set, so existing recipes keep their canonical bytes (and
+        // the effective hash their profiles and compiled plans are bound to).
+        if (std::string(f.key) == "host_spare_units" && p.v[k] == 0) continue;
         switch (f.type) {
           case FieldType::Gib:
           case FieldType::Float:

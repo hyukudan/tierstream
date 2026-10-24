@@ -376,6 +376,35 @@ TEST(exclusive_disk_units_seed_and_failed_read) {
   CHECK_OK(ss_test_check_exclusive(q.c));
 }
 
+// Every admission's deferrals are counted, also a prefetch admission that admitted nothing (Sol sol-8 #2).
+TEST(exclusive_prefetch_deferrals_counted) {
+  for (int spec : {0, 1}) {
+    Fixture fx(spec ? "x-pdefs" : "x-pdef");
+    Run r;
+    budget(r.b, 4 << 20, 1);
+    if (!open_run(r, fx, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"}, SS_POLICY_LRU, spec)) return;
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    int32_t pre[2] = {5, 6};
+    CHECK_OK(ss_prefetch(r.c, 2, pre, 2, spec ? SS_PREFETCH_SPECULATIVE : SS_PREFETCH_CERTAIN));
+    ss_exclusive_stats x = xstats(r.c);
+    if (spec) {
+      CHECK_EQ(x.writebacks, uint64_t(0));  // the one spare is the demand reserve
+      CHECK_EQ(x.deferred, uint64_t(2));
+    } else {
+      CHECK_EQ(x.writebacks, uint64_t(1));
+      CHECK_EQ(x.deferred, uint64_t(1));
+    }
+    int32_t ids[2] = {5, 6};
+    CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));
+    ss_layer_view v{};
+    CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+    CHECK(same(v, fx, 2, 5) && same(v, fx, 2, 6));
+    CHECK_OK(ss_release(r.c, 2, nullptr));
+    CHECK_OK(ss_end(r.c));
+    CHECK_OK(ss_test_check_exclusive(r.c));
+  }
+}
+
 // Seeds with free dynamic slots: a seeded pinned unit leaves its block at once.
 TEST(exclusive_seed_frees_blocks) {
   Fixture fx("x-seed");

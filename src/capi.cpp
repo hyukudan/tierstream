@@ -416,6 +416,11 @@ ss_status ss_test_check_exclusive(ss_ctx* c) {
   });
 }
 
+// Test hook (CUDA test): the write-back stream waits for `event` (a cudaEvent_t) before its next copies.
+ss_status ss_test_gate_writeback(ss_ctx* c, void* event) {
+  return ctx_guard(c, [&] { c->c->test_gate_writeback(event); });
+}
+
 ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size) {
   return guard([&] {
     need(c && out && size >= sizeof(uint32_t), "ss_stats_exclusive: bad argument");
