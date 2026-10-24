@@ -124,10 +124,15 @@ struct Probe {
       CU(cudaEventRecord(wb_done, wb));
       t_enq_wb = ms_since(t);
     }
+    double t_wait = 0;
+    if (cond == 3) {  // the explicit control's wait goes in before the gate check: the check is the last call before H2D
+      auto t = std::chrono::steady_clock::now();
+      CU(cudaStreamWaitEvent(cp, wb_done, 0));
+      t_wait = ms_since(t);
+    }
     const int gate_at_submit = query(gate);  // must still be pending, or the observation is UNKNOWN
     {
       auto t = std::chrono::steady_clock::now();
-      if (cond == 3) CU(cudaStreamWaitEvent(cp, wb_done, 0));
       CU(cudaMemcpyAsync(R, cond >= 2 ? B : A, bytes, cudaMemcpyHostToDevice, cp));
       CU(cudaEventRecord(h2d_done, cp));
       t_enq_cp = ms_since(t);
@@ -155,10 +160,10 @@ struct Probe {
     *content = fill_name(r, &b0);
     const char* expect = cond <= 1 ? "source(0x11)" : cond == 3 ? "ordered(0x5A)" : nullptr;
     *ok_content = !expect || std::strcmp(*content, expect) == 0;
-    std::printf("  %-8s %-7s gate at submit %s; R %s%s; enqueue gate %.3f ms, wb %.3f ms, cp %.3f ms; decided at %.1f "
+    std::printf("  %-8s %-7s gate at submit %s; R %s%s; enqueue gate %.3f ms, wb %.3f ms, wait %.3f ms, cp %.3f ms; decided at %.1f "
                 "ms\n",
                 name, obs_name(obs), gate_at_submit == 0 ? "pending" : gate_at_submit == 1 ? "ENDED" : "ERROR",
-                *content, *ok_content ? "" : " (UNEXPECTED)", t_gate, t_enq_wb, t_enq_cp, t_seen);
+                *content, *ok_content ? "" : " (UNEXPECTED)", t_gate, t_enq_wb, t_wait, t_enq_cp, t_seen);
     return obs;
   }
 };
