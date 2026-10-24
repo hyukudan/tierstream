@@ -32,6 +32,7 @@ class CudaBackend final : public Backend {
   }
   const char* name() const override { return "cuda"; }
   bool unified() const override { return false; }
+  void bind_thread() override { ck(cudaSetDevice(device_), "cudaSetDevice"); }
 
   void* alloc_device(size_t bytes) override {
     ck(cudaSetDevice(device_), "cudaSetDevice");

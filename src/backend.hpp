@@ -15,6 +15,8 @@ class Backend {
   // Unified: device memory is host-addressable (CPU, Strix Halo). File reads and host copies land in place; there is
   // no separate pinned tier to copy from (a pinned unit is just host memory the slot copy reads).
   virtual bool unified() const = 0;
+  // Called once on every library thread before it touches the device (CUDA: cudaSetDevice).
+  virtual void bind_thread() {}
 
   virtual void* alloc_device(size_t bytes) = 0;
   virtual void free_device(void* p) = 0;

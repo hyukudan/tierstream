@@ -33,6 +33,7 @@ class HipBackend final : public Backend {
   explicit HipBackend(int device) : device_(device) { ck(hipSetDevice(device_), "hipSetDevice"); }
   const char* name() const override { return "hip"; }
   bool unified() const override { return true; }
+  void bind_thread() override { ck(hipSetDevice(device_), "hipSetDevice"); }
 
   void* alloc_device(size_t bytes) override {
     void* p = nullptr;

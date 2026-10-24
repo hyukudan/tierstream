@@ -109,6 +109,8 @@ class Ctx {
   void read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest);
   void read_unit_device(Job& j);
   void submit(const JobPtr& j);
+  void promote(const JobPtr& j);
+  class StagingLease;
   void wait_job(Job& j);
   JobPtr make_job(int layer, int unit, void* dst, bool spec);
   void fetch_into_persistent(int layer, int unit, int slot, bool spec);

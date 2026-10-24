@@ -241,6 +241,11 @@ void Ctx::stop_workers() {
 }
 
 void Ctx::worker() {
+  try {
+    be_->bind_thread();
+  } catch (const std::exception&) {
+    // The first job reports the device error.
+  }
   while (true) {
     JobPtr j;
     {
@@ -307,6 +312,18 @@ void Ctx::submit(const JobPtr& j) {
   q_cv_.notify_all();
 }
 
+void Ctx::promote(const JobPtr& j) {
+  // A speculative read that is now a demand jumps to the front of the demand queue if it has not started.
+  std::lock_guard<std::mutex> lk(q_mu_);
+  if (j->state.load() != Job::Queued || !j->spec) return;
+  auto it = std::find(spec_q_.begin(), spec_q_.end(), j);
+  if (it == spec_q_.end()) return;
+  spec_q_.erase(it);
+  j->spec = false;
+  demand_q_.push_front(j);
+  q_cv_.notify_one();
+}
+
 void Ctx::wait_job(Job& j) {
   std::unique_lock<std::mutex> lk(q_mu_);
   done_cv_.wait(lk, [&] {
@@ -339,6 +356,44 @@ void Ctx::run_job(Job& j) {
                         ") bytes differ from the descriptor hash");
 }
 
+// A staging buffer for one chunk: taken from the free list (its last H2D done), always given back.
+class Ctx::StagingLease {
+ public:
+  explicit StagingLease(Ctx& c) : c_(c) {
+    {
+      std::unique_lock<std::mutex> lk(c_.staging_mu_);
+      c_.staging_cv_.wait(lk, [&] { return !c_.staging_free_.empty(); });
+      i_ = c_.staging_free_.back();
+      c_.staging_free_.pop_back();
+    }
+    try {
+      c_.be_->event_sync(c_.staging_[i_].ev);
+    } catch (...) {
+      give_back();
+      throw;
+    }
+  }
+  ~StagingLease() { give_back(); }
+  StagingLease(const StagingLease&) = delete;
+  StagingLease& operator=(const StagingLease&) = delete;
+  void* host() const { return c_.staging_[i_].host; }
+  void* ev() const { return c_.staging_[i_].ev; }
+
+ private:
+  void give_back() {
+    if (done_) return;
+    done_ = true;
+    {
+      std::lock_guard<std::mutex> lk(c_.staging_mu_);
+      c_.staging_free_.push_back(i_);
+    }
+    c_.staging_cv_.notify_one();
+  }
+  Ctx& c_;
+  size_t i_ = 0;
+  bool done_ = false;
+};
+
 void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest) {
   const Layer& l = d_.layers[size_t(layer)];
   Xxh64 h;
@@ -360,23 +415,9 @@ void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* di
         uint64_t len = std::min(cap, part.bytes - c);
         uint64_t a0 = (F + c) / al * al, delta = F + c - a0;
         uint64_t a1 = round_up(F + c + len, al);
-        size_t bi;
-        {
-          std::unique_lock<std::mutex> lk(staging_mu_);
-          staging_cv_.wait(lk, [&] { return !staging_free_.empty(); });
-          bi = staging_free_.back();
-          staging_free_.pop_back();
-        }
-        be_->event_sync(staging_[bi].ev);
-        uint64_t got = f.pread(staging_[bi].host, a1 - a0, a0);
-        bool ok = got >= delta + len;
-        if (ok) std::memcpy(out + c, at(staging_[bi].host, delta), size_t(len));
-        {
-          std::lock_guard<std::mutex> lk(staging_mu_);
-          staging_free_.push_back(bi);
-        }
-        staging_cv_.notify_one();
-        require(ok, SS_E_IO, "short read");
+        StagingLease buf(*this);
+        require(f.pread(buf.host(), a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
+        std::memcpy(out + c, at(buf.host(), delta), size_t(len));
         c += len;
       }
     }
@@ -403,33 +444,17 @@ void Ctx::read_unit_device(Job& j) {
       uint64_t len = std::min(cap, part.bytes - c);
       uint64_t a0 = (F + c) / al * al, delta = F + c - a0;
       uint64_t a1 = round_up(F + c + len, al);
-      size_t bi;
-      {
-        std::unique_lock<std::mutex> lk(staging_mu_);
-        staging_cv_.wait(lk, [&] { return !staging_free_.empty(); });
-        bi = staging_free_.back();
-        staging_free_.pop_back();
+      StagingLease buf(*this);  // waits for the previous H2D out of this buffer
+      require(f.pread(buf.host(), a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
+      const char* src = at(buf.host(), delta);
+      if (want_hash) h.update(src, size_t(len));
+      std::lock_guard<std::mutex> lk(copy_mu_);
+      if (!waited) {
+        be_->stream_wait(nullptr, j.dst_release_ev);
+        waited = true;
       }
-      be_->event_sync(staging_[bi].ev);  // the previous H2D out of this buffer is done
-      uint64_t got = f.pread(staging_[bi].host, a1 - a0, a0);
-      bool ok = got >= delta + len;
-      if (ok) {
-        const char* src = at(staging_[bi].host, delta);
-        if (want_hash) h.update(src, size_t(len));
-        std::lock_guard<std::mutex> lk(copy_mu_);
-        if (!waited) {
-          be_->stream_wait(nullptr, j.dst_release_ev);
-          waited = true;
-        }
-        be_->copy_h2d(at(j.dst, pos + c), src, size_t(len), nullptr);
-        be_->event_record(staging_[bi].ev, nullptr);
-      }
-      {
-        std::lock_guard<std::mutex> lk(staging_mu_);
-        staging_free_.push_back(bi);
-      }
-      staging_cv_.notify_one();
-      require(ok, SS_E_IO, "short read");
+      be_->copy_h2d(at(j.dst, pos + c), src, size_t(len), nullptr);
+      be_->event_record(buf.ev(), nullptr);
       c += len;
     }
     pos += part.bytes;
@@ -604,6 +629,7 @@ void Ctx::ingest_routes(int layer, const int32_t* ids, int n) {
       if (s.spec_unclaimed[size_t(u)]) {
         s.spec_unclaimed[size_t(u)] = 0;
         ++st.spec_used;
+        if (s.job[size_t(u)]) promote(s.job[size_t(u)]);
       } else {
         ++st.prefetched;
       }
