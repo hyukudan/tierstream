@@ -132,6 +132,15 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
   t.tier.assign(n, SS_TIER_PAIR);
   t.peer.assign(n, -1);
   auto unit_name = [&](int L, int u) { return "unit (layer " + std::to_string(L) + ", " + std::to_string(u) + ")"; };
+  // Every benefit that can rank a unit (the caller's, else the descriptor's) is finite and >= 0: a NaN would break
+  // the sort's strict weak ordering.
+  for (size_t L = 0; L < d.layers.size(); ++L)
+    for (int u = 0; u < d.layers[L].n_units; ++u) {
+      const bool given = !benefit.empty() || !d.layers[L].benefit.empty();
+      const double x = given ? benefit_of(d, benefit, int(L), u) : 1.0;
+      if (!(std::isfinite(x) && x >= 0))
+        fail(SS_E_RECIPE, w + ": the benefit of " + unit_name(int(L), u) + " must be finite and >= 0");
+    }
   std::vector<int> group_of(n, -1);
   std::vector<std::vector<UnitRef>> members(p.groups.size());
 

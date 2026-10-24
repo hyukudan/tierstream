@@ -1,6 +1,7 @@
 // CPU tests of recipes (docs/recipes.md): TOML reader, schema validation, profile / override layers and explain,
 // hardware binding, admission with fallbacks, and compilation to plan-v1 (parity with ss_plan_make).
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <string>
@@ -814,6 +815,15 @@ TEST(plan_hetero_ownership) {
       R"({"index":1,"kind":"moe","n_units":8,"top_k":2,"parts":[{"format":"Q2_K","offset":0,"bytes":67108864,"stride":67108864}]}]})");
   std::vector<RefInput> pr = {{&part2, {}}, {&part2, {}}};
   CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", part2, {}, pr), "needs a measured benefit");
+  // Benefits that cannot be ordered are refused (caller's and reference inputs).
+  std::vector<double> nan_ben = ben;
+  nan_ben[3] = std::nan("");
+  CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", dr, nan_ben, {{&dr, nan_ben}, {&dp, {}}}),
+                "must be finite and >= 0");
+  std::vector<double> neg_ben = ben;
+  neg_ben[0] = -1;
+  CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", dr, ben, {{&dr, neg_ben}, {&dp, {}}}),
+                "must be finite and >= 0");
 
   // Without the reference inputs a hetero route cannot be compiled.
   CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", dr, ben, {}), "reference descriptor of every set");
