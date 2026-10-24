@@ -24,6 +24,7 @@ using sstest::Fixture;
 // write-back stream waits for before its next copies.
 extern "C" ss_status ss_test_check_exclusive(ss_ctx* c);
 extern "C" ss_status ss_test_gate_writeback(ss_ctx* c, void* event);
+extern "C" ss_status ss_test_hold_readers(ss_ctx* c, int hold);
 
 namespace {
 
@@ -365,6 +366,63 @@ void exclusive_same_forward(const char* name, uint32_t spares) {
   cudaStreamDestroy(gate_s);
 }
 
+// The source wait alone (Sol sol-9 #3): layer 2 residents 0-3, pinned 4-5, disk 6-7, one spare. Reader threads held,
+// write-back stream gated: certain prefetch 6 (a file read, held: its destination wait is not on the copy stream yet)
+// evicts 0 into the only spare; the routes {0, 7}: no block left, both deferred to the ring; 0's copy out of its block
+// is issued at once on the copy stream and nothing but its source wait orders it after 0's write-back. Without that
+// wait it copies the spare block's stale bytes (the mutation build SS_MUTATION_NO_SRC_WAIT must fail this case).
+TEST(cuda_exclusive_source_wait_only) {
+  Fixture fx("cuda-x-src");
+  Gpu gpu;
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 32;
+  r.b.host_pinned_bytes = 4 << 20;
+  r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
+  r.b.host_spare_units = 1;
+  plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPDD", "P", "PPPPPPPPPPPPPPPP"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.pin_planned = 0;
+  r.o.verify_hash = 1;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  cudaStream_t gate_s = nullptr;
+  cudaEvent_t gate = nullptr;
+  CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
+  CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+  spin<<<1, 1, 0, gate_s>>>(40000000);  // ~20 ms
+  CU(cudaEventRecord(gate, gate_s));
+  CHECK_OK(ss_test_gate_writeback(r.c, gate));
+  CHECK_OK(ss_test_hold_readers(r.c, 1));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t pre[1] = {6};
+  CHECK_OK(ss_prefetch(r.c, 2, pre, 1, SS_PREFETCH_CERTAIN));
+  int32_t ids[2] = {0, 7};
+  CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));
+  ss_exclusive_stats x{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK(cudaEventQuery(gate) == cudaErrorNotReady);  // 0's copy was issued while its write-back was still gated
+  CHECK_OK(ss_test_hold_readers(r.c, 0));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
+  gpu.check(v, fx, 2, {0, 6, 7}, false);
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  CHECK_EQ(x.writebacks, uint64_t(1));
+  CHECK_EQ(x.deferred, uint64_t(2));
+  CHECK_EQ(x.rereads, uint64_t(1));
+  gpu.verify();
+  cudaStreamSynchronize(gate_s);
+  cudaEventDestroy(gate);
+  cudaStreamDestroy(gate_s);
+}
+
 TEST(cuda_exclusive_same_forward_persistent) { exclusive_same_forward("x-same-persistent", 0); }
 TEST(cuda_exclusive_same_forward_ring) { exclusive_same_forward("x-same-ring", 1); }
 
@@ -523,8 +581,10 @@ TEST(cuda_bandwidth_pinned_and_nvme) {
 }
 
 int main(int argc, char** argv) {
+  const char* only = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--no-bw")) g_bw = false;
+    else if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
     else if (!std::strcmp(argv[i], "--bw-dir") && i + 1 < argc) g_bw_dir = argv[++i];
   }
   int dev = 0;
@@ -534,5 +594,5 @@ int main(int argc, char** argv) {
     return 2;
   }
   std::printf("device %d: %s, %.1f GiB\n", dev, p.name, double(p.totalGlobalMem) / double(1ull << 30));
-  return sstest::run_all();
+  return sstest::run_all(only);
 }

@@ -416,6 +416,11 @@ ss_status ss_test_check_exclusive(ss_ctx* c) {
   });
 }
 
+// Test hook (CUDA test): reader threads take no job while held.
+ss_status ss_test_hold_readers(ss_ctx* c, int hold) {
+  return ctx_guard(c, [&] { c->c->test_hold_readers(hold != 0); });
+}
+
 // Test hook (CUDA test): the write-back stream waits for `event` (a cudaEvent_t) before its next copies.
 ss_status ss_test_gate_writeback(ss_ctx* c, void* event) {
   return ctx_guard(c, [&] { c->c->test_gate_writeback(event); });

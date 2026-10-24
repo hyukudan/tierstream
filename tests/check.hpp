@@ -35,9 +35,11 @@ struct Reg {
   Reg(const char* n, std::function<void()> f) { cases().push_back({n, std::move(f)}); }
 };
 
-inline int run_all() {
+// only: run the cases whose name contains it (nullptr = all).
+inline int run_all(const char* only = nullptr) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   for (const Case& c : cases()) {
+    if (only && std::string(c.name).find(only) == std::string::npos) continue;
     int before = failures();
     try {
       c.fn();

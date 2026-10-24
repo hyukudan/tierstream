@@ -311,7 +311,9 @@ void Ctx::worker() {
     {
       std::unique_lock<std::mutex> lk(q_mu_);
       // A speculative read runs only while no demand is queued and at most one demand is running.
-      q_cv_.wait(lk, [&] { return stop_ || !demand_q_.empty() || (!spec_q_.empty() && demand_running_ <= 1); });
+      q_cv_.wait(lk, [&] {
+        return stop_ || (!hold_ && (!demand_q_.empty() || (!spec_q_.empty() && demand_running_ <= 1)));
+      });
       if (stop_ && demand_q_.empty() && spec_q_.empty()) return;
       if (!demand_q_.empty()) {
         j = demand_q_.front();
@@ -369,7 +371,9 @@ void Ctx::submit(const JobPtr& j) {
       std::lock_guard<std::mutex> lk(copy_mu_);
       be_->stream_wait(nullptr, j->dst_release_ev);
       be_->stream_wait(nullptr, j->dst_wb_ev);
+#if !defined(SS_MUTATION_NO_SRC_WAIT)  // test-only mutation build: proves the CUDA test catches its absence
       be_->stream_wait(nullptr, j->src_wait_ev);
+#endif
       for (uint64_t off = 0; off < n; off += o_.copy_piece_bytes)
         be_->copy_h2d(at(j->dst, off), static_cast<const char*>(j->host_src) + off,
                       size_t(std::min<uint64_t>(o_.copy_piece_bytes, n - off)), nullptr);
@@ -1307,6 +1311,14 @@ Json Ctx::stats_json() const {
     j["exclusive"] = x;
   }
   return j;
+}
+
+void Ctx::test_hold_readers(bool hold) {
+  {
+    std::lock_guard<std::mutex> lk(q_mu_);
+    hold_ = hold;
+  }
+  q_cv_.notify_all();
 }
 
 void Ctx::test_gate_writeback(void* ev) {

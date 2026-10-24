@@ -75,6 +75,8 @@ class Ctx {
   void check_exclusive() const;
   // Tests: the write-back stream waits for this event before its next copies (makes a pending write-back certain).
   void test_gate_writeback(void* ev);
+  // Tests: reader threads take no job while held (queued file reads wait; pinned copies are issued at submission).
+  void test_hold_readers(bool hold);
 
  private:
   enum Loc : int8_t { None = 0, Persistent = 1, Ring = 2 };
@@ -194,6 +196,7 @@ class Ctx {
   std::deque<JobPtr> demand_q_, spec_q_;
   int demand_running_ = 0;
   bool stop_ = false;
+  bool hold_ = false;  // test_hold_readers
   std::vector<std::thread> workers_;
 
   void* fwd_stream_ = nullptr;
