@@ -12,6 +12,14 @@ namespace {
 
 constexpr uint64_t kHostAlign = 4096;
 
+// Copies an error message if it can; a failed copy (out of memory) leaves it empty rather than throwing.
+void keep_message(std::string& out, const char* msg) noexcept {
+  try {
+    out = msg;
+  } catch (...) {
+  }
+}
+
 bool resident_tier(uint8_t t) { return t == SS_TIER_RESIDENT || t == SS_TIER_RESIDENT_BACKED; }
 
 uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
@@ -266,11 +274,20 @@ void Ctx::worker() {
       run_job(*j);
     } catch (const Error& e) {
       j->err_status = e.status();
-      j->err = e.what();
+      try {
+        j->err = e.what();
+      } catch (...) {
+      }
+      final_state = Job::Failed;
+    } catch (const std::bad_alloc&) {
+      j->err_status = SS_E_NOMEM;
       final_state = Job::Failed;
     } catch (const std::exception& e) {
       j->err_status = SS_E_BACKEND;
-      j->err = e.what();
+      try {
+        j->err = e.what();
+      } catch (...) {
+      }
       final_state = Job::Failed;
     }
     {
@@ -314,11 +331,15 @@ void Ctx::submit(const JobPtr& j) {
   q_cv_.notify_all();
 }
 
-void Ctx::fail_job(Job& j, ss_status st, const std::string& msg) {
+void Ctx::fail_job(Job& j, ss_status st, const char* msg) noexcept {
+  // The terminal state is published even if copying the message fails (it then stays empty).
   {
     std::lock_guard<std::mutex> lk(q_mu_);
     j.err_status = st;
-    j.err = msg;
+    try {
+      j.err = msg;
+    } catch (...) {
+    }
     j.state.store(Job::Failed);
   }
   done_cv_.notify_all();
@@ -330,9 +351,13 @@ void Ctx::promote(const JobPtr& j) {
   if (j->state.load() != Job::Queued || !j->spec) return;
   auto it = std::find(spec_q_.begin(), spec_q_.end(), j);
   if (it == spec_q_.end()) return;
-  spec_q_.erase(it);
+  try {
+    demand_q_.push_front(j);
+  } catch (...) {
+    return;  // stays queued as speculative: still owned by a queue, still runs
+  }
+  spec_q_.erase(std::find(spec_q_.begin(), spec_q_.end(), j));
   j->spec = false;
-  demand_q_.push_front(j);
   q_cv_.notify_one();
 }
 
@@ -604,8 +629,11 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
   require(n >= 0 && (units || n == 0), SS_E_INVALID, "seed: bad unit list");
   for (int i = 0; i < n; ++i)  // the whole list is valid before anything is placed
     require(units[i] >= 0 && units[i] < d_.layers[size_t(layer)].n_units, SS_E_INVALID, "seed: unit out of range");
+  // Bookkeeping is reserved before anything is placed, so recording a placement never throws.
   std::vector<JobPtr> jobs;
   std::vector<int32_t> placed;
+  jobs.reserve(size_t(n));
+  placed.reserve(size_t(n));
   ss_status failed = SS_OK;
   std::string err;
   try {
@@ -621,13 +649,12 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
     }
   } catch (const Error& e) {
     failed = e.status();
-    err = e.what();
+    keep_message(err, e.what());
   } catch (const std::bad_alloc&) {
     failed = SS_E_NOMEM;
-    err = "seed: out of host memory";
   } catch (const std::exception& e) {
     failed = SS_E_BACKEND;
-    err = e.what();
+    keep_message(err, e.what());
   }
   // A placed seed without a finished read (never submitted, or failed) must not stay resident. Every job in `jobs`
   // was submitted, and a submission that failed published Failed, so these waits always end.
