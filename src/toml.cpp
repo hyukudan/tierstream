@@ -1,6 +1,8 @@
 #include "toml.hpp"
 
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
@@ -28,6 +30,7 @@ class Reader {
 
   Json run() {
     require(s_.size() <= kMaxText, SS_E_RECIPE, "toml: document larger than 16 MiB");
+    check_utf8();
     if (s_.compare(0, 3, "\xEF\xBB\xBF") == 0) i_ = 3;
     while (true) {
       skip_blank_lines();
@@ -67,6 +70,28 @@ class Reader {
   Json root_ = Json::object();
   std::vector<std::string> cur_;
   std::set<std::string> defined_, dotted_, frozen_, aot_;
+
+  // The whole document must be well-formed UTF-8 (no overlongs, surrogates or code points above U+10FFFF).
+  void check_utf8() {
+    for (size_t k = 0; k < s_.size();) {
+      const unsigned char c = static_cast<unsigned char>(s_[k]);
+      size_t n = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+      uint32_t cp = n == 1 ? c : n == 2 ? c & 0x1F : n == 3 ? c & 0x0F : c & 0x07;
+      bool ok = n > 0 && k + n <= s_.size();
+      for (size_t j = 1; ok && j < n; ++j) {
+        const unsigned char x = static_cast<unsigned char>(s_[k + j]);
+        ok = (x & 0xC0) == 0x80;
+        cp = cp << 6 | (x & 0x3F);
+      }
+      ok = ok && !(n == 2 && cp < 0x80) && !(n == 3 && cp < 0x800) && !(n == 4 && cp < 0x10000) && cp <= 0x10FFFF &&
+           !(cp >= 0xD800 && cp <= 0xDFFF);
+      if (!ok) {
+        i_ = k;
+        bad("invalid UTF-8");
+      }
+      k += n;
+    }
+  }
 
   [[noreturn]] void bad(const std::string& what) const {
     size_t line = 1;
@@ -455,6 +480,7 @@ class Reader {
       const std::string lim = out[0] == '-' ? "9223372036854775808" : "9223372036854775807";
       if (ip.size() > lim.size() || (ip.size() == lim.size() && ip > lim)) bad("integer out of range '" + t + "'");
     }
+    if (is_float && !std::isfinite(std::strtod(out.c_str(), nullptr))) bad("number out of range '" + t + "'");
     j.text = out;
     return j;
   }

@@ -530,8 +530,9 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
       return t;
     }
   }
-  std::memcpy(static_cast<void*>(budget), &bout, std::min<size_t>(budget->struct_size, sizeof bout));
-  budget->struct_size = std::min<uint32_t>(budget->struct_size, uint32_t(sizeof bout));
+  const uint32_t bsz = budget->struct_size;
+  std::memcpy(static_cast<void*>(budget), &bout, std::min<size_t>(bsz, sizeof bout));
+  budget->struct_size = std::min<uint32_t>(bsz, uint32_t(sizeof bout));
   const uint32_t osz = options->struct_size;
   std::memcpy(static_cast<void*>(options), &oout, std::min<size_t>(osz, sizeof oout));
   options->struct_size = std::min<uint32_t>(osz, uint32_t(sizeof oout));

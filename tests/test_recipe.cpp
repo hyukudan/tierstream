@@ -255,6 +255,9 @@ TEST(toml_refusals) {
   CHECK_REFUSED(toml_parse("x = 9223372036854775808\n"), "out of range");
   CHECK_REFUSED(toml_parse("x = \"abc\n"), "unterminated");
   CHECK_REFUSED(toml_parse("x = {a = 1,\n b = 2}\n"), "one line");
+  CHECK_REFUSED(toml_parse("x-note = 1e999\n"), "out of range");
+  CHECK_REFUSED(toml_parse("s = \"\xC3\x28\"\n"), "invalid UTF-8");
+  CHECK_REFUSED(toml_parse("s = \"\xED\xA0\x80\"\n"), "invalid UTF-8");
   // Line numbers in messages.
   CHECK_REFUSED(toml_parse("a = 1\n\nb = = 2\n"), "line 3");
 }
@@ -571,7 +574,7 @@ TEST(plan_blob_tiers_32_16_12_and_plan_json_roundtrip) {
   CHECK_EQ(int(p.plan.tier[48]), int(SS_TIER_DISK));
   CHECK_EQ(p.budget.device_bytes, 90 * GiB);
   CHECK_EQ(p.budget.host_pinned_bytes, 48 * GiB);
-  CHECK_EQ(p.budget.workspace_bytes, 4 * GiB);
+  CHECK_EQ(p.budget.workspace_bytes, 4 * GiB + 16 * 60);  // + the device unit tables of a discrete card
   CHECK_EQ(int(p.options.backend), int(SS_BACKEND_CUDA));
   CHECK_EQ(p.options.staging_bytes, 256 * MiB);
   // The plan-v1 in the output is what ss_plan_from_json reads back to the same plan.
@@ -660,7 +663,7 @@ TEST(plan_fill_matches_ss_plan_make) {
       }
   // Prefix descriptor (layer blobs), uniform benefit: the longest prefix with the exact remaining rings.
   Desc b = make_desc(desc_text(20, "blob", 1, 1 * GiB, "prefix", "pinned|disk"));
-  for (double dev : {9.0, 14.0, 26.0, 40.0}) {
+  for (double dev : {10.0, 14.0, 26.0, 40.0}) {
     Recipe r = parse_recipe(
         fill_recipe("class = \"blob\"\nresident = \"fill\"\npinned = \"fill\"\nrest = \"disk\"\n", dev, 6.0));
     RecipePlan p = recipe_plan(r, "x", "d", "c", 0, "c0", b, {}, {});
@@ -707,7 +710,10 @@ TEST(plan_refusals) {
   Desc dw = make_desc(desc_text(4, "moe", 8, 64 * MiB, "ranked", "disk",
                                 R"("workspace_bytes_per_row":1000,"state_bytes_per_position":100,)"));
   RecipePlan pw = recipe_plan(nw, "x", "d", "c", 0, "c0", dw, {}, {});
-  CHECK_EQ(pw.budget.workspace_bytes, uint64_t(1000 * 1 + 100 * 100 * 1));  // decode: rows = max_batch
+  // decode: rows = max_batch; + the device unit tables (2 x 8 bytes x 32 units) of a discrete card
+  CHECK_EQ(pw.budget.workspace_bytes, uint64_t(1000 * 1 + 100 * 100 * 1 + 16 * 32));
+  // The whole device requirement stays within the cap.
+  CHECK(json_u64(*pw.doc.find("resources")->find("device_bytes"), "d") <= pw.budget.device_bytes);
   // Staging must hold 4 x the source alignment.
   RecipeStack sa(fill_recipe("class = \"moe\"\nresident = 2\nrest = \"disk\"\n", 20, 0), "f");
   Desc big_align = make_desc(R"({"schema":"strix-stream/desc-v1","model":"mm","engine":"t","tiers":"disk",)"
@@ -789,6 +795,26 @@ TEST(plan_hetero_ownership) {
   }
   CHECK_EQ(a.plan.n_pair, uint64_t(4 * 5));
   CHECK_EQ(a.plan.ring, uint64_t(0));  // pair units take no ring
+  // A resident fill next to peer units reserves no ring for them: 6 of 8 units fit ~1.6 GiB of room.
+  std::string fill = kHetero;
+  const std::string hot = "rank = \"frequency\"\nresident = 3", cap = "device_gib = 40.0";
+  fill.replace(fill.find(hot), hot.size(), "resident = \"fill\"");
+  fill.replace(fill.find(cap), cap.size(), "device_gib = 8.6");
+  Recipe rf = parse_recipe(fill);
+  Desc big = make_desc(desc_text(1, "moe", 8, 256 * MiB, "ranked", "pinned|disk"));
+  Desc bigp = make_desc(desc_text(1, "moe", 8, 256 * MiB, "ranked", "pinned|disk"));
+  std::vector<RefInput> rr = {{&big, {}}, {&bigp, {}}};
+  RecipePlan af = recipe_plan(rf, "x", "dec", "rtx", 0, "GPU-PRO", big, {}, rr);
+  CHECK_EQ(af.plan.n_resident, uint64_t(6));
+  CHECK_EQ(af.plan.n_pair, uint64_t(2));
+  // Frequency ranking needs a measurement for every ranked unit.
+  Desc part2 = make_desc(
+      R"({"schema":"strix-stream/desc-v1","model":"mm","engine":"t","sources":[{"path":"x.bin"}],"layers":[)" +
+      layers_json(1, "moe", 8, 64 * MiB, R"(,"benefit":[1,2,3,4,5,6,7,8])") + "," +
+      R"({"index":1,"kind":"moe","n_units":8,"top_k":2,"parts":[{"format":"Q2_K","offset":0,"bytes":67108864,"stride":67108864}]}]})");
+  std::vector<RefInput> pr = {{&part2, {}}, {&part2, {}}};
+  CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", part2, {}, pr), "needs a measured benefit");
+
   // Without the reference inputs a hetero route cannot be compiled.
   CHECK_REFUSED(recipe_plan(r, "x", "dec", "rtx", 0, "GPU-PRO", dr, ben, {}), "reference descriptor of every set");
   // Different layer structures cannot share an ownership map.
@@ -879,6 +905,14 @@ TEST(select_routes_and_fallbacks) {
   lab.state["running"].push(run);
   CHECK_EQ(lab.route(), std::string("prefill_long"));
   // A running entry for other plans gets no credit.
+  // A credited route still needs its hosts' reports and floors.
+  lab.state["hosts"]["pc"]["free_ram_gib"] = Json::number(7.0);
+  CHECK_EQ(lab.route(), std::string("prefill_nodes"));
+  Json saved_pc = lab.state["hosts"]["pc"];
+  lab.state["hosts"].obj.erase("pc");
+  CHECK_EQ(lab.route(), std::string("prefill_nodes"));
+  lab.state["hosts"]["pc"] = saved_pc;
+  lab.state["hosts"]["pc"]["free_ram_gib"] = Json::number(30.0);
   lab.state["running"].arr[0]["plan_ids"].arr[0] = Json::string("stale");
   CHECK_EQ(lab.route(), std::string("prefill_nodes"));
   lab.state["running"] = Json::array();
@@ -1023,6 +1057,7 @@ TEST(capi_recipe_roundtrip) {
                           &o2, nullptr, nullptr, nullptr));
   CHECK_EQ(small.b.device_bytes, 90 * GiB);
   CHECK_EQ(int(small.guard[0]), 0x5a);
+  CHECK_EQ(small.b.struct_size, uint32_t(offsetof(ss_budget, dynamic_slots_per_layer)));  // size kept
   CHECK_EQ(int(reinterpret_cast<unsigned char*>(&small.b.dynamic_slots_per_layer)[0]), 0x5a);
   // Explain through the ABI.
   CHECK_OK(ss_recipe_explain(r, &out, nullptr));

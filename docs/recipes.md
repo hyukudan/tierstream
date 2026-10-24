@@ -235,7 +235,9 @@ set, else `min(when.prompt_tokens_max, max_context_tokens)`, an unset max meanin
 
 `workspace_gib` absent: derived from the descriptor as `workspace_bytes_per_row × forward rows +
 state_bytes_per_position × max_context_tokens × max_batch`. When the descriptor gives 0 for either size, the mapping
-is refused: "set workspace_gib". Zero is never assumed.
+is refused: "set workspace_gib". Zero is never assumed. On a `cuda` set the compiled `workspace_bytes` also includes
+the device copies of the unit tables (2 × 8 bytes per unit), so the planner's cap check covers every device
+allocation.
 
 Streaming knobs (`ss_options`; `backend` comes from the set's `kind`; `device` is the caller's, §8.1):
 
@@ -292,8 +294,8 @@ resident. When a placement has groups, every streamable unit of the member's des
 - `model`: (layer, unit).
 - `list`: (position in `list`, layer); units not in `list` follow in (layer, unit).
 - `frequency`: benefit per unit stride descending, then (layer, unit). Benefit is the caller's array (global unit
-  index, `ss_desc_unit_index`), else the descriptor's `benefit`; refused when neither gives a value for the group's
-  layers.
+  index, `ss_desc_unit_index`), else the descriptor's `benefit`; refused unless one of them gives a value for every
+  unit of the group (no unit is ranked on an invented default).
 For integer `moe` counts the order is applied per layer; for fills and `blob` counts over the whole group.
 
 **Integer counts never shrink.** For `moe`, `resident + pinned` (integers) must be ≤ `n_units` of every layer in the
@@ -513,7 +515,8 @@ host (from the binding).
 
 A route in `running` (`{route, effective_sha256, plan_ids}`; its service is up and its memory is already counted as
 used) charges 0 when its `effective_sha256` is the current one and its `plan_ids` are exactly the `plan_id`s of the
-route's counting requirements; otherwise it gets no credit. A route is admissible when on every host it charges,
+route's counting requirements; otherwise it gets no credit. A credited route's hosts are still checked: each must
+report its free RAM (and commit, when that floor is set) and stay at or above the floors. A route is admissible when on every host it charges,
 `free_ram_gib − charge ≥ host_free_ram_floor_gib`, and, when `host_free_commit_floor_gib` > 0, `free_commit_gib −
 commit charge ≥ host_free_commit_floor_gib` (the commit charge is `commit_bytes`: host bytes plus, on a discrete
 device, its device bytes). Select is a pure decision: the orchestrator reserves what it admits (atomically, under its

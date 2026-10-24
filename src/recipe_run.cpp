@@ -202,8 +202,8 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
         return a.g < c.g;
       });
     } else if (g.rank == Rank::Frequency) {
-      bool have = !benefit.empty();
-      for (const auto& x : m) have = have || !d.layers[size_t(x.layer)].benefit.empty();
+      bool have = true;
+      for (const auto& x : m) have = have && (!benefit.empty() || !d.layers[size_t(x.layer)].benefit.empty());
       require(
           have, SS_E_RECIPE,
           w + ".units." + g.id + ".rank: \"frequency\" needs a measured benefit (the caller's or the descriptor's)");
@@ -261,6 +261,12 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
     };
     std::set<int64_t> in_cand;
     for (const auto& x : cand) in_cand.insert(x.g);
+    // Whether a unit that does not end resident may stream (needs a ring): PAIR units never do.
+    auto may_stream = [&](const UnitRef& x) {
+      if (st[size_t(x.g)] == Pin) return true;
+      const RGroup& g = p.groups[size_t(group_of[size_t(x.g)])];
+      return g.rest != Rest::Peer || g.pinned == kFill;
+    };
     uint64_t res_bytes = 0;
     std::map<uint64_t, int64_t> rest_count;  // stride -> non-resident streamed units outside the candidates
     std::vector<UnitRef> all_avail;
@@ -270,7 +276,7 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
     for (const auto& x : all_avail) {
       if (st[size_t(x.g)] == Res) {
         res_bytes = add_ck(res_bytes, d.unit_stride(x.layer), w);
-      } else if (!in_cand.count(x.g)) {
+      } else if (!in_cand.count(x.g) && may_stream(x)) {
         ++rest_count[d.unit_stride(x.layer)];
       }
     }
@@ -307,7 +313,7 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
       size_t chosen = SIZE_MAX;
       for (size_t k = cand.size() + 1; k-- > 0;) {
         if (k < cand.size()) {
-          ++counts[d.unit_stride(cand[k].layer)];
+          if (may_stream(cand[k])) ++counts[d.unit_stride(cand[k].layer)];
           prefix_bytes -= d.unit_stride(cand[k].layer);
         }
         const int64_t max_res = std::max(max_res1, k ? pos(cand[k - 1].g) : int64_t(-1));
@@ -332,7 +338,8 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
         took = cand.size();
       } else {
         std::map<uint64_t, int64_t> counts = rest_count;
-        for (const auto& x : cand) ++counts[d.unit_stride(x.layer)];
+        for (const auto& x : cand)
+          if (may_stream(x)) ++counts[d.unit_stride(x.layer)];
         const uint64_t ring = rings(counts);
         if (ring <= room) {
           uint64_t used = res_bytes;
@@ -434,7 +441,10 @@ Tiering tier_units(const Desc& d, const ss_budget& b, const RPlacement& p, const
 }
 
 // Budget of one placement against one descriptor (workspace derived when not set; docs/recipes.md §5.1).
-ss_budget budget_for(const RRoute& rt, const RPlacement& p, const Desc& d, const std::string& w, uint64_t* rows_out) {
+// On a discrete device the library also allocates the unit tables there (2 x 8 bytes per unit): they are reserved
+// in workspace_bytes so tiering and the planner's cap check see them.
+ss_budget budget_for(const RRoute& rt, const RPlacement& p, const Desc& d, bool discrete, const std::string& w,
+                     uint64_t* rows_out) {
   ss_budget b{};
   b.struct_size = uint32_t(sizeof b);
   b.device_bytes = gib_bytes(p.get("device_gib"));
@@ -465,6 +475,9 @@ ss_budget budget_for(const RRoute& rt, const RPlacement& p, const Desc& d, const
                mul_ck(mul_ck(d.state_bytes_per_position, ctx, w + ".workspace_gib"), batch, w + ".workspace_gib"),
                w + ".workspace_gib");
   }
+  if (discrete)
+    for (const auto& l : d.layers)
+      if (l.n_units > 0) b.workspace_bytes = add_ck(b.workspace_bytes, 16 * uint64_t(l.n_units), w);
   return b;
 }
 
@@ -811,10 +824,10 @@ Json recipe_select(const Recipe& r, const std::string& eff_sha, const Json& stat
       std::sort(want.begin(), want.end());
       credited = credited || got == want;
     }
-    if (!credited) {
-      for (const auto& kv : mine) charge[kv.first] = add_ck(charge[kv.first], kv.second, "admission");
-      for (const auto& kv : mine_commit) commit[kv.first] = add_ck(commit[kv.first], kv.second, "admission");
-    }
+    // A credited route charges 0, but its hosts stay in the maps: their reports and floors are still checked.
+    for (const auto& kv : mine) charge[kv.first] = add_ck(charge[kv.first], credited ? 0 : kv.second, "admission");
+    for (const auto& kv : mine_commit)
+      commit[kv.first] = add_ck(commit[kv.first], credited ? 0 : kv.second, "admission");
     return "";
   };
   auto admit = [&](const RRoute& rt, std::map<std::string, uint64_t>& charge) -> std::string {
@@ -961,7 +974,7 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
 
   RecipePlan out;
   uint64_t rows = 0;
-  out.budget = budget_for(*rt, p, desc, w, &rows);
+  out.budget = budget_for(*rt, p, desc, dev->kind == SS_BACKEND_CUDA, w, &rows);
   ss_options& o = out.options;
   o.struct_size = uint32_t(sizeof o);
   o.backend = dev->kind;
@@ -1010,7 +1023,7 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
       const std::string wk = "routes." + route + ".placement." + rt->devices[k];
       std::vector<char> av(n, 0);
       for (size_t g = 0; g < n; ++g) av[g] = state[g] < 0 || state[g] == int(k);
-      ss_budget bk = budget_for(*rt, pk, *refs[k].desc, wk, nullptr);
+      ss_budget bk = budget_for(*rt, pk, *refs[k].desc, r.device(rt->devices[k])->kind == SS_BACKEND_CUDA, wk, nullptr);
       Tiering tk = tier_units(*refs[k].desc, bk, pk, refs[k].benefit, av, rt->devices, wk);
       for (size_t g = 0; g < n; ++g) {
         if (!av[g]) continue;
@@ -1084,21 +1097,21 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   // Resources (docs/recipes.md §7.3): everything the library allocates for this member.
   const uint64_t staging_one = (o.staging_bytes + max_align - 1) / max_align * max_align;
   const uint64_t staging = mul_ck(staging_one, o.staging_buffers, w);
-  uint64_t tables = 0, ids = 0, dev_tables = 0;
+  uint64_t tables = 0, ids = 0;
   uint64_t meta = add_ck(65536, mul_ck(16, uint64_t(desc.total_units), w), w);
   for (const RingClass& rc : out.plan.rings) meta = add_ck(meta, 128 * uint64_t(rc.slots), w);
   for (const auto& l : desc.layers) {
     if (l.n_units <= 0) continue;
     const uint64_t nu = uint64_t(l.n_units);
     tables = add_ck(tables, 16 * nu, w);
-    if (dev->kind == SS_BACKEND_CUDA) dev_tables = add_ck(dev_tables, 16 * nu, w);
     if (l.kind == LayerKind::Moe)
       ids = add_ck(ids, mul_ck(4, std::max<uint64_t>(1024, mul_ck(rows, uint64_t(std::max(l.top_k, 1)), w)), w), w);
     meta = add_ck(meta, 4096 + 768 * nu, w);
     if (o.policy == SS_POLICY_SCORED)
       meta = add_ck(meta, add_ck(mul_ck(4 * nu, nu, w), mul_ck(uint64_t(o.score_window) + 1, 64 + 8 * nu, w), w), w);
   }
-  const uint64_t device_bytes = add_ck(add_ck(out.plan.peak, out.plan.margin, w), dev_tables, w);
+  // Device tables are inside workspace_bytes (budget_for), so peak + margin is the whole device requirement.
+  const uint64_t device_bytes = add_ck(out.plan.peak, out.plan.margin, w);
   uint64_t host = add_ck(add_ck(add_ck(out.plan.pinned, staging, w), add_ck(tables, ids, w), w), meta, w);
   if (dev->unified()) host = add_ck(host, device_bytes, w);
   // Commit: host memory plus, on a discrete device, its allocations (Windows WDDM bills them to commit).
