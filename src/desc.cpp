@@ -316,6 +316,15 @@ void desc_validate(Desc& d) {
     for (const auto& n : d.fixed_device) t = add_checked(t, n.bytes, "desc.fixed_device");
     uint64_t h = 0;
     for (const auto& n : d.host_fixed) h = add_checked(h, n.bytes, "desc.host_fixed");
+    // Every unit at a 4 KiB host stride, plus the fixed bytes, stays below 2^56 (64 PiB): no sum the planner or the
+    // pinned layout forms can wrap.
+    uint64_t all = add_checked(t, h, "desc");
+    for (size_t L = 0; L < d.layers.size(); ++L) {
+      const uint64_t stride = add_checked(d.layers[L].unit_bytes, 4096, at("desc.layers", L));
+      all = add_checked(all, mul_checked(uint64_t(d.layers[L].n_units), stride, at("desc.layers", L)),
+                        at("desc.layers", L));
+    }
+    require(all < (uint64_t(1) << 56), SS_E_DESC, "desc: total bytes above 2^56 (64 PiB)");
     for (size_t L = 0; L < d.layers.size(); ++L) {
       t = add_checked(t, d.layers[L].fixed_bytes, at("desc.layers", L) + ".fixed_bytes");
       if (!d.layers[L].streamable)

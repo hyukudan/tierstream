@@ -114,6 +114,7 @@ class Ctx {
   void read_unit_device(Job& j);
   void submit(const JobPtr& j);
   void promote(const JobPtr& j);
+  void fail_job(Job& j, ss_status st, const std::string& msg);
   class StagingLease;
   void wait_job(Job& j);
   JobPtr make_job(int layer, int unit, void* dst, bool spec);

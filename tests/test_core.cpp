@@ -339,6 +339,11 @@ TEST(desc_overflow_and_narrowing) {
              "\"host_fixed\":[{\"name\":\"a\",\"bytes\":9223372036854775808},"
              "{\"name\":\"b\",\"bytes\":9223372036854775808}],\"fixed_device\"");
   CHECK_EQ(bad(hf), int(SS_E_DESC));  // 2^63 + 2^63 wraps to 0
+  // Two blob layers of one 2^63-byte unit each: the model total bound refuses it before any planner sum.
+  std::string blobs = R"({"schema":"strix-stream/desc-v1","sources":[{"path":"x"}],"layers":[
+    {"index":0,"kind":"blob","parts":[{"format":"BF16","offset":0,"bytes":9223372036854775808}]},
+    {"index":1,"kind":"blob","parts":[{"format":"BF16","offset":0,"bytes":9223372036854775808}]}]})";
+  CHECK_EQ(bad(blobs), int(SS_E_DESC));
 }
 
 TEST(capi_struct_size_and_budget_match) {

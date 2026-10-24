@@ -187,7 +187,10 @@ PinnedLayout pinned_layout(const Desc& d, const std::vector<uint8_t>& tier) {
     }
   }
   if (open) pl.chunk_bytes.push_back(used);
-  for (uint64_t c : pl.chunk_bytes) pl.total += c;
+  for (uint64_t c : pl.chunk_bytes) {
+    require(pl.total <= UINT64_MAX - c, SS_E_INVALID, "plan: pinned layout overflows");
+    pl.total += c;
+  }
   return pl;
 }
 

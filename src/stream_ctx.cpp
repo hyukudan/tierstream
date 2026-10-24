@@ -287,20 +287,41 @@ void Ctx::submit(const JobPtr& j) {
   if (!be_->unified() && j->from_pinned && !j->host_dst) {
     // Pinned tier -> device: issue the pieces now on the copy stream (no host wait, no reader thread).
     const uint64_t n = d_.layers[size_t(j->layer)].unit_bytes;
-    std::lock_guard<std::mutex> lk(copy_mu_);
-    be_->stream_wait(nullptr, j->dst_release_ev);
-    for (uint64_t off = 0; off < n; off += o_.copy_piece_bytes)
-      be_->copy_h2d(at(j->dst, off), static_cast<const char*>(j->host_src) + off,
-                    size_t(std::min<uint64_t>(o_.copy_piece_bytes, n - off)), nullptr);
-    be_->event_record(j->done_ev, nullptr);
+    try {
+      std::lock_guard<std::mutex> lk(copy_mu_);
+      be_->stream_wait(nullptr, j->dst_release_ev);
+      for (uint64_t off = 0; off < n; off += o_.copy_piece_bytes)
+        be_->copy_h2d(at(j->dst, off), static_cast<const char*>(j->host_src) + off,
+                      size_t(std::min<uint64_t>(o_.copy_piece_bytes, n - off)), nullptr);
+      be_->event_record(j->done_ev, nullptr);
+    } catch (const Error& e) {
+      fail_job(*j, e.status(), e.what());
+      throw;
+    } catch (const std::exception& e) {
+      fail_job(*j, SS_E_BACKEND, e.what());
+      throw;
+    }
     j->state.store(Job::Done);
     return;
   }
-  {
+  try {
     std::lock_guard<std::mutex> lk(q_mu_);
     (j->spec ? spec_q_ : demand_q_).push_back(j);
+  } catch (const std::exception& e) {
+    fail_job(*j, SS_E_NOMEM, e.what());
+    throw;
   }
   q_cv_.notify_all();
+}
+
+void Ctx::fail_job(Job& j, ss_status st, const std::string& msg) {
+  {
+    std::lock_guard<std::mutex> lk(q_mu_);
+    j.err_status = st;
+    j.err = msg;
+    j.state.store(Job::Failed);
+  }
+  done_cv_.notify_all();
 }
 
 void Ctx::promote(const JobPtr& j) {
@@ -601,8 +622,15 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
   } catch (const Error& e) {
     failed = e.status();
     err = e.what();
+  } catch (const std::bad_alloc&) {
+    failed = SS_E_NOMEM;
+    err = "seed: out of host memory";
+  } catch (const std::exception& e) {
+    failed = SS_E_BACKEND;
+    err = e.what();
   }
-  // A placed seed without a finished read (never submitted, or failed) must not stay resident.
+  // A placed seed without a finished read (never submitted, or failed) must not stay resident. Every job in `jobs`
+  // was submitted, and a submission that failed published Failed, so these waits always end.
   for (int32_t u : placed) {
     bool ok = false;
     for (const JobPtr& j : jobs)
@@ -620,7 +648,14 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
     }
   for (const JobPtr& j : jobs)
     if (j->done_ev) ev_pool_.push_back(j->done_ev);
-  be_->stream_sync(nullptr);
+  try {
+    be_->stream_sync(nullptr);
+  } catch (const Error& e) {
+    if (failed == SS_OK) {
+      failed = e.status();
+      err = e.what();
+    }
+  }
   if (failed != SS_OK) fail(failed, err);
 }
 
