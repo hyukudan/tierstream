@@ -45,6 +45,14 @@ bool same_budget(const ss_budget& a, const ss_budget& b);
 Plan plan_make(const Desc& d, const ss_budget& b, const std::vector<double>& benefit);
 // Tiers decided elsewhere (hyperloom vramplan, a test, an engine flag): same totals and checks as plan_make.
 Plan plan_from_tiers(const Desc& d, const ss_budget& b, const std::vector<uint8_t>& tiers);
+// The planner's arithmetic for placements decided outside plan_make (recipes, docs/recipes.md §5.2).
+uint64_t host_stride(uint64_t bytes);  // pinned host bytes of a unit (4 KiB stride)
+// cap - margin - fixed - workspace - dynamic-slot bound (throws SS_E_CAPACITY like plan_make when negative).
+uint64_t plan_room(const Desc& d, const ss_budget& b);
+// Device bytes of the stream rings for these streamed units (global indices).
+uint64_t plan_ring_bytes(const Desc& d, const ss_budget& b, const std::vector<int64_t>& streamed);
+// plan_make's pinned_backing step: RESIDENT -> RESIDENT_BACKED with the host budget left.
+void plan_backing(const Desc& d, const ss_budget& b, const std::vector<double>& benefit, std::vector<uint8_t>& tier);
 std::vector<uint8_t> tiers_from_json(const Desc& d, const Json& plan_json);
 Json plan_to_json(const Desc& d, const Plan& p);
 

@@ -21,8 +21,6 @@ struct U {
 constexpr uint64_t kHostStride = 4096;
 constexpr uint64_t kPinnedChunk = uint64_t(1) << 30;
 
-uint64_t host_stride(uint64_t bytes) { return (bytes + kHostStride - 1) / kHostStride * kHostStride; }
-
 bool has_pinned_copy(uint8_t t) { return t == SS_TIER_PINNED || t == SS_TIER_RESIDENT_BACKED; }
 
 std::string gib(uint64_t n) {
@@ -118,7 +116,8 @@ void finalize(const Desc& d, const ss_budget& b, Plan& p) {
         if (t == SS_TIER_RESIDENT_BACKED) ++p.n_backed;
         continue;
       }
-      streamed.push_back({g, int(L), d.unit_stride(int(L)), 0.0});
+      // Pair units are computed by another device and never fetched: they take no stream ring.
+      if (t != SS_TIER_PAIR) streamed.push_back({g, int(L), d.unit_stride(int(L)), 0.0});
       if (t == SS_TIER_PINNED) {
         ++p.n_pinned;
       } else if (t == SS_TIER_DISK) {
@@ -164,6 +163,47 @@ Plan start(const Desc& d, const ss_budget& b) {
 }
 
 }  // namespace
+
+uint64_t host_stride(uint64_t bytes) { return (bytes + kHostStride - 1) / kHostStride * kHostStride; }
+
+uint64_t plan_room(const Desc& d, const ss_budget& b) {
+  Plan p = start(d, b);
+  return p.cap - p.margin - p.fixed - p.dynamic;
+}
+
+uint64_t plan_ring_bytes(const Desc& d, const ss_budget& b, const std::vector<int64_t>& streamed) {
+  std::vector<U> units;
+  units.reserve(streamed.size());
+  for (int64_t g : streamed) {
+    const int L = int(std::upper_bound(d.unit_base.begin(), d.unit_base.end(), g) - d.unit_base.begin()) - 1;
+    units.push_back({g, L, d.unit_stride(L), 0.0});
+  }
+  return ring_bytes(rings_for(d, b, units));
+}
+
+void plan_backing(const Desc& d, const ss_budget& b, const std::vector<double>& benefit, std::vector<uint8_t>& tier) {
+  // Pinned copies for residents with the host budget left after host_fixed and the pinned tier, the likeliest to be
+  // evicted (lowest benefit per byte) first, stopping at the first that does not fit.
+  uint64_t host_left = b.host_pinned_bytes;
+  for (const auto& n : d.host_fixed) host_left = host_left > n.bytes ? host_left - n.bytes : 0;
+  std::vector<U> res;
+  for (const U& u : units_of(d, benefit)) {
+    const uint8_t t = tier[size_t(u.g)];
+    if (t == SS_TIER_PINNED) {
+      const uint64_t hb = host_stride(d.layers[size_t(u.layer)].unit_bytes);
+      host_left = host_left > hb ? host_left - hb : 0;
+    } else if (t == SS_TIER_RESIDENT) {
+      res.push_back(u);
+    }
+  }
+  std::stable_sort(res.begin(), res.end(), [](const U& x, const U& y) { return better(y, x); });
+  for (const U& u : res) {
+    const uint64_t hb = host_stride(d.layers[size_t(u.layer)].unit_bytes);
+    if (hb > host_left) break;
+    tier[size_t(u.g)] = SS_TIER_RESIDENT_BACKED;
+    host_left -= hb;
+  }
+}
 
 PinnedLayout pinned_layout(const Desc& d, const std::vector<uint8_t>& tier) {
   PinnedLayout pl;
@@ -286,19 +326,7 @@ Plan plan_make(const Desc& d, const ss_budget& b, const std::vector<double>& ben
       p.tier[size_t(u.g)] = SS_TIER_DISK;
     }
   }
-  if (b.pinned_backing) {
-    // Pinned copies for residents with what is left, the likeliest to be evicted (lowest benefit per byte) first.
-    std::vector<U> res;
-    for (size_t i = 0; i < units.size(); ++i)
-      if (chosen[i]) res.push_back(units[i]);
-    std::stable_sort(res.begin(), res.end(), [](const U& x, const U& y) { return better(y, x); });
-    for (const U& u : res) {
-      const uint64_t hb = host_stride(d.layers[size_t(u.layer)].unit_bytes);
-      if (hb > host_left) break;
-      p.tier[size_t(u.g)] = SS_TIER_RESIDENT_BACKED;
-      host_left -= hb;
-    }
-  }
+  if (b.pinned_backing) plan_backing(d, b, benefit, p.tier);
   finalize(d, b, p);
   return p;
 }

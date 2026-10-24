@@ -9,6 +9,7 @@
 #include "desc.hpp"
 #include "errors.hpp"
 #include "plan.hpp"
+#include "recipe.hpp"
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
 
@@ -21,6 +22,9 @@ struct ss_plan {
 };
 struct ss_ctx {
   std::unique_ptr<ss::Ctx> c;
+};
+struct ss_recipe {
+  ss::RecipeStack s;
 };
 
 namespace {
@@ -59,6 +63,23 @@ ss_status give_text(const std::string& s, char** out, size_t* len) {
 }
 
 void need(bool ok, const char* what) { ss::require(ok, SS_E_INVALID, what); }
+
+std::string read_text(const char* path, const char* what) {
+  std::ifstream f(path, std::ios::binary);
+  ss::require(bool(f), SS_E_IO, std::string("cannot open ") + what + " " + path);
+  std::stringstream ss_;
+  ss_ << f.rdbuf();
+  return ss_.str();
+}
+
+// JSON inputs of the recipe calls (probe report, identity, request state).
+ss::Json parse_input(const char* text, size_t len, const char* what) {
+  try {
+    return ss::json_parse(std::string(text, len));
+  } catch (const ss::Error& e) {
+    ss::fail(SS_E_RECIPE, std::string(what) + ": " + e.what());
+  }
+}
 
 void budget_defaults(ss_budget* b) {
   std::memset(b, 0, sizeof *b);
@@ -380,6 +401,142 @@ ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) {
     s = ss::json_write(c->c->stats_json());
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
+}
+
+ss_status ss_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) {
+  return guard([&] {
+    need(text && out, "ss_recipe_from_text: null argument");
+    *out = new ss_recipe{ss::RecipeStack(std::string(text, len), origin ? origin : "<text>")};
+  });
+}
+
+ss_status ss_recipe_from_file(const char* path, ss_recipe** out) {
+  return guard([&] {
+    need(path && out, "ss_recipe_from_file: null argument");
+    *out = new ss_recipe{ss::RecipeStack(read_text(path, "recipe"), path)};
+  });
+}
+
+void ss_recipe_free(ss_recipe* r) { delete r; }
+
+ss_status ss_recipe_add_profile(ss_recipe* r, const char* text, size_t len, const char* origin,
+                                const char* identity_json, size_t identity_len) {
+  return guard([&] {
+    need(r && text && identity_json, "ss_recipe_add_profile: null argument");
+    ss::Json id = parse_input(identity_json, identity_len, "identity");
+    r->s.add_profile(std::string(text, len), origin ? origin : "<profile>", id);
+  });
+}
+
+ss_status ss_recipe_add_overrides(ss_recipe* r, const char* text, size_t len, const char* origin) {
+  return guard([&] {
+    need(r && text, "ss_recipe_add_overrides: null argument");
+    r->s.add_overrides(std::string(text, len), origin ? origin : "<overrides>");
+  });
+}
+
+ss_status ss_recipe_set(ss_recipe* r, const char* path, const char* value, const char* origin) {
+  return guard([&] {
+    need(r && path && value, "ss_recipe_set: null argument");
+    r->s.set(path, value, origin ? origin : "--set");
+  });
+}
+
+ss_status ss_recipe_to_json(const ss_recipe* r, char** out, size_t* len) {
+  std::string s;
+  ss_status st = guard([&] {
+    need(r != nullptr, "ss_recipe_to_json: null recipe");
+    s = ss::json_write(r->s.effective_json());
+  });
+  return st != SS_OK ? st : give_text(s, out, len);
+}
+
+ss_status ss_recipe_explain(const ss_recipe* r, char** out, size_t* len) {
+  std::string s;
+  ss_status st = guard([&] {
+    need(r != nullptr, "ss_recipe_explain: null recipe");
+    s = ss::json_write(r->s.explain());
+  });
+  return st != SS_OK ? st : give_text(s, out, len);
+}
+
+ss_status ss_recipe_match(const ss_recipe* r, const char* probe_json, size_t len, char** out, size_t* olen) {
+  std::string s;
+  ss_status st = guard([&] {
+    need(r && probe_json, "ss_recipe_match: null argument");
+    ss::Binding b = ss::recipe_bind(r->s.effective(), parse_input(probe_json, len, "probe"));
+    ss::Json j = ss::Json::object();
+    j["schema"] = ss::Json::string("strix-stream/recipe-match-v1");
+    j["recipe"] = ss::Json::string(r->s.effective().name);
+    j["effective_sha256"] = ss::Json::string(r->s.effective_sha256());
+    j["binding"] = ss::binding_json(b);
+    s = ss::json_write(j);
+  });
+  return st != SS_OK ? st : give_text(s, out, olen);
+}
+
+ss_status ss_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen) {
+  std::string s;
+  ss_status st = guard([&] {
+    need(r && state_json, "ss_recipe_select: null argument");
+    s = ss::json_write(
+        ss::recipe_select(r->s.effective(), r->s.effective_sha256(), parse_input(state_json, len, "state")));
+  });
+  return st != SS_OK ? st : give_text(s, out, olen);
+}
+
+ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member, const char* device_id,
+                         const ss_desc* desc, const double* benefit, size_t n_benefit, const ss_desc* const* ref_descs,
+                         const double* const* ref_benefits, const size_t* ref_n_benefits, size_t n_refs,
+                         ss_budget* budget, ss_options* options, ss_plan** plan, char** out, size_t* olen) {
+  std::string s;
+  ss_plan* made = nullptr;
+  ss_budget bout{};
+  ss_options oout{};
+  ss_status st = guard([&] {
+    need(r && route && set && device_id && desc && budget && options, "ss_recipe_plan: null argument");
+    std::vector<double> ben;
+    if (benefit) ben.assign(benefit, benefit + n_benefit);
+    std::vector<ss::RefInput> refs;
+    need(n_refs == 0 || ref_descs, "ss_recipe_plan: n_refs > 0 needs ref_descs");
+    for (size_t k = 0; k < n_refs; ++k) {
+      ss::RefInput ref;
+      ref.desc = ref_descs[k] ? &ref_descs[k]->d : nullptr;
+      if (ref_benefits && ref_benefits[k]) {
+        need(ref_n_benefits != nullptr, "ss_recipe_plan: ref_benefits needs ref_n_benefits");
+        ref.benefit.assign(ref_benefits[k], ref_benefits[k] + ref_n_benefits[k]);
+      }
+      refs.push_back(std::move(ref));
+    }
+    ss::RecipePlan rp = ss::recipe_plan(r->s.effective(), r->s.effective_sha256(), route, set, member, device_id,
+                                        desc->d, ben, refs);
+    // Versioned in/out structs: start from the caller's (device ordinal kept), recipe fields from the plan.
+    bout = rp.budget;
+    oout = versioned(options, options_defaults, "ss_recipe_plan");
+    const int device = oout.device;
+    oout = rp.options;
+    oout.device = device;
+    bout.struct_size = uint32_t(sizeof bout);
+    oout.struct_size = uint32_t(sizeof oout);
+    need(budget->struct_size >= 2 * sizeof(uint32_t), "ss_recipe_plan: budget struct_size not set (ss_budget_defaults)");
+    if (plan) made = new ss_plan{std::move(rp.plan), desc};
+    s = ss::json_write(rp.doc);
+  });
+  if (st != SS_OK) return st;
+  if (out) {
+    ss_status t = give_text(s, out, olen);
+    if (t != SS_OK) {
+      delete made;
+      return t;
+    }
+  }
+  std::memcpy(static_cast<void*>(budget), &bout, std::min<size_t>(budget->struct_size, sizeof bout));
+  budget->struct_size = std::min<uint32_t>(budget->struct_size, uint32_t(sizeof bout));
+  const uint32_t osz = options->struct_size;
+  std::memcpy(static_cast<void*>(options), &oout, std::min<size_t>(osz, sizeof oout));
+  options->struct_size = std::min<uint32_t>(osz, uint32_t(sizeof oout));
+  if (plan) *plan = made;
+  return SS_OK;
 }
 
 }  // extern "C"

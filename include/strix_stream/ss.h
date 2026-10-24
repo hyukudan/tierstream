@@ -61,7 +61,8 @@ typedef enum ss_status {
   SS_E_BACKEND = 5,     /* CUDA / HIP runtime error */
   SS_E_CAPACITY = 6,    /* plan or ring cannot hold what a layer needs */
   SS_E_HASH = 7,        /* landed bytes differ from the descriptor hash */
-  SS_E_UNSUPPORTED = 8  /* backend not compiled in, or feature not in this backend */
+  SS_E_UNSUPPORTED = 8, /* backend not compiled in, or feature not in this backend */
+  SS_E_RECIPE = 9       /* recipe parse / validation, stale profile, hardware refusal, no admissible route */
 } ss_status;
 
 /* Last error message of the calling thread (static storage, valid until the next failing call on that thread). */
@@ -277,6 +278,47 @@ typedef void (*ss_stats_hook)(void* user, const ss_layer_stats* forward_total, c
                               int n_layers);
 SS_API void ss_set_stats_hook(ss_ctx* c, ss_stats_hook hook, void* user);
 SS_API ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Recipes (docs/recipes.md): how one model runs on one hardware set per workload class, compiled into ss_budget /
+ * ss_options / plan-v1. Every char** output is NUL-terminated and freed with ss_free (a length pointer may be NULL);
+ * on failure nothing is written to any output. A recipe holds its profile / override layers; each change is atomic
+ * (a refused layer leaves the effective recipe as it was).
+ * ------------------------------------------------------------------------------------------------------------- */
+typedef struct ss_recipe ss_recipe;
+
+/* TOML, or JSON when the first non-blank character is '{'. origin names the text in messages (NULL = "<text>"). */
+SS_API ss_status ss_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out);
+SS_API ss_status ss_recipe_from_file(const char* path, ss_recipe** out);
+SS_API void ss_recipe_free(ss_recipe* r);
+/* The autotuner's profile (strix-stream/recipe-profile-v1), checked against the current identity (probe report +
+ * workload + descriptors, docs/recipes.md §8.2); a stale profile is refused. At most one. */
+SS_API ss_status ss_recipe_add_profile(ss_recipe* r, const char* text, size_t len, const char* origin,
+                                       const char* identity_json, size_t identity_len);
+/* A human's overrides (strix-stream/recipe-overrides-v1). */
+SS_API ss_status ss_recipe_add_overrides(ss_recipe* r, const char* text, size_t len, const char* origin);
+/* One override: path (docs/recipes.md §6.2) = value as TOML value text ("33", "\"fill\"", "[[0, 3], 7]"). */
+SS_API ss_status ss_recipe_set(ss_recipe* r, const char* path, const char* value, const char* origin);
+/* The effective recipe (every default written out), canonical JSON. */
+SS_API ss_status ss_recipe_to_json(const ss_recipe* r, char** out, size_t* len);
+/* strix-stream/recipe-explain-v1: every field with its value, layer, origin and the values it shadowed. */
+SS_API ss_status ss_recipe_explain(const ss_recipe* r, char** out, size_t* len);
+/* Hardware check of a probe report: strix-stream/recipe-match-v1 with the device binding, or SS_E_RECIPE listing
+ * every unmet requirement. */
+SS_API ss_status ss_recipe_match(const ss_recipe* r, const char* probe_json, size_t len, char** out, size_t* olen);
+/* Admission of a new request (or the next step of a session) from the request state: strix-stream/recipe-select-v1
+ * naming the route, or SS_E_RECIPE listing why each visited route was not admitted. */
+SS_API ss_status ss_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen);
+/* Compiles one member of a route's device set (docs/recipes.md §8.1). device_id: the member's bound probe id.
+ * desc / benefit: that member's descriptor and per-unit benefit (NULL = the descriptor's). ref_*: indexed like the
+ * route's devices (member 0 of each set), required for hetero routes, else NULL / 0. budget and options must be
+ * initialized with ss_budget_defaults / ss_options_defaults; options->device keeps the caller's value. plan may be
+ * NULL; out (may be NULL) receives strix-stream/recipe-plan-v1. */
+SS_API ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member,
+                                const char* device_id, const ss_desc* desc, const double* benefit, size_t n_benefit,
+                                const ss_desc* const* ref_descs, const double* const* ref_benefits,
+                                const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options,
+                                ss_plan** plan, char** out, size_t* olen);
 
 #ifdef __cplusplus
 }

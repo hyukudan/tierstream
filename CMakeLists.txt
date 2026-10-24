@@ -24,9 +24,14 @@ find_package(Threads REQUIRED)
 
 add_library(strix_stream STATIC
   src/json.cpp
+  src/toml.cpp
   src/xxh64.cpp
+  src/sha256.cpp
   src/desc.cpp
   src/plan.cpp
+  src/recipe.cpp
+  src/recipe_resolve.cpp
+  src/recipe_run.cpp
   src/resident_set.cpp
   src/file_reader.cpp
   src/backend_cpu.cpp
@@ -57,6 +62,10 @@ endif()
 add_executable(ss-plan tools/ss_plan.cpp)
 target_link_libraries(ss-plan PRIVATE strix_stream)
 
+add_executable(ss-recipe tools/ss_recipe.cpp)
+target_include_directories(ss-recipe PRIVATE src)
+target_link_libraries(ss-recipe PRIVATE strix_stream)
+
 if(SS_TESTS)
   enable_testing()
   add_executable(ss-test-core tests/test_core.cpp)
@@ -68,6 +77,11 @@ if(SS_TESTS)
   target_include_directories(ss-test-runtime PRIVATE src)
   target_link_libraries(ss-test-runtime PRIVATE strix_stream)
   add_test(NAME runtime COMMAND ss-test-runtime)
+
+  add_executable(ss-test-recipe tests/test_recipe.cpp)
+  target_include_directories(ss-test-recipe PRIVATE src)
+  target_link_libraries(ss-test-recipe PRIVATE strix_stream)
+  add_test(NAME recipe COMMAND ss-test-recipe WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   add_executable(ss-test-capi tests/test_capi.c)
   target_link_libraries(ss-test-capi PRIVATE strix_stream)

@@ -278,6 +278,13 @@ Intentional differences are per-size rings, dynamic slots, `B` tiers and 4 KiB h
 
 `ss_plan_from_tiers` / `ss_plan_from_json` take tiers decided elsewhere and run the same totals and checks. This is
 how an engine runs exactly the placement hyperloom planned (plan-v1 JSON: one `RPDX` letter per unit, per layer).
+Pair units (`X`) are never fetched, so they take no stream ring: `rings(streamed)` counts only pinned and disk units.
+This matters when tiers mix `X` with resident units on a descriptor whose `tiers` is not `pair` (a heterogeneous
+split, where the device keeps hot units and the peer computes the rest).
+
+**Recipes.** A recipe ([recipes.md](recipes.md)) compiles to these same inputs: an `ss_budget`, `ss_options` and
+tiers that go through `ss_plan_from_tiers`. A recipe placement with one unit group `{rank = "frequency", resident =
+"fill", pinned = "fill", rest = "disk"}` gives exactly `ss_plan_make`'s plan.
 
 ## 6. Engine contract
 
