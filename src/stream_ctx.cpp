@@ -506,8 +506,9 @@ void Ctx::run_job(Job& j) {
   bool want_hash = o_.verify_hash && !l.hash.empty();
   uint64_t digest = 0;
   if (j.host_dst) {
-    read_unit_host(j.layer, j.unit, j.dst, want_hash, &digest);
-    if (j.ra_producer) j.bytes_read = l.unit_bytes;  // the file was read, whatever the hash check says
+    // A producer's bytes_read counts every completed part, also when a later part or the hash check fails.
+    read_unit_host(j.layer, j.unit, j.dst, want_hash, &digest, j.ra_producer ? &j.bytes_read : nullptr);
+    if (j.ra_producer && test_inject_.load() == 9 && test_inject_.exchange(0) == 9) digest = ~digest;
   } else if (be_->unified()) {
     be_->event_sync(j.dst_release_ev);  // the slot's previous reader is done
     be_->event_sync(j.dst_wb_ev);
@@ -564,7 +565,7 @@ class Ctx::StagingLease {
   bool done_ = false;
 };
 
-void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest) {
+void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest, uint64_t* progress) {
   const Layer& l = d_.layers[size_t(layer)];
   Xxh64 h;
   uint64_t pos = 0;
@@ -593,6 +594,11 @@ void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* di
     }
     if (hash) h.update(out, size_t(part.bytes));
     pos += part.bytes;
+    if (progress) {
+      *progress = pos;
+      if (test_inject_.load() == 8 && test_inject_.exchange(0) == 8)
+        fail(SS_E_IO, "read-ahead: injected failure after a part");
+    }
   }
   if (digest) *digest = h.digest();
 }

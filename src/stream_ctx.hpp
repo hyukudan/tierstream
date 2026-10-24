@@ -104,7 +104,8 @@ class Ctx {
   // Tests: reader threads take no job while held (queued file reads wait; pinned copies are issued at submission).
   void test_hold_readers(bool hold);
   // Tests: one-shot read-ahead fault injection (1 = queueing a read throws, 2 = queueing a landing throws,
-  // 3 = the next landing copy fails before any copy, 4 = it fails after its first piece, 5 = the next read fails).
+  // 3 = the next landing copy fails before any copy, 4 = it fails after its first piece, 5 = the next read fails,
+  // 8 = the next read fails after its first part, 9 = the next read's hash check fails though its bytes are right).
   void test_inject(int what) { test_inject_.store(what); }
   // Tests: wait until every read-ahead read of this forward has ended (a deterministic Ready state).
   void test_ra_quiesce();
@@ -161,7 +162,8 @@ class Ctx {
   void stop_workers();
   void worker();
   void run_job(Job& j);
-  void read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest);
+  // progress (may be null): file bytes read so far, updated as each part completes (kept when a later part fails).
+  void read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* digest, uint64_t* progress = nullptr);
   void read_unit_device(Job& j);
   void submit(const JobPtr& j);
   void promote(const JobPtr& j);

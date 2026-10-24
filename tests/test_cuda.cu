@@ -328,6 +328,7 @@ void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = 
   r.o.backend = SS_BACKEND_CUDA;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;  // a few MiB pinned in all
   if (readahead) r.o.readahead_units = 2;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;

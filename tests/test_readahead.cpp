@@ -283,6 +283,34 @@ TEST(readahead_k1_full_ring_starts_reads) {
   }
 }
 
+// A read that fails after its first part keeps the bytes it read; the fallback (an ordinary read) succeeds.
+// And the successful-fallback gate: a read-ahead whose hash check fails, then an ordinary read that succeeds.
+TEST(readahead_partial_and_hash_fallback) {
+  Fixture fx("ra-partial");
+  Run r;
+  if (!open_run(r, fx, 4, 16)) return;
+  for (int inj : {8, 9}) {
+    const uint64_t before = disk_bytes(r.c);
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    int32_t five[1] = {5};
+    CHECK_OK(ss_test_inject(r.c, inj));
+    CHECK_OK(ss_host_prefetch(r.c, 1, five, 1));
+    CHECK_OK(ss_test_ra_quiesce(r.c));
+    CHECK_OK(ss_layer_routes(r.c, 1, five, 1));
+    ss_layer_view v{};
+    CHECK_OK(ss_acquire(r.c, 1, nullptr, &v));
+    CHECK(same(v, fx, 1, 5));
+    CHECK_OK(ss_release(r.c, 1, nullptr));
+    CHECK_OK(ss_end(r.c));  // the read-ahead failure is auxiliary: the forward is clean
+    // inj 8: 3,000 bytes (the first part) by the failed read + 11,000 by the fallback; inj 9: 11,000 + 11,000.
+    CHECK_EQ(disk_bytes(r.c) - before, uint64_t(inj == 8 ? 3000 + 11000 : 11000 + 11000));
+  }
+  const std::string s = stats(r.c);
+  CHECK_EQ(stat_u64(s, "failed"), uint64_t(2));
+  CHECK_EQ(stat_u64(s, "fallback"), uint64_t(2));
+  CHECK_EQ(stat_u64(s, "bytes"), uint64_t(3000 + 11000));
+}
+
 // File bytes: a read whose hash fails still read its bytes (counted once), and its ordinary fallback counts its own.
 TEST(readahead_byte_accounting) {
   Fixture bad("ra-bytes", /*corrupt_hash=*/true);
