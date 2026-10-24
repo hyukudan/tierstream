@@ -123,6 +123,10 @@ Our current three (descriptor shapes):
   - With `pin_planned = 1` (prefill) they are never evicted.
   - With `pin_planned = 0` (decode) they are only the warm start of an adaptive set: our DS traces give LRU 95-98 %
     against 84-93 % for static placement at the same size (study §5).
+  - An evicted planner resident reloads from its file unless it has a pinned copy: tier `RESIDENT_BACKED` (letter
+    `B`). With `ss_budget.pinned_backing = 1` the planner gives residents pinned copies from the host budget left after
+    the pinned tier, lowest benefit per byte first. The DS decode replica ("80 GiB LRU + the rest pinned") needs this,
+    or every eviction becomes an NVMe read.
 - **Stream rings.** There is one ring per unit size, each with `slots × size` bytes. Every layer of that size shares
   the ring for its transient units: misses that are not admitted, whole-layer prefetch, and speculative reads that
   have no persistent slot.
@@ -167,8 +171,10 @@ lower id.
   - The first `lookahead_budget` (default 2) non-resident units are issued at lower priority. Workers take them only
     while no demand is queued and at most one demand is running.
   - A later route that includes one claims it (`spec_used`). Otherwise it is counted `spec_dropped`.
-  - A speculative unit takes a persistent slot through admission (LRU or SCORED) when it can, else a ring slot. A
-    speculative read that never started is cancelled at `ss_end`, and its slot is dropped.
+  - By default a speculative unit lands **only in a ring slot** and never evicts a resident on a guess.
+    `spec_persistent = 1` sends it through admission into a persistent slot instead. Turn that on only once a trace
+    shows the extra evictions pay.
+  - A speculative read that never started is cancelled at `ss_end`; a persistent slot it held is dropped.
 
 ### 3.4 Groups (hits first)
 
@@ -216,7 +222,7 @@ lookup tables (Engram) unbuffered (study §6.5).
 
 ### 4.5 Byte identity
 
-- `verify_hash = 1` checks the xxh64 of every unit's bytes on the host side before they land: at the pinned fill,
+- `verify_hash = 1` checks the xxh64 of every unit's bytes on the host side before its job is reported done: at the pinned fill,
   on the staging buffer, or in place.
 - `ss_check_unit` (tests) copies the landed bytes back and compares them with a fresh read and with the descriptor
   hash.
@@ -229,8 +235,9 @@ lookup tables (Engram) unbuffered (study §6.5).
 |---|---|
 | a slot is overwritten while a kernel still reads it | Every write into a slot of layer L waits (on the copy stream, or on the host for unified backends) for L's release event. A ring slot waits for the release event of the layer that last used it. A slot is handed out only after its owner has recorded its release on the host side, so the wait is never on an unrecorded event. |
 | the engine reads a unit before it lands | `ss_acquire` / `ss_group_wait` make the engine stream wait on each job's event, after the host has seen the job issued (discrete) or landed (unified). |
-| the unit table is rewritten while in use | There are two device tables per layer, alternating per acquire. The host waits for the event of the previous H2D from that pinned mirror before rewriting it. The device copy is ordered on the engine stream. |
-| jobs still in flight across forwards | `ss_end` drains the forward's jobs; speculative jobs that never started are cancelled. |
+| the unit table is rewritten while in use | There are two tables per layer, alternating per acquire. `ss_release` records the table's event on the engine stream, and the next rewrite of that version host-waits it. This covers the CUDA H2D from the pinned mirror and the unified backends, whose kernels read the mapped mirror itself. |
+| jobs still in flight across forwards | `ss_end` waits until every job of the forward has been *issued* (discrete) or has *landed* (unified), and cancels speculative jobs that never started. On a discrete GPU an issued copy may still be in flight, so for every layer that got persistent copies `ss_end` records a per-layer `ready` event on the copy stream. The next `ss_acquire` of that layer makes the engine stream wait for it once, before any hit is read. |
+| a failed read leaves a unit marked resident | `ss_end` drops every persistent unit whose job did not finish; `ss_seed` drops the seeds that failed and returns the first error. A failed unit is read again at its next use. |
 
 ## 5. Planner (same rule as vramplan's third tier)
 
@@ -248,12 +255,26 @@ lookup tables (Engram) unbuffered (study §6.5).
    - `prefix`: the longest prefix whose bytes plus the rings for the remaining units fit.
    - `ranked`: everything if it fits. Otherwise the rings for every unit size are reserved first, then units go in by
      best benefit per byte, ties in model order (greedy, exact for the equal-sized units of a layer).
-3. **Non-resident units.**
+3. **Non-resident units** (host bytes are counted as the pinned tier allocates them: 4 KiB strides packed into
+   chunks of at most 1 GiB, exactly the layout the context allocates):
    - `pinned` → pinned; refused if over the host budget (vramplan's refusal).
    - `disk` → disk.
    - `pair` → pair.
    - `pinned|disk` → pinned while the host budget lasts (after `host_fixed`), best benefit per byte first, else disk.
-4. **Final check.** `peak = fixed + dynamic + rings(streamed) + resident ≤ cap − margin`.
+   - With `pinned_backing`, what is left gives residents pinned copies (`B`), the lowest benefit per byte first.
+4. **Final check.** `peak = fixed + dynamic + rings(streamed) + resident ≤ cap − margin`, and pinned
+   (`host_fixed` + pinned copies) ≤ the host budget. Both are refused, as in vramplan.
+   - Dynamic slots are billed exactly as allocated, `min(dynamic, n_units − residents)` per layer. Room is first
+     reserved with the upper bound, so the real peak is never above the plan's.
+   - Non-streamable units are billed at the pool stride they occupy.
+
+**Decode budgets set `ring_slots`.** The default (2 × the most units of a layer of that size) suits layer-major
+prefill. For DS it means 768 expert slots, about 7.6 GB, far more than a decode window needs (top-6 × verify rows ×
+2 layers in flight).
+
+**Parity.** `tools/vramplan_parity.py` builds the vramplan `Model` from a descriptor (the §2 mapping) and compares
+every unit's tier and the totals on DS- and MiniMax-shaped descriptors across caps and host budgets: 13 of 13 equal.
+Intentional differences are per-size rings, dynamic slots, `B` tiers and 4 KiB host strides.
 
 `ss_plan_from_tiers` / `ss_plan_from_json` take tiers decided elsewhere and run the same totals and checks. This is
 how an engine runs exactly the placement hyperloom planned (plan-v1 JSON: one `RPDX` letter per unit, per layer).
@@ -280,6 +301,25 @@ how an engine runs exactly the placement hyperloom planned (plan-v1 JSON: one `R
 
 **Stream handles.** A `void*` stream is a `cudaStream_t` / `hipStream_t`. `nullptr` means the library's copy stream;
 pass `cudaStreamLegacy` for the legacy default stream.
+
+**One engine stream per forward (enforced).** Every stream argument of one forward must be the same stream:
+`ss_layer_routes_dev`, `ss_acquire*`, `ss_group_wait` and `ss_release`. Otherwise the call returns `SS_E_INVALID`. An
+engine that runs a layer on several streams joins them into that stream (event + wait) before `ss_release`. A new
+forward may use another stream.
+
+**Lifetimes.** An `ss_layer_view` (tables and groups) is valid from `ss_acquire*` of L until `ss_release` of L.
+`table_dev` changes between forwards.
+
+**Graphs.** The `ss_*` calls are host calls that issue copies and record events, so they cannot be captured into a
+CUDA/HIP graph or run from a graph host node. An engine captures only the work between `ss_acquire` and
+`ss_release`, and passes the table through a pointer the graph reads at run time.
+
+**Fixed placement.** A context's placement (plan, pool, rings, pinned tier) is fixed for its lifetime. Another P
+bucket or cap is another context; `ss_open` refuses a plan made with a different budget. Resizing in place is not in
+v1.
+
+**Versioned structs.** `ss_budget` and `ss_options` start with `struct_size`. `*_defaults` sets it, and the library
+reads only that many bytes and defaults the rest. Fields are appended only.
 
 ### 6.2 What the engine must guarantee (exact)
 

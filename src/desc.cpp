@@ -1,5 +1,6 @@
 #include "desc.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <set>
 
@@ -11,6 +12,22 @@ namespace {
 constexpr const char* kSchema = "strix-stream/desc-v1";
 constexpr int kMaxLayers = 4096;
 constexpr int kMaxUnits = 1 << 16;
+
+// Bounded integer reads: every narrowing is checked, so a hostile or mistyped manifest cannot wrap a count.
+uint64_t bounded(uint64_t v, uint64_t max, const std::string& where) {
+  require(v <= max, SS_E_DESC, where + ": " + std::to_string(v) + " is above the limit " + std::to_string(max));
+  return v;
+}
+
+uint64_t add_checked(uint64_t a, uint64_t b, const std::string& where) {
+  require(a <= UINT64_MAX - b, SS_E_DESC, where + ": byte arithmetic overflows 64 bits");
+  return a + b;
+}
+
+uint64_t mul_checked(uint64_t a, uint64_t b, const std::string& where) {
+  require(a == 0 || b <= UINT64_MAX / a, SS_E_DESC, where + ": byte arithmetic overflows 64 bits");
+  return a * b;
+}
 
 std::string at(const std::string& base, size_t i) { return base + "[" + std::to_string(i) + "]"; }
 
@@ -100,11 +117,12 @@ uint64_t Desc::unit_stride(int layer) const {
 }
 
 uint64_t Desc::fixed_total() const {
+  // Validated not to overflow (desc_validate). Non-streamable units are billed at the pool stride they occupy.
   uint64_t t = 0;
   for (const auto& n : fixed_device) t += n.bytes;
-  for (const auto& l : layers) {
-    t += l.fixed_bytes;
-    if (!l.streamable) t += uint64_t(l.n_units) * l.unit_bytes;
+  for (size_t L = 0; L < layers.size(); ++L) {
+    t += layers[L].fixed_bytes;
+    if (!layers[L].streamable) t += uint64_t(layers[L].n_units) * unit_stride(int(L));
   }
   return t;
 }
@@ -125,7 +143,7 @@ Desc desc_from_json(const Json& j) {
   d.state_bytes_per_position = opt_u64(j, "state_bytes_per_position", w, 0);
   d.workspace_bytes_per_row = opt_u64(j, "workspace_bytes_per_row", w, 0);
   d.unit_align = opt_u64(j, "unit_align", w, 256);
-  d.ring_slots = uint32_t(opt_u64(j, "ring_slots", w, 0));
+  d.ring_slots = uint32_t(bounded(opt_u64(j, "ring_slots", w, 0), 1u << 20, "desc.ring_slots"));
   d.routes = opt_str(j, "routes", w);
 
   std::string order = opt_str(j, "order", w, "ranked");
@@ -162,16 +180,18 @@ Desc desc_from_json(const Json& j) {
                {"index", "kind", "fixed_bytes", "n_units", "top_k", "n_shared", "unit_bytes", "parts", "router",
                 "hash", "benefit", "streamable"});
     Layer l;
-    l.index = int(json_i64(need(lj, "index", lw), lw + ".index"));
+    int64_t index = json_i64(need(lj, "index", lw), lw + ".index");
+    require(index >= 0 && index < kMaxLayers, SS_E_DESC, lw + ".index: 0..4095");
+    l.index = int(index);
     std::string kind = json_str(need(lj, "kind", lw), lw + ".kind");
     if (kind == "dense") l.kind = LayerKind::Dense;
     else if (kind == "moe") l.kind = LayerKind::Moe;
     else if (kind == "blob") l.kind = LayerKind::Blob;
     else fail(SS_E_DESC, lw + ".kind: expected dense | moe | blob");
     l.fixed_bytes = opt_u64(lj, "fixed_bytes", lw, 0);
-    l.n_units = int(opt_u64(lj, "n_units", lw, l.kind == LayerKind::Blob ? 1 : 0));
-    l.top_k = int(opt_u64(lj, "top_k", lw, 0));
-    l.n_shared = int(opt_u64(lj, "n_shared", lw, 0));
+    l.n_units = int(bounded(opt_u64(lj, "n_units", lw, l.kind == LayerKind::Blob ? 1 : 0), kMaxUnits, lw + ".n_units"));
+    l.top_k = int(bounded(opt_u64(lj, "top_k", lw, 0), kMaxUnits, lw + ".top_k"));
+    l.n_shared = int(bounded(opt_u64(lj, "n_shared", lw, 0), kMaxUnits, lw + ".n_shared"));
     l.unit_bytes = opt_u64(lj, "unit_bytes", lw, 0);
     if (const Json* st = lj.find("streamable")) l.streamable = json_bool(*st, lw + ".streamable");
     if (const Json* parts = lj.find("parts")) {
@@ -183,7 +203,7 @@ Desc desc_from_json(const Json& j) {
         Part part;
         part.name = opt_str(pj, "name", pw);
         part.format = json_str(need(pj, "format", pw), pw + ".format");
-        part.source = int(opt_u64(pj, "source", pw, 0));
+        part.source = int(bounded(opt_u64(pj, "source", pw, 0), 1024, pw + ".source"));
         part.offset = json_u64(need(pj, "offset", pw), pw + ".offset");
         part.bytes = json_u64(need(pj, "bytes", pw), pw + ".bytes");
         part.stride = opt_u64(pj, "stride", pw, part.bytes);
@@ -198,8 +218,8 @@ Desc desc_from_json(const Json& j) {
       l.router.bias = opt_str(*r, "bias", rw);
       l.router.format = opt_str(*r, "format", rw, "F32");
       l.router.score = opt_str(*r, "score", rw, "softmax");
-      l.router.rows = uint32_t(opt_u64(*r, "rows", rw, 0));
-      l.router.cols = uint32_t(opt_u64(*r, "cols", rw, 0));
+      l.router.rows = uint32_t(bounded(opt_u64(*r, "rows", rw, 0), kMaxUnits, rw + ".rows"));
+      l.router.cols = uint32_t(bounded(opt_u64(*r, "cols", rw, 0), 1u << 24, rw + ".cols"));
     }
     if (const Json* h = lj.find("hash")) {
       require(h->is_array(), SS_E_DESC, lw + ".hash: expected an array of xxh64 hex strings");
@@ -220,7 +240,7 @@ Desc desc_from_json(const Json& j) {
       check_keys(t->arr[i], tw, {"name", "source", "offset", "rows", "row_bytes", "placement"});
       LookupTable lt;
       lt.name = json_str(need(t->arr[i], "name", tw), tw + ".name");
-      lt.source = int(opt_u64(t->arr[i], "source", tw, 0));
+      lt.source = int(bounded(opt_u64(t->arr[i], "source", tw, 0), 1024, tw + ".source"));
       lt.offset = opt_u64(t->arr[i], "offset", tw, 0);
       lt.rows = json_u64(need(t->arr[i], "rows", tw), tw + ".rows");
       lt.row_bytes = json_u64(need(t->arr[i], "row_bytes", tw), tw + ".row_bytes");
@@ -268,11 +288,16 @@ void desc_validate(Desc& d) {
         require(format_known(part.format), SS_E_DESC, pw + ".format: unknown format " + part.format);
         require(part.source >= 0 && size_t(part.source) < d.sources.size(), SS_E_DESC, pw + ".source: no such source");
         require(l.n_units == 1 || part.stride >= part.bytes, SS_E_DESC, pw + ".stride: >= bytes (units overlap)");
-        sum += part.bytes;
+        sum = add_checked(sum, part.bytes, pw);
+        // The last unit's part must be addressable: offset + (n_units - 1) x stride + bytes fits in 64 bits.
+        add_checked(add_checked(part.offset, mul_checked(uint64_t(l.n_units - 1), part.stride, pw), pw),
+                    part.bytes, pw);
       }
       if (l.unit_bytes == 0) l.unit_bytes = sum;
       require(l.unit_bytes == sum, SS_E_DESC,
               lw + ".unit_bytes: " + std::to_string(l.unit_bytes) + " != sum of parts " + std::to_string(sum));
+      // Pool bytes of the layer (stride x units) must fit; the stride rounds up to unit_align.
+      mul_checked(add_checked(l.unit_bytes, d.unit_align, lw), uint64_t(l.n_units), lw);
       require(l.hash.empty() || l.hash.size() == size_t(l.n_units), SS_E_DESC, lw + ".hash: one per unit");
       require(l.benefit.empty() || l.benefit.size() == size_t(l.n_units), SS_E_DESC, lw + ".benefit: one per unit");
       if (l.has_router)
@@ -285,6 +310,17 @@ void desc_validate(Desc& d) {
     }
     d.unit_base[i] = d.total_units;
     d.total_units += l.n_units;
+  }
+  {
+    uint64_t t = 0;
+    for (const auto& n : d.fixed_device) t = add_checked(t, n.bytes, "desc.fixed_device");
+    for (const auto& n : d.host_fixed) add_checked(0, n.bytes, "desc.host_fixed");
+    for (size_t L = 0; L < d.layers.size(); ++L) {
+      t = add_checked(t, d.layers[L].fixed_bytes, at("desc.layers", L) + ".fixed_bytes");
+      if (!d.layers[L].streamable)
+        t = add_checked(t, mul_checked(uint64_t(d.layers[L].n_units), d.unit_stride(int(L)), at("desc.layers", L)),
+                        at("desc.layers", L));
+    }
   }
   for (size_t i = 0; i < d.lookup_tables.size(); ++i) {
     const LookupTable& t = d.lookup_tables[i];

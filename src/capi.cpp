@@ -60,6 +60,20 @@ ss_status give_text(const std::string& s, char** out, size_t* len) {
 
 void need(bool ok, const char* what) { ss::require(ok, SS_E_INVALID, what); }
 
+// Versioned structs: start from this build's defaults and take only the bytes the caller's struct has.
+template <class T>
+T versioned(const T* in, void (*defaults)(T*), const char* what) {
+  T v;
+  defaults(&v);
+  if (!in) return v;
+  ss::require(in->struct_size >= sizeof(uint32_t) + sizeof(uint32_t) && in->struct_size <= sizeof(T), SS_E_INVALID,
+              std::string(what) + ": struct_size not set (fill it with the *_defaults function) or from a newer "
+                                  "header");
+  std::memcpy(static_cast<void*>(&v), in, in->struct_size);
+  v.struct_size = uint32_t(sizeof(T));
+  return v;
+}
+
 }  // namespace
 
 extern "C" {
@@ -124,6 +138,7 @@ ss_status ss_desc_to_json(const ss_desc* d, char** out_json, size_t* out_len) {
 void ss_budget_defaults(ss_budget* b) {
   if (!b) return;
   std::memset(b, 0, sizeof *b);
+  b->struct_size = uint32_t(sizeof *b);
   b->margin_gib = 2.0;
   b->margin_fraction = 0.03;
 }
@@ -131,16 +146,18 @@ void ss_budget_defaults(ss_budget* b) {
 ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benefit, size_t n_benefit, ss_plan** out) {
   return guard([&] {
     need(d && b && out, "ss_plan_make: null argument");
+    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_make");
     std::vector<double> ben;
     if (benefit) ben.assign(benefit, benefit + n_benefit);
-    *out = new ss_plan{ss::plan_make(d->d, *b, ben), d};
+    *out = new ss_plan{ss::plan_make(d->d, bb, ben), d};
   });
 }
 
 ss_status ss_plan_from_tiers(const ss_desc* d, const ss_budget* b, const uint8_t* tiers, size_t n, ss_plan** out) {
   return guard([&] {
     need(d && b && tiers && out, "ss_plan_from_tiers: null argument");
-    *out = new ss_plan{ss::plan_from_tiers(d->d, *b, std::vector<uint8_t>(tiers, tiers + n)), d};
+    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_from_tiers");
+    *out = new ss_plan{ss::plan_from_tiers(d->d, bb, std::vector<uint8_t>(tiers, tiers + n)), d};
   });
 }
 
@@ -148,7 +165,8 @@ ss_status ss_plan_from_json(const ss_desc* d, const ss_budget* b, const char* pl
   return guard([&] {
     need(d && b && plan_json && out, "ss_plan_from_json: null argument");
     auto t = ss::tiers_from_json(d->d, ss::json_parse(std::string(plan_json, len)));
-    *out = new ss_plan{ss::plan_from_tiers(d->d, *b, t), d};
+    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_from_json");
+    *out = new ss_plan{ss::plan_from_tiers(d->d, bb, t), d};
   });
 }
 
@@ -186,6 +204,7 @@ ss_status ss_plan_to_json(const ss_plan* p, char** out_json, size_t* out_len) {
 void ss_options_defaults(ss_options* o) {
   if (!o) return;
   std::memset(o, 0, sizeof *o);
+  o->struct_size = uint32_t(sizeof *o);
   o->backend = SS_BACKEND_CPU;
   o->policy = SS_POLICY_LRU;
   o->lookahead_budget = 2;
@@ -203,15 +222,20 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
   return guard([&] {
     need(d && budget && out, "ss_open: null argument");
     need(!plan || plan->desc == d, "ss_open: plan was made from another descriptor");
-    ss_options o;
-    if (opt) o = *opt;
-    else ss_options_defaults(&o);
-    ss::Plan p = plan ? plan->p : ss::plan_make(d->d, *budget, {});
-    *out = new ss_ctx{std::make_unique<ss::Ctx>(d->d, *budget, p, o)};
+    ss_options o = versioned(opt, ss_options_defaults, "ss_open options");
+    ss_budget bb = versioned(budget, ss_budget_defaults, "ss_open budget");
+    need(!plan || ss::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
+    ss::Plan p = plan ? plan->p : ss::plan_make(d->d, bb, {});
+    *out = new ss_ctx{std::make_unique<ss::Ctx>(d->d, bb, p, o)};
   });
 }
 
 void ss_close(ss_ctx* c) { delete c; }
+
+int ss_source_direct(const ss_ctx* c, int source) {
+  if (!c || source < 0 || source >= c->c->n_sources()) return -1;
+  return c->c->source_direct(source) ? 1 : 0;
+}
 
 #define CTX_CALL(expr)                              \
   return guard([&] {                                \

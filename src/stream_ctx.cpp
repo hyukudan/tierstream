@@ -10,8 +10,9 @@
 namespace ss {
 namespace {
 
-constexpr uint64_t kPinnedChunk = uint64_t(1) << 30;
 constexpr uint64_t kHostAlign = 4096;
+
+bool resident_tier(uint8_t t) { return t == SS_TIER_RESIDENT || t == SS_TIER_RESIDENT_BACKED; }
 
 uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 
@@ -80,26 +81,14 @@ void Ctx::init() {
     staging_free_.push_back(i);
   }
 
-  // Pinned host tier: units the plan puts there, packed in model order in 1 GiB chunks.
+  // Pinned host tier (PINNED units and pinned copies of RESIDENT_BACKED units): the planner's exact layout.
   pinned_of_.assign(size_t(d_.total_units), nullptr);
   {
-    void* chunk = nullptr;
-    uint64_t used = 0, cap = 0;
-    for (size_t L = 0; L < d_.layers.size(); ++L) {
-      const Layer& l = d_.layers[L];
-      uint64_t stride = round_up(l.unit_bytes, kHostAlign);
-      for (int u = 0; u < l.n_units; ++u) {
-        if (plan_.tier[size_t(gidx(int(L), u))] != SS_TIER_PINNED) continue;
-        if (!chunk || used + stride > cap) {
-          cap = std::max(kPinnedChunk, stride);
-          chunk = be_->alloc_pinned(size_t(cap));
-          pinned_chunks_.push_back(chunk);
-          used = 0;
-        }
-        pinned_of_[size_t(gidx(int(L), u))] = at(chunk, used);
-        used += stride;
-      }
-    }
+    PinnedLayout pl = pinned_layout(d_, plan_.tier);
+    for (uint64_t bytes : pl.chunk_bytes) pinned_chunks_.push_back(be_->alloc_pinned(size_t(bytes)));
+    for (int64_t g = 0; g < d_.total_units; ++g)
+      if (pl.chunk_of[size_t(g)] >= 0)
+        pinned_of_[size_t(g)] = at(pinned_chunks_[size_t(pl.chunk_of[size_t(g)])], pl.offset_of[size_t(g)]);
   }
 
   // Layers: resident pool, release event, unit tables.
@@ -108,11 +97,12 @@ void Ctx::init() {
     const Layer& l = d_.layers[L];
     LayerState& s = L_[L];
     s.release_ev = be_->event_create();
+    s.ready_ev = be_->event_create();
     s.ids_ev = be_->event_create();
     if (l.n_units == 0) continue;
     int planned = 0;
     for (int u = 0; u < l.n_units; ++u)
-      if (plan_.tier[size_t(gidx(int(L), u))] == SS_TIER_RESIDENT) ++planned;
+      if (resident_tier(plan_.tier[size_t(gidx(int(L), u))])) ++planned;
     int cap = l.streamable ? std::min(l.n_units, planned + int(plan_.dynamic_slots_per_layer)) : l.n_units;
     s.rs = std::make_unique<ResidentSet>(l.n_units, cap, o_.policy, o_.score_window);
     if (cap) s.pool = be_->alloc_device(size_t(uint64_t(cap) * d_.unit_stride(int(L))));
@@ -148,7 +138,7 @@ void Ctx::init() {
   fwd_stats_.assign(d_.layers.size(), ss_layer_stats{});
   start_workers();
 
-  // Fill: the pinned tier first (host), then residents (from their file; a resident has no pinned copy).
+  // Fill: the pinned tier first (host), then residents (from their pinned copy when they have one, else the file).
   std::vector<JobPtr> fill;
   for (size_t L = 0; L < d_.layers.size(); ++L) {
     for (int u = 0; u < d_.layers[L].n_units; ++u) {
@@ -170,7 +160,7 @@ void Ctx::init() {
     LayerState& s = L_[L];
     if (!s.rs) continue;
     for (int u = 0; u < l.n_units; ++u) {
-      bool res = !l.streamable || plan_.tier[size_t(gidx(int(L), u))] == SS_TIER_RESIDENT;
+      bool res = !l.streamable || resident_tier(plan_.tier[size_t(gidx(int(L), u))]);
       if (!res) continue;
       int slot = s.rs->place(u, !l.streamable || o_.pin_planned != 0);
       require(slot >= 0, SS_E_CAPACITY, "open: resident pool full (internal)");
@@ -198,6 +188,7 @@ void Ctx::cleanup() {
   for (auto& s : L_) {
     if (s.pool) be_->free_device(s.pool);
     if (s.release_ev) be_->event_destroy(s.release_ev);
+    if (s.ready_ev) be_->event_destroy(s.ready_ev);
     if (s.ids_ev) be_->event_destroy(s.ids_ev);
     if (s.ids_host) be_->free_pinned(s.ids_host);
     for (int v = 0; v < 2; ++v) {
@@ -548,6 +539,17 @@ void* Ctx::unit_addr(int layer, int unit) const {
 
 // ---- forward API -----------------------------------------------------------------------------------------------------
 
+void Ctx::check_stream(void* stream, const char* what) {
+  // Every event the library records or waits on sits on one engine stream per forward (design.md §6.1).
+  if (!fwd_stream_set_) {
+    fwd_stream_ = stream;
+    fwd_stream_set_ = true;
+    return;
+  }
+  require(stream == fwd_stream_, SS_E_INVALID,
+          std::string(what) + ": a forward must use one engine stream (join other streams into it first)");
+}
+
 void Ctx::check_layer(int layer, const char* what) const {
   require(layer >= 0 && layer < n_layers(), SS_E_INVALID, std::string(what) + ": layer out of range");
 }
@@ -589,10 +591,23 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
     jobs.push_back(j);
     submit(j);
   }
-  for (const JobPtr& j : jobs) wait_job(*j);
+  // A seed whose read failed is not resident (it would be a hit on garbage): drop it, then report the first error.
+  ss_status failed = SS_OK;
+  std::string err;
+  for (const JobPtr& j : jobs) {
+    wait_job_quiet(*j);
+    if (j->state.load() != Job::Done) {
+      s.rs->drop(j->unit);
+      if (failed == SS_OK) {
+        failed = j->err_status;
+        err = j->err;
+      }
+    }
+  }
   for (const JobPtr& j : jobs)
     if (j->done_ev) ev_pool_.push_back(j->done_ev);
   be_->stream_sync(nullptr);
+  if (failed != SS_OK) fail(failed, err);
 }
 
 void Ctx::begin(const uint32_t* rows, int n_layers_in) {
@@ -673,6 +688,7 @@ void Ctx::routes_dev(int layer, const int32_t* ids_dev, int n, void* stream) {
     s.ids_cap = std::max<size_t>(size_t(n), 1024);
     s.ids_host = static_cast<int32_t*>(be_->alloc_pinned(sizeof(int32_t) * s.ids_cap));
   }
+  check_stream(stream, "routes_dev");
   // Copied on the engine stream right behind the router; read at the next call that needs this layer's routes.
   be_->copy_d2h(s.ids_host, ids_dev, sizeof(int32_t) * size_t(n), stream);
   be_->event_record(s.ids_ev, stream);
@@ -714,7 +730,8 @@ void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {
     if (u < 0 || u >= l.n_units) continue;
     if (s.loc[size_t(u)] != None || s.rs->slot(u) >= 0) continue;
     if (plan_.tier[size_t(gidx(layer, u))] == SS_TIER_PAIR) continue;
-    Admission a = s.rs->admit({u}, busy, true);
+    // A speculative read uses only the ring unless spec_persistent: it never evicts a resident on a guess.
+    Admission a = speculative && !o_.spec_persistent ? Admission{} : s.rs->admit({u}, busy, true);
     if (!a.admitted.empty()) {
       fetch_into_persistent(layer, u, a.slot_of[0], speculative);
       st.evicted += a.evicted.size();
@@ -747,6 +764,7 @@ void Ctx::acquire(int layer, void* stream, bool wait_all, ss_layer_view* out) {
   const Layer& l = d_.layers[size_t(layer)];
   require(s.rs != nullptr, SS_E_INVALID, "acquire: layer has no units");
   require(!s.acquired, SS_E_INVALID, "acquire: layer acquired twice in one forward");
+  check_stream(stream, "acquire");
   ingest_dev_routes(layer);
   require(s.routes_given, SS_E_INVALID, "acquire: no routes for layer " + std::to_string(layer) +
                                             " (ss_layer_routes / ss_layer_all first)");
@@ -755,6 +773,13 @@ void Ctx::acquire(int layer, void* stream, bool wait_all, ss_layer_view* out) {
           "acquire: the stream ring cannot hold layer " + std::to_string(layer) + "'s " +
               std::to_string(s.pending.size()) + " remaining transient units (release earlier layers or plan more "
               "ring slots)");
+
+  // Units that became resident in an earlier forward: their copies were issued then, maybe not finished. The engine
+  // stream waits once for the last copy issued for this layer (device-side; a no-op when it has landed).
+  if (s.ready_wait) {
+    be_->stream_wait(stream, s.ready_ev);
+    s.ready_wait = false;
+  }
 
   // Groups: 0 = resident before this forward; then the fetched units by route count (desc), id.
   std::vector<int32_t> fetched;
@@ -790,10 +815,7 @@ void Ctx::acquire(int layer, void* stream, bool wait_all, ss_layer_view* out) {
     if (s.job[size_t(u)] ? s.count[size_t(u)] != 0 : s.rs->slot(u) >= 0) a = unit_addr(layer, u);
     t[u] = uint64_t(reinterpret_cast<uintptr_t>(a));
   }
-  if (!be_->unified()) {
-    be_->copy_h2d(s.table_dev[v], t, sizeof(uint64_t) * size_t(l.n_units), stream);
-    be_->event_record(s.table_ev[v], stream);
-  }
+  if (!be_->unified()) be_->copy_h2d(s.table_dev[v], t, sizeof(uint64_t) * size_t(l.n_units), stream);
   s.group_view.clear();
   for (const auto& g : s.groups) s.group_view.push_back({g.data(), int(g.size())});
   s.acquired = true;
@@ -809,6 +831,7 @@ void Ctx::group_wait(int layer, int group, void* stream) {
   LayerState& s = L_[size_t(layer)];
   require(s.acquired && !s.released, SS_E_INVALID, "group_wait: layer not acquired");
   require(group >= 0 && size_t(group) < s.groups.size(), SS_E_INVALID, "group_wait: no such group");
+  check_stream(stream, "group_wait");
   if (group == 0) return;
   uint64_t t0 = now_ns();
   for (int32_t u : s.groups[size_t(group)]) {
@@ -836,7 +859,11 @@ void Ctx::release(int layer, void* stream) {
   check_layer(layer, "release");
   LayerState& s = L_[size_t(layer)];
   require(s.acquired && !s.released, SS_E_INVALID, "release: layer not acquired or already released");
+  check_stream(stream, "release");
   be_->event_record(s.release_ev, stream);
+  // The table this acquire handed out is read until here: its mirror is rewritten only after this point (unified
+  // backends read the mirror itself; CUDA's H2D from it sits before this point on the same stream).
+  be_->event_record(s.table_ev[s.version], stream);
   s.released = true;
   for (int u = 0; u < d_.layers[size_t(layer)].n_units; ++u)
     if (s.spec_unclaimed[size_t(u)]) {
@@ -888,9 +915,27 @@ void Ctx::end() {
         ring_[i].job.reset();
       }
   }
+  // Persistent copies of this forward are issued (Done) but may still be in flight on the copy stream: the next
+  // acquire of each such layer waits for this point (they would otherwise be hits with no wait).
+  if (!be_->unified()) {
+    std::lock_guard<std::mutex> lk(copy_mu_);
+    for (size_t L = 0; L < L_.size(); ++L) {
+      LayerState& s = L_[L];
+      if (!s.rs) continue;
+      bool any = false;
+      for (int u = 0; u < d_.layers[L].n_units && !any; ++u)
+        any = s.loc[size_t(u)] == Persistent && s.job[size_t(u)] && s.job[size_t(u)]->state.load() == Job::Done;
+      if (any) {
+        be_->event_record(s.ready_ev, nullptr);
+        s.ready_wait = true;
+      }
+    }
+  }
   for (const JobPtr& j : fwd_jobs_)
     if (j->done_ev) ev_pool_.push_back(j->done_ev);
   fwd_jobs_.clear();
+  fwd_stream_set_ = false;
+  fwd_stream_ = nullptr;
   ss_layer_stats tot{};
   for (size_t L = 0; L < L_.size(); ++L) {
     add(stats_[L], fwd_stats_[L]);
@@ -960,6 +1005,9 @@ Json Ctx::stats_json() const {
   j["schema"] = Json::string("strix-stream/stats-v1");
   j["backend"] = Json::string(be_->name());
   j["forwards"] = Json::number(forward_);
+  Json direct = Json::array();
+  for (const auto& f : files_) direct.push(Json::boolean(f->direct()));
+  j["sources_direct"] = direct;
   j["total"] = one(total());
   Json layers = Json::array();
   for (const auto& s : stats_) layers.push(one(s));

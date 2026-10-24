@@ -9,6 +9,19 @@
  * Threading: one context is driven by one engine thread (every ss_* call on a context from the same thread, or
  * externally serialized). The library runs its own reader threads.
  *
+ * Streams and lifetimes (design.md §6.1):
+ *   - every stream argument of one forward (ss_layer_routes_dev, ss_acquire*, ss_group_wait, ss_release) must be the
+ *     same engine stream; an engine that computes a layer on several streams joins them into that stream before
+ *     ss_release (the library records its events there);
+ *   - a ss_layer_view (tables, groups) is valid from ss_acquire* of L until ss_release of L;
+ *   - CUDA / HIP graphs: ss_* calls are host calls that issue copies and events; they cannot be captured or run from
+ *     a graph host node. Capture only the work between ss_acquire and ss_release, and pass tables by pointer
+ *     indirection the graph reads at run time (table_dev changes between forwards).
+ *
+ * Versioning: ss_budget and ss_options start with struct_size. Fill them with ss_*_defaults (which sets
+ * struct_size = sizeof); the library reads only struct_size bytes and defaults the rest, so a caller built against
+ * an older header keeps working when fields are appended.
+ *
  * Exactness: the library never changes bytes. A unit's bytes on the device are identical whether it is resident,
  * landed from the pinned tier or read from a file. Which slot holds a unit, and when it landed, is visible to the
  * engine only through the pointer table; kernels must give the same bits whatever the table says (design.md §4).
@@ -76,9 +89,16 @@ SS_API void ss_free(void* p);
  * non-resident unit takes the pinned tier while host budget lasts (best benefit/byte first) if its tiers allow it,
  * else disk.
  * ------------------------------------------------------------------------------------------------------------- */
-typedef enum ss_tier { SS_TIER_RESIDENT = 0, SS_TIER_PINNED = 1, SS_TIER_DISK = 2, SS_TIER_PAIR = 3 } ss_tier;
+typedef enum ss_tier {
+  SS_TIER_RESIDENT = 0,         /* on the device at open; reloaded from its file if evicted (dynamic mode) */
+  SS_TIER_PINNED = 1,           /* not resident; copied from the pinned host tier */
+  SS_TIER_DISK = 2,             /* not resident; read from its file */
+  SS_TIER_PAIR = 3,             /* not here: another device computes it (never fetched) */
+  SS_TIER_RESIDENT_BACKED = 4   /* resident at open, with a pinned host copy for when the dynamic set evicts it */
+} ss_tier;
 
 typedef struct ss_budget {
+  uint32_t struct_size;        /* sizeof(ss_budget), set by ss_budget_defaults */
   uint64_t device_bytes;       /* device memory the library and the engine's fixed bytes may use (the cap) */
   uint64_t host_pinned_bytes;  /* pinned host the library may lock for the pinned tier (0 = no pinned tier) */
   uint64_t workspace_bytes;    /* engine workspaces/state already sized by the engine for this request class */
@@ -89,6 +109,10 @@ typedef struct ss_budget {
   /* Slots per stream ring (one ring per streamed unit size; unit-sized device slots shared by every layer of that
    * size for transient units). 0 = descriptor ring_slots, else 2 x the most units of a layer of that size. */
   uint32_t ring_slots;
+  /* 1 = after the pinned tier is placed, give resident units a pinned host copy (tier RESIDENT_BACKED) while the
+   * host budget lasts, lowest benefit per byte first (the likeliest to be evicted): a decode replica whose dynamic set
+   * evicts planner residents then reloads them over PCIe instead of from NVMe. */
+  int pinned_backing;
 } ss_budget;
 
 typedef struct ss_plan ss_plan;
@@ -131,6 +155,7 @@ typedef enum ss_policy {
 } ss_policy;
 
 typedef struct ss_options {
+  uint32_t struct_size;           /* sizeof(ss_options), set by ss_options_defaults */
   ss_backend_kind backend;
   int device;                     /* CUDA/HIP device ordinal */
   ss_policy policy;
@@ -145,16 +170,23 @@ typedef struct ss_options {
   int pin_planned;                /* 1 = planner residents are never evicted (prefill); 0 = they seed the dynamic set */
   int direct_io;                  /* 1 = unbuffered file reads (default); falls back to buffered if the FS refuses */
   uint32_t group_units;           /* misses per landing group in ss_acquire_groups (default 0 = one group) */
+  /* 0 (default) = speculative reads land only in ring slots and never evict a resident; 1 = they go through
+   * admission into persistent slots (only after a trace shows the extra evictions pay). */
+  int spec_persistent;
 } ss_options;
 
 typedef struct ss_ctx ss_ctx;
 
 SS_API void ss_options_defaults(ss_options* o);
 /* Opens the sources named by the descriptor, allocates the resident pool, ring and pinned tier per the plan, fills
- * residents and the pinned tier. plan may be NULL (made from budget with descriptor benefits). */
+ * residents and the pinned tier. plan may be NULL (made from budget with descriptor benefits); a given plan must have
+ * been made with this budget (SS_E_INVALID otherwise). The placement is fixed for the context's lifetime: a new
+ * placement (another P bucket, another cap) is a new context. */
 SS_API ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan, const ss_options* opt,
                          ss_ctx** out);
 SS_API void ss_close(ss_ctx* c);
+/* 1 if source i is read unbuffered (O_DIRECT / FILE_FLAG_NO_BUFFERING), 0 if the filesystem forced buffered IO. */
+SS_API int ss_source_direct(const ss_ctx* c, int source);
 
 /* Optional warm seed: make these units resident now (usage profile), ranked best first, within the dynamic slots. */
 SS_API ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n);

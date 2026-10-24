@@ -60,6 +60,8 @@ class Ctx {
   void stats_reset();
   void set_hook(ss_stats_hook h, void* user) { hook_ = h; hook_user_ = user; }
   int n_layers() const { return int(d_.layers.size()); }
+  bool source_direct(int i) const { return files_[size_t(i)]->direct(); }
+  int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
 
  private:
@@ -78,6 +80,8 @@ class Ctx {
     std::unique_ptr<ResidentSet> rs;
     void* pool = nullptr;                // persistent slots (capacity x stride)
     void* release_ev = nullptr;          // recorded at ss_release
+    void* ready_ev = nullptr;            // copy stream, at ss_end: last persistent copy issued for this layer
+    bool ready_wait = false;             // the next acquire waits for ready_ev
     void* table_dev[2] = {nullptr, nullptr};
     uint64_t* table_host[2] = {nullptr, nullptr};
     void* table_ev[2] = {nullptr, nullptr};
@@ -119,6 +123,7 @@ class Ctx {
   void ingest_routes(int layer, const int32_t* ids, int n);
   void ingest_dev_routes(int layer);
   void check_layer(int layer, const char* what) const;
+  void check_stream(void* stream, const char* what);
   void* unit_addr(int layer, int unit) const;
   void open_forward();
   void retire_ring(int layer);
@@ -156,6 +161,8 @@ class Ctx {
   bool stop_ = false;
   std::vector<std::thread> workers_;
 
+  void* fwd_stream_ = nullptr;
+  bool fwd_stream_set_ = false;
   bool in_forward_ = false;
   bool fwd_open_ = false;  // per-forward state reset (prefetch may open the next forward before ss_begin)
   uint64_t forward_ = 0;

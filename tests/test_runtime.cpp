@@ -82,14 +82,16 @@ void check_stats_balance(ss_ctx* c, int layer) {
   CHECK_EQ(s.hits + s.admitted + s.transient + s.prefetched + s.spec_used, s.routed);
 }
 
-void decode_loop(const Fixture& fx, ss_policy policy, bool speculative, int direct, uint64_t staging) {
+void decode_loop(const Fixture& fx, ss_policy policy, bool speculative, int direct, uint64_t staging,
+                 int spec_persistent = 0, bool backing = false) {
   Run r;
   CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
   if (!r.d) return;
   // Residents 0-3 of layers 1, 2 and 4, some pinned, the rest from the files; 2 dynamic slots per layer; 6 ring
   // slots per unit size.
-  budget(r.b, 6, 1 << 20, 2);
-  plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
+  budget(r.b, 6, 2 << 20, 2);
+  if (backing) plan(r, {"", "BBBBPPPPPPDDDDDD", "BBBBPPDD", "D", "BBBBDDDDDDDDDDDD"});
+  else plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
   if (!r.p) return;
   ss_options_defaults(&r.o);
   r.o.policy = policy;
@@ -98,6 +100,7 @@ void decode_loop(const Fixture& fx, ss_policy policy, bool speculative, int dire
   r.o.direct_io = direct;
   r.o.staging_bytes = staging;
   r.o.group_units = 2;
+  r.o.spec_persistent = spec_persistent;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
   std::mt19937 g(1234);
@@ -152,6 +155,9 @@ void decode_loop(const Fixture& fx, ss_policy policy, bool speculative, int dire
 TEST(decode_lru_direct_staging) { decode_loop(Fixture("lru"), SS_POLICY_LRU, false, 1, 64 * 1024); }
 TEST(decode_scored_spec) { decode_loop(Fixture("scored"), SS_POLICY_SCORED, true, 1, 64 * 1024); }
 TEST(decode_lru_spec_buffered_big_staging) { decode_loop(Fixture("buf"), SS_POLICY_LRU, true, 0, 4 << 20); }
+TEST(decode_spec_persistent_backed) {
+  decode_loop(Fixture("specp"), SS_POLICY_LRU, true, 1, 64 * 1024, /*spec_persistent=*/1, /*backing=*/true);
+}
 
 TEST(prefill_layer_major_static_residents) {
   // Prefill shape: planner residents pinned, no dynamic slots, every miss from a ring; whole-layer prefetch of later
@@ -302,6 +308,41 @@ TEST(call_order_errors) {
   CHECK_EQ(int(ss_end(r.c)), int(SS_E_INVALID));  // acquired, not released
   CHECK_OK(ss_release(r.c, 2, nullptr));
   CHECK_OK(ss_end(r.c));
+}
+
+TEST(one_stream_per_forward_and_seed_rollback) {
+  Fixture fx("stream", /*corrupt_hash=*/true);
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  budget(r.b, 4, 0, 4);
+  plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
+  ss_options_defaults(&r.o);
+  r.o.verify_hash = 1;
+  r.o.pin_planned = 0;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  int32_t seed[2] = {2, 3};  // unit 3's hash is wrong: its seed is rolled back
+  CHECK_EQ(int(ss_seed(r.c, 1, seed, 2)), int(SS_E_HASH));
+  void* s1 = reinterpret_cast<void*>(uintptr_t(0x1000));
+  void* s2 = reinterpret_cast<void*>(uintptr_t(0x2000));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t ids[1] = {2};
+  CHECK_OK(ss_layer_routes(r.c, 1, ids, 1));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 1, s1, &v));
+  CHECK(same(v, fx, 1, 2));
+  CHECK_EQ(int(ss_release(r.c, 1, s2)), int(SS_E_INVALID));  // another stream in the same forward
+  CHECK_OK(ss_release(r.c, 1, s1));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));  // a new forward may use another stream
+  int32_t three[1] = {3};
+  CHECK_OK(ss_layer_routes(r.c, 1, three, 1));
+  CHECK_EQ(int(ss_acquire(r.c, 1, s2, &v)), int(SS_E_HASH));  // not a hit on garbage: read again, fails again
+  CHECK(ss_end(r.c) != SS_OK);
+  ss_layer_stats s;
+  CHECK_OK(ss_stats_layer(r.c, 1, &s));
+  CHECK_EQ(s.hits, uint64_t(1));
+  CHECK_EQ(ss_source_direct(r.c, 0) >= 0, true);
 }
 
 int main() { return sstest::run_all(); }

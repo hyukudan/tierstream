@@ -1,5 +1,6 @@
 // CPU tests of the host-only pieces: JSON, xxh64, descriptor validation, planner, resident set, lookahead select.
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <string>
 
@@ -264,6 +265,102 @@ TEST(lookahead_select_union_order) {
   CHECK_EQ(n, 2);
   CHECK_EQ(out[0], 0);
   CHECK_EQ(out[1], 1);
+}
+
+TEST(plan_review_rules) {
+  // host_fixed over the host budget is refused even with no pinned unit (vramplan's rule).
+  std::string base = moe_desc(2, 8, 1 << 20);
+  std::string hf = base;
+  hf.replace(hf.find("\"fixed_device\""), 14, "\"host_fixed\":[{\"name\":\"ple\",\"bytes\":1000}],\"fixed_device\"");
+  Desc d = desc_from_json(json_parse(hf));
+  ss_budget b;
+  ss_budget_defaults(&b);
+  b.margin_fraction = 0;
+  b.device_bytes = 4 * kGiB;
+  CHECK_EQ(int(status_of([&] { plan_make(d, b, {}); })), int(SS_E_CAPACITY));
+  b.host_pinned_bytes = 1000;
+  CHECK_EQ(int(status_of([&] { plan_make(d, b, {}); })), int(SS_OK));
+  // Pinned bytes are billed as allocated: 4 KiB strides (a 1000-byte unit takes 4096).
+  Desc s = desc_from_json(json_parse(moe_desc(1, 8, 1000)));
+  std::vector<uint8_t> t(8, SS_TIER_PINNED);
+  ss_budget c;
+  ss_budget_defaults(&c);
+  c.margin_fraction = 0;
+  c.device_bytes = 4 * kGiB;
+  c.host_pinned_bytes = 8 * 4096;
+  Plan p = plan_from_tiers(s, c, t);
+  CHECK_EQ(p.pinned, uint64_t(8 * 4096));
+  CHECK_EQ(pinned_layout(s, t).total, p.pinned);
+  c.host_pinned_bytes = 8 * 4096 - 1;
+  CHECK_EQ(int(status_of([&] { plan_from_tiers(s, c, t); })), int(SS_E_CAPACITY));
+  // Dynamic slots are billed exactly: a layer fully resident gets none.
+  Desc e = desc_from_json(json_parse(moe_desc(2, 8, 1 << 20)));
+  ss_budget dyn;
+  ss_budget_defaults(&dyn);
+  dyn.margin_fraction = 0;
+  dyn.device_bytes = 4 * kGiB;
+  dyn.dynamic_slots_per_layer = 3;
+  dyn.ring_slots = 1;
+  std::vector<uint8_t> t2(16, SS_TIER_RESIDENT);
+  for (int u = 8; u < 16; ++u) t2[size_t(u)] = SS_TIER_DISK;
+  p = plan_from_tiers(e, dyn, t2);
+  CHECK_EQ(p.dynamic, uint64_t(3) << 20);
+  // pinned_backing gives residents pinned copies, the lowest benefit per byte first.
+  ss_budget bk;
+  ss_budget_defaults(&bk);
+  bk.margin_fraction = 0;
+  bk.ring_slots = 2;
+  bk.device_bytes = 3 * kGiB + 10 * (1 << 20);
+  bk.host_pinned_bytes = 10 * (1 << 20);
+  bk.pinned_backing = 1;
+  p = plan_make(e, bk, {});
+  CHECK_EQ(p.n_resident, uint64_t(8));
+  CHECK_EQ(p.n_pinned, uint64_t(8));
+  CHECK_EQ(p.n_backed, uint64_t(2));
+  CHECK_EQ(int(p.tier[7]), int(SS_TIER_RESIDENT_BACKED));  // ties: the last in model order goes first
+  CHECK_EQ(int(p.tier[0]), int(SS_TIER_RESIDENT));
+  // The JSON letters round-trip (B included).
+  CHECK(plan_from_tiers(e, bk, tiers_from_json(e, plan_to_json(e, p))).tier == p.tier);
+}
+
+TEST(desc_overflow_and_narrowing) {
+  auto bad = [](const std::string& s) { return int(status_of([&] { desc_from_json(json_parse(s)); })); };
+  std::string huge = moe_desc(1, 8, 1000);
+  huge.replace(huge.find("\"stride\":1000"), 13, "\"stride\":4000000000000000000");
+  CHECK_EQ(bad(huge), int(SS_E_DESC));  // offset + 7 x stride overflows
+  std::string many = moe_desc(1, 8, 1000);
+  many.replace(many.find("\"n_units\":8"), 11, "\"n_units\":4294967297");
+  CHECK_EQ(bad(many), int(SS_E_DESC));  // would wrap to 1 as an int
+  std::string idx = moe_desc(1, 8, 1000);
+  idx.replace(idx.find("\"index\":0"), 9, "\"index\":-1");
+  CHECK_EQ(bad(idx), int(SS_E_DESC));
+}
+
+TEST(capi_struct_size_and_budget_match) {
+  std::string js = moe_desc(1, 4, 4096);
+  ss_desc* d = nullptr;
+  CHECK_OK(ss_desc_from_json(js.data(), js.size(), &d));
+  ss_budget b;
+  ss_budget_defaults(&b);
+  b.device_bytes = 4 * kGiB;
+  ss_plan* p = nullptr;
+  // An older caller's struct (shorter struct_size) is accepted; the missing fields take the defaults.
+  ss_budget old = b;
+  old.struct_size = uint32_t(offsetof(ss_budget, pinned_backing));
+  CHECK_OK(ss_plan_make(d, &old, nullptr, 0, &p));
+  ss_plan_free(p);
+  p = nullptr;
+  ss_budget zero = b;
+  zero.struct_size = 0;
+  CHECK_EQ(int(ss_plan_make(d, &zero, nullptr, 0, &p)), int(SS_E_INVALID));
+  CHECK_OK(ss_plan_make(d, &b, nullptr, 0, &p));
+  ss_budget other = b;
+  other.device_bytes = 5 * kGiB;
+  ss_ctx* c = nullptr;
+  CHECK_EQ(int(ss_open(d, &other, p, nullptr, &c)), int(SS_E_INVALID));  // plan made with another budget
+  CHECK(std::strstr(ss_last_error(), "budget") != nullptr);
+  ss_plan_free(p);
+  ss_desc_free(d);
 }
 
 int main() { return sstest::run_all(); }

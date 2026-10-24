@@ -1,7 +1,11 @@
-// CUDA backend test (one short PC-BIG on the RTX PRO): a kernel reads every byte of every routed unit through the
-// device unit table on the engine stream, right after ss_acquire / ss_group_wait. A missing copy-stream wait would
-// show as a wrong checksum. Then a pinned-tier and an unbuffered-NVMe bandwidth probe (256 MiB each).
-//   ss-test-cuda [--bw-dir D:\tmp\ss-test] [--no-bw]
+// CUDA backend test (one short PC-BIG on the RTX PRO).
+// Exactness and hazards: a kernel reads every byte of every routed unit through the device unit table on the engine
+// stream, AFTER a spin kernel that keeps the stream busy, and the host releases the layer and moves on without any
+// synchronization: slots are reused while earlier readers are still queued, and forwards run back to back. All
+// checksums are compared once at the end. A missing wait (copy before release, read before landing, table rewritten
+// while in use, a hit from the previous forward's copy in flight) shows as a wrong checksum.
+// Then a corrupt-hash fixture (the read failure path) and a pinned-tier / unbuffered-file bandwidth probe.
+//   ss-test-cuda [--bw-dir DIR] [--no-bw]
 #include <cuda_runtime.h>
 
 #include <chrono>
@@ -27,6 +31,12 @@ namespace {
     }                                                                                              \
   } while (0)
 
+__global__ void spin(long long cycles) {
+  long long t0 = clock64();
+  while (clock64() - t0 < cycles) {
+  }
+}
+
 // One block per listed unit: 64-bit sum of (byte x (index % 251 + 1)), order-free so the reduction is exact.
 __global__ void checksum(const uint64_t* table, const int32_t* units, int n, uint64_t bytes,
                          unsigned long long* out) {
@@ -36,8 +46,8 @@ __global__ void checksum(const uint64_t* table, const int32_t* units, int n, uin
   unsigned long long s = 0;
   if (p)
     for (uint64_t i = threadIdx.x; i < bytes; i += blockDim.x) s += (unsigned long long)p[i] * (i % 251 + 1);
-  else
-    s = 0xFFFFFFFFFFFFFFFFull / blockDim.x;  // a null entry can never match
+  else if (threadIdx.x == 0)
+    s = 0xDEADDEADDEADDEADull;  // a null entry can never match
   atomicAdd(&out[k], s);
 }
 
@@ -73,37 +83,64 @@ void plan(Run& r, std::initializer_list<const char*> tiers) {
   CHECK_OK(ss_plan_from_json(r.d, &r.b, js.data(), js.size(), &r.p));
 }
 
+// Asynchronous checker: every check appends unit ids and expected sums; the device writes into its own result
+// slots; nothing synchronizes until verify().
 struct Gpu {
+  static constexpr int kMax = 1 << 15;
   cudaStream_t s = nullptr;
-  int32_t* units = nullptr;
-  unsigned long long* sums = nullptr;
+  int32_t* units = nullptr;               // device, kMax
+  unsigned long long* sums = nullptr;     // device, kMax
+  int32_t* units_host = nullptr;          // pinned staging for the unit lists (never reused before verify)
+  std::vector<uint64_t> want;
+  std::vector<std::pair<int, int>> who;   // (layer, unit) per slot
+  int used = 0;
+  long long spin_cycles = 2000000;        // ~1 ms at 2 GHz
   Gpu() {
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    CU(cudaMalloc(&units, 64 * sizeof(int32_t)));
-    CU(cudaMalloc(&sums, 64 * sizeof(unsigned long long)));
+    CU(cudaMalloc(&units, kMax * sizeof(int32_t)));
+    CU(cudaMalloc(&sums, kMax * sizeof(unsigned long long)));
+    CU(cudaMemset(sums, 0, kMax * sizeof(unsigned long long)));
+    CU(cudaHostAlloc(&units_host, kMax * sizeof(int32_t), cudaHostAllocDefault));
   }
   ~Gpu() {
     cudaStreamSynchronize(s);
     cudaFree(units);
     cudaFree(sums);
+    cudaFreeHost(units_host);
     cudaStreamDestroy(s);
   }
-  // Checks units[0..n) of layer L through the device table (async on s; compared after a sync).
-  void check(const ss_layer_view& v, const Fixture& fx, int L, const std::vector<int32_t>& list) {
+  void check(const ss_layer_view& v, const Fixture& fx, int L, const std::vector<int32_t>& list, bool delay = true) {
     int n = int(list.size());
-    if (!n) return;
-    CU(cudaMemcpyAsync(units, list.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-    CU(cudaMemsetAsync(sums, 0, n * sizeof(unsigned long long), s));
-    uint64_t bytes = fx.expected[size_t(L)][0].size();
-    checksum<<<n, 256, 0, s>>>(v.table_dev, units, n, bytes, sums);
-    std::vector<unsigned long long> got(static_cast<size_t>(n));
-    CU(cudaMemcpyAsync(got.data(), sums, n * sizeof(unsigned long long), cudaMemcpyDeviceToHost, s));
-    CU(cudaStreamSynchronize(s));
-    for (int k = 0; k < n; ++k) {
-      bool ok = got[size_t(k)] == host_sum(fx.expected[size_t(L)][size_t(list[size_t(k)])]);
-      if (!ok) std::printf("  layer %d unit %d: device checksum differs\n", L, list[size_t(k)]);
-      CHECK(ok);
+    if (!n || used + n > kMax) {
+      if (n) std::printf("  checker full\n");
+      return;
     }
+    std::memcpy(units_host + used, list.data(), n * sizeof(int32_t));
+    CU(cudaMemcpyAsync(units + used, units_host + used, n * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+    if (delay) spin<<<1, 1, 0, s>>>(spin_cycles);
+    checksum<<<n, 256, 0, s>>>(v.table_dev, units + used, n, fx.expected[size_t(L)][0].size(), sums + used);
+    for (int32_t u : list) {
+      want.push_back(host_sum(fx.expected[size_t(L)][size_t(u)]));
+      who.push_back({L, u});
+    }
+    used += n;
+  }
+  void verify() {
+    CU(cudaStreamSynchronize(s));
+    std::vector<unsigned long long> got(static_cast<size_t>(used));
+    CU(cudaMemcpy(got.data(), sums, size_t(used) * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    int bad = 0;
+    for (int k = 0; k < used; ++k)
+      if (got[size_t(k)] != want[size_t(k)]) {
+        if (bad++ < 10) std::printf("  check %d: layer %d unit %d: device checksum differs\n", k, who[size_t(k)].first,
+                                    who[size_t(k)].second);
+      }
+    std::printf("  %d device checksums, %d wrong\n", used, bad);
+    CHECK_EQ(bad, 0);
+    CU(cudaMemset(sums, 0, kMax * sizeof(unsigned long long)));
+    want.clear();
+    who.clear();
+    used = 0;
   }
 };
 
@@ -118,85 +155,98 @@ std::vector<int32_t> route(std::mt19937& g, int E, int k, int rows) {
   return ids;
 }
 
-}  // namespace
-
-TEST(cuda_decode_through_device_table) {
-  Fixture fx("cuda-decode");
+void decode_variant(const char* name, ss_policy policy, int spec_persistent, bool backing) {
+  Fixture fx(std::string("cuda-") + name);
   Gpu gpu;
-  for (int pol = 0; pol < 2; ++pol) {
-    Run r;
-    CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
-    ss_budget_defaults(&r.b);
-    r.b.device_bytes = uint64_t(1) << 30;
-    r.b.margin_fraction = 0;
-    r.b.margin_gib = 1.0 / 1024;
-    r.b.ring_slots = 6;
-    r.b.host_pinned_bytes = 1 << 20;
-    r.b.dynamic_slots_per_layer = 2;
-    plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
-    ss_options_defaults(&r.o);
-    r.o.backend = SS_BACKEND_CUDA;
-    r.o.policy = pol ? SS_POLICY_SCORED : SS_POLICY_LRU;
-    r.o.pin_planned = 0;
-    r.o.verify_hash = 1;
-    r.o.staging_bytes = 64 * 1024;
-    r.o.group_units = 2;
-    CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
-    if (!r.c) return;
-    std::mt19937 g(77 + pol);
-    for (int step = 0; step < 30; ++step) {
-      CHECK_OK(ss_begin(r.c, nullptr, 0));
-      for (int L : {1, 2, 4}) {
-        int E = L == 2 ? Fixture::kE2 : Fixture::kE1, k = L == 2 ? 2 : 4;
-        auto ids = route(g, E, k, 1 + step % 3);
-        if (L == 1) {
-          int32_t pred[2] = {int32_t(step % 8), int32_t((step * 5) % 8)};
-          CHECK_OK(ss_prefetch(r.c, 2, pred, 2, SS_PREFETCH_SPECULATIVE));
-        }
-        ss_layer_view v{};
-        if (step % 3 == 0) {
-          // Device routes: the ids are copied back on the engine stream.
-          int32_t* ids_dev = nullptr;
-          CU(cudaMalloc(&ids_dev, ids.size() * sizeof(int32_t)));
-          CU(cudaMemcpyAsync(ids_dev, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, gpu.s));
-          CHECK_OK(ss_layer_routes_dev(r.c, L, ids_dev, int(ids.size()), gpu.s));
-          CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
-          CU(cudaFreeAsync(ids_dev, gpu.s));
-        } else {
-          CHECK_OK(ss_layer_routes(r.c, L, ids.data(), int(ids.size())));
-        }
-        if (step % 3 == 1) {
-          CHECK_OK(ss_acquire_groups(r.c, L, gpu.s, &v));
-          for (int gi = 0; gi < v.n_groups; ++gi) {
-            CHECK_OK(ss_group_wait(r.c, L, gi, gpu.s));
-            gpu.check(v, fx, L, std::vector<int32_t>(v.groups[gi].units, v.groups[gi].units + v.groups[gi].n_units));
-          }
-        } else {
-          if (step % 3 == 2) CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
-          std::set<int32_t> distinct(ids.begin(), ids.end());
-          gpu.check(v, fx, L, std::vector<int32_t>(distinct.begin(), distinct.end()));
-        }
-        if (step == 5) CHECK_OK(ss_check_unit(r.c, L, ids[0]));
-        CHECK_OK(ss_release(r.c, L, gpu.s));
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 6;
+  r.b.host_pinned_bytes = 2 << 20;
+  r.b.dynamic_slots_per_layer = 2;
+  if (backing) plan(r, {"", "BBBBPPPPPPDDDDDD", "BBBBPPDD", "D", "BBBBDDDDDDDDDDDD"});
+  else plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.policy = policy;
+  r.o.pin_planned = 0;
+  r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;
+  r.o.group_units = 2;
+  r.o.spec_persistent = spec_persistent;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  std::mt19937 g(77 + int(policy) * 3 + spec_persistent);
+  std::vector<int32_t*> ids_dev_list;
+  for (int step = 0; step < 40; ++step) {
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    for (int L : {1, 2, 4}) {
+      int E = L == 2 ? Fixture::kE2 : Fixture::kE1, k = L == 2 ? 2 : 4;
+      auto ids = route(g, E, k, 1 + step % 3);
+      if (L == 1) {
+        int32_t pred[2] = {int32_t(step % 8), int32_t((step * 5) % 8)};
+        CHECK_OK(ss_prefetch(r.c, 2, pred, 2, SS_PREFETCH_SPECULATIVE));
       }
-      CHECK_OK(ss_layer_all(r.c, 3));
       ss_layer_view v{};
-      CHECK_OK(ss_acquire(r.c, 3, gpu.s, &v));
-      gpu.check(v, fx, 3, {0});
-      CHECK_OK(ss_release(r.c, 3, gpu.s));
-      CHECK_OK(ss_end(r.c));
+      std::set<int32_t> distinct(ids.begin(), ids.end());
+      std::vector<int32_t> list(distinct.begin(), distinct.end());
+      if (step % 3 == 0) {
+        // Device routes, copied back on the engine stream (freed after the final sync).
+        int32_t* ids_dev = nullptr;
+        CU(cudaMalloc(&ids_dev, ids.size() * sizeof(int32_t)));
+        ids_dev_list.push_back(ids_dev);
+        CU(cudaMemcpyAsync(ids_dev, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, gpu.s));
+        CU(cudaStreamSynchronize(gpu.s));  // ids is a pageable temporary
+        CHECK_OK(ss_layer_routes_dev(r.c, L, ids_dev, int(ids.size()), gpu.s));
+        CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
+        gpu.check(v, fx, L, list);
+      } else if (step % 3 == 1) {
+        CHECK_OK(ss_layer_routes(r.c, L, ids.data(), int(ids.size())));
+        CHECK_OK(ss_acquire_groups(r.c, L, gpu.s, &v));
+        for (int gi = 0; gi < v.n_groups; ++gi) {
+          CHECK_OK(ss_group_wait(r.c, L, gi, gpu.s));
+          gpu.check(v, fx, L, std::vector<int32_t>(v.groups[gi].units, v.groups[gi].units + v.groups[gi].n_units));
+        }
+      } else {
+        CHECK_OK(ss_layer_routes(r.c, L, ids.data(), int(ids.size())));
+        CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
+        gpu.check(v, fx, L, list);
+      }
+      if (step == 5) CHECK_OK(ss_check_unit(r.c, L, ids[0]));
+      CHECK_OK(ss_release(r.c, L, gpu.s));  // no sync: the spin + checksum are still queued
     }
-    ss_layer_stats t;
-    CHECK_OK(ss_stats_total(r.c, &t));
-    CHECK(t.bytes_pinned > 0 && t.bytes_disk > 0 && t.hits > 0);
-    std::printf("  policy %s: routed %llu hits %llu admitted %llu transient %llu spec %llu/%llu\n",
-                pol ? "scored" : "lru", (unsigned long long)t.routed, (unsigned long long)t.hits,
-                (unsigned long long)t.admitted, (unsigned long long)t.transient, (unsigned long long)t.spec_used,
-                (unsigned long long)t.spec_issued);
+    CHECK_OK(ss_layer_all(r.c, 3));
+    ss_layer_view v{};
+    CHECK_OK(ss_acquire(r.c, 3, gpu.s, &v));
+    gpu.check(v, fx, 3, {0});
+    CHECK_OK(ss_release(r.c, 3, gpu.s));
+    CHECK_OK(ss_end(r.c));
+    if (step % 10 == 0) CHECK_EQ(int(ss_acquire(r.c, 1, (void*)gpu.s, &v)), int(SS_E_INVALID));  // outside a forward
   }
+  gpu.verify();
+  for (int32_t* p : ids_dev_list) cudaFree(p);
+  ss_layer_stats t;
+  CHECK_OK(ss_stats_total(r.c, &t));
+  CHECK(t.hits > 0 && t.bytes_disk > 0 && t.bytes_pinned > 0);
+  CHECK_EQ(t.hits + t.admitted + t.transient + t.prefetched + t.spec_used, t.routed);
+  std::printf("  %s: routed %llu hits %llu admitted %llu transient %llu evicted %llu spec %llu used %llu dropped %llu "
+              "pinned %.1f MB disk %.1f MB\n",
+              name, (unsigned long long)t.routed, (unsigned long long)t.hits, (unsigned long long)t.admitted,
+              (unsigned long long)t.transient, (unsigned long long)t.evicted, (unsigned long long)t.spec_issued,
+              (unsigned long long)t.spec_used, (unsigned long long)t.spec_dropped, double(t.bytes_pinned) / 1e6,
+              double(t.bytes_disk) / 1e6);
 }
 
-TEST(cuda_prefill_layer_major) {
+}  // namespace
+
+TEST(cuda_decode_lru_async) { decode_variant("lru", SS_POLICY_LRU, 0, false); }
+TEST(cuda_decode_scored_async) { decode_variant("scored", SS_POLICY_SCORED, 0, false); }
+TEST(cuda_decode_lru_spec_persistent_backed) { decode_variant("lru-specp-backed", SS_POLICY_LRU, 1, true); }
+
+TEST(cuda_prefill_layer_major_async) {
   Fixture fx("cuda-prefill");
   Gpu gpu;
   Run r;
@@ -206,7 +256,7 @@ TEST(cuda_prefill_layer_major) {
   r.b.margin_fraction = 0;
   r.b.margin_gib = 1.0 / 1024;
   r.b.ring_slots = 12;
-  r.b.host_pinned_bytes = 1 << 20;
+  r.b.host_pinned_bytes = 2 << 20;
   plan(r, {"", "RRRRRRRRPPPPDDDD", "RRRRRRRR", "P", "RRRRRRRRDDDDPPPP"});
   ss_options_defaults(&r.o);
   r.o.backend = SS_BACKEND_CUDA;
@@ -217,16 +267,16 @@ TEST(cuda_prefill_layer_major) {
   std::vector<int32_t> all(16);
   for (int u = 0; u < 16; ++u) all[size_t(u)] = u;
   uint32_t rows[5] = {512, 512, 0, 512, 512};
-  for (int pass = 0; pass < 3; ++pass) {
+  for (int pass = 0; pass < 6; ++pass) {
     CHECK_OK(ss_begin(r.c, rows, 5));
     CHECK_OK(ss_prefetch_layer(r.c, 1));
     CHECK_OK(ss_prefetch_layer(r.c, 3));
-    CHECK_OK(ss_prefetch_layer(r.c, 4));
+    CHECK_OK(ss_prefetch_layer(r.c, 4));  // half waits for ring slots held by layer 1
     ss_layer_view v{};
     CHECK_OK(ss_layer_all(r.c, 1));
     CHECK_OK(ss_acquire(r.c, 1, gpu.s, &v));
     gpu.check(v, fx, 1, all);
-    CHECK_OK(ss_release(r.c, 1, gpu.s));
+    CHECK_OK(ss_release(r.c, 1, gpu.s));  // layer 4's copies into these ring slots wait for this point
     CHECK_OK(ss_layer_all(r.c, 3));
     CHECK_OK(ss_acquire(r.c, 3, gpu.s, &v));
     gpu.check(v, fx, 3, {0});
@@ -237,6 +287,46 @@ TEST(cuda_prefill_layer_major) {
     CHECK_OK(ss_release(r.c, 4, gpu.s));
     CHECK_OK(ss_end(r.c));
   }
+  gpu.verify();
+}
+
+TEST(cuda_read_failure_reported_and_recovered) {
+  Fixture fx("cuda-hash", /*corrupt_hash=*/true);
+  Gpu gpu;
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 8;
+  r.b.dynamic_slots_per_layer = 4;
+  plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.verify_hash = 1;
+  r.o.pin_planned = 0;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  // A seed whose read fails is rolled back.
+  int32_t bad_seed[2] = {2, 3};
+  CHECK_EQ(int(ss_seed(r.c, 1, bad_seed, 2)), int(SS_E_HASH));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t ids[2] = {2, 3};
+  CHECK_OK(ss_layer_routes(r.c, 1, ids, 2));
+  ss_layer_view v{};
+  CHECK_EQ(int(ss_acquire(r.c, 1, gpu.s, &v)), int(SS_E_HASH));  // unit 3 is read again and fails again
+  CHECK(ss_end(r.c) != SS_OK);
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  CHECK_OK(ss_layer_routes(r.c, 1, ids, 1));
+  CHECK_OK(ss_acquire(r.c, 1, gpu.s, &v));
+  gpu.check(v, fx, 1, {2});
+  CHECK_OK(ss_release(r.c, 1, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  gpu.verify();
+  ss_layer_stats s;
+  CHECK_OK(ss_stats_layer(r.c, 1, &s));
+  CHECK_EQ(s.hits, uint64_t(2));  // unit 2 (seeded fine) in both forwards; unit 3 never became a hit
 }
 
 namespace {
@@ -246,8 +336,8 @@ bool g_bw = true;
 
 TEST(cuda_bandwidth_pinned_and_nvme) {
   if (!g_bw) return;
-  // Two layers of 32 x 8 MiB records in one file: layer 0 from the pinned tier, layer 1 read unbuffered from the
-  // file (never cached by the OS), each landing in a 32-slot ring. 256 MiB each way.
+  // Two layers of 32 x 8 MiB records in one file: layer 0 from the pinned tier, layer 1 read from the file, each
+  // landing in a 32-slot ring. 256 MiB each way, 3 repetitions (a small end-to-end sample, not sustained bandwidth).
   const uint64_t unit = uint64_t(8) << 20, n = 32;
   std::filesystem::path dir = g_bw_dir.empty() ? Fixture::temp_root() / "ss-test-bw" : std::filesystem::path(g_bw_dir);
   std::filesystem::create_directories(dir);
@@ -280,8 +370,12 @@ TEST(cuda_bandwidth_pinned_and_nvme) {
   ss_options_defaults(&r.o);
   r.o.backend = SS_BACKEND_CUDA;
   r.o.reader_threads = 4;
+  r.o.staging_buffers = 4;
+  r.o.staging_bytes = uint64_t(16) << 20;  // pinned total: 256 MiB tier + 64 MiB staging
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
+  int direct = ss_source_direct(r.c, 0);
+  std::printf("  source opened %s\n", direct == 1 ? "unbuffered (FILE_FLAG_NO_BUFFERING / O_DIRECT)" : "BUFFERED");
   Gpu gpu;
   for (int rep = 0; rep < 3; ++rep) {
     for (int L = 0; L < 2; ++L) {
@@ -294,7 +388,8 @@ TEST(cuda_bandwidth_pinned_and_nvme) {
       double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
       CHECK_OK(ss_release(r.c, L, gpu.s));
       CHECK_OK(ss_end(r.c));
-      std::printf("  %s -> device: %.0f MiB in %.3f s = %.2f GB/s\n", L ? "file (unbuffered)" : "pinned tier",
+      std::printf("  %s -> device: %.0f MiB in %.3f s = %.2f GB/s\n",
+                  L ? (direct == 1 ? "file (unbuffered)" : "file (buffered)") : "pinned tier",
                   double(n * unit) / double(1 << 20), s, double(n * unit) / s / 1e9);
     }
   }

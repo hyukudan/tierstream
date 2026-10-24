@@ -17,10 +17,21 @@ struct RingClass {
   uint32_t slots = 0;
 };
 
+// Pinned host copies (tiers PINNED and RESIDENT_BACKED), packed in model order at 4 KiB strides into chunks of at most
+// 1 GiB (one chunk holds a larger unit alone). The planner bills exactly what the context allocates.
+struct PinnedLayout {
+  std::vector<uint64_t> chunk_bytes;
+  std::vector<int32_t> chunk_of;    // per global unit, -1 = no pinned copy
+  std::vector<uint64_t> offset_of;  // per global unit, inside its chunk
+  uint64_t total = 0;
+};
+PinnedLayout pinned_layout(const Desc& d, const std::vector<uint8_t>& tier);
+
 struct Plan {
   std::vector<uint8_t> tier;  // per global unit: ss_tier
+  ss_budget budget{};         // the budget the plan was made with (ss_open checks it)
   uint64_t cap = 0, margin = 0, fixed = 0, dynamic = 0, ring = 0, resident = 0, pinned = 0, disk = 0, peak = 0;
-  uint64_t n_resident = 0, n_pinned = 0, n_disk = 0, n_pair = 0;
+  uint64_t n_resident = 0, n_pinned = 0, n_disk = 0, n_pair = 0, n_backed = 0;
   std::vector<RingClass> rings;      // one stream ring per unit size that streams (empty when nothing streams)
   uint32_t dynamic_slots_per_layer = 0;
   std::vector<std::string> notes;
@@ -29,6 +40,7 @@ struct Plan {
 constexpr uint64_t kGiB = uint64_t(1) << 30;
 
 uint64_t plan_margin(const ss_budget& b);
+bool same_budget(const ss_budget& a, const ss_budget& b);
 // benefit: per global unit (size total_units) or empty for the descriptor's.
 Plan plan_make(const Desc& d, const ss_budget& b, const std::vector<double>& benefit);
 // Tiers decided elsewhere (hyperloom vramplan, a test, an engine flag): same totals and checks as plan_make.
