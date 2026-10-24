@@ -23,8 +23,19 @@ class CudaBackend final : public Backend {
     ck(cudaSetDevice(device_), "cudaSetDevice");
     ck(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
   }
+  void* writeback_stream() override {
+    if (!wb_) {
+      ck(cudaSetDevice(device_), "cudaSetDevice");
+      ck(cudaStreamCreateWithFlags(&wb_, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+    }
+    return wb_;
+  }
   ~CudaBackend() override {
     cudaSetDevice(device_);
+    if (wb_) {
+      cudaStreamSynchronize(wb_);
+      cudaStreamDestroy(wb_);
+    }
     if (copy_) {
       cudaStreamSynchronize(copy_);
       cudaStreamDestroy(copy_);
@@ -88,6 +99,7 @@ class CudaBackend final : public Backend {
 
   int device_;
   cudaStream_t copy_ = nullptr;
+  cudaStream_t wb_ = nullptr;
 };
 
 }  // namespace

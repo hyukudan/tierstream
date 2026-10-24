@@ -33,6 +33,9 @@ class Backend {
   virtual void copy_d2h(void* dst, const void* src, size_t n, void* stream) = 0;
   virtual void copy_d2d(void* dst, const void* src, size_t n, void* stream) = 0;
   virtual void stream_sync(void* stream) = 0;
+  // A second copy stream for device-to-host write-backs (exclusive tier mode), so they run in the opposite PCIe
+  // direction from the H2D copies. nullptr = the copy stream (backends with synchronous copies).
+  virtual void* writeback_stream() { return nullptr; }
 };
 
 std::unique_ptr<Backend> make_cpu_backend();

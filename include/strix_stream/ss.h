@@ -104,6 +104,17 @@ typedef enum ss_tier {
   SS_TIER_RESIDENT_BACKED = 4   /* resident at open, with a pinned host copy for when the dynamic set evicts it */
 } ss_tier;
 
+/* How the pinned host tier and the device slots share units (design.md §3.4).
+ * INCLUSIVE: a unit promoted into a device slot keeps its pinned copy; an evicted unit without one reloads from its
+ *   file. EXCLUSIVE: each unit lives in exactly one place at a forward boundary: a device slot, a pinned block, or (when
+ *   neither holds it) only its file. A promotion frees the unit's block; an evicted unit is written back from its slot
+ *   into a free block (device to host, on a second copy stream), or falls back to its file when no block is free. With
+ *   device + host room for every unit, files are read only at open. */
+typedef enum ss_tier_mode {
+  SS_TIER_MODE_INCLUSIVE = 0,
+  SS_TIER_MODE_EXCLUSIVE = 1
+} ss_tier_mode;
+
 typedef struct ss_budget {
   uint32_t struct_size;        /* sizeof(ss_budget), set by ss_budget_defaults */
   uint64_t device_bytes;       /* device memory the library and the engine's fixed bytes may use (the cap) */
@@ -120,6 +131,17 @@ typedef struct ss_budget {
    * host budget lasts, lowest benefit per byte first (the likeliest to be evicted): a decode replica whose dynamic set
    * evicts planner residents then reloads them over PCIe instead of from NVMe. */
   int pinned_backing;
+  /* Never read: the bytes where older callers' structs had padding (their struct_size covers them). */
+  uint32_t reserved0;
+  /* ss_tier_mode (default INCLUSIVE). EXCLUSIVE refuses pinned_backing = 1, fill_residents = 0 and the HIP backend
+   * (unified memory). */
+  int tier_mode;
+  /* EXCLUSIVE: free pinned blocks wanted per unit size (units whose 4 KiB-strided host bytes are equal share blocks).
+   * Coverage first: they come from the host budget left after host_fixed and the pinned tier, never displacing a
+   * unit's home (the plan JSON says how many fit). A miss that needs an eviction while no block is free is served from
+   * the stream ring and its victim stays (counted as deferred); blocks freed by promotions are reusable from the next
+   * forward. 0 = auto: min(64, units of that size). */
+  uint32_t host_spare_units;
 } ss_budget;
 
 typedef struct ss_plan ss_plan;
@@ -278,6 +300,22 @@ typedef void (*ss_stats_hook)(void* user, const ss_layer_stats* forward_total, c
                               int n_layers);
 SS_API void ss_set_stats_hook(ss_ctx* c, ss_stats_hook hook, void* user);
 SS_API ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len);
+
+/* EXCLUSIVE tier counters since open (not reset by ss_stats_reset); all zero in INCLUSIVE mode. Versioned like
+ * ss_budget: use the inline ss_stats_exclusive. */
+typedef struct ss_exclusive_stats {
+  uint32_t struct_size;
+  uint64_t writebacks;        /* evicted units written back from their slot into a pinned block */
+  uint64_t writeback_bytes;
+  uint64_t deferred;          /* misses served from the stream ring because no block was free for their victim */
+  uint64_t promoted;          /* units whose pinned block was freed by a promotion into a device slot */
+  uint64_t free_blocks;       /* free pinned blocks now (all sizes) */
+  uint64_t min_free_blocks;   /* fewest free blocks at any forward start since open */
+} ss_exclusive_stats;
+SS_API ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size);
+static inline ss_status ss_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* out) {
+  return ss_stats_exclusive_sized(c, out, (uint32_t)sizeof *out);
+}
 
 /* ---------------------------------------------------------------------------------------------------------------
  * Recipes (docs/recipes.md): how one model runs on one hardware set per workload class, compiled into ss_budget /

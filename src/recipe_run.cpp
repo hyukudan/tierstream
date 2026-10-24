@@ -463,6 +463,8 @@ ss_budget budget_for(const RRoute& rt, const RPlacement& p, const Desc& d, bool 
   b.dynamic_slots_per_layer = uint32_t(p.get("dynamic_slots_per_layer"));
   b.ring_slots = uint32_t(p.get("ring_slots"));
   b.pinned_backing = p.get("pinned_backing") != 0;
+  b.tier_mode = p.get("tier_mode") == kTierExclusive ? SS_TIER_MODE_EXCLUSIVE : SS_TIER_MODE_INCLUSIVE;
+  b.host_spare_units = uint32_t(p.get("host_spare_units"));
   const uint64_t ctx = uint64_t(p.get("max_context_tokens")), batch = uint64_t(p.get("max_batch"));
   uint64_t rows = batch;
   if (rt.phase == Phase::Prefill) {
@@ -1001,8 +1003,16 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   o.direct_io = p.get("direct_io") != 0;
   o.group_units = uint32_t(p.get("group_units"));
   o.spec_persistent = p.get("spec_persistent") != 0;
-  require(p.get("tier_mode") == kTierInclusive, SS_E_RECIPE,
-          w + ".tier_mode: \"exclusive\" is not supported by this strix-stream build (inclusive tiers only)");
+  if (p.get("tier_mode") == kTierExclusive) {
+    require(o.backend != SS_BACKEND_HIP, SS_E_RECIPE,
+            w + ".tier_mode: \"exclusive\" needs a discrete device; on unified memory a slot and a pinned block are "
+                "the same memory (use \"inclusive\")");
+    require(o.fill_residents, SS_E_RECIPE,
+            w + ".tier_mode: \"exclusive\" needs fill_residents = true (an evicted resident's slot is its only copy)");
+    require(p.get("pinned_backing") == 0, SS_E_RECIPE,
+            w + ".tier_mode: \"exclusive\" with pinned_backing = true: the backing copy is the second copy exclusive "
+                "removes");
+  }
   uint64_t max_align = 4096;
   for (const auto& s : desc.sources) max_align = std::max(max_align, s.align);
   require(
@@ -1152,6 +1162,10 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   bj["dynamic_slots_per_layer"] = Json::number(uint64_t(out.budget.dynamic_slots_per_layer));
   bj["ring_slots"] = Json::number(uint64_t(out.budget.ring_slots));
   bj["pinned_backing"] = Json::boolean(out.budget.pinned_backing != 0);
+  if (out.budget.tier_mode == SS_TIER_MODE_EXCLUSIVE) {  // inclusive outputs keep today's keys exactly
+    bj["tier_mode"] = Json::string("exclusive");
+    bj["host_spare_units"] = Json::number(uint64_t(out.budget.host_spare_units));
+  }
   j["budget"] = bj;
   Json oj = Json::object();
   oj["backend"] = Json::string(backend_word(o.backend));

@@ -184,6 +184,45 @@ lower id.
 
 The engine runs group 0, then calls `ss_group_wait(g)` before each later group. `ss_acquire` waits for everything.
 
+### 3.5 Tier modes: inclusive and exclusive
+
+`ss_budget.tier_mode` says whether a unit may be held twice.
+
+- **Inclusive** (default, v1 behaviour): a unit promoted from the pinned tier into a device slot keeps its pinned
+  copy. A resident evicted by the dynamic set is reloaded from its file next time, unless it has a `B` copy.
+- **Exclusive**: at every forward boundary each unit is in exactly one place: a device slot, a pinned block, or only
+  its file. Device + host bytes then cover `units` instead of `units + pinned copies of the slots`; for the DS RTX
+  decode replica, 80 GiB of slots + ~63 GiB of blocks hold all 142.4 GiB of experts and no file is read after open.
+
+Exclusive mechanics:
+- **Blocks.** The pinned tier is a pool of blocks per host size (units with equal 4 KiB-strided bytes share blocks): the
+  plan's pinned units, plus `host_spare_units` spare blocks per size (0 = min(64, units of that size)). Coverage
+  comes first: spares take only the host bytes left after `host_fixed` and every pinned unit, so asking for spares
+  never moves a unit to disk (the plan JSON gives `asked` and `blocks` per size). Blocks sit in ≤ 1 GiB chunks; a
+  block larger than 1 GiB has a chunk of its own.
+- **Promotion.** A miss admitted into a slot is copied from its block (or its file). At `ss_end` its block goes to
+  the free list; it is reusable from the next forward.
+- **Eviction.** Admission caps its evictions at the free blocks of the victims' size. Each victim is copied
+  device → host from its slot into a free block on a second copy stream (the write-back stream, the opposite PCIe
+  direction), and the admitted unit's copy into that slot waits for the write-back. A miss past the cap is served
+  from the stream ring and its victim stays (`deferred`): no unit ever falls back to its file. With no spare and full
+  slots the cache cannot adapt (every miss from the ring) but stays covered.
+- **Speculation.** A speculative admission (`spec_persistent`) leaves half of the spares to demands.
+- **Refused:** `pinned_backing` / tier `B` (the second copy), `fill_residents = 0` (a resident's slot is its only
+  copy), the HIP backend (on unified memory a slot and a block are the same memory), descriptors whose tiers do not
+  allow pinned.
+
+Exclusive ordering (CUDA; the CPU backend copies synchronously):
+
+| hazard | rule |
+|---|---|
+| a write-back reads a slot before its unit landed | every victim became resident in an earlier forward (or at open / seed, which synchronize); the write-back stream waits once per forward for `blocks_ev`, recorded on the copy stream at the previous `ss_end` after all of that forward's copies |
+| a freed block is overwritten while an H2D still reads it | blocks freed in forward F are taken only from F + 1, after the same `blocks_ev` wait |
+| the admitted unit overwrites the victim before the write-back read it | its copy into the slot waits for the write-back event (as well as the slot's release event) |
+| a written-back unit is read again in the same forward (a certain prefetch evicted it, then the routes name it) | its copy out of the block waits for that write-back event |
+| a block written in F is read in a later forward | `ss_end` makes the copy stream wait for the write-back stream's mark before recording `blocks_ev` |
+| events reused | write-back events return to the pool at `ss_end`, after every wait on them is enqueued (a CUDA wait captures the record at call time); no wait cycle: every wait points at an earlier record |
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier
@@ -338,6 +377,8 @@ reads only that many bytes and defaults the rest. Fields are appended only.
 3. **Byte identity.** Streamed bytes equal resident bytes. The descriptor carries xxh64 per unit, checked at load and
    in test builds after every copy.
 4. **The plan may depend on P and the budget; the bits may not.**
+5. **Weight slots are read-only.** Kernels never write the bytes a table entry points to. The exclusive tier mode
+   (§3.5) writes a slot back into a pinned block as the unit's only copy.
 
 ### 6.3 Per-engine status (from spec-rtx-prefill §6.4, spec-deepseek, spec-minimax)
 
@@ -359,6 +400,10 @@ Per layer and in total, since open:
 
 They balance: `hits + admitted + transient + prefetched + spec_used == routed`.
 
+Exclusive tier mode, since open (`ss_stats_exclusive`, and `"exclusive"` in the JSON): `writebacks`,
+`writeback_bytes`, `deferred` (misses left in the ring for lack of a free block), `promoted` (blocks freed by
+promotions), `free_blocks`, `min_free_blocks` (at forward starts). Too many deferred misses means too few spares.
+
 `ss_stats_to_json` gives `strix-stream/stats-v1`. The hook fires at every `ss_end` with the forward's numbers, which is
 where a TTFT receipt takes its bytes and waits.
 
@@ -367,7 +412,7 @@ where a TTFT receipt takes its bytes and waits.
 | backend | status | notes |
 |---|---|---|
 | CPU | done, tested | host memory, unified; the reference for the in-place path |
-| CUDA | done, CPU-built; GPU test `ss-test-cuda` (one short PC-BIG) | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream: one DMA engine reaches 31-32.5 GB/s and a second stream adds nothing (spec-rtx-prefill §2.1) |
+| CUDA | done, CPU-built; GPU test `ss-test-cuda` (one short PC-BIG) | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream for H2D: one DMA engine reaches 31-32.5 GB/s and a second H2D stream adds nothing (spec-rtx-prefill §2.1); exclusive mode adds a write-back (D2H) stream |
 | HIP | stub: compiles only with `-DSS_HIP=ON` on a ROCm host; not built or run yet | unified: slots are mapped host memory, misses are read in place from the local NVMe, host waits in v1 |
 
 ## 9. Versioning
@@ -384,3 +429,7 @@ where a TTFT receipt takes its bytes and waits.
 - **Mapped-flag gates** (`cuStreamWaitValue32` / `hipStreamWaitValue64`) instead of host waits for file jobs.
 - **Per-layer row splits** from miss curves (dynamic slots per layer instead of a uniform count).
 - **A rate-tally file across runs.** Measured to generalize poorly in the study, so only as an opt-in.
+- **One slot arena across layers** (exclusive decode): wdsrtx's G0 gives 8.0 misses/token with a global LRU vs 8.6
+  with per-layer pools at 80 GiB.
+- **Boundary eviction into spare device slots** (wdsrtx's engine-side store): takes the write-back off the miss
+  path; worth it if the write-back wait shows in the stats.

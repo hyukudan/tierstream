@@ -20,6 +20,9 @@
 
 using sstest::Fixture;
 
+// Test hook (capi.cpp, not in ss.h): the exclusive tier mode's ownership check between forwards.
+extern "C" ss_status ss_test_check_exclusive(ss_ctx* c);
+
 namespace {
 
 #define CU(x)                                                                                      \
@@ -155,7 +158,10 @@ std::vector<int32_t> route(std::mt19937& g, int E, int k, int rows) {
   return ids;
 }
 
-void decode_variant(const char* name, ss_policy policy, int spec_persistent, bool backing) {
+// exclusive: every unit resident or pinned (slots + blocks cover the model), the victims written back D2H while the
+// engine stream still has queued readers; spares = host_spare_units (1 forces deferred misses).
+void decode_variant(const char* name, ss_policy policy, int spec_persistent, bool backing, bool exclusive = false,
+                    uint32_t spares = 0) {
   Fixture fx(std::string("cuda-") + name);
   Gpu gpu;
   Run r;
@@ -167,8 +173,18 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
   r.b.ring_slots = 6;
   r.b.host_pinned_bytes = 2 << 20;
   r.b.dynamic_slots_per_layer = 2;
-  if (backing) plan(r, {"", "BBBBPPPPPPDDDDDD", "BBBBPPDD", "D", "BBBBDDDDDDDDDDDD"});
-  else plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
+  if (exclusive) {
+    r.b.ring_slots = 32;  // deferred misses are served from the ring
+    r.b.host_pinned_bytes = 4 << 20;
+    r.b.dynamic_slots_per_layer = 0;
+    r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
+    r.b.host_spare_units = spares;
+    plan(r, {"", "RRRRPPPPPPPPPPPP", "RRRRPPPP", "P", "RRRRPPPPPPPPPPPP"});
+  } else if (backing) {
+    plan(r, {"", "BBBBPPPPPPDDDDDD", "BBBBPPDD", "D", "BBBBDDDDDDDDDDDD"});
+  } else {
+    plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
+  }
   ss_options_defaults(&r.o);
   r.o.backend = SS_BACKEND_CUDA;
   r.o.policy = policy;
@@ -179,7 +195,8 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
   r.o.spec_persistent = spec_persistent;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
-  std::mt19937 g(77 + int(policy) * 3 + spec_persistent);
+  ss_stats_reset(r.c);  // exclusive: no file read after open
+  std::mt19937 g(77 + int(policy) * 3 + spec_persistent + int(spares) * 11);
   std::vector<int32_t*> ids_dev_list;
   int32_t* ids_pinned = nullptr;  // one pinned slice per device-route call, never reused before the final sync
   CU(cudaHostAlloc(&ids_pinned, 40 * 3 * 64 * sizeof(int32_t), cudaHostAllocDefault));
@@ -192,6 +209,10 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
       if (L == 1) {
         int32_t pred[2] = {int32_t(step % 8), int32_t((step * 5) % 8)};
         CHECK_OK(ss_prefetch(r.c, 2, pred, 2, SS_PREFETCH_SPECULATIVE));
+      }
+      if (exclusive && L == 4 && step % 5 == 3) {  // its admission may evict a unit layer 4 routes just after
+        int32_t pre[2] = {int32_t(4 + step % 12), int32_t(4 + (step * 7) % 12)};
+        CHECK_OK(ss_prefetch(r.c, 4, pre, 2, SS_PREFETCH_CERTAIN));
       }
       ss_layer_view v{};
       std::set<int32_t> distinct(ids.begin(), ids.end());
@@ -229,6 +250,7 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
     gpu.check(v, fx, 3, {0});
     CHECK_OK(ss_release(r.c, 3, gpu.s));
     CHECK_OK(ss_end(r.c));
+    if (exclusive) CHECK_OK(ss_test_check_exclusive(r.c));
     if (step % 10 == 0) CHECK_EQ(int(ss_acquire(r.c, 1, (void*)gpu.s, &v)), int(SS_E_INVALID));  // outside a forward
   }
   gpu.verify();
@@ -236,7 +258,20 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
   cudaFreeHost(ids_pinned);
   ss_layer_stats t;
   CHECK_OK(ss_stats_total(r.c, &t));
-  CHECK(t.hits > 0 && t.bytes_disk > 0 && t.bytes_pinned > 0);
+  if (exclusive) {
+    CHECK(t.hits > 0 && t.bytes_pinned > 0 && t.evicted > 0);
+    CHECK_EQ(t.bytes_disk, uint64_t(0));
+    ss_exclusive_stats x{};
+    CHECK_OK(ss_stats_exclusive(r.c, &x));
+    CHECK(x.writebacks > 0 && x.promoted > 0);
+    CHECK_EQ(x.writebacks, t.evicted);
+    if (spares == 1) CHECK(x.deferred > 0);
+    std::printf("  %s: write-backs %llu (%.1f MB) promoted %llu deferred %llu min free blocks %llu\n", name,
+                (unsigned long long)x.writebacks, double(x.writeback_bytes) / 1e6, (unsigned long long)x.promoted,
+                (unsigned long long)x.deferred, (unsigned long long)x.min_free_blocks);
+  } else {
+    CHECK(t.hits > 0 && t.bytes_disk > 0 && t.bytes_pinned > 0);
+  }
   CHECK_EQ(t.hits + t.admitted + t.transient + t.prefetched + t.spec_used, t.routed);
   std::printf("  %s: routed %llu hits %llu admitted %llu transient %llu evicted %llu spec %llu used %llu dropped %llu "
               "pinned %.1f MB disk %.1f MB\n",
@@ -251,6 +286,9 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
 TEST(cuda_decode_lru_async) { decode_variant("lru", SS_POLICY_LRU, 0, false); }
 TEST(cuda_decode_scored_async) { decode_variant("scored", SS_POLICY_SCORED, 0, false); }
 TEST(cuda_decode_lru_spec_persistent_backed) { decode_variant("lru-specp-backed", SS_POLICY_LRU, 1, true); }
+TEST(cuda_exclusive_lru_async) { decode_variant("x-lru", SS_POLICY_LRU, 0, false, true, 0); }
+TEST(cuda_exclusive_scored_spec_persistent_async) { decode_variant("x-scored-specp", SS_POLICY_SCORED, 1, false, true, 0); }
+TEST(cuda_exclusive_one_spare_async) { decode_variant("x-one", SS_POLICY_LRU, 0, false, true, 1); }
 
 TEST(cuda_prefill_layer_major_async) {
   Fixture fx("cuda-prefill");

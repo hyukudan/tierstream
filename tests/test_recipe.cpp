@@ -586,11 +586,29 @@ TEST(plan_blob_tiers_32_16_12_and_plan_json_roundtrip) {
   CHECK_EQ(p.doc.find("engine")->find("forward_rows")->text, std::string("4096"));
   CHECK_EQ(p.doc.find("engine")->find("idle_preload_layers")->text, std::string("0"));
   CHECK_EQ(json_u64(*p.doc.find("resources")->find("disk_bytes"), "d"), 12 * 2 * GiB);
-  // The exclusive tier mode is part of the schema; this build compiles inclusive tiers only and says so.
-  RecipeStack x(kLab, "lab.toml");
-  x.set("routes.prefill_long.placement.rtx.tier_mode", "\"exclusive\"", "--set");
-  CHECK_REFUSED(recipe_plan(x.effective(), x.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {}),
-                "inclusive tiers only");
+  // The exclusive tier mode compiles into the budget; its refusals name the conflicting field.
+  {
+    RecipeStack x(kLab, "lab.toml");
+    x.set("routes.prefill_long.placement.rtx.tier_mode", "\"exclusive\"", "--set");
+    x.set("routes.prefill_long.placement.rtx.host_spare_units", "3", "--set");
+    RecipePlan e = recipe_plan(x.effective(), x.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {});
+    CHECK_EQ(e.budget.tier_mode, int(SS_TIER_MODE_EXCLUSIVE));
+    CHECK_EQ(e.budget.host_spare_units, 3u);
+    CHECK(e.plan.tier == p.plan.tier);  // coverage first: the spares never move a unit's tier
+    CHECK_EQ(e.plan.pinned, p.plan.pinned + 3 * host_stride(d.layers[0].unit_bytes));
+    CHECK_EQ(e.doc.find("budget")->find("tier_mode")->text, std::string("exclusive"));
+    CHECK(p.doc.find("budget")->find("tier_mode") == nullptr);  // inclusive output unchanged
+    RecipeStack y(kLab, "lab.toml");
+    y.set("routes.prefill_long.placement.rtx.tier_mode", "\"exclusive\"", "--set");
+    y.set("routes.prefill_long.placement.rtx.fill_residents", "false", "--set");
+    CHECK_REFUSED(recipe_plan(y.effective(), y.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {}),
+                  "needs fill_residents = true");
+    RecipeStack z(kLab, "lab.toml");
+    z.set("routes.prefill_long.placement.rtx.tier_mode", "\"exclusive\"", "--set");
+    z.set("routes.prefill_long.placement.rtx.pinned_backing", "true", "--set");
+    CHECK_REFUSED(recipe_plan(z.effective(), z.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {}),
+                  "second copy exclusive removes");
+  }
   const Json* res = p.doc.find("resources");
   CHECK(json_u64(*res->find("host_bytes"), "h") > 16 * 2 * GiB);  // pinned tier + staging + tables + metadata
   CHECK(json_u64(*res->find("host_pinned_bytes"), "h") == p.plan.pinned);

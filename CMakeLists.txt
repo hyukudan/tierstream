@@ -83,6 +83,11 @@ if(SS_TESTS)
   target_link_libraries(ss-test-recipe PRIVATE strix_stream)
   add_test(NAME recipe COMMAND ss-test-recipe WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+  add_executable(ss-test-exclusive tests/test_exclusive.cpp)
+  target_include_directories(ss-test-exclusive PRIVATE src)
+  target_link_libraries(ss-test-exclusive PRIVATE strix_stream)
+  add_test(NAME exclusive COMMAND ss-test-exclusive)
+
   add_executable(ss-test-capi tests/test_capi.c)
   target_link_libraries(ss-test-capi PRIVATE strix_stream)
   set_target_properties(ss-test-capi PROPERTIES LINKER_LANGUAGE CXX)

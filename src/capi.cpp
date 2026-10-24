@@ -82,7 +82,7 @@ ss::Json parse_input(const char* text, size_t len, const char* what) {
 }
 
 void budget_defaults(ss_budget* b) {
-  std::memset(b, 0, sizeof *b);
+  std::memset(b, 0, sizeof *b);  // tier_mode INCLUSIVE, host_spare_units auto
   b->struct_size = uint32_t(sizeof *b);
   b->margin_gib = 2.0;
   b->margin_fraction = 0.03;
@@ -104,6 +104,10 @@ void options_defaults(ss_options* o) {
   o->direct_io = 1;
 }
 
+// Bytes that were padding in older headers carry whatever the caller's compiler left there: never read.
+void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
+void clear_reserved(ss_options&) {}
+
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
 // (an older caller's missing fields keep their defaults; a newer caller's extra fields are not read).
 template <class T>
@@ -115,6 +119,7 @@ T versioned(const T* in, void (*defaults)(T*), const char* what) {
               std::string(what) + ": struct_size not set (fill the struct with its *_defaults function)");
   std::memcpy(static_cast<void*>(&v), in, std::min<size_t>(in->struct_size, sizeof(T)));
   v.struct_size = uint32_t(sizeof(T));
+  clear_reserved(v);
   return v;
 }
 
@@ -403,6 +408,23 @@ ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) {
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
 
+// Test hook (tests/test_exclusive.cpp, CUDA test): not in ss.h.
+ss_status ss_test_check_exclusive(ss_ctx* c) {
+  return guard([&] {
+    need(c != nullptr, "ss_test_check_exclusive: null context");
+    c->c->check_exclusive();
+  });
+}
+
+ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size) {
+  return guard([&] {
+    need(c && out && size >= sizeof(uint32_t), "ss_stats_exclusive: bad argument");
+    ss_exclusive_stats x = c->c->exclusive_stats();
+    x.struct_size = std::min<uint32_t>(size, uint32_t(sizeof x));
+    std::memcpy(static_cast<void*>(out), &x, x.struct_size);
+  });
+}
+
 ss_status ss_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) {
   return guard([&] {
     need(text && out, "ss_recipe_from_text: null argument");
@@ -519,6 +541,12 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
     bout.struct_size = uint32_t(sizeof bout);
     oout.struct_size = uint32_t(sizeof oout);
     need(budget->struct_size >= 2 * sizeof(uint32_t), "ss_recipe_plan: budget struct_size not set (ss_budget_defaults)");
+    // A truncated copy of an exclusive budget would read back as inclusive: refuse rather than hand out a budget
+    // that no longer matches the plan.
+    need(bout.tier_mode == SS_TIER_MODE_INCLUSIVE ||
+             budget->struct_size >= offsetof(ss_budget, host_spare_units) + sizeof(bout.host_spare_units),
+         "ss_recipe_plan: the route's placement is tier_mode = exclusive, which this caller's ss_budget (an older "
+         "header) cannot hold");
     if (plan) made = new ss_plan{std::move(rp.plan), desc};
     s = ss::json_write(rp.doc);
   });

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <set>
 
 #include "errors.hpp"
 #include "xxh64.hpp"
@@ -63,6 +64,12 @@ Ctx::~Ctx() { cleanup(); }
 
 void Ctx::init() {
   require(int64_t(plan_.tier.size()) == d_.total_units, SS_E_INVALID, "open: plan does not match the descriptor");
+  excl_ = plan_.budget.tier_mode == SS_TIER_MODE_EXCLUSIVE;
+  require(!(excl_ && o_.backend == SS_BACKEND_HIP), SS_E_UNSUPPORTED,
+          "open: the exclusive tier mode needs a discrete device (on unified memory a slot and a pinned block are the "
+          "same memory)");
+  // A resident's slot is the only copy an eviction writes back: it must hold the unit's bytes from open.
+  require(!(excl_ && !o_.fill_residents), SS_E_INVALID, "open: the exclusive tier mode needs fill_residents = 1");
   switch (o_.backend) {
     case SS_BACKEND_CPU: be_ = make_cpu_backend(); break;
     case SS_BACKEND_CUDA: be_ = make_cuda_backend(o_.device); break;
@@ -97,6 +104,49 @@ void Ctx::init() {
     for (int64_t g = 0; g < d_.total_units; ++g)
       if (pl.chunk_of[size_t(g)] >= 0)
         pinned_of_[size_t(g)] = at(pinned_chunks_[size_t(pl.chunk_of[size_t(g)])], pl.offset_of[size_t(g)]);
+  }
+
+  // Exclusive tier mode: block classes (one per host stride), spare blocks, write-back stream and events.
+  if (excl_) {
+    wb_stream_ = be_->writeback_stream();
+    blocks_ev_ = be_->event_create();
+    wb_mark_ev_ = be_->event_create();
+    wb_pending_.assign(size_t(d_.total_units), nullptr);
+    for (const SpareClass& c : plan_.spares) block_bytes_.push_back(c.block_bytes);
+    free_blocks_.resize(block_bytes_.size());
+    layer_class_.assign(d_.layers.size(), -1);
+    std::vector<uint64_t> class_total(block_bytes_.size(), 0);
+    for (size_t L = 0; L < d_.layers.size(); ++L) {
+      const Layer& l = d_.layers[L];
+      if (!l.streamable || !l.n_units) continue;
+      const uint64_t hs = host_stride(l.unit_bytes);
+      const auto it = std::find(block_bytes_.begin(), block_bytes_.end(), hs);
+      require(it != block_bytes_.end(), SS_E_INVALID, "open: exclusive plan without a block class (internal)");
+      layer_class_[L] = int(it - block_bytes_.begin());
+      for (int u = 0; u < l.n_units; ++u)
+        if (pinned_of_[size_t(gidx(int(L), u))]) ++class_total[size_t(layer_class_[L])];
+    }
+    for (size_t k = 0; k < plan_.spares.size(); ++k) {
+      const uint64_t bytes = plan_.spares[k].block_bytes;
+      const uint64_t per_chunk = std::max<uint64_t>(1, (uint64_t(1) << 30) / bytes);
+      class_total[k] += plan_.spares[k].blocks;
+      // Every block of the class can be free at once: the free list never reallocates after open.
+      free_blocks_[k].reserve(size_t(class_total[k]));
+      std::vector<void*> blocks;
+      for (uint64_t left = plan_.spares[k].blocks; left > 0;) {
+        const uint64_t n = std::min(per_chunk, left);
+        void* chunk = be_->alloc_pinned(size_t(n * bytes));
+        spare_chunks_.push_back(chunk);
+        for (uint64_t i = 0; i < n; ++i) blocks.push_back(at(chunk, i * bytes));
+        left -= n;
+      }
+      for (size_t i = blocks.size(); i-- > 0;) free_blocks_[k].push_back(blocks[i]);  // lowest address taken first
+      n_blocks_ += class_total[k];
+      spares_of_.push_back(plan_.spares[k].blocks);
+      xst_.free_blocks += plan_.spares[k].blocks;
+    }
+    xst_.min_free_blocks = xst_.free_blocks;
+    wb_units_.reserve(size_t(d_.total_units));
   }
 
   // Layers: resident pool, release event, unit tables.
@@ -205,8 +255,19 @@ void Ctx::cleanup() {
       if (s.table_ev[v]) be_->event_destroy(s.table_ev[v]);
     }
   }
+  try {
+    if (wb_stream_) be_->stream_sync(wb_stream_);
+  } catch (const Error&) {
+  }
   for (const RingRange& r : ring_classes_) be_->free_device(r.base);
   for (void* c : pinned_chunks_) be_->free_pinned(c);
+  for (void* c : spare_chunks_) be_->free_pinned(c);
+  for (void* e : wb_evs_) be_->event_destroy(e);
+  if (blocks_ev_) be_->event_destroy(blocks_ev_);
+  if (wb_mark_ev_) be_->event_destroy(wb_mark_ev_);
+  spare_chunks_.clear();
+  wb_evs_.clear();
+  blocks_ev_ = wb_mark_ev_ = nullptr;
   for (auto& s : staging_) {
     be_->free_pinned(s.host);
     be_->event_destroy(s.ev);
@@ -307,6 +368,8 @@ void Ctx::submit(const JobPtr& j) {
     try {
       std::lock_guard<std::mutex> lk(copy_mu_);
       be_->stream_wait(nullptr, j->dst_release_ev);
+      be_->stream_wait(nullptr, j->dst_wb_ev);
+      be_->stream_wait(nullptr, j->src_wait_ev);
       for (uint64_t off = 0; off < n; off += o_.copy_piece_bytes)
         be_->copy_h2d(at(j->dst, off), static_cast<const char*>(j->host_src) + off,
                       size_t(std::min<uint64_t>(o_.copy_piece_bytes, n - off)), nullptr);
@@ -378,6 +441,7 @@ void Ctx::run_job(Job& j) {
     read_unit_host(j.layer, j.unit, j.dst, want_hash, &digest);
   } else if (be_->unified()) {
     be_->event_sync(j.dst_release_ev);  // the slot's previous reader is done
+    be_->event_sync(j.dst_wb_ev);
     if (j.from_pinned) {
       std::memcpy(j.dst, j.host_src, size_t(l.unit_bytes));
       if (want_hash) digest = xxh64(j.dst, size_t(l.unit_bytes));
@@ -488,6 +552,7 @@ void Ctx::read_unit_device(Job& j) {
       std::lock_guard<std::mutex> lk(copy_mu_);
       if (!waited) {
         be_->stream_wait(nullptr, j.dst_release_ev);
+        be_->stream_wait(nullptr, j.dst_wb_ev);
         waited = true;
       }
       be_->copy_h2d(at(j.dst, pos + c), src, size_t(len), nullptr);
@@ -514,6 +579,7 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
   j->dst_release_ev = L_[size_t(layer)].release_ev;
   j->host_src = pinned_of_[size_t(gidx(layer, unit))];
   j->from_pinned = j->host_src != nullptr;
+  if (excl_ && j->from_pinned) j->src_wait_ev = wb_pending_[size_t(gidx(layer, unit))];
   if (!be_->unified()) {
     if (!ev_pool_.empty()) {
       j->done_ev = ev_pool_.back();
@@ -525,9 +591,10 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
   return j;
 }
 
-void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec) {
+void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* dst_wb_ev) {
   LayerState& s = L_[size_t(layer)];
   JobPtr j = make_job(layer, unit, at(s.pool, uint64_t(slot) * d_.unit_stride(layer)), spec);
+  j->dst_wb_ev = dst_wb_ev;
   fwd_jobs_.push_back(j);  // tracked before anything points at it (end() drains and rolls back what it tracks)
   s.loc[size_t(unit)] = Persistent;
   s.slot[size_t(unit)] = slot;
@@ -535,6 +602,96 @@ void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec) {
   (j->from_pinned ? fwd_stats_[size_t(layer)].bytes_pinned : fwd_stats_[size_t(layer)].bytes_disk) +=
       d_.layers[size_t(layer)].unit_bytes;
   submit(j);
+}
+
+int Ctx::block_class(int layer) const { return excl_ ? layer_class_[size_t(layer)] : -1; }
+
+// Exclusive tier mode: evictions this admission may make, one free block per victim. A speculative admission
+// (spec_persistent) leaves half of the class's spares to demands.
+int Ctx::eviction_cap(int layer, bool speculative) const {
+  if (!excl_) return -1;
+  const int cls = block_class(layer);
+  if (cls < 0) return 0;
+  uint64_t f = free_blocks_[size_t(cls)].size();
+  if (speculative) {
+    const uint64_t reserve = (spares_of_[size_t(cls)] + 1) / 2;
+    f = f > reserve ? f - reserve : 0;
+  }
+  return int(std::min<uint64_t>(f, uint64_t(INT32_MAX)));
+}
+
+// Exclusive tier mode: the admission's victims leave their slots for free blocks (device to host on the write-back
+// stream) before anything is written into those slots; admission capped the evictions at the free blocks. Returns the
+// event the admitted units' writes into the victims' slots wait for (nullptr on synchronous backends).
+void* Ctx::write_back(int layer, const Admission& a) {
+  const LayerState& s = L_[size_t(layer)];
+  const Layer& l = d_.layers[size_t(layer)];
+  const int cls = block_class(layer);
+  if (cls < 0 || free_blocks_[size_t(cls)].size() < a.evicted.size())
+    fail(SS_E_BACKEND, "exclusive: more victims than free blocks (internal)");
+  void* ev = nullptr;
+  if (!be_->unified()) {
+    // Blocks freed by earlier forwards: their last H2D reader is before blocks_ev_ on the copy stream, and so is the
+    // last copy into any slot that holds a resident of an earlier forward (every victim).
+    if (wb_gate_) {
+      be_->stream_wait(wb_stream_, blocks_ev_);
+      wb_gate_ = false;
+    }
+    if (!ev_pool_.empty()) {
+      ev = ev_pool_.back();
+      ev_pool_.pop_back();
+    } else {
+      ev = be_->event_create();
+    }
+    try {
+      wb_evs_.push_back(ev);
+    } catch (...) {
+      be_->event_destroy(ev);
+      throw;
+    }
+  }
+  for (size_t i = 0; i < a.evicted.size(); ++i) {
+    const int64_t g = gidx(layer, a.evicted[i]);
+    if (pinned_of_[size_t(g)] != nullptr) fail(SS_E_BACKEND, "exclusive: an evicted resident still owns a block (internal)");
+    void* b = free_blocks_[size_t(cls)].back();
+    free_blocks_[size_t(cls)].pop_back();
+    pinned_of_[size_t(g)] = b;
+    be_->copy_d2h(b, at(s.pool, uint64_t(a.evicted_slot[i]) * d_.unit_stride(layer)), size_t(l.unit_bytes),
+                  wb_stream_);
+    ++xst_.writebacks;
+    xst_.writeback_bytes += l.unit_bytes;
+  }
+  if (ev) be_->event_record(ev, wb_stream_);
+  // Published after the record: a read of one of these blocks in the same forward waits for it.
+  for (int32_t v : a.evicted) {
+    const int64_t g = gidx(layer, v);
+    wb_pending_[size_t(g)] = ev;
+    wb_units_.push_back(g);  // reserved for every unit at open: never reallocates
+  }
+  return ev;
+}
+
+void Ctx::fetch_admitted(int layer, const Admission& a, bool spec) {
+  xst_.deferred += uint64_t(a.deferred);
+  void* ev = excl_ && !a.evicted.empty() ? write_back(layer, a) : nullptr;
+  for (size_t k = 0; k < a.admitted.size(); ++k) {
+    void* wait = nullptr;  // only a write into a victim's slot waits for the victims' write-back
+    if (ev)
+      for (size_t i = 0; i < a.evicted.size() && !wait; ++i)
+        if (a.evicted_slot[i] == a.slot_of[k]) wait = ev;
+    fetch_into_persistent(layer, a.admitted[k], a.slot_of[k], spec, wait);
+  }
+}
+
+// A unit that landed in a slot from its block no longer owns the block (its H2D was issued; the block's next writer
+// waits for that copy through blocks_ev_ or a stream sync).
+void Ctx::free_block(int layer, int unit) {
+  const int64_t g = gidx(layer, unit);
+  void* b = const_cast<void*>(pinned_of_[size_t(g)]);
+  if (!b) return;
+  free_blocks_[size_t(block_class(layer))].push_back(b);  // capacity reserved at open
+  pinned_of_[size_t(g)] = nullptr;
+  ++xst_.promoted;
 }
 
 bool Ctx::fetch_into_ring(int layer, int unit, bool spec) {
@@ -658,6 +815,8 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
   }
   // A placed seed without a finished read (never submitted, or failed) must not stay resident. Every job in `jobs`
   // was submitted, and a submission that failed published Failed, so these waits always end.
+  std::vector<int32_t> landed;
+  landed.reserve(placed.size());
   for (int32_t u : placed) {
     bool ok = false;
     for (const JobPtr& j : jobs)
@@ -666,6 +825,7 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
         ok = j->state.load() == Job::Done;
       }
     if (!ok) s.rs->drop(u);
+    else landed.push_back(u);
   }
   // Report the first failed read (its unit was dropped above: it would be a hit on garbage).
   for (const JobPtr& j : jobs)
@@ -675,14 +835,19 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
     }
   for (const JobPtr& j : jobs)
     if (j->done_ev) ev_pool_.push_back(j->done_ev);
+  bool synced = false;
   try {
     be_->stream_sync(nullptr);
+    synced = true;
   } catch (const Error& e) {
     if (failed == SS_OK) {
       failed = e.status();
       keep_message(err, e.what());
     }
   }
+  // Exclusive: a seeded unit's copy out of its block has completed (stream sync): the block is free at once.
+  if (excl_ && synced)
+    for (int32_t u : landed) free_block(layer, u);
   if (failed != SS_OK) fail(failed, err);
 }
 
@@ -692,6 +857,12 @@ void Ctx::begin(const uint32_t* rows, int n_layers_in) {
   open_forward();
   if (rows)
     for (size_t L = 0; L < L_.size(); ++L) L_[L].skip = rows[L] == 0;
+  if (excl_) {
+    uint64_t f = 0;
+    for (const auto& v : free_blocks_) f += v.size();
+    xst_.free_blocks = f;
+    xst_.min_free_blocks = std::min(xst_.min_free_blocks, f);
+  }
   in_forward_ = true;
 }
 
@@ -734,8 +905,8 @@ void Ctx::ingest_routes(int layer, const int32_t* ids, int n) {
   }
   st.routed += s.routed.size();
   st.hits += s.hits.size();
-  Admission a = s.rs->admit(to_admit, busy, true);
-  for (size_t k = 0; k < a.admitted.size(); ++k) fetch_into_persistent(layer, a.admitted[k], a.slot_of[k], false);
+  Admission a = s.rs->admit(to_admit, busy, true, eviction_cap(layer, false));
+  fetch_admitted(layer, a, false);
   for (int32_t u : a.transient)
     if (!fetch_into_ring(layer, u, false)) {
       s.pending.push_back(u);
@@ -807,9 +978,10 @@ void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {
     if (s.loc[size_t(u)] != None || s.rs->slot(u) >= 0) continue;
     if (plan_.tier[size_t(gidx(layer, u))] == SS_TIER_PAIR) continue;
     // A speculative read uses only the ring unless spec_persistent: it never evicts a resident on a guess.
-    Admission a = speculative && !o_.spec_persistent ? Admission{} : s.rs->admit({u}, busy, true);
+    Admission a =
+        speculative && !o_.spec_persistent ? Admission{} : s.rs->admit({u}, busy, true, eviction_cap(layer, speculative));
     if (!a.admitted.empty()) {
-      fetch_into_persistent(layer, u, a.slot_of[0], speculative);
+      fetch_admitted(layer, a, speculative);
       st.evicted += a.evicted.size();
     } else if (!fetch_into_ring(layer, u, speculative)) {
       if (speculative) break;  // ring full: speculation never waits
@@ -991,6 +1163,36 @@ void Ctx::end() {
         ring_[i].job.reset();
       }
   }
+  // Exclusive (every job of the forward has ended above): promotions free their blocks; the copy stream waits for
+  // this forward's write-backs (every block they wrote is complete before a later forward reads it), then marks
+  // blocks_ev_ after every H2D of this forward (the next forward's first write-back waits for it before reusing a
+  // freed block or reading a slot filled in this forward).
+  if (excl_) {
+    for (size_t L = 0; L < L_.size(); ++L) {
+      LayerState& s = L_[L];
+      if (!s.rs) continue;
+      for (int u = 0; u < d_.layers[L].n_units; ++u)
+        if (s.loc[size_t(u)] == Persistent && s.job[size_t(u)] && s.job[size_t(u)]->from_pinned &&
+            s.job[size_t(u)]->state.load() == Job::Done)
+          free_block(int(L), u);
+    }
+    if (!be_->unified()) {
+      std::lock_guard<std::mutex> lk(copy_mu_);
+      if (!wb_evs_.empty()) {
+        be_->event_record(wb_mark_ev_, wb_stream_);
+        be_->stream_wait(nullptr, wb_mark_ev_);
+      }
+      be_->event_record(blocks_ev_, nullptr);
+      wb_gate_ = true;
+    }
+    for (int64_t g : wb_units_) wb_pending_[size_t(g)] = nullptr;
+    wb_units_.clear();
+    for (void* e : wb_evs_) ev_pool_.push_back(e);  // every wait on them is enqueued (CUDA captures the record)
+    wb_evs_.clear();
+    uint64_t f = 0;
+    for (const auto& v : free_blocks_) f += v.size();
+    xst_.free_blocks = f;
+  }
   // Persistent copies of this forward are issued (Done) but may still be in flight on the copy stream: the next
   // acquire of each such layer waits for this point (they would otherwise be hits with no wait).
   if (!be_->unified()) {
@@ -1088,7 +1290,50 @@ Json Ctx::stats_json() const {
   Json layers = Json::array();
   for (const auto& s : stats_) layers.push(one(s));
   j["layers"] = layers;
+  if (excl_) {
+    Json x = Json::object();
+    x["writebacks"] = Json::number(xst_.writebacks);
+    x["writeback_bytes"] = Json::number(xst_.writeback_bytes);
+    x["deferred"] = Json::number(xst_.deferred);
+    x["promoted"] = Json::number(xst_.promoted);
+    x["free_blocks"] = Json::number(xst_.free_blocks);
+    x["min_free_blocks"] = Json::number(xst_.min_free_blocks);
+    x["blocks"] = Json::number(n_blocks_);
+    j["exclusive"] = x;
+  }
   return j;
+}
+
+ss_exclusive_stats Ctx::exclusive_stats() const {
+  ss_exclusive_stats x = xst_;
+  x.struct_size = uint32_t(sizeof x);
+  return x;
+}
+
+void Ctx::check_exclusive() const {
+  require(excl_, SS_E_INVALID, "check_exclusive: the context is not in the exclusive tier mode");
+  require(!in_forward_ && !fwd_open_, SS_E_INVALID, "check_exclusive: only between forwards");
+  std::set<const void*> owned;
+  for (size_t L = 0; L < d_.layers.size(); ++L) {
+    const Layer& l = d_.layers[L];
+    if (!L_[L].rs) continue;
+    for (int u = 0; u < l.n_units; ++u) {
+      const int64_t g = gidx(int(L), u);
+      if (plan_.tier[size_t(g)] == SS_TIER_PAIR) continue;  // another device's unit: never here
+      const void* b = pinned_of_[size_t(g)];
+      require(!wb_pending_[size_t(g)], SS_E_INVALID, "check_exclusive: a write-back is still pending at a boundary");
+      if (!b) continue;
+      require(l.streamable, SS_E_INVALID, "check_exclusive: a non-streamable unit owns a block");
+      require(L_[L].rs->slot(u) < 0, SS_E_INVALID,
+              "check_exclusive: unit (" + std::to_string(L) + ", " + std::to_string(u) + ") is in a slot and a block");
+      require(owned.insert(b).second, SS_E_INVALID, "check_exclusive: a block is owned twice");
+    }
+  }
+  for (const auto& v : free_blocks_)
+    for (const void* b : v) require(owned.insert(b).second, SS_E_INVALID, "check_exclusive: a free block is owned");
+  require(owned.size() == n_blocks_, SS_E_INVALID,
+          "check_exclusive: " + std::to_string(owned.size()) + " blocks accounted for, " + std::to_string(n_blocks_) +
+              " allocated");
 }
 
 }  // namespace ss

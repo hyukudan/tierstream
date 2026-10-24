@@ -160,6 +160,13 @@ measured, derived, projected, bound or target). CTest validates each file with `
 structural negative fixtures in `recipes/examples/tests/` are refused; `validate_v1.py` adds the citation checks
 (it needs the lab notes the `ref`s point into).
 
+## Tier modes
+
+`tier_mode = inclusive` (default) keeps a promoted unit's pinned copy. `tier_mode = exclusive` keeps every unit in
+exactly one place (a device slot, a pinned block, or its file): a promotion frees the block, and an evicted unit is
+written back into a free block, so device + host memory that together hold the model never read its files after
+open. See [docs/design.md §3.5](docs/design.md); a recipe sets it per placement (`tier_mode`, `host_spare_units`).
+
 ## Status
 
 v1, local only. The CPU tests pass on MSVC and on GCC with ASan, UBSan and TSan. The CUDA backend is built; its GPU

@@ -92,6 +92,8 @@ uint64_t ring_bytes(const std::vector<RingClass>& r) {
   return t;
 }
 
+bool exclusive(const ss_budget& b) { return b.tier_mode == SS_TIER_MODE_EXCLUSIVE; }
+
 // Totals and the last checks, from the tiers alone (shared by the planner and by externally decided tiers). Every
 // figure is what the context allocates.
 void finalize(const Desc& d, const ss_budget& b, Plan& p) {
@@ -109,6 +111,8 @@ void finalize(const Desc& d, const ss_budget& b, Plan& p) {
         require(t == SS_TIER_RESIDENT, SS_E_INVALID, "plan: a non-streamable layer's units must be resident");
         continue;
       }
+      require(!(exclusive(b) && t == SS_TIER_RESIDENT_BACKED), SS_E_INVALID,
+              "plan: tier B (resident with a pinned copy) is the second copy the exclusive tier mode removes");
       if (t == SS_TIER_RESIDENT || t == SS_TIER_RESIDENT_BACKED) {
         p.resident += d.unit_stride(int(L));
         ++p.n_resident;
@@ -135,6 +139,9 @@ void finalize(const Desc& d, const ss_budget& b, Plan& p) {
   p.pinned = pinned_layout(d, p.tier).total;
   for (const auto& n : d.host_fixed) p.pinned += n.bytes;  // sum validated not to overflow (desc_validate)
   require(p.pinned >= pinned_layout(d, p.tier).total, SS_E_INVALID, "plan: host byte total overflows");
+  // Exclusive: spare blocks from what the host budget has left (none when the units already exceed it: refused below).
+  p.spares = spare_classes(d, b, b.host_pinned_bytes > p.pinned ? b.host_pinned_bytes - p.pinned : 0);
+  p.pinned += spare_bytes(p.spares);  // <= host_pinned_bytes by construction
   p.rings = rings_for(d, b, streamed);
   p.ring = ring_bytes(p.rings);
   require(p.pinned <= b.host_pinned_bytes, SS_E_CAPACITY,
@@ -148,6 +155,15 @@ void finalize(const Desc& d, const ss_budget& b, Plan& p) {
 
 Plan start(const Desc& d, const ss_budget& b) {
   require(b.device_bytes > 0, SS_E_INVALID, "plan: device budget must be > 0");
+  require(b.tier_mode == SS_TIER_MODE_INCLUSIVE || b.tier_mode == SS_TIER_MODE_EXCLUSIVE, SS_E_INVALID,
+          "plan: tier_mode must be SS_TIER_MODE_INCLUSIVE or SS_TIER_MODE_EXCLUSIVE");
+  if (exclusive(b)) {
+    require(!b.pinned_backing, SS_E_INVALID,
+            "plan: pinned_backing keeps a second pinned copy of residents, which the exclusive tier mode removes");
+    require(d.tiers == Tiers::Pinned || d.tiers == Tiers::PinnedDisk, SS_E_INVALID,
+            d.engine + ": the exclusive tier mode needs a descriptor whose tiers allow pinned (it says \"" +
+                std::string(tiers_name(d.tiers)) + "\")");
+  }
   Plan p;
   p.budget = b;
   p.cap = b.device_bytes;
@@ -165,6 +181,39 @@ Plan start(const Desc& d, const ss_budget& b) {
 }  // namespace
 
 uint64_t host_stride(uint64_t bytes) { return (bytes + kHostStride - 1) / kHostStride * kHostStride; }
+
+std::vector<SpareClass> spare_classes(const Desc& d, const ss_budget& b, uint64_t host_left) {
+  std::vector<SpareClass> out;
+  if (!exclusive(b)) return out;
+  std::vector<std::pair<uint64_t, uint64_t>> units;  // host stride -> streamable units of that stride
+  for (const Layer& l : d.layers) {
+    if (!l.streamable || !l.n_units) continue;
+    const uint64_t hs = host_stride(l.unit_bytes);
+    auto it = std::find_if(units.begin(), units.end(), [&](const auto& x) { return x.first == hs; });
+    if (it == units.end()) units.push_back({hs, uint64_t(l.n_units)});
+    else it->second += uint64_t(l.n_units);
+  }
+  for (const auto& [hs, n] : units) {
+    const uint64_t want = b.host_spare_units ? b.host_spare_units : 64;
+    out.push_back({hs, uint32_t(std::min<uint64_t>(want, n)), 0});
+  }
+  std::sort(out.begin(), out.end(), [](const SpareClass& x, const SpareClass& y) { return x.block_bytes < y.block_bytes; });
+  for (SpareClass& c : out) {  // smallest blocks first: deterministic, and the most blocks for the bytes
+    c.blocks = uint32_t(std::min<uint64_t>(c.asked, host_left / c.block_bytes));
+    host_left -= uint64_t(c.blocks) * c.block_bytes;
+  }
+  return out;
+}
+
+uint64_t spare_bytes(const std::vector<SpareClass>& s) {
+  uint64_t t = 0;
+  for (const SpareClass& c : s) {
+    require(c.blocks == 0 || c.block_bytes <= (UINT64_MAX - t) / c.blocks, SS_E_INVALID,
+            "plan: spare block bytes overflow");
+    t += c.block_bytes * c.blocks;
+  }
+  return t;
+}
 
 uint64_t plan_room(const Desc& d, const ss_budget& b) {
   Plan p = start(d, b);
@@ -238,7 +287,8 @@ bool same_budget(const ss_budget& a, const ss_budget& b) {
   return a.device_bytes == b.device_bytes && a.host_pinned_bytes == b.host_pinned_bytes &&
          a.workspace_bytes == b.workspace_bytes && a.margin_gib == b.margin_gib &&
          a.margin_fraction == b.margin_fraction && a.dynamic_slots_per_layer == b.dynamic_slots_per_layer &&
-         a.ring_slots == b.ring_slots && a.pinned_backing == b.pinned_backing;
+         a.ring_slots == b.ring_slots && a.pinned_backing == b.pinned_backing && a.tier_mode == b.tier_mode &&
+         a.host_spare_units == b.host_spare_units;
 }
 
 uint64_t plan_margin(const ss_budget& b) {
@@ -366,6 +416,18 @@ Json plan_to_json(const Desc& d, const Plan& p) {
   j["n_disk"] = Json::number(p.n_disk);
   j["n_pair"] = Json::number(p.n_pair);
   j["n_backed"] = Json::number(p.n_backed);
+  if (p.budget.tier_mode == SS_TIER_MODE_EXCLUSIVE) {  // inclusive plans keep today's keys exactly
+    j["tier_mode"] = Json::string("exclusive");
+    Json sp = Json::array();
+    for (const SpareClass& c : p.spares) {
+      Json x = Json::object();
+      x["block_bytes"] = Json::number(c.block_bytes);
+      x["asked"] = Json::number(uint64_t(c.asked));
+      x["blocks"] = Json::number(uint64_t(c.blocks));
+      sp.push(x);
+    }
+    j["spare_blocks"] = sp;
+  }
   // Per layer, one letter per unit: R resident, P pinned, D disk, X pair, B resident with a pinned copy.
   Json layers = Json::array();
   for (size_t L = 0; L < d.layers.size(); ++L) {

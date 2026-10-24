@@ -30,6 +30,8 @@ struct Job {
   void* dst = nullptr;              // device address
   const void* host_src = nullptr;   // pinned tier address (from_pinned)
   void* dst_release_ev = nullptr;   // writes to dst wait for it
+  void* dst_wb_ev = nullptr;        // exclusive: writes to dst also wait for the write-back of its previous unit
+  void* src_wait_ev = nullptr;      // exclusive: host_src is a block whose write-back of this forward lands first
   void* done_ev = nullptr;          // non-unified: recorded on the copy stream after the last piece
   std::atomic<int> state{Queued};
   ss_status err_status = SS_OK;
@@ -67,6 +69,10 @@ class Ctx {
   bool source_direct(int i) const { return files_[size_t(i)]->direct(); }
   int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
+  ss_exclusive_stats exclusive_stats() const;
+  // Exclusive tier mode, between forwards (tests): every unit in a slot XOR a block XOR only its file, every block
+  // owned exactly once (a unit or a free list). Throws SS_E_INVALID naming the first broken rule.
+  void check_exclusive() const;
 
  private:
   enum Loc : int8_t { None = 0, Persistent = 1, Ring = 2 };
@@ -122,7 +128,7 @@ class Ctx {
   class StagingLease;
   void wait_job(Job& j);
   JobPtr make_job(int layer, int unit, void* dst, bool spec);
-  void fetch_into_persistent(int layer, int unit, int slot, bool spec);
+  void fetch_into_persistent(int layer, int unit, int slot, bool spec, void* dst_wb_ev = nullptr);
   bool fetch_into_ring(int layer, int unit, bool spec);
   void dispatch_pending();
   void ingest_routes(int layer, const int32_t* ids, int n);
@@ -133,6 +139,11 @@ class Ctx {
   void open_forward();
   void retire_ring(int layer);
   void wait_job_quiet(Job& j);
+  void* write_back(int layer, const Admission& a);
+  void fetch_admitted(int layer, const Admission& a, bool spec);
+  int eviction_cap(int layer, bool speculative) const;
+  void free_block(int layer, int unit);
+  int block_class(int layer) const;
   int64_t gidx(int layer, int unit) const { return d_.unit_base[size_t(layer)] + unit; }
 
   Desc d_;
@@ -151,7 +162,24 @@ class Ctx {
   };
   std::vector<RingRange> ring_classes_;
   std::vector<void*> pinned_chunks_;
-  std::vector<const void*> pinned_of_;  // per global unit (nullptr when not in the pinned tier)
+  std::vector<const void*> pinned_of_;  // per global unit (nullptr when not in the pinned tier); exclusive: its block
+
+  // Exclusive tier mode (design.md §3.4).
+  bool excl_ = false;
+  void* wb_stream_ = nullptr;               // backend write-back stream (D2H)
+  std::vector<uint64_t> block_bytes_;       // per block class: host stride
+  std::vector<int> layer_class_;            // per layer: block class, -1 = none
+  std::vector<std::vector<void*>> free_blocks_;  // per class, LIFO
+  std::vector<void*> spare_chunks_;
+  std::vector<void*> wb_pending_;           // per global unit: write-back event of this forward into its block
+  std::vector<int64_t> wb_units_;           // units with wb_pending_ set this forward
+  std::vector<void*> wb_evs_;               // write-back events of this forward
+  void* blocks_ev_ = nullptr;               // copy stream, at ss_end: after every H2D that read a freed block
+  void* wb_mark_ev_ = nullptr;              // write-back stream, at ss_end: after the forward's write-backs
+  bool wb_gate_ = false;                    // the next write-back waits blocks_ev_ first
+  uint64_t n_blocks_ = 0;                   // every block (pinned tier + spares)
+  std::vector<uint64_t> spares_of_;         // per class: spare blocks the plan placed (the speculation reserve)
+  ss_exclusive_stats xst_{};
   std::vector<Staging> staging_;
   std::vector<size_t> staging_free_;
   std::mutex staging_mu_;

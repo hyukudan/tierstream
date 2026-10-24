@@ -228,6 +228,7 @@ Budget (`ss_budget`):
 | `dynamic_slots_per_layer` | integer 0..65536 | 0 | `dynamic_slots_per_layer` |
 | `ring_slots` | integer 0..65536 | 0 | `ring_slots` (0 = the descriptor's, else 2 × most units of a layer of that size) |
 | `pinned_backing` | bool | false | `pinned_backing` (§5.2 step 6) |
+| `host_spare_units` | integer 0..65536 | 0 | `host_spare_units` (exclusive tier mode: free pinned blocks wanted per unit size, from the host bytes left after the pinned tier; 0 = auto, min(64, units of that size)) |
 
 **Forward rows** (the most rows one forward runs, across the whole batch): prefill = `max_batch` × (`chunk_tokens` if
 set, else `min(when.prompt_tokens_max, max_context_tokens)`, an unset max meaning `max_context_tokens`); decode =
@@ -256,7 +257,7 @@ Streaming knobs (`ss_options`; `backend` comes from the set's `kind`; `device` i
 | `verify_hash` | bool | false | `verify_hash` |
 | `group_units` | integer 0..65536 | 0 | `group_units` |
 | `spec_persistent` | bool | false | `spec_persistent` |
-| `tier_mode` | `"inclusive"` \| `"exclusive"` | `"inclusive"` | inclusive: a promoted unit keeps its pinned copy (today's library). exclusive: each unit lives in exactly one tier. A build without the exclusive mode refuses `"exclusive"` at compilation. |
+| `tier_mode` | `"inclusive"` \| `"exclusive"` | `"inclusive"` | `tier_mode` of the budget. inclusive: a promoted unit keeps its pinned copy. exclusive: each unit lives in exactly one place (a device slot, a pinned block, or only its file); a promotion frees its block and an evicted unit is written back into a free block (design.md §3.4). Exclusive is refused on a `hip` set, with `fill_residents = false` and with `pinned_backing = true`. Pick it for a decode route with dynamic residency (`pin_planned = false`) whose device + host bytes cover the model only when no unit is held twice. |
 
 Engine knobs (in the compiled plan's `engine` section; the library does not read them; every value has one concrete
 meaning, and an engine refuses a value outside its legal set rather than substituting its own):
@@ -414,8 +415,8 @@ descriptor or workload class means building the stack again (the old one keeps t
 
 A profile is tuned for the budgets it was measured with. Once a profile is applied, an override that changes a budget
 field (`device_gib`, `host_pinned_gib`, `workspace_gib`, `max_context_tokens`, `max_batch`, `margin_gib`,
-`margin_fraction`, `dynamic_slots_per_layer`, `ring_slots`, `pinned_backing`, `staging_buffers`, `staging_mib`,
-`tier_mode`) of a placement the
+`margin_fraction`, `dynamic_slots_per_layer`, `ring_slots`, `pinned_backing`, `host_spare_units`, `staging_buffers`,
+`staging_mib`, `tier_mode`) of a placement the
 profile sets anything in, or any `match.*` field, is refused ("drop the profile or retune"); the same holds when the
 profile is added after such an override.
 

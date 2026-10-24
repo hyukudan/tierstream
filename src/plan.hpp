@@ -27,12 +27,24 @@ struct PinnedLayout {
 };
 PinnedLayout pinned_layout(const Desc& d, const std::vector<uint8_t>& tier);
 
+// EXCLUSIVE tier mode: free pinned blocks of one host size (design.md §3.4).
+struct SpareClass {
+  uint64_t block_bytes = 0;  // host stride of the units sharing these blocks
+  uint32_t asked = 0;        // host_spare_units, or the auto count
+  uint32_t blocks = 0;       // what the host budget holds after every pinned unit (coverage first)
+};
+// Spare blocks (empty unless tier_mode is EXCLUSIVE), ascending block size, from the host bytes left after
+// host_fixed and the pinned tier: they never displace a unit's home.
+std::vector<SpareClass> spare_classes(const Desc& d, const ss_budget& b, uint64_t host_left);
+uint64_t spare_bytes(const std::vector<SpareClass>& s);
+
 struct Plan {
   std::vector<uint8_t> tier;  // per global unit: ss_tier
   ss_budget budget{};         // the budget the plan was made with (ss_open checks it)
   uint64_t cap = 0, margin = 0, fixed = 0, dynamic = 0, ring = 0, resident = 0, pinned = 0, disk = 0, peak = 0;
   uint64_t n_resident = 0, n_pinned = 0, n_disk = 0, n_pair = 0, n_backed = 0;
   std::vector<RingClass> rings;      // one stream ring per unit size that streams (empty when nothing streams)
+  std::vector<SpareClass> spares;    // EXCLUSIVE: free pinned blocks (billed in `pinned`)
   uint32_t dynamic_slots_per_layer = 0;
   std::vector<std::string> notes;
 };

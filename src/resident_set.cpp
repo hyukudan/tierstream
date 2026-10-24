@@ -84,7 +84,7 @@ int ResidentSet::victim_lru(const std::vector<char>& keep) const {
 }
 
 Admission ResidentSet::admit(const std::vector<int32_t>& routed_in, const std::vector<char>& busy,
-                             bool admit_misses) {
+                             bool admit_misses, int max_evictions) {
   Admission a;
   std::vector<int32_t> routed = routed_in;
   std::sort(routed.begin(), routed.end());
@@ -148,11 +148,16 @@ Admission ResidentSet::admit(const std::vector<int32_t>& routed_in, const std::v
         break;
       }
     if (s < 0) {
+      if (max_evictions >= 0 && int(a.evicted.size()) >= max_evictions) {
+        ++a.deferred;  // no free slot and no eviction allowed: this miss (and every later one) stays transient
+        continue;
+      }
       s = victim_lru(keep);
       if (s < 0) break;  // everything resident is pinned or in use this forward
       int32_t old = unit_in_[size_t(s)];
       slot_of_[size_t(old)] = -1;
       a.evicted.push_back(old);
+      a.evicted_slot.push_back(s);
       --n_resident_;
     }
     unit_in_[size_t(s)] = u;
@@ -175,7 +180,13 @@ Admission ResidentSet::admit(const std::vector<int32_t>& routed_in, const std::v
     sorted.admitted[i] = a.admitted[ord[i]];
     sorted.slot_of[i] = a.slot_of[ord[i]];
   }
-  std::sort(sorted.evicted.begin(), sorted.evicted.end());
+  std::vector<size_t> ev(a.evicted.size());
+  for (size_t i = 0; i < ev.size(); ++i) ev[i] = i;
+  std::sort(ev.begin(), ev.end(), [&](size_t x, size_t y) { return a.evicted[x] < a.evicted[y]; });
+  for (size_t i = 0; i < ev.size(); ++i) {
+    sorted.evicted[i] = a.evicted[ev[i]];
+    sorted.evicted_slot[i] = a.evicted_slot[ev[i]];
+  }
   return sorted;
 }
 

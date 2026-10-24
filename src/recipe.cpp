@@ -289,6 +289,7 @@ const std::vector<PlacementField>& placement_fields() {
       {"dynamic_slots_per_layer", FieldType::Int, 0, 65536, 0},
       {"ring_slots", FieldType::Int, 0, 65536, 0},
       {"pinned_backing", FieldType::Bool, 0, 1, 0},
+      {"host_spare_units", FieldType::Int, 0, 65536, 0},
       {"policy", FieldType::Policy, 0, 1, double(SS_POLICY_LRU)},
       {"tier_mode", FieldType::TierMode, 0, 1, kTierInclusive},
       {"lookahead_units", FieldType::Int, 0, 64, 2},

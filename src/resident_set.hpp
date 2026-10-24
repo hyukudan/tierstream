@@ -14,8 +14,10 @@ struct Admission {
   std::vector<int32_t> hits;       // routed and resident (ascending)
   std::vector<int32_t> admitted;   // misses that take a persistent slot (ascending)
   std::vector<int32_t> slot_of;    // slot for each admitted unit (parallel to admitted)
-  std::vector<int32_t> evicted;    // units that lost their slot to an admitted miss
+  std::vector<int32_t> evicted;    // units that lost their slot to an admitted miss (ascending)
+  std::vector<int32_t> evicted_slot;  // the slot each evicted unit held (parallel to evicted)
   std::vector<int32_t> transient;  // misses served from the stream ring this forward (ascending)
+  int deferred = 0;                // misses that would have evicted, refused by max_evictions (in transient)
 };
 
 class ResidentSet {
@@ -36,8 +38,10 @@ class ResidentSet {
 
   // Admission for one forward. routed: distinct routed units (any order); busy: units that must not be evicted this
   // forward (already planned / in flight), may be empty. admit_misses = false serves every miss from the ring
-  // (prefill with static residents).
-  Admission admit(const std::vector<int32_t>& routed, const std::vector<char>& busy, bool admit_misses);
+  // (prefill with static residents). max_evictions >= 0 caps the evictions (exclusive tier mode: one free block per
+  // victim); misses past the cap that need a victim are served from the ring and nothing is evicted for them.
+  Admission admit(const std::vector<int32_t>& routed, const std::vector<char>& busy, bool admit_misses,
+                  int max_evictions = -1);
 
   // Record the forward's routed set and which of them missed (recency, transition counts, frequency window).
   void observe(const std::vector<int32_t>& routed, const std::vector<int32_t>& misses);
