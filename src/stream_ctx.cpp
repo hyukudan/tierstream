@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <set>
 
@@ -428,6 +429,10 @@ void Ctx::submit(const JobPtr& j) {
       be_->stream_wait(nullptr, j->dst_wb_ev);
 #if !defined(SS_MUTATION_NO_SRC_WAIT)  // test-only mutation build: proves the CUDA test catches its absence
       be_->stream_wait(nullptr, j->src_wait_ev);
+#else
+      if (j->src_wait_ev)  // the mutation reports what it skipped and what else orders this copy
+        std::fprintf(stderr, "mutation: source wait skipped (src %p, dst_release %p, dst_wb %p)\n", j->src_wait_ev,
+                     j->dst_release_ev, j->dst_wb_ev);
 #endif
       for (uint64_t off = 0; off < n; off += o_.copy_piece_bytes)
         be_->copy_h2d(at(j->dst, off), static_cast<const char*>(j->host_src) + off,

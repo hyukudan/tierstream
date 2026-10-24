@@ -121,6 +121,7 @@ if(SS_TESTS)
   endforeach()
 
   if(SS_CUDA)
+    add_executable(ss-probe-order tests/probe_order.cu)
     add_executable(ss-test-cuda tests/test_cuda.cu)
     target_include_directories(ss-test-cuda PRIVATE src)
     target_link_libraries(ss-test-cuda PRIVATE strix_stream CUDA::cudart)
