@@ -374,7 +374,7 @@ void exclusive_same_forward(const char* name, uint32_t spares) {
 // is issued at once on the copy stream and nothing but its source wait orders it after 0's write-back. Without that
 // wait it copies the spare block's stale bytes (the mutation build SS_MUTATION_NO_SRC_WAIT must fail this case).
 // The spare is filled with 0xEE first (stale bytes whose checksum differs from unit 0's). After the routes the host
-// waits for the copy stream while the write-back stream is still gated (~200 ms spin): with the source wait the copy
+// waits for the copy stream while the write-back stream is still gated (~2 s spin): with the source wait the copy
 // stream cannot finish before the gate (the sync outlasts it); without it, 0's copy completes while the gate is
 // still pending, which the test reports ("copy finished while gated") before the checksum fails on (2, 0).
 TEST(cuda_exclusive_source_wait_only) {
@@ -403,7 +403,7 @@ TEST(cuda_exclusive_source_wait_only) {
   cudaEvent_t gate = nullptr;
   CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
   CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
-  spin<<<1, 1, 0, gate_s>>>(400000000);  // ~200 ms
+  spin<<<1, 1, 0, gate_s>>>(4000000000LL);  // ~2 s: host and API delays stay far inside the window
   CU(cudaEventRecord(gate, gate_s));
   CHECK_OK(ss_test_gate_writeback(r.c, gate));
   CHECK_OK(ss_test_hold_readers(r.c, 1));
