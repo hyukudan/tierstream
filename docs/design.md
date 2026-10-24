@@ -223,6 +223,33 @@ Exclusive ordering (CUDA; the CPU backend copies synchronously):
 | a block written in F is read in a later forward | `ss_end` makes the copy stream wait for the write-back stream's mark before recording `blocks_ev` |
 | events reused | write-back events return to the pool at `ss_end`, after every wait on them is enqueued (a CUDA wait captures the record at call time); no wait cycle: every wait points at an earlier record |
 
+### 3.6 Host read-ahead
+
+Without it, a file-backed unit starts reading only once a device slot is free. With a 2-slot ring of 2.86 GB layer
+blobs (MiniMax RTX prefill), that put every disk read on the critical path: ~0.45 s of acquire wait per disk layer at
+8K. `ss_options.readahead_units = R` (default 0 = off) adds R pinned host buffers, each the size of the largest unit
+that can be read from its file.
+
+- **Requests.**
+  - `ss_host_prefetch(_layer)(L)` asks for a host-only read of layer L's file-backed units, with no device slot. The
+    engine calls it for L+1..L+H while layer L runs; recipe engine knob `host_prefetch_layers` sets H.
+  - Units that wait for a ring slot are requested too.
+  - Requests are idempotent per forward. A unit that is resident, in flight, computed by a peer or pinned is skipped.
+- **Reads.** A reader reads the unit into a free buffer, with the hash checked as on every path, at a priority below
+  demands. Unattached read-ahead reads use at most max(1, readers - 1) readers.
+- **Landing.** When the unit gets its ring slot, a copy job takes it from the buffer: H2D on the copy stream after
+  the slot's release event; memcpy on unified backends. If the read has not finished, the copy is queued the moment
+  it does, and a still-queued read is promoted to a demand. A buffer is reused only after its last copy's event.
+- **Not used:** a unit admitted into a persistent slot (decode, exclusive eviction) abandons its request and takes the
+  ordinary path. A failed read falls back to an ordinary file read; it fails the forward only when a landing was
+  already waiting on it.
+- **Shutdown.** `ss_end` and `ss_close` sweep and drain every request: unused reads, waiting requests, parked and
+  queued landings.
+- **Stats.** `ss_stats_to_json` has `"readahead"`: requested, read, landed, unused, failed, fallback, bytes. File
+  bytes count once in `bytes_disk`.
+- **Cost.** R x buffer bytes of pinned host memory, billed by recipes in `resources.readahead_bytes`. The adapter
+  must take them out of the host budget before placement.
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier

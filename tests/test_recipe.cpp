@@ -588,6 +588,19 @@ TEST(plan_blob_tiers_32_16_12_and_plan_json_roundtrip) {
   CHECK_EQ(json_u64(*p.doc.find("resources")->find("disk_bytes"), "d"), 12 * 2 * GiB);
   // The exclusive tier mode compiles into the budget; its refusals name the conflicting field.
   {
+    // Read-ahead: billed in the resources, written into the canonical recipe only when set.
+    RecipeStack ra(kLab, "lab.toml");
+    ra.set("routes.prefill_long.placement.rtx.readahead_units", "2", "--set");
+    ra.set("routes.prefill_long.placement.rtx.host_prefetch_layers", "3", "--set");
+    RecipePlan rp = recipe_plan(ra.effective(), ra.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {});
+    CHECK_EQ(rp.options.readahead_units, 2u);
+    CHECK_EQ(json_u64(*rp.doc.find("resources")->find("readahead_bytes"), "r"),
+             2 * ra_buffer_bytes(d, rp.plan.tier));
+    CHECK_EQ(json_u64(*rp.doc.find("resources")->find("host_bytes"), "h"),
+             json_u64(*p.doc.find("resources")->find("host_bytes"), "h") + 2 * ra_buffer_bytes(d, rp.plan.tier));
+    CHECK_EQ(rp.doc.find("engine")->find("host_prefetch_layers")->text, std::string("3"));
+    CHECK(p.doc.find("resources")->find("readahead_bytes") == nullptr);  // unset: today's output
+    CHECK(json_write(ra.effective_json()).find("\"readahead_units\":2") != std::string::npos);
     // host_spare_units came after recipe-v1: unset, the canonical recipe (and its effective hash) is unchanged.
     RecipeStack c0(kLab, "lab.toml");
     CHECK(json_write(c0.effective_json()).find("host_spare_units") == std::string::npos);

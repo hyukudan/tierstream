@@ -434,6 +434,54 @@ TEST(cuda_exclusive_source_wait_only) {
   cudaStreamDestroy(gate_s);
 }
 
+// Host read-ahead, layer-major, async (wave4/gapfix/wstream-readahead): every unit read from its file, host lookahead
+// H = 2, 4 buffers. Layers 1 and 4 share the 11,008-B ring, so layer 4's landings reuse slots layer 1 released while
+// its checksums are still queued behind a spin: a landing that skipped the slot's release wait shows as a wrong sum.
+TEST(cuda_readahead_layer_major_async) {
+  Fixture fx("cuda-ra");
+  Gpu gpu;
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 16;
+  r.b.host_pinned_bytes = 4 << 20;
+  plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;
+  r.o.readahead_units = 4;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  for (int pass = 0; pass < 6; ++pass) {
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    for (int L = 1; L <= 2; ++L) CHECK_OK(ss_host_prefetch_layer(r.c, L));
+    for (int L = 1; L <= 4; ++L) {
+      for (int k = 1; k <= 2 && L + k <= 4; ++k) CHECK_OK(ss_host_prefetch_layer(r.c, L + k));
+      CHECK_OK(ss_layer_all(r.c, L));
+      ss_layer_view v{};
+      CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
+      const int n = L == 2 ? Fixture::kE2 : L == 3 ? 1 : Fixture::kE1;
+      std::vector<int32_t> all(static_cast<size_t>(n));
+      for (int u = 0; u < n; ++u) all[size_t(u)] = u;
+      gpu.check(v, fx, L, all);
+      CHECK_OK(ss_release(r.c, L, gpu.s));  // no sync: the spin + checksum are still queued
+    }
+    CHECK_OK(ss_end(r.c));
+  }
+  gpu.verify();
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(r.c, &js, nullptr));
+  const char* ra = js ? std::strstr(js, "\"readahead\":") : nullptr;
+  CHECK(ra != nullptr);
+  if (ra) std::printf("  readahead: %.200s\n", ra);
+  CHECK(ra && !std::strstr(ra, "\"landed\":0,"));
+  ss_free(js);
+}
+
 TEST(cuda_exclusive_same_forward_persistent) { exclusive_same_forward("x-same-persistent", 0); }
 TEST(cuda_exclusive_same_forward_ring) { exclusive_same_forward("x-same-ring", 1); }
 
