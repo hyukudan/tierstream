@@ -1,0 +1,201 @@
+# PENDING (no 32 GB card measured; ranked MiniMax descriptor): MiniMax M3.1 Flash on the Strix pair plus a 32 GB discrete card (RTX 5090 class,
+# PCIe 5 x16) in a 128 GB host with the lab's ~70 GB pinned budget. PROJECTED: no 32 GB card was run. The card must
+# probe >= 25 GB/s host-to-device (h2d_gbytes_ps_min); the model assumes ~30 GB/s. Model = spec-rtx-prefill §4.1,
+# 32 GB column (32 decimal GB, 70 GB pinned + NVMe, fractional per-layer residency, PRO-class compute). This
+# placement has 29 GiB (31.14 GB) of room: device_gib 31 - margin max(2 GiB, 3 % x 31). The planner rerun at this
+# room (derived/card32_planner.py) gives 15.4 s + 0.3 s hand-off, a conditional projection: the planner uses
+# fractional per-layer residency (this placement holds whole blobs) and PRO compute (a 5090 has ~10 % fewer SMs).
+schema = "strix-stream/recipe-v1"
+name = "minimax-m3.1-flash-card32"
+description = "MiniMax M3.1 Flash: pair TP2 + a 32 GB card for prompts >= 8K (few resident blobs, ~70 GB pinned, rest NVMe): ~15.7 s at 8K vs 45 s"
+x-status = "pending: no 32 GB card measured; ranked-order MiniMax descriptor (blob list); conditional planner projection"
+x-schema = "wave4/recipes/core/schema-draft-5.md (Sol GO)"
+
+[match]
+model = "minimax-m3.1-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 110.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[match.devices]]
+id = "card"
+kind = "cuda"
+name = "5090"
+memory_min_gib = 31.0
+host_ram_min_gib = 120.0
+disk_read_gbytes_ps_min = 5.0
+h2d_gbytes_ps_min = 25.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["card", "pair"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[limits]
+host_free_ram_floor_gib = 6.0
+
+[[routes]]
+id = "prefill_long_card"
+phase = "prefill"
+devices = ["card"]
+execute = "single"
+handoff_route = "decode_pair"
+links = ["pc-nodes"]
+fallback = "prefill_pair"
+when = { prompt_tokens_min = 8192 }
+[routes.placement.card]
+device_gib = 31.0
+host_pinned_gib = 65.2
+max_context_tokens = 9216
+max_batch = 1
+staging_buffers = 4
+staging_mib = 2732
+reader_threads = 1
+[[routes.placement.card.units]]
+id = "layers"
+class = "blob"
+rank = "list"
+list = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 59,
+        3, 5, 7, 9, 13, 17, 21, 25, 29, 33, 35, 39, 43, 47, 51, 55,
+        11, 15, 19, 23, 27, 31, 37, 41, 45, 49, 53, 57]
+resident = "fill"
+pinned = "fill"
+rest = "disk"
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 9216
+max_batch = 1
+workspace_gib = 7.0
+
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 9216
+max_batch = 4
+workspace_gib = 7.0
+
+[x-cites]
+"match.devices.pair.memory_min_gib" = "mm-node-gtt"
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"match.devices.card.memory_min_gib" = "card32-mm-vram"
+"match.devices.card.host_ram_min_gib" = "card32-pinned-budget"
+"match.devices.card.h2d_gbytes_ps_min" = "pcie-planning"
+"match.devices.card.disk_read_gbytes_ps_min" = "pc-nvme-ring"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"limits.host_free_ram_floor_gib" = "mm-watchdog"
+"routes.prefill_long_card.when.prompt_tokens_min" = ["card32-mm-8k", "card32-below-4k"]
+"routes.prefill_long_card.placement.card.device_gib" = "card32-mm-vram"
+"routes.prefill_long_card.placement.card.host_pinned_gib" = "card32-pinned-budget"
+"routes.prefill_long_card.placement.card.max_context_tokens" = "mm-t7-8k"
+"routes.prefill_long_card.placement.card.staging_buffers" = "mm-stage"
+"routes.prefill_long_card.placement.card.staging_mib" = "mm-blob-size"
+"routes.prefill_long_card.placement.card.units.layers.list" = "mm-t7-tiers"
+"routes.prefill_pair.placement.pair.max_context_tokens" = "mm-t7-8k"
+"routes.prefill_pair.placement.pair.workspace_gib" = ["mm-node-kv", "mm-node-act"]
+"routes.decode_pair.placement.pair.max_context_tokens" = "mm-t7-8k"
+"routes.decode_pair.placement.pair.workspace_gib" = ["mm-node-kv", "mm-node-act"]
+"routes.decode_pair.placement.pair.max_batch" = "mm-node-kv"
+"routes.prefill_long_card.placement.card.reader_threads" = "mm-reader"
+
+[[x-predicted]]
+route = "prefill_long_card"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 15.7
+basis = "projected"
+scope = "spec planner rerun at this recipe's room (29 GiB = 31.14 GB, 70 GB pinned, 30 GB/s): compute phase 15.416 s + 0.3 s hand-off; the planner uses fractional per-layer residency and PRO compute (a 5090 has ~10 % fewer SMs, whole blobs round down): conditional projection"
+evidence = ["card32-planner-mm8k", "card32-mm-phase", "mm-handoff"]
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 45.0
+basis = "measured"
+evidence = "mm-t7-8k"
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.mm-node-gtt]
+ref = "wave4/wstream/spec-minimax.md:175"
+quote = "The ceiling is GTT 125.8 GB less a 3 GB margin = **122.8 GB**"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.card32-mm-vram]
+ref = "wave4/wstream/spec-rtx-prefill.md:180"
+quote = "| MiniMax (FP32 identity) | never (124) | **12.7 / 32.8** |"
+note = "full speed at 8K needs 32.8 GB (30.5 GiB) with the 70 GB pinned budget; a 32 GB card reports ~31.8 GiB"
+[x-evidence.card32-pinned-budget]
+ref = "wave4/wstream/spec-rtx-prefill.md:183"
+quote = "the PC's ~70 GB pinned budget plus NVMe for the rest"
+note = "70 GB = 65.2 GiB; admission then needs >= 65.2 + 10.7 staging + ~9 process + 6 floor of free host RAM"
+[x-evidence.pc-nvme-ring]
+ref = "wave4/mmrtxpf/report.md:191"
+quote = "31.5 GB in 10.5 s (3.0 GB/s, paced by the ring)"
+note = "the projection assumes ~5 GB/s NVMe for the file tier (spec-rtx-prefill.md:32-33); the lab SN850X does 6.6-6.95 cold"
+[x-evidence.mm-watchdog]
+ref = "wave4/mmrtxpf/t7_run.sh:19"
+quote = "WATCHDOG: free RAM ${free} GB"
+[x-evidence.card32-mm-8k]
+ref = "wave4/wstream/spec-rtx-prefill.md:250"
+quote = "**MiniMax ≥ 8K at full speed** with enough pinned RAM (15.4 s at 8K with the PC's 70 GB)."
+[x-evidence.card32-below-4k]
+ref = "wave4/wstream/spec-rtx-prefill.md:254"
+quote = "Below 4K, every model on 32 GB is slower than the nodes or near them. Route to the nodes."
+note = "4K-8K is not modelled for MiniMax on 32 GB, so the route starts at the first modelled win (8K)"
+[x-evidence.card32-mm-phase]
+ref = "wave4/wstream/spec-rtx-prefill.md:193"
+quote = "Hand-off is not included"
+[x-evidence.mm-handoff]
+ref = "wave4/mmrtxpf/report.md:171"
+quote = "| 8K | 45.0 s | ≈ 12.0 + 0.3 = 12.3 s | 3.7x |"
+note = "0.3 s = hand-off share at 8K"
+[x-evidence.mm-t7-8k]
+ref = "wave4/mmrtxpf/report.md:210"
+quote = "| code8k (8,192 tokens) | 45.059 s | 16.080 / 16.138 / 16.266 s | 44.773 s | **2.78x faster** |"
+[x-evidence.mm-t7-tiers]
+ref = "wave4/mmrtxpf/t7_pc.log:4"
+quote = "tiers device 32, pinned 16, file 12: dddpdpdpdpdfdpdfdpdfdpdfdpdfdpdfdpdpdfdpdfdpdfdpdfdpdfdpdfdd"
+note = "rank order = the t7 spread (device layers first, then pinned, then file); the card fills it in that order"
+[x-evidence.mm-stage]
+ref = "wave4/mmrtxpf/t7_pc.log:2"
+quote = "--pinned 16 (2.86 GiB blobs + 11.6 GiB staging + >= ~6 GB margin)"
+[x-evidence.mm-blob-size]
+ref = "wave4/vramplan/report.md:58"
+quote = "2,864,462,336 B MoE (== engine)"
+[x-evidence.mm-node-kv]
+ref = "wave4/wstream/spec-minimax.md:183"
+quote = "| KV + index keys (138,240 B/token, both halves) | 1.13 | 4.53 | 4.53 |"
+[x-evidence.mm-node-act]
+ref = "wave4/wstream/spec-minimax.md:184"
+quote = "| activations, MSA, workspaces | ~2.0 [E] | ~2.2 [E] | ~2.5 [E] |"
+[x-evidence.mm-reader]
+ref = "wave4/mmrtxpf/report.md:184"
+quote = "by a reader thread"
+[x-evidence.pcie-planning]
+ref = "wave4/wstream/spec-rtx-prefill.md:14"
+quote = "**30 GB/s**, sensitivity at 25."
+note = "the projection runs at 30 GB/s; 25 is the spec's sensitivity floor, so slower cards are refused"
+[x-evidence.card32-planner-mm8k]
+ref = "wave4/recipes/examples/derived/card32_planner.out:8"
+quote = "minimax room31.14GB P=8192 compute_phase_s=15.416"

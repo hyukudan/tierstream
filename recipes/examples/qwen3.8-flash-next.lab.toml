@@ -1,0 +1,208 @@
+# Qwen3.8-Flash-Next on today's lab: one full replica per Strix node (no USB4 needed), and the RTX PRO 6000 as a
+# fully resident prefill service for prompts >= 1K that hands the state to the replica that will decode (1 GbE,
+# bp-v1, per-layer delivery, 2 connections). The service has no partial weight residency: the whole non-PLE model
+# sits in VRAM with block schedule 1024,2048,4096,8192 (83.94 GiB measured). The adapter (hyperloom
+# placement/qwen.py) emits one descriptor per block schedule and bills state, rope and the schedule's workspaces as its
+# fixed bytes, so this placement's workspace_gib is 0 and the schedule is chosen by picking that descriptor. Host: 27.845 GiB pinned = the mapped PLE table + the export staging. A smaller
+# schedule (1024,2048) runs in 80.33 GiB at +7 % prefill time (workspace 2.4 GiB less); below that it refuses.
+# The replicas run the production line (8 slots of 12,288 positions), which bounds every route through the hand-off:
+# RTX receipts at 16K/32K exist (4.95 / 8.99 s) but are not admissible with this decode line.
+schema = "strix-stream/recipe-v1"
+name = "qwen3.8-flash-next-lab"
+description = "Qwen3.8-Flash-Next: two node replicas; prompts >= 1K prefill on the RTX PRO (1.36-8.99 s vs 1.80-44.02 s on a node)"
+x-status = "measured"
+x-engine = "strix-cuda-qwen-prefill-service --max-positions 32768 --blocks 1024,2048,4096,8192; descriptor = the qwen.py option for block cap 8192"
+x-host-fixed = "descriptor host_fixed = ple_table_mapped + export_staging = 27.845 GiB at 32768 positions; host_pinned_gib 28.0 covers both"
+x-schema = "wave4/recipes/core/schema-draft-5.md (Sol GO)"
+
+[match]
+model = "qwen3.8-flash-next"
+
+[[match.devices]]
+id = "nodes"
+kind = "hip"
+count = 2
+memory_min_gib = 116.0
+host_ram_min_gib = 119.0
+
+[[match.devices]]
+id = "rtx"
+kind = "cuda"
+name = "RTX PRO 6000"
+memory_min_gib = 90.0
+host_ram_min_gib = 120.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["rtx", "nodes"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[[routes]]
+id = "prefill_rtx"
+phase = "prefill"
+devices = ["rtx"]
+execute = "single"
+handoff_route = "decode_replicas"
+links = ["pc-nodes"]
+fallback = "prefill_replicas"
+when = { prompt_tokens_min = 1024 }
+[routes.placement.rtx]
+device_gib = 90.0
+host_pinned_gib = 28.0
+max_context_tokens = 32768
+max_batch = 1
+workspace_gib = 0.0
+
+[[routes]]
+id = "prefill_replicas"
+phase = "prefill"
+devices = ["nodes"]
+execute = "replicas"
+handoff_route = "decode_replicas"
+[routes.placement.nodes]
+max_context_tokens = 12288
+max_batch = 1
+workspace_gib = 7.2
+chunk_tokens = 2048
+
+[[routes]]
+id = "decode_replicas"
+phase = "decode"
+devices = ["nodes"]
+execute = "replicas"
+[routes.placement.nodes]
+max_context_tokens = 12288
+max_batch = 8
+workspace_gib = 7.2
+
+[x-cites]
+"match.devices.nodes.memory_min_gib" = ["qw-node-register", "node-gtt"]
+"match.devices.nodes.host_ram_min_gib" = "node-gtt"
+"match.devices.rtx.memory_min_gib" = "qw-vram"
+"match.devices.rtx.host_ram_min_gib" = "pc-ram"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"routes.prefill_rtx.when.prompt_tokens_min" = ["qw-router-floor", "qw-rtx-1k"]
+"routes.prefill_rtx.placement.rtx.device_gib" = "qw-vram"
+"routes.prefill_rtx.placement.rtx.host_pinned_gib" = "qw-ple"
+"routes.prefill_rtx.placement.rtx.max_context_tokens" = "qw-vram-run"
+"routes.prefill_rtx.placement.rtx.workspace_gib" = ["qw-adapter-fixed", "qw-plan-ws"]
+"routes.prefill_replicas.placement.nodes.max_context_tokens" = "qw-prod-context"
+"routes.prefill_replicas.placement.nodes.workspace_gib" = ["qw-state-size", "qw-node-gtt"]
+"routes.prefill_replicas.placement.nodes.chunk_tokens" = "qw-node-t2048"
+"routes.decode_replicas.placement.nodes.max_context_tokens" = "qw-prod-context"
+"routes.decode_replicas.placement.nodes.max_batch" = "qw-batch"
+"routes.decode_replicas.placement.nodes.workspace_gib" = ["qw-state-size", "qw-node-gtt"]
+
+[[x-predicted]]
+route = "prefill_rtx"
+metric = "ttft_s"
+at_prompt_tokens = 1024
+value = 1.36
+basis = "measured"
+scope = "RTX prefill + per-layer delivery over 1 GbE + node restore; node alone 1.80 s"
+evidence = "qw-rtx-1k"
+[[x-predicted]]
+route = "prefill_rtx"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 2.94
+basis = "measured"
+evidence = "qw-rtx-8k"
+[[x-predicted]]
+route = "prefill_replicas"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 10.46
+basis = "measured"
+scope = "production server (T=2048), node alone"
+evidence = "qw-rtx-8k"
+[[x-predicted]]
+route = "decode_replicas"
+metric = "serve_wall_agg_tok_s"
+concurrency = 1
+value = 65.5
+basis = "measured"
+scope = "two-replica server (production line, 8 slots x 12,288), client concurrency C1, wall aggregate (w5 COMB2)"
+evidence = "qw-replicas-c1"
+[[x-predicted]]
+route = "decode_replicas"
+metric = "serve_wall_agg_tok_s"
+concurrency = 8
+value = 163.5
+basis = "measured"
+scope = "two-replica server, client concurrency C8, wall aggregate"
+evidence = "qw-replicas-c8"
+[[x-predicted]]
+route = "prefill_rtx"
+metric = "vram_gib"
+value = 83.94
+basis = "measured"
+evidence = "qw-vram"
+
+[x-evidence.qw-node-register]
+ref = "ds41-coord.md:5508"
+quote = "registra el GGUF de 111 GB entero con hipHostRegister"
+note = "same line: node of 122 GB, GTT 125.8 GB (117.2 GiB). 111 GB registered = 103.4 GiB + workspace 7.2 = 110.6 GiB, inside 116 - 3 % margin = 112.5 GiB"
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.pc-ram]
+ref = "ds41-coord.md:812"
+quote = "\"PhysicalTotal\": 127.762"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.qw-router-floor]
+ref = "wave4/qwen-rtx-prefill/report.md:25"
+quote = "medido (cruce 549, suelo efectivo `min_tokens` 1024)."
+note = "549 is a receipt crossover extrapolated below the measured 1K point (line 24: 'cruce extrapolado ~550 tokens [E]'); 1024 is the router floor"
+[x-evidence.qw-rtx-1k]
+ref = "wave4/qwen-rtx-prefill/report.md:249"
+quote = "| 1K | 1,80 s | 1,92 s | **1,36 s** | 0,39 s | 0,80 s | idénticos |"
+[x-evidence.qw-rtx-8k]
+ref = "wave4/qwen-rtx-prefill/report.md:251"
+quote = "| 8K | 10,46 s | 3,73 s | **2,94 s** | 1,98 s | 0,81 s | idénticos |"
+[x-evidence.qw-vram]
+ref = "wave4/vramplan/report.md:142"
+quote = "| 90 GiB | 1024,2048,4096,8192 | 83.95 GiB | 85,955 MiB = **83.94 GiB**"
+note = "line 143: cap 84, blocks 1024,2048 -> 80.33 GiB, 32K rows 8.40 s (+7 %)"
+[x-evidence.qw-vram-run]
+ref = "wave4/vramplan/report.md:135"
+quote = "`--max-positions 32768` with the MTP sidecar"
+[x-evidence.qw-ple]
+ref = "wave4/vramplan/report.md:79"
+quote = "`--max-positions 32768 --blocks 1024,2048,4096,8192` | 83.954 | 0.0 | 0.0 | 27.845 | 0.0 |"
+note = "27.845 GiB pinned host_fixed (PLE table mapped + export staging, hyperloom placement/qwen.py:87-89) -> host_pinned_gib 28.0"
+[x-evidence.qw-state-size]
+ref = "wave4/qwen-rtx-prefill/report.md:108"
+quote = "**29.952 B**"
+note = "29,952 B/token + 116.4 MB fixed per sequence (line 109): 8 slots x 12,288 = 2.94 GB + 0.93 GB = 3.87 GB = 3.61 GiB of state"
+[x-evidence.qw-replicas-c1]
+ref = "wave4/qwenint/w5-e2e.md:97"
+quote = "| 1 | 56.5 (34.7-65.8) | 65.5 (60.0-66.8) | +16.0 %"
+[x-evidence.qw-replicas-c8]
+ref = "wave4/qwenint/w5-e2e.md:100"
+quote = "| 8 | 150.5 (123.7-162.8) | 163.5 (149.4-164.6) | +8.6 %"
+[x-evidence.qw-plan-ws]
+ref = "wave4/vramplan/run/qwen-cap90/plan.json:40"
+quote = "\"workspaces\","
+note = "plan.json lines 20-42: context 0.6 + weights 77.232 + mtp 0.033 + state 1.024 + rope 0.008 + workspaces 5.058 = 83.95 GiB, all fixed bytes of the descriptor for blocks 1024..8192"
+[x-evidence.qw-prod-context]
+ref = "../hyperloom/hyperloom/presets/qwen-replicas-w5.json:225"
+quote = "\"min\": 12288,"
+note = "production replica line: --context 12288 (line 27), 8 slots (one replica, 8 slots: qsplit/claudeinfo-qbatch.md:3)"
+[x-evidence.qw-batch]
+ref = "wave4/qsplit/claudeinfo-qbatch.md:3"
+quote = "measured with the production server (one replica, 8 slots)"
+[x-evidence.qw-adapter-fixed]
+ref = "../hyperloom/hyperloom/placement/qwen.py:98"
+quote = "engine=\"qwen-rtx-prefill\", fixed=fixed_common + [(\"workspaces\", workspace_bytes(cap, positions,"
+note = "fixed_common (line 86) holds context, weights, mtp, state and rope; the schedule's workspaces are added here, so workspace_gib = 0"
+[x-evidence.qw-node-gtt]
+ref = "wave4/qwenint/state-report.md:209"
+quote = "tras el registro el motor solo reserva **~3,8 GB de GTT**"
+note = "measured maximum of mem_info_gtt_used beyond the registered GGUF, on single-request runs: 3.8 GB = 3.54 GiB. workspace_gib 7.2 = the 8-slot state (3.61 GiB) + that whole reservation counted as scratch (3.54 GiB): a conservative sum, not a receipt of the 8 x 12,288 line"
+[x-evidence.qw-node-t2048]
+ref = "wave4/qwen-rtx-prefill/report.md:177"
+quote = "configuración srv de producción, T = 2048"

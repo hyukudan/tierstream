@@ -147,6 +147,19 @@ ss-recipe plan     RECIPE --route R --device-set S --desc DESC.json   # budget, 
 
 The same calls are in the C ABI (`ss_recipe_*`).
 
+**Example recipes** are in [recipes/examples/](recipes/examples/README.md), calibrated on the lab's measured setups
+(two Strix Halo nodes on USB4 and a PC with an RTX PRO 6000 96 GB):
+
+- deployable: DeepSeek V4.1 Flash (pair, and the measured RTX + pair hetero placement), MiniMax M3.1 Flash, Qwen3.8
+  Flash Next;
+- `pending/`: recipes that wait for an engine run, a descriptor or hardware: a DeepSeek RTX decode replica, DeepSeek
+  and MiniMax on a 32 GB card, MiniMax with >= 192 GB of host RAM, GLM 5.3 Flash.
+
+Every number in them carries its evidence in `x-` keys (`x-evidence`, `x-cites`, `x-predicted` with a basis:
+measured, derived, projected, bound or target). CTest validates each file with `ss-recipe` and checks that the
+structural negative fixtures in `recipes/examples/tests/` are refused; `validate_v1.py` adds the citation checks
+(it needs the lab notes the `ref`s point into).
+
 ## Status
 
 v1, local only. The CPU tests pass on MSVC and on GCC with ASan, UBSan and TSan. The CUDA backend is built; its GPU

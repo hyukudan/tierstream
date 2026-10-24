@@ -1,0 +1,208 @@
+# PENDING (engine not run on the PRO): DeepSeek V4.1 Flash with a decode replica on the RTX PRO (streamed experts)
+# next to the pair. The replica has not run on the PRO yet; hyperloom deploys one decode configuration per recipe, so
+# this file (two decode routes) is a planning example until the orchestrator supports a replica lane. This is the INCLUSIVE mapping v1 can express: no planned residents, an expert cache of
+# dynamic slots, a pinned host tier and the rest on NVMe; a miss outside the pinned tier reads NVMe. The spec's
+# design is an EXCLUSIVE cache (VRAM LRU + pinned hold disjoint experts, NVMe never touched); main 20:12 asked the core
+# for tier_mode = exclusive. Even exclusive, this budget's 8,000 cached experts leave 68.2 GiB of experts for a
+# 62.4 GiB host tier: 5.8 GiB still on NVMe, so the spec's NVMe-free rows (65-75 tok/s, 8,630 cached) do not apply.
+# No model exists for this exact configuration: the only number is the spec's acceptance gate (55 tok/s), a target.
+schema = "strix-stream/recipe-v1"
+name = "deepseek-v4.1-flash-lab-rtx-replica"
+description = "DeepSeek V4.1 Flash: RTX PRO decode replica (expert cache + pinned + NVMe, <= 4 sequences per forward) admitted first; when it is not admissible the request decodes on the pair (<= 2 sequences)"
+x-status = "pending: engine not run on the PRO; no calibrated model for this budget"
+x-schema = "wave4/recipes/core/schema-draft-5.md (Sol GO)"
+
+[match]
+model = "deepseek-v4.1-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 100.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[match.devices]]
+id = "rtx"
+kind = "cuda"
+name = "RTX PRO 6000"
+memory_min_gib = 94.0
+host_ram_min_gib = 120.0
+disk_read_gbytes_ps_min = 6.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["rtx", "pair"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[limits]
+host_free_ram_floor_gib = 20.0
+
+[[routes]]
+id = "prefill_for_replica"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_rtx_replica"
+links = ["pc-nodes"]
+fallback = "prefill_pair"
+x-handoff = "pair -> RTX replica state import; replica-side prefill and this direction of hand-off are not measured"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 1
+workspace_gib = 7.6
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 1
+workspace_gib = 7.6
+
+[[routes]]
+id = "decode_rtx_replica"
+phase = "decode"
+devices = ["rtx"]
+execute = "single"
+fallback = "decode_pair"
+x-weight-identity = "must equal the pair's serve identity (ds41-exact-v1) for both lanes to serve one model"
+[routes.placement.rtx]
+device_gib = 92.0
+host_pinned_gib = 62.4
+max_context_tokens = 32768
+max_batch = 4
+workspace_gib = 1.5
+dynamic_slots_per_layer = 200
+ring_slots = 384
+prefetch_layers = 0
+lookahead_units = 4
+policy = "lru"
+pin_planned = false
+[[routes.placement.rtx.units]]
+id = "experts"
+class = "moe"
+rank = "frequency"
+resident = 0
+pinned = "fill"
+rest = "disk"
+
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 2
+workspace_gib = 7.6
+
+[x-cites]
+"match.devices.pair.memory_min_gib" = ["node-gtt", "pair-footprint"]
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"match.devices.rtx.memory_min_gib" = "pro-vram"
+"match.devices.rtx.host_ram_min_gib" = "pc-ram"
+"match.devices.rtx.disk_read_gbytes_ps_min" = "dsrtx-nvme"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"limits.host_free_ram_floor_gib" = "ds-physical-reserve"
+"routes.prefill_for_replica.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.prefill_for_replica.placement.pair.workspace_gib" = "pair-footprint"
+"routes.prefill_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.prefill_pair.placement.pair.workspace_gib" = "pair-footprint"
+"routes.decode_rtx_replica.placement.rtx.max_batch" = "ds-policy-lane"
+"routes.decode_pair.placement.pair.max_batch" = "pair-long-context"
+"routes.decode_rtx_replica.placement.rtx.device_gib" = ["dsrtx-vram-table", "dsrtx-arena"]
+"routes.decode_rtx_replica.placement.rtx.host_pinned_gib" = "dsrtx-pinned"
+"routes.decode_rtx_replica.placement.rtx.max_context_tokens" = "dsrtx-kv"
+"routes.decode_rtx_replica.placement.rtx.workspace_gib" = "dsrtx-kv"
+"routes.decode_rtx_replica.placement.rtx.dynamic_slots_per_layer" = ["dsrtx-arena", "w1-expert-bytes"]
+"routes.decode_rtx_replica.placement.rtx.ring_slots" = "w1-expert-bytes"
+"routes.decode_rtx_replica.placement.rtx.lookahead_units" = "dsrtx-prefetch"
+"routes.decode_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.decode_pair.placement.pair.workspace_gib" = "pair-footprint"
+
+[[x-predicted]]
+route = "decode_rtx_replica"
+metric = "decode_tok_s"
+batch = 1
+value = 55
+basis = "target"
+scope = "the spec's acceptance gate, not a model of this budget (8,000 cached experts, 5.8 GiB of experts on NVMe); the smoke's ~45 % recall points to ~60 for the spec's own budget"
+evidence = ["dsrtx-gate", "dsrtx-recall-risk"]
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_tok_s"
+batch = 1
+value = 33.9
+basis = "measured"
+scope = "candidate cab238d6, 1-2 runs"
+evidence = "ds-pair-candidate"
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.pair-footprint]
+ref = "wave4/wstream/spec-deepseek.md:68"
+quote = "~86 GiB (78.2 weights + 7.6 runtime) + 3.5 GiB device prefill"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.pro-vram]
+ref = "../hyperloom/hyperloom/placement/ds41.py:32"
+quote = "measured 93.09 of 95.57 GiB"
+[x-evidence.pc-ram]
+ref = "ds41-coord.md:812"
+quote = "\"PhysicalTotal\": 127.762"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.pair-long-context]
+ref = "../hyperloom/hyperloom/presets/ds41-pair-long.json:4"
+quote = "--context 33024 --slots 2"
+[x-evidence.ds-policy-lane]
+ref = "wave4/wstream/spec-deepseek.md:305"
+quote = "TP batch on the pair + RTX replica lane (1-4 users)"
+[x-evidence.dsrtx-vram-table]
+ref = "wave4/wstream/spec-deepseek.md:288"
+quote = "| **Expert LRU** | **~80** | 8,630 slices, 56 % |"
+note = "spec budget: non-routed ~8.0 + KV/state/workspaces ~1.5 + staging 0.2 + LRU ~80 GiB (lines 285-288)"
+[x-evidence.dsrtx-arena]
+ref = "wave4/wstream/dsrtx/design.md:181"
+quote = "expert arena 8,726 slots (8,630 + 96 spares)"
+note = "v1 mapping: 200 dynamic slots x 40 layers = 8,000 (74.2 GiB) + a 384-slot ring (3.6 GiB) + ~8 GiB fixed + 1.5 workspace + margin 2.76 = 90 GiB <= 92"
+[x-evidence.w1-expert-bytes]
+ref = "hetero/w1-report.md:68"
+quote = "**Coste:** 9.953.280 B por experto"
+note = "ring_slots 384 = (prefetch_layers 0 + 1) x 384 experts of one layer, the core's minimum"
+[x-evidence.dsrtx-pinned]
+ref = "wave4/wstream/spec-deepseek.md:289"
+quote = "**62.4** (or 40 + NVMe)"
+[x-evidence.dsrtx-kv]
+ref = "wave4/wstream/spec-deepseek.md:286"
+quote = "| KV + state + workspaces (R ≤ 8, ≤ 32K) | ~1.5 | |"
+[x-evidence.dsrtx-prefetch]
+ref = "wave4/wstream/dsrtx/design.md:292"
+quote = "≤ 4 per layer, ≤ 48 per token"
+[x-evidence.dsrtx-nvme]
+ref = "wave4/wstream/spec-deepseek.md:250"
+quote = "| PC NVMe only, a=0.8 | 14.5 | 27 | 37 | 1.1× |"
+note = "misses outside the pinned tier read NVMe; the spec assumes the PC's 6.7-6.9 GB/s sequential (spec-deepseek.md:174)"
+[x-evidence.dsrtx-recall-risk]
+ref = "wave4/wstream/i2-dsrtx.log:49"
+quote = "expect about 60 tok/s (prediction-off estimate)"
+[x-evidence.ds-pair-candidate]
+ref = "ds41-coord.md:7389"
+quote = "N8 B 73.90 vs K 74.16"
+[x-evidence.dsrtx-gate]
+ref = "wave4/wstream/i2-dsrtx.log:49"
+quote = "the spec's acceptance gate is 55"
+[x-evidence.ds-physical-reserve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:17"
+quote = "\"host_gib\": {\"max\": 80, \"physical_reserve_gib\": 20}"
+note = "the PC physical reserve rule for the DS services"

@@ -1,0 +1,240 @@
+# DeepSeek V4.1 Flash on today's lab: the Strix Halo pair runs prefill and decode (TP over USB4); an RTX PRO 6000
+# prefill route for long prompts (>= 2323 uncached tokens, state handed to the pair over 1 GbE) ships DISABLED
+# (enabled = false): an offloaded request runs a composed weight identity (RTX base-model exact prefill + pair trellis
+# decode) whose quality receipt is pending. Turn it on with an override once the receipt exists:
+#   ss-recipe ... --set routes.prefill_long_rtx.enabled=true
+# The RTX timings are the service's receipt with its OWN cap planning (91.7 GiB used at full VRAM); this placement
+# (no unit groups = ss_plan_make on the adapter's descriptor, device_gib 93 -> 90.2 GiB room) does not reproduce that
+# plan, so they are receipt-conditional comparisons, to be re-measured when the route is enabled.
+schema = "strix-stream/recipe-v1"
+name = "deepseek-v4.1-flash-lab"
+description = "DeepSeek V4.1 Flash: pair TP prefill + decode; RTX PRO prefill from 2323 uncached tokens, shipped disabled until its quality receipt"
+generated_by = "human"
+x-status = "measured (pair: candidate cab238d6 + published; RTX route disabled, receipt-conditional)"
+x-requires = "prompt_tokens in the request state = uncached length (core §8.3)"
+
+[match]
+model = "deepseek-v4.1-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 100.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[match.devices]]
+id = "rtx"
+kind = "cuda"
+name = "RTX PRO 6000"
+memory_min_gib = 94.0
+host_ram_min_gib = 120.0
+disk_read_gbytes_ps_min = 3.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["rtx", "pair"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[limits]
+host_free_ram_floor_gib = 20.0
+host_free_commit_floor_gib = 14.0
+
+# ---- prefill ----
+[[routes]]
+id = "prefill_long_rtx"
+phase = "prefill"
+enabled = false
+devices = ["rtx"]
+execute = "single"
+handoff_route = "decode_pair"
+links = ["pc-nodes"]
+fallback = "prefill_pair"
+when = { prompt_tokens_min = 2323 }
+x-engine = "ds41-rtx-prefill service, --exact; plans its own cone residency from the cap (no unit groups)"
+[routes.placement.rtx]
+device_gib = 93.0
+host_pinned_gib = 68.0
+max_context_tokens = 32768
+max_batch = 1
+prefetch_layers = 1
+idle_preload_layers = 2
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 1
+workspace_gib = 7.6
+
+# ---- decode ----
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 2
+workspace_gib = 7.6
+
+# ---- citations ----
+[x-cites]
+"match.devices.pair.memory_min_gib" = ["node-gtt", "pair-footprint"]
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"match.devices.rtx.memory_min_gib" = "pro-vram"
+"match.devices.rtx.host_ram_min_gib" = "pc-ram"
+"match.devices.rtx.disk_read_gbytes_ps_min" = "pc-nvme"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"limits.host_free_ram_floor_gib" = "ds-physical-reserve"
+"limits.host_free_commit_floor_gib" = "ds-commit-floor"
+"routes.prefill_long_rtx.placement.rtx.idle_preload_layers" = "ds-preload"
+"routes.prefill_long_rtx.when.prompt_tokens_min" = ["ds-crossover", "ds-crossover-def"]
+"routes.prefill_long_rtx.placement.rtx.device_gib" = "ds-rtx-vram"
+"routes.prefill_long_rtx.placement.rtx.host_pinned_gib" = "ds-host-rule"
+"routes.prefill_long_rtx.placement.rtx.max_context_tokens" = "ds-rtx-positions"
+"routes.prefill_long_rtx.placement.rtx.prefetch_layers" = "ds-double-buffer"
+"routes.prefill_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.prefill_pair.placement.pair.workspace_gib" = "pair-footprint"
+"routes.decode_pair.placement.pair.max_batch" = "pair-long-context"
+"routes.decode_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.decode_pair.placement.pair.workspace_gib" = "pair-footprint"
+
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_tok_s"
+batch = 1
+value = 33.9
+basis = "measured"
+scope = "candidate cab238d6, R1 29.5 ms/token, 1-2 runs (published production: 32.7 tok/s)"
+evidence = ["ds-pair-candidate", "ds-pair-published"]
+date = "2026-10-24"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 1024
+value = 2.20
+basis = "measured"
+evidence = "ds-pair-published"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 2048
+value = 3.81
+basis = "derived"
+scope = "3.880 s base x (1 - 1.92 %) with every env flag on"
+evidence = "ds-pair-2k"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 10.78
+basis = "measured"
+evidence = "ds-pair-published"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 32768
+value = 39.55
+basis = "measured"
+evidence = "ds-pair-published"
+[[x-predicted]]
+route = "prefill_long_rtx"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 4.53
+basis = "derived"
+scope = "receipt configuration (service cap plan at full VRAM, 73.3 GB pinned): prefill 4.037 s + end-to-end hand-off 0.496 s (export, sha256, 1 GbE, pair import); not recompiled for this budget"
+evidence = ["ds-rtx-prefill-curve", "ds-rtx-handoff-curve"]
+[[x-predicted]]
+route = "prefill_long_rtx"
+metric = "ttft_s"
+at_prompt_tokens = 32768
+value = 12.67
+basis = "derived"
+scope = "receipt configuration at a 32,768-token prompt: 11.548 s + 1.117 s hand-off. Under max_context_tokens 32768 a request with any generation budget is not admissible on this route, so this point is a receipt, not an admissible prediction"
+evidence = ["ds-rtx-prefill-curve", "ds-rtx-handoff-curve"]
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.pair-footprint]
+ref = "wave4/wstream/spec-deepseek.md:68"
+quote = "~86 GiB (78.2 weights + 7.6 runtime) + 3.5 GiB device prefill"
+note = "memory_min 100 GiB = 86 serve + 3.5 prefill scratch + margin; workspace_gib = the 7.6 GiB runtime"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.pro-vram]
+ref = "../hyperloom/hyperloom/placement/ds41.py:32"
+quote = "measured 93.09 of 95.57 GiB"
+[x-evidence.pc-ram]
+ref = "ds41-coord.md:812"
+quote = "\"PhysicalTotal\": 127.762"
+[x-evidence.pc-nvme]
+ref = "wave4/wstream/spec-minimax.md:154"
+quote = "6.6-6.95 GB/s cold, 3.4-5.2 hot"
+note = "floor 3.0 = below the hot range; the exact service's file tier is only the overflow of the pinned tier"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.ds-physical-reserve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:17"
+quote = "\"host_gib\": {\"max\": 80, \"physical_reserve_gib\": 20}"
+note = "physical free RAM kept back on the PC; the 14 GiB commit floor is limits.host_free_commit_floor_gib"
+[x-evidence.ds-host-rule]
+ref = "ds41-ttft-report.md:471"
+quote = "--host-gib = min(80, free phys − 20) = 68–74"
+note = "68 = the low end measured at load; the 20 GiB physical reserve is the PC floor"
+[x-evidence.ds-crossover]
+ref = "ds41-ttft-report.md:44"
+quote = "the crossover is **2323 tokens** of uncached length"
+note = "historical receipt (W2 exact arm on a busy PC vs the pair of that day); spec-rtx-prefill.md:227 expects ~1.5K after the interleave plan and asks for a re-measured receipt"
+[x-evidence.ds-crossover-def]
+ref = "ds41-ttft-report.md:175"
+quote = "**Threshold: 2323 tokens of effective length** (prompt minus prefix-cache hit)"
+[x-evidence.ds-rtx-vram]
+ref = "ds41-ttft-report.md:470"
+quote = "device 98.45 GB = dense 10.07 + experts 71.5–71.9 + slots 7.64"
+note = "98.45 GB = 91.7 GiB"
+[x-evidence.ds-rtx-positions]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:16"
+quote = "\"positions\": {\"default\": 32768, \"values\": [32768]}"
+[x-evidence.ds-double-buffer]
+ref = "hetero/w2-report.md:16"
+quote = "doble buffer de 2 x 3.82 GB sostiene 25-29 GB/s"
+note = "two layer slots = one streamed layer in flight while one computes"
+[x-evidence.pair-long-context]
+ref = "../hyperloom/hyperloom/presets/ds41-pair-long.json:4"
+quote = "--context 33024 --slots 2"
+note = "the configuration main qualified for the RTX offload profile"
+[x-evidence.ds-pair-candidate]
+ref = "ds41-coord.md:7389"
+quote = "R1 B 29.5/29.9 vs S 29.5/29.5 vs K 29.5/29.5 ms/token; R6 B 55.54/55.65"
+note = "same line: N8 B 73.90 ms/step"
+[x-evidence.ds-pair-published]
+ref = "ds41-coord.md:7219"
+quote = "DS pair 32.7 tok/s (30.6 ms), R6 58.92 ms, N8 101.3 tok/s, TTFT 2.20/10.78/20.40 s at 1K/8K/16K"
+[x-evidence.ds-pair-2k]
+ref = "ds41-coord.md:5574"
+quote = "2K base 3.880: hp -1.15, eng -0.66, til -0.37, slb -0.22, pall -1.92 %"
+[x-evidence.ds-rtx-prefill-curve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:39"
+quote = "\"prefill_curve\": [[512, 3.270], [2048, 3.387], [8192, 4.037], [32768, 11.548]]"
+[x-evidence.ds-rtx-handoff-curve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:40"
+quote = "\"handoff_curve\": [[512, 0.285], [2048, 0.326], [8192, 0.496], [32768, 1.117]]"
+[x-evidence.ds-commit-floor]
+ref = "ds41-ttft-report.md:470"
+quote = "--host-commit-floor-gib 14"
+[x-evidence.ds-preload]
+ref = "wave4/wstream/spec-rtx-prefill.md:188"
+quote = "**Without idle preload** (cold slots), DS 8K exact rises from 81 to 121 GB"
+note = "the service preloads the first 2 streamed layers between requests (hetero/w2: 2 slots)"

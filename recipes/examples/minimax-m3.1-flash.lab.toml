@@ -1,0 +1,258 @@
+# MiniMax M3.1 Flash on today's lab: Strix Halo pair TP2 (decode + prompts < 4K) and the RTX PRO 6000 for prompts
+# >= 4K, three tiers of layer blobs exactly as the t7 live run (32 device / 16 pinned / 12 NVMe blob cache), state
+# handed to the pair (bp-v1 over 1 GbE).
+# 4K is main's route rule, supported by the measured 1K loss (RTX 7.4-7.9 s vs pair 5.9 s) and 8K win (16.1 vs
+# 45 s); 2K-4K was never measured on either side.
+# The RTX route ships DISABLED (enabled = false): t7's spread layer list (rank = list) needs a ranked-order MiniMax
+# descriptor, and today's adapter (hyperloom placement/minimax.py) emits order = prefix, which the core refuses for a
+# non-prefix resident set. Enable it once the ranked adapter exists (asked of the planner owner). The disk tier is
+# gated by the core: a plan with disk bytes needs disk_available = true in the request state (fail closed); the
+# orchestrator sets it from the lab's disk duty rule.
+schema = "strix-stream/recipe-v1"
+name = "minimax-m3.1-flash-lab"
+description = "MiniMax M3.1 Flash: pair TP2 prefill + decode; RTX PRO prefill from 4K (t7: 32 device / 16 pinned / 12 NVMe layers, 8K 16.1 s vs 45 s), disabled until the ranked descriptor exists"
+x-status = "measured (t7 live TTFT ABA, G6 VRAM/pinned receipts)"
+x-pinned-at-up = "t7 chose the pinned count at start: H = floor((free_GB - 22) * 100 / 307), capped at 17, refused below 8 (t7_run.sh:7-9). In v1 that is the orchestrator/autotuner setting host_pinned_gib (and units.layers.pinned) per host state; this recipe pins the t7 point (16)."
+x-requires = "ranked-order MiniMax descriptor (rank = list over a spread layer set); orchestrator: disk_available from the disk duty rule"
+
+[match]
+model = "minimax-m3.1-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 110.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[match.devices]]
+id = "rtx"
+kind = "cuda"
+name = "RTX PRO 6000"
+memory_min_gib = 94.0
+host_ram_min_gib = 120.0
+disk_read_gbytes_ps_min = 4.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["rtx", "pair"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[limits]
+host_free_ram_floor_gib = 6.0
+
+[[routes]]
+id = "prefill_long_rtx"
+phase = "prefill"
+enabled = false
+devices = ["rtx"]
+execute = "single"
+handoff_route = "decode_pair"
+links = ["pc-nodes"]
+fallback = "prefill_pair"
+when = { prompt_tokens_min = 4096 }
+x-engine = "mm-rtx-prefill (FP32 identity), --resident 32 --pinned 16 --blob-cache DIR; node side STRIX_MM_PREFILL_IDENTITY=fp32 + --offload-import"
+[routes.placement.rtx]
+device_gib = 93.0
+host_pinned_gib = 44.3
+max_context_tokens = 9216
+max_batch = 1
+workspace_gib = 0.0
+staging_buffers = 4
+staging_mib = 2732
+reader_threads = 1
+[[routes.placement.rtx.units]]
+id = "layers"
+class = "blob"
+rank = "list"
+# t7 tier string dddpdpdpdpdfdpdf...: device layers (dense 0-2 + spread MoE), then pinned, then file
+list = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 59,
+        3, 5, 7, 9, 13, 17, 21, 25, 29, 33, 35, 39, 43, 47, 51, 55,
+        11, 15, 19, 23, 27, 31, 37, 41, 45, 49, 53, 57]
+resident = 32
+pinned = 16
+rest = "disk"
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 9216
+max_batch = 1
+workspace_gib = 7.0
+
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 9216
+max_batch = 4
+workspace_gib = 7.0
+
+[x-cites]
+"match.devices.pair.memory_min_gib" = "mm-node-gtt"
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"match.devices.rtx.memory_min_gib" = "pro-vram"
+"match.devices.rtx.host_ram_min_gib" = "pc-ram"
+"match.devices.rtx.disk_read_gbytes_ps_min" = "mm-t7-disk"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"limits.host_free_ram_floor_gib" = "mm-watchdog"
+"routes.prefill_long_rtx.when.prompt_tokens_min" = ["mm-route-rule", "mm-t7-1k", "mm-t7-8k"]
+"routes.prefill_long_rtx.placement.rtx.device_gib" = ["mm-g6-vram", "mm-vram-9216"]
+"routes.prefill_long_rtx.placement.rtx.host_pinned_gib" = ["mm-t7-load", "mm-pinned-rule", "mm-host-fixed"]
+"routes.prefill_long_rtx.placement.rtx.max_context_tokens" = "mm-t7-8k"
+"routes.prefill_long_rtx.placement.rtx.workspace_gib" = "mm-adapter-fixed"
+"routes.prefill_long_rtx.placement.rtx.staging_buffers" = "mm-stage"
+"routes.prefill_long_rtx.placement.rtx.reader_threads" = "mm-reader"
+"routes.prefill_long_rtx.placement.rtx.staging_mib" = "mm-blob-size"
+"routes.prefill_long_rtx.placement.rtx.units.layers.list" = "mm-t7-tiers"
+"routes.prefill_long_rtx.placement.rtx.units.layers.resident" = "mm-t7-tiers"
+"routes.prefill_long_rtx.placement.rtx.units.layers.pinned" = ["mm-t7-tiers", "mm-pinned-rule"]
+"routes.prefill_pair.placement.pair.max_context_tokens" = "mm-t7-8k"
+"routes.prefill_pair.placement.pair.workspace_gib" = ["mm-node-kv", "mm-node-act"]
+"routes.decode_pair.placement.pair.max_context_tokens" = "mm-t7-8k"
+"routes.decode_pair.placement.pair.workspace_gib" = ["mm-node-kv", "mm-node-act"]
+"routes.decode_pair.placement.pair.max_batch" = ["mm-node-kv", "mm-pair-batch"]
+
+[[x-predicted]]
+route = "prefill_long_rtx"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 16.1
+basis = "measured"
+scope = "live TTFT incl. hand-off, 3 runs 16.08-16.27 s, t7 2026-10-24"
+evidence = "mm-t7-8k"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 8192
+value = 45.0
+basis = "measured"
+scope = "t7 control arms 45.06 / 44.77 s (node binary of that day; hp env not re-measured at 8K)"
+evidence = "mm-t7-8k"
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 1024
+value = 5.0
+basis = "measured"
+scope = "hp env default since bb1fa4c7"
+evidence = "mm-pair-latest"
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_tok_s"
+batch = 1
+value = 20.4
+basis = "measured"
+evidence = "mm-pair-latest"
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_agg_tok_s"
+batch = 4
+value = 36.79
+basis = "measured"
+scope = "older binary 7a548a43 (55 ms/token single); not re-measured on the current default"
+evidence = "mm-pair-batch"
+[[x-predicted]]
+route = "prefill_long_rtx"
+metric = "vram_gib"
+at_prompt_tokens = 8192
+value = 89.07
+basis = "measured"
+scope = "G6 = 32/17/11 at cap 92 (one more pinned layer than t7; the device side is identical)"
+evidence = "mm-g6-vram"
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.mm-node-gtt]
+ref = "wave4/wstream/spec-minimax.md:175"
+quote = "The ceiling is GTT 125.8 GB less a 3 GB margin = **122.8 GB**"
+note = "TP2 shard ~80 GB of weights (half of the ~160 GB of layer blobs) + trunk/KV/workspaces"
+[x-evidence.mm-node-kv]
+ref = "wave4/wstream/spec-minimax.md:183"
+quote = "| KV + index keys (138,240 B/token, both halves) | 1.13 | 4.53 | 4.53 |"
+note = "[C] for both halves on one device; a TP2 rank holds half: 4 x 9216 x 69,120 B = 2.5 GB; with activations ~2.5 GB the 7.0 GiB workspace is conservative"
+[x-evidence.mm-node-act]
+ref = "wave4/wstream/spec-minimax.md:184"
+quote = "| activations, MSA, workspaces | ~2.0 [E] | ~2.2 [E] | ~2.5 [E] |"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.pro-vram]
+ref = "../hyperloom/hyperloom/placement/ds41.py:32"
+quote = "measured 93.09 of 95.57 GiB"
+[x-evidence.pc-ram]
+ref = "ds41-coord.md:812"
+quote = "\"PhysicalTotal\": 127.762"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.mm-watchdog]
+ref = "wave4/mmrtxpf/t7_run.sh:19"
+quote = "WATCHDOG: free RAM ${free} GB"
+note = "t7 stops the PRO job below 6 GB of physical free RAM"
+[x-evidence.mm-route-rule]
+ref = "ds41-coord.md:7517"
+quote = "ROUTE RULE (prompt >= 4K and PRO available -> RTX, else nodes)"
+[x-evidence.mm-t7-1k]
+ref = "wave4/mmrtxpf/report.md:209"
+quote = "| code1k (1,023 tokens) | 5.891 s | 7.914 / 7.361 / 7.692 s | 5.897 s | 0.77x (slower) |"
+[x-evidence.mm-t7-8k]
+ref = "wave4/mmrtxpf/report.md:210"
+quote = "| code8k (8,192 tokens) | 45.059 s | 16.080 / 16.138 / 16.266 s | 44.773 s | **2.78x faster** |"
+note = "max_context 9216 = the measured 8K prompt + a 1K generation budget (the prefill engine holds prompt rows; generation runs on the pair)"
+[x-evidence.mm-t7-tiers]
+ref = "wave4/mmrtxpf/t7_pc.log:4"
+quote = "tiers device 32, pinned 16, file 12: dddpdpdpdpdfdpdfdpdfdpdfdpdfdpdfdpdpdfdpdfdpdfdpdfdpdfdpdfdd"
+[x-evidence.mm-t7-load]
+ref = "wave4/mmrtxpf/t7_pc.log:40"
+quote = "device used 85.4 GiB, 28 streamed so far (pinned 42.7 GiB"
+[x-evidence.mm-pinned-rule]
+ref = "wave4/mmrtxpf/t7_run.sh:7"
+quote = "H=$(( (free0 - 22) * 100 / 307 )); [ $H -gt 17 ] && H=17"
+note = "at 74 GB free t7 got 16 (t7_pc.log:2); 16 x 2,864,462,336 B = 42.68 GiB"
+[x-evidence.mm-stage]
+ref = "wave4/mmrtxpf/t7_pc.log:2"
+quote = "--pinned 16 (2.86 GiB blobs + 11.6 GiB staging + >= ~6 GB margin)"
+note = "engine kStage = 4 blob-sized slots"
+[x-evidence.mm-blob-size]
+ref = "wave4/vramplan/report.md:58"
+quote = "2,864,462,336 B MoE (== engine)"
+note = "2,864,462,336 B = 2731.76 MiB -> 2732"
+[x-evidence.mm-t7-disk]
+ref = "wave4/mmrtxpf/report.md:220"
+quote = "1K: bound by reading 12 layers (34 GB) from D: at ~4.5 GB/s."
+[x-evidence.mm-g6-vram]
+ref = "wave4/vramplan/report.md:112"
+quote = "91,207 MiB = **89.07 GiB**"
+[x-evidence.mm-pair-latest]
+ref = "ds41-coord.md:7513"
+quote = "TTFT 1K 5.715/5.732/5.750 -> 4.981/5.025/4.984 s (-12.8 %)"
+note = "same line: base defaults decode ~49 ms/token = 20.4 tok/s at 1K"
+[x-evidence.mm-pair-batch]
+ref = "ds41-coord.md:6891"
+quote = "batch N=1/2/4/8 17.42/26.10/36.79/42.98 tok/s aggregat"
+[x-evidence.mm-host-fixed]
+ref = "../hyperloom/hyperloom/placement/minimax.py:134"
+quote = "host_fixed=[(\"state_blobs\", 2 * rows * LAYERS * 1280), (\"embed_staging\", rows * HIDDEN * 4)]"
+note = "at 9216 rows: 1,415,577,600 + 226,492,416 B = 1.53 GiB, added to the pinned blobs"
+[x-evidence.mm-vram-9216]
+ref = "wave4/vramplan/prereg-mm-g6.txt:3"
+quote = "nvidia-smi peak incl. 0.51 GiB measured overhead = 89.08 GiB"
+note = "G6 8K prediction (measured 89.07); the same model adds ~0.66 GiB from 8192 to 9216 rows -> ~89.74 GiB; device_gib 93 leaves 90.2 GiB after the default margin (2.79)"
+[x-evidence.mm-reader]
+ref = "wave4/mmrtxpf/report.md:184"
+quote = "by a reader thread"
+[x-evidence.mm-adapter-fixed]
+ref = "../hyperloom/hyperloom/placement/minimax.py:120"
+quote = "(\"activations\", run[\"activations\"]), (\"rope_and_norm\", run[\"rope\"] + CUDA_GRANULE)]"
+note = "the adapter bills KV state, activations and rope as the descriptor's fixed bytes (line 118-119), so the placement's workspace is 0 (no double count)"

@@ -88,6 +88,24 @@ if(SS_TESTS)
   set_target_properties(ss-test-capi PROPERTIES LINKER_LANGUAGE CXX)
   add_test(NAME capi COMMAND ss-test-capi)
 
+  # Shipped example recipes: each must validate; each structural negative fixture must be refused. The six
+  # citation-only fixtures (x-* keys, which the core never reads) are checked by recipes/examples/validate_v1.py.
+  file(GLOB ss_example_recipes RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+       recipes/examples/*.toml recipes/examples/pending/*.toml)
+  foreach(r ${ss_example_recipes})
+    add_test(NAME "example:${r}" COMMAND ss-recipe validate ${r} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endforeach()
+  set(ss_citation_only bad-bad-quote bad-dangling-cite bad-empty-evidence-list bad-layers-uncited
+      bad-uncited-idle-preload bad-uncited-threshold)
+  file(GLOB ss_bad_recipes RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} recipes/examples/tests/bad-*.toml)
+  foreach(r ${ss_bad_recipes})
+    get_filename_component(n ${r} NAME_WE)
+    if(NOT n IN_LIST ss_citation_only)
+      add_test(NAME "refuse:${n}" COMMAND ss-recipe validate ${r} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+      set_tests_properties("refuse:${n}" PROPERTIES WILL_FAIL TRUE)
+    endif()
+  endforeach()
+
   if(SS_CUDA)
     add_executable(ss-test-cuda tests/test_cuda.cu)
     target_include_directories(ss-test-cuda PRIVATE src)

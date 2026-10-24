@@ -1,0 +1,196 @@
+# PENDING (no 32 GB card measured; DS quality receipt): DeepSeek V4.1 Flash on the Strix pair plus a 32 GB discrete
+# card (RTX 5090 class, PCIe 5 x16) with the lab's ~70 GB pinned budget. PROJECTED: no 32 GB card was run. The card
+# must probe >= 25 GB/s host-to-device (h2d_gbytes_ps_min); the model assumes ~30 GB/s. The numbers re-run the spec
+# planner (wave4/wstream/plan/planner.py, spec-rtx-prefill.md §4.1) at this placement's room: device_gib 31 - margin
+# max(2 GiB, 3 % x 31) = 29 GiB = 31.14 GB, 70 GB pinned (derived/card32_planner.py + .out). They are conditional
+# projections: the planner models the service's interleaved routed fetch and idle preload with PRO-class compute.
+# At 8K the card is NVMe-bound (12.1 s + hand-off) and loses to the pair (10.78 s); at 16K it wins (12.3 + 0.7 s vs
+# 20.40 s) and at 32K (13.4 + 1.1 s vs 39.55 s), so the route starts at 16K. The route is disabled like the lab RTX
+# route (composed identity, quality receipt pending).
+schema = "strix-stream/recipe-v1"
+name = "deepseek-v4.1-flash-card32"
+description = "DeepSeek V4.1 Flash: pair TP + a 32 GB card for prompts >= 16K (exact arm, 26 GB base + streamed experts): 32K ~14.5 s vs 39.6 s"
+x-status = "pending: quality receipt (DS RTX exact) and card performance check (H2D minimum)"
+x-schema = "wave4/recipes/core/schema-draft-5.md (Sol GO)"
+
+[match]
+model = "deepseek-v4.1-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 100.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[match.devices]]
+id = "card"
+kind = "cuda"
+name = "5090"
+memory_min_gib = 31.0
+host_ram_min_gib = 120.0
+disk_read_gbytes_ps_min = 5.0
+h2d_gbytes_ps_min = 25.0
+
+[[match.links]]
+id = "pc-nodes"
+between = ["card", "pair"]
+kind = "ethernet"
+gbps_min = 0.9
+
+[limits]
+host_free_ram_floor_gib = 20.0
+host_free_commit_floor_gib = 14.0
+
+[[routes]]
+id = "prefill_long_card"
+phase = "prefill"
+enabled = false
+devices = ["card"]
+execute = "single"
+handoff_route = "decode_pair"
+links = ["pc-nodes"]
+fallback = "prefill_pair"
+when = { prompt_tokens_min = 16384 }
+[routes.placement.card]
+device_gib = 31.0
+host_pinned_gib = 65.2
+max_context_tokens = 32768
+max_batch = 1
+prefetch_layers = 1
+idle_preload_layers = 2
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 1
+workspace_gib = 7.6
+
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 33024
+max_batch = 2
+workspace_gib = 7.6
+
+[x-cites]
+"match.devices.pair.memory_min_gib" = ["node-gtt", "pair-footprint"]
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"match.devices.card.memory_min_gib" = "card32-ds-base"
+"match.devices.card.host_ram_min_gib" = "card32-pinned-budget"
+"match.devices.card.h2d_gbytes_ps_min" = "pcie-planning"
+"match.devices.card.disk_read_gbytes_ps_min" = "card32-nvme"
+"routes.decode_pair.placement.pair.max_batch" = "pair-long-context"
+"match.links.pc-nodes.gbps_min" = "lan-bw"
+"limits.host_free_ram_floor_gib" = "ds-physical-reserve"
+"limits.host_free_commit_floor_gib" = "ds-commit-floor"
+"routes.prefill_long_card.placement.card.idle_preload_layers" = "ds-preload"
+"routes.prefill_long_card.when.prompt_tokens_min" = ["card32-ds-8k", "card32-ds-32k", "ds-pair-published"]
+"routes.prefill_long_card.placement.card.device_gib" = "card32-ds-base"
+"routes.prefill_long_card.placement.card.host_pinned_gib" = "card32-pinned-budget"
+"routes.prefill_long_card.placement.card.max_context_tokens" = "ds-rtx-positions"
+"routes.prefill_long_card.placement.card.prefetch_layers" = "ds-double-buffer"
+"routes.prefill_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.prefill_pair.placement.pair.workspace_gib" = "pair-footprint"
+"routes.decode_pair.placement.pair.max_context_tokens" = "pair-long-context"
+"routes.decode_pair.placement.pair.workspace_gib" = "pair-footprint"
+
+[[x-predicted]]
+route = "prefill_long_card"
+metric = "ttft_s"
+at_prompt_tokens = 32768
+value = 14.5
+basis = "projected"
+scope = "spec planner rerun at this recipe's room (29 GiB = 31.14 GB, 70 GB pinned, 30 GB/s): compute phase 13.388 s + measured 32K hand-off 1.117 s; a 32,768-token prompt is a receipt-style point (any generation budget exceeds max_context 32768); PRO-class compute assumed"
+evidence = ["card32-planner-ds32k", "ds-rtx-handoff-curve"]
+[[x-predicted]]
+route = "prefill_long_card"
+metric = "ttft_s"
+at_prompt_tokens = 16384
+value = 13.0
+basis = "projected"
+scope = "spec planner rerun at this recipe's room: compute phase 12.326 s + hand-off 0.703 s (linear between the measured 8K 0.496 and 32K 1.117 s); pair 20.40 s"
+evidence = ["card32-planner-ds16k", "ds-rtx-handoff-curve", "ds-pair-published"]
+[[x-predicted]]
+route = "prefill_pair"
+metric = "ttft_s"
+at_prompt_tokens = 32768
+value = 39.55
+basis = "measured"
+evidence = "ds-pair-published"
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.pair-footprint]
+ref = "wave4/wstream/spec-deepseek.md:68"
+quote = "~86 GiB (78.2 weights + 7.6 runtime) + 3.5 GiB device prefill"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.lan-bw]
+ref = "ds41-coord.md:7451"
+quote = "identity 111-113 MB/s wire (1 stream), 116.5 (2 streams)"
+[x-evidence.card32-ds-base]
+ref = "wave4/wstream/spec-rtx-prefill.md:252"
+quote = "**DS 32K fits** (base 26 GB)"
+[x-evidence.card32-pinned-budget]
+ref = "wave4/wstream/spec-rtx-prefill.md:183"
+quote = "the PC's ~70 GB pinned budget plus NVMe for the rest"
+note = "70 GB = 65.2 GiB"
+[x-evidence.card32-nvme]
+ref = "wave4/wstream/spec-rtx-prefill.md:33"
+quote = "NVMe at ~5 GB/s, and small-card TTFTs grow 2-3x"
+[x-evidence.card32-ds-8k]
+ref = "wave4/wstream/spec-rtx-prefill.md:201"
+quote = "| DS exact | 8K | 3.00 | 4.4 / 13.0 | 4.3 / 12.0 |"
+note = "32 GB column, second figure = 70 GB pinned + NVMe: 12.0 s > pair 10.78 s at 8K"
+[x-evidence.card32-ds-32k]
+ref = "wave4/wstream/spec-rtx-prefill.md:202"
+quote = "| DS exact | 32K | 9.77 | — | 11.2 / 13.4 |"
+[x-evidence.ds-rtx-handoff-curve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:40"
+quote = "\"handoff_curve\": [[512, 0.285], [2048, 0.326], [8192, 0.496], [32768, 1.117]]"
+[x-evidence.ds-pair-published]
+ref = "ds41-coord.md:7219"
+quote = "TTFT 2.20/10.78/20.40 s at 1K/8K/16K (16K from dsint t03 21.36 -> 20.40) and 39.55 s at 32K"
+[x-evidence.ds-rtx-positions]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:16"
+quote = "\"positions\": {\"default\": 32768, \"values\": [32768]}"
+[x-evidence.ds-double-buffer]
+ref = "hetero/w2-report.md:16"
+quote = "doble buffer de 2 x 3.82 GB sostiene 25-29 GB/s"
+[x-evidence.pair-long-context]
+ref = "../hyperloom/hyperloom/presets/ds41-pair-long.json:4"
+quote = "--context 33024 --slots 2"
+[x-evidence.ds-physical-reserve]
+ref = "../hyperloom/hyperloom/presets/rtx-prefill-ds41.json:17"
+quote = "\"host_gib\": {\"max\": 80, \"physical_reserve_gib\": 20}"
+[x-evidence.pcie-planning]
+ref = "wave4/wstream/spec-rtx-prefill.md:14"
+quote = "**30 GB/s**, sensitivity at 25."
+note = "the projection runs at 30 GB/s; 25 is the spec's sensitivity floor, so slower cards are refused"
+[x-evidence.ds-commit-floor]
+ref = "ds41-ttft-report.md:470"
+quote = "--host-commit-floor-gib 14"
+[x-evidence.ds-preload]
+ref = "wave4/wstream/spec-rtx-prefill.md:188"
+quote = "**Without idle preload** (cold slots), DS 8K exact rises from 81 to 121 GB"
+note = "the service preloads the first 2 streamed layers between requests (hetero/w2: 2 slots)"
+[x-evidence.card32-planner-ds16k]
+ref = "wave4/recipes/examples/derived/card32_planner.out:5"
+quote = "ds-exact room31.14GB P=16384 compute_phase_s=12.326"
+[x-evidence.card32-planner-ds32k]
+ref = "wave4/recipes/examples/derived/card32_planner.out:6"
+quote = "ds-exact room31.14GB P=32768 compute_phase_s=13.388"
+note = "derived/card32_planner.py re-runs wave4/wstream/plan/planner.py (the spec's §4.1 model) at the recipe's room"

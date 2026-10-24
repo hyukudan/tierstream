@@ -1,0 +1,100 @@
+# PENDING (engine P2 not run): GLM-5.3-Flash on the Strix pair, TP2, EXL3 4.05 bpw. PROVISIONAL: only device gates have run (K 27/27 bitwise,
+# D 24/25, TP2 split bit-identical); no speed exists. The predictions are arithmetic from the plan; re-calibrate
+# after P2 (first TP2 numbers at 1K/8K). The one-node sc_2.60 replica is a different weight identity, so it is not a
+# fallback here: with USB4 down nothing is admissible. No RTX route: 4.05 bpw does not fit 96 GB and the streamed
+# RTX prefill (P5) is not built.
+schema = "strix-stream/recipe-v1"
+name = "glm-5.3-flash-lab"
+description = "GLM-5.3-Flash: pair TP2, 77.5 GiB/rank all resident, up to 4 sequences x 128K context (provisional, no speed measured)"
+x-status = "pending: TP2 engine (P2) not run; provisional"
+x-schema = "wave4/recipes/core/schema-draft-5.md (Sol GO)"
+
+[match]
+model = "glm-5.3-flash"
+
+[[match.devices]]
+id = "pair"
+kind = "hip"
+count = 2
+memory_min_gib = 110.0
+host_ram_min_gib = 119.0
+internal_link = { kind = "usb4", gbps_min = 30.0 }
+
+[[routes]]
+id = "prefill_pair"
+phase = "prefill"
+devices = ["pair"]
+execute = "tp"
+handoff_route = "decode_pair"
+[routes.placement.pair]
+max_context_tokens = 131072
+max_batch = 1
+workspace_gib = 10.54
+chunk_tokens = 2048
+
+[[routes]]
+id = "decode_pair"
+phase = "decode"
+devices = ["pair"]
+execute = "tp"
+[routes.placement.pair]
+max_context_tokens = 131072
+max_batch = 4
+workspace_gib = 10.54
+
+[x-cites]
+"match.devices.pair.memory_min_gib" = ["glm-peak", "glm-split"]
+"match.devices.pair.host_ram_min_gib" = "node-gtt"
+"match.devices.pair.internal_link.gbps_min" = "usb4-bw"
+"routes.prefill_pair.placement.pair.max_context_tokens" = "glm-peak"
+"routes.prefill_pair.placement.pair.workspace_gib" = "glm-peak"
+"routes.prefill_pair.placement.pair.chunk_tokens" = "glm-peak"
+"routes.decode_pair.placement.pair.max_context_tokens" = "glm-peak"
+"routes.decode_pair.placement.pair.workspace_gib" = "glm-peak"
+"routes.decode_pair.placement.pair.max_batch" = "glm-peak"
+
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_tok_s"
+batch = 1
+context_tokens = 8192
+value = 24
+basis = "projected"
+scope = "first engine estimate (~41 ms/token), carried over from MiniMax's measured 59 % of its floor; target >= 75 % (~31 tok/s)"
+evidence = "glm-first-estimate"
+[[x-predicted]]
+route = "decode_pair"
+metric = "decode_tok_s"
+batch = 1
+context_tokens = 8192
+value = 41.5
+basis = "upper_bound"
+scope = "bandwidth floor 24.1 ms/token: an upper bound, not an expected number"
+evidence = "glm-floor"
+[[x-predicted]]
+route = "decode_pair"
+metric = "device_peak_gib_per_rank"
+value = 88.2
+basis = "projected"
+scope = "4 sequences x 128K context + 2,048-row chunk, 12,384 units resident, 0 disk"
+evidence = "glm-peak"
+
+[x-evidence.node-gtt]
+ref = "wave4/wstream/spec-deepseek.md:268"
+quote = "| Physical | 119.2 | 128 GB; GTT limit ~117 GiB |"
+[x-evidence.usb4-bw]
+ref = "wave4/wstream/spec-deepseek.md:72"
+quote = "2 cables ~37 Gb/s (≈4.6 GB/s per direction, both cables)"
+[x-evidence.glm-peak]
+ref = "wave4/glm/plan.md:150"
+quote = "**rank 0 @ 117 GiB + `--workspace-gib 10.54`** (4 seq × 128K ctx + 2,048-row chunk) | 12,384 resident, 0 disk | **88.2 GiB**"
+[x-evidence.glm-split]
+ref = "wave4/glm/report.md:15"
+quote = "`split-4.05bpw.json` (77.54 GiB/rank)"
+[x-evidence.glm-first-estimate]
+ref = "wave4/glm/plan.md:98"
+quote = "First engine estimate ≈ 41 ms (≈ 24 tok/s)."
+[x-evidence.glm-floor]
+ref = "wave4/glm/plan.md:97"
+quote = "**TP2, 4.05 bpw: 5.94 GB/rank → floor 24.1 ms (41.5 tok/s).**"
+note = "plan.md:96 states the bytes per token at 8K context"
