@@ -105,7 +105,7 @@ All nine pass the core's `ss-recipe validate` (exit 0) and this folder's `valida
 ## Validate
 
 ```
-D:\tmp\strix-stream-recipes\build\ss-recipe.exe validate FILE.toml   # the core (exit 0 for all nine)
+build/ss-recipe validate FILE.toml   # the core (exit 0 for all nine; CTest runs it)
 python -I validate_v1.py "*.toml" "pending/*.toml"                  # structure + citations: all OK
 python -I tests/make_tests.py                                        # regenerates tests/bad-*.toml (46 cases)
 python -I validate_v1.py "tests/bad-*.toml"                          # each rejected by its intended rule
