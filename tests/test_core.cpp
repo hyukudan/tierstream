@@ -334,6 +334,11 @@ TEST(desc_overflow_and_narrowing) {
   std::string idx = moe_desc(1, 8, 1000);
   idx.replace(idx.find("\"index\":0"), 9, "\"index\":-1");
   CHECK_EQ(bad(idx), int(SS_E_DESC));
+  std::string hf = moe_desc(1, 8, 1000);
+  hf.replace(hf.find("\"fixed_device\""), 14,
+             "\"host_fixed\":[{\"name\":\"a\",\"bytes\":9223372036854775808},"
+             "{\"name\":\"b\",\"bytes\":9223372036854775808}],\"fixed_device\"");
+  CHECK_EQ(bad(hf), int(SS_E_DESC));  // 2^63 + 2^63 wraps to 0
 }
 
 TEST(capi_struct_size_and_budget_match) {
@@ -350,6 +355,27 @@ TEST(capi_struct_size_and_budget_match) {
   CHECK_OK(ss_plan_make(d, &old, nullptr, 0, &p));
   ss_plan_free(p);
   p = nullptr;
+  // Defaults write only the caller's size (an older caller's smaller struct is never overrun).
+  {
+    const uint32_t old_size = uint32_t(offsetof(ss_budget, pinned_backing));
+    unsigned char buf[sizeof(ss_budget) + 16];
+    std::memset(buf, 0xAB, sizeof buf);
+    ss_budget_defaults_sized(reinterpret_cast<ss_budget*>(buf), old_size);
+    bool untouched = true;
+    for (size_t k = old_size; k < sizeof buf; ++k) untouched = untouched && buf[k] == 0xAB;
+    CHECK(untouched);
+    CHECK_EQ(reinterpret_cast<ss_budget*>(buf)->struct_size, old_size);
+  }
+  // A newer caller's larger struct: only this build's fields are read.
+  {
+    unsigned char big[sizeof(ss_budget) + 64];
+    std::memset(big, 0, sizeof big);
+    std::memcpy(big, &b, sizeof b);
+    reinterpret_cast<ss_budget*>(big)->struct_size = uint32_t(sizeof big);
+    ss_plan* q = nullptr;
+    CHECK_OK(ss_plan_make(d, reinterpret_cast<ss_budget*>(big), nullptr, 0, &q));
+    ss_plan_free(q);
+  }
   ss_budget zero = b;
   zero.struct_size = 0;
   CHECK_EQ(int(ss_plan_make(d, &zero, nullptr, 0, &p)), int(SS_E_INVALID));

@@ -60,18 +60,51 @@ ss_status give_text(const std::string& s, char** out, size_t* len) {
 
 void need(bool ok, const char* what) { ss::require(ok, SS_E_INVALID, what); }
 
-// Versioned structs: start from this build's defaults and take only the bytes the caller's struct has.
+void budget_defaults(ss_budget* b) {
+  std::memset(b, 0, sizeof *b);
+  b->struct_size = uint32_t(sizeof *b);
+  b->margin_gib = 2.0;
+  b->margin_fraction = 0.03;
+}
+
+void options_defaults(ss_options* o) {
+  std::memset(o, 0, sizeof *o);
+  o->struct_size = uint32_t(sizeof *o);
+  o->backend = SS_BACKEND_CPU;
+  o->policy = SS_POLICY_LRU;
+  o->lookahead_budget = 2;
+  o->reader_threads = 2;
+  o->staging_buffers = 4;
+  o->staging_bytes = uint64_t(256) << 20;
+  o->copy_piece_bytes = uint64_t(64) << 20;
+  o->fill_residents = 1;
+  o->score_window = 16;
+  o->pin_planned = 1;
+  o->direct_io = 1;
+}
+
+// Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
+// (an older caller's missing fields keep their defaults; a newer caller's extra fields are not read).
 template <class T>
 T versioned(const T* in, void (*defaults)(T*), const char* what) {
   T v;
   defaults(&v);
   if (!in) return v;
-  ss::require(in->struct_size >= sizeof(uint32_t) + sizeof(uint32_t) && in->struct_size <= sizeof(T), SS_E_INVALID,
-              std::string(what) + ": struct_size not set (fill it with the *_defaults function) or from a newer "
-                                  "header");
-  std::memcpy(static_cast<void*>(&v), in, in->struct_size);
+  ss::require(in->struct_size >= 2 * sizeof(uint32_t), SS_E_INVALID,
+              std::string(what) + ": struct_size not set (fill the struct with its *_defaults function)");
+  std::memcpy(static_cast<void*>(&v), in, std::min<size_t>(in->struct_size, sizeof(T)));
   v.struct_size = uint32_t(sizeof(T));
   return v;
+}
+
+// Defaults into the caller's first `size` bytes only.
+template <class T>
+void sized_defaults(T* out, uint32_t size, void (*defaults)(T*)) {
+  if (!out || size < sizeof(uint32_t)) return;
+  T v;
+  defaults(&v);
+  v.struct_size = std::min<uint32_t>(size, uint32_t(sizeof(T)));
+  std::memcpy(static_cast<void*>(out), &v, v.struct_size);
 }
 
 }  // namespace
@@ -135,18 +168,12 @@ ss_status ss_desc_to_json(const ss_desc* d, char** out_json, size_t* out_len) {
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
 
-void ss_budget_defaults(ss_budget* b) {
-  if (!b) return;
-  std::memset(b, 0, sizeof *b);
-  b->struct_size = uint32_t(sizeof *b);
-  b->margin_gib = 2.0;
-  b->margin_fraction = 0.03;
-}
+void ss_budget_defaults_sized(ss_budget* b, uint32_t size) { sized_defaults(b, size, budget_defaults); }
 
 ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benefit, size_t n_benefit, ss_plan** out) {
   return guard([&] {
     need(d && b && out, "ss_plan_make: null argument");
-    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_make");
+    ss_budget bb = versioned(b, budget_defaults, "ss_plan_make");
     std::vector<double> ben;
     if (benefit) ben.assign(benefit, benefit + n_benefit);
     *out = new ss_plan{ss::plan_make(d->d, bb, ben), d};
@@ -156,7 +183,7 @@ ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benef
 ss_status ss_plan_from_tiers(const ss_desc* d, const ss_budget* b, const uint8_t* tiers, size_t n, ss_plan** out) {
   return guard([&] {
     need(d && b && tiers && out, "ss_plan_from_tiers: null argument");
-    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_from_tiers");
+    ss_budget bb = versioned(b, budget_defaults, "ss_plan_from_tiers");
     *out = new ss_plan{ss::plan_from_tiers(d->d, bb, std::vector<uint8_t>(tiers, tiers + n)), d};
   });
 }
@@ -165,7 +192,7 @@ ss_status ss_plan_from_json(const ss_desc* d, const ss_budget* b, const char* pl
   return guard([&] {
     need(d && b && plan_json && out, "ss_plan_from_json: null argument");
     auto t = ss::tiers_from_json(d->d, ss::json_parse(std::string(plan_json, len)));
-    ss_budget bb = versioned(b, ss_budget_defaults, "ss_plan_from_json");
+    ss_budget bb = versioned(b, budget_defaults, "ss_plan_from_json");
     *out = new ss_plan{ss::plan_from_tiers(d->d, bb, t), d};
   });
 }
@@ -201,29 +228,14 @@ ss_status ss_plan_to_json(const ss_plan* p, char** out_json, size_t* out_len) {
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
 
-void ss_options_defaults(ss_options* o) {
-  if (!o) return;
-  std::memset(o, 0, sizeof *o);
-  o->struct_size = uint32_t(sizeof *o);
-  o->backend = SS_BACKEND_CPU;
-  o->policy = SS_POLICY_LRU;
-  o->lookahead_budget = 2;
-  o->reader_threads = 2;
-  o->staging_buffers = 4;
-  o->staging_bytes = uint64_t(256) << 20;
-  o->copy_piece_bytes = uint64_t(64) << 20;
-  o->fill_residents = 1;
-  o->score_window = 16;
-  o->pin_planned = 1;
-  o->direct_io = 1;
-}
+void ss_options_defaults_sized(ss_options* o, uint32_t size) { sized_defaults(o, size, options_defaults); }
 
 ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan, const ss_options* opt, ss_ctx** out) {
   return guard([&] {
     need(d && budget && out, "ss_open: null argument");
     need(!plan || plan->desc == d, "ss_open: plan was made from another descriptor");
-    ss_options o = versioned(opt, ss_options_defaults, "ss_open options");
-    ss_budget bb = versioned(budget, ss_budget_defaults, "ss_open budget");
+    ss_options o = versioned(opt, options_defaults, "ss_open options");
+    ss_budget bb = versioned(budget, budget_defaults, "ss_open budget");
     need(!plan || ss::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
     ss::Plan p = plan ? plan->p : ss::plan_make(d->d, bb, {});
     *out = new ss_ctx{std::make_unique<ss::Ctx>(d->d, bb, p, o)};

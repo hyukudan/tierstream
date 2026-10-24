@@ -321,6 +321,8 @@ TEST(one_stream_per_forward_and_seed_rollback) {
   r.o.pin_planned = 0;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
+  int32_t mixed[2] = {2, 99};  // an invalid id: the whole call is refused before anything is placed
+  CHECK_EQ(int(ss_seed(r.c, 1, mixed, 2)), int(SS_E_INVALID));
   int32_t seed[2] = {2, 3};  // unit 3's hash is wrong: its seed is rolled back
   CHECK_EQ(int(ss_seed(r.c, 1, seed, 2)), int(SS_E_HASH));
   void* s1 = reinterpret_cast<void*>(uintptr_t(0x1000));

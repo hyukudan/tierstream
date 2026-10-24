@@ -181,6 +181,9 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
   if (!r.c) return;
   std::mt19937 g(77 + int(policy) * 3 + spec_persistent);
   std::vector<int32_t*> ids_dev_list;
+  int32_t* ids_pinned = nullptr;  // one pinned slice per device-route call, never reused before the final sync
+  CU(cudaHostAlloc(&ids_pinned, 40 * 3 * 64 * sizeof(int32_t), cudaHostAllocDefault));
+  int ids_used = 0;
   for (int step = 0; step < 40; ++step) {
     CHECK_OK(ss_begin(r.c, nullptr, 0));
     for (int L : {1, 2, 4}) {
@@ -198,8 +201,10 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
         int32_t* ids_dev = nullptr;
         CU(cudaMalloc(&ids_dev, ids.size() * sizeof(int32_t)));
         ids_dev_list.push_back(ids_dev);
-        CU(cudaMemcpyAsync(ids_dev, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, gpu.s));
-        CU(cudaStreamSynchronize(gpu.s));  // ids is a pageable temporary
+        std::memcpy(ids_pinned + ids_used, ids.data(), ids.size() * sizeof(int32_t));
+        CU(cudaMemcpyAsync(ids_dev, ids_pinned + ids_used, ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+                           gpu.s));
+        ids_used += 64;
         CHECK_OK(ss_layer_routes_dev(r.c, L, ids_dev, int(ids.size()), gpu.s));
         CHECK_OK(ss_acquire(r.c, L, gpu.s, &v));
         gpu.check(v, fx, L, list);
@@ -228,6 +233,7 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
   }
   gpu.verify();
   for (int32_t* p : ids_dev_list) cudaFree(p);
+  cudaFreeHost(ids_pinned);
   ss_layer_stats t;
   CHECK_OK(ss_stats_total(r.c, &t));
   CHECK(t.hits > 0 && t.bytes_disk > 0 && t.bytes_pinned > 0);
@@ -306,6 +312,7 @@ TEST(cuda_read_failure_reported_and_recovered) {
   r.o.backend = SS_BACKEND_CUDA;
   r.o.verify_hash = 1;
   r.o.pin_planned = 0;
+  r.o.staging_bytes = 64 * 1024;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
   // A seed whose read fails is rolled back.

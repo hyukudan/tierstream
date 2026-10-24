@@ -119,8 +119,18 @@ def main():
                 want = {key: ("R" if key in res else {"pinned": "P", "disk": "D", "pair": "X"}[theirs.tiers[key]])
                         for key in mine}
                 diff = [key for key in mine if mine[key] != want[key]]
+                # Pinned bytes: vramplan bills unit bytes; strix-stream bills the 4 KiB strides its pinned tier
+                # allocates. Compare after converting vramplan's pinned units to 4 KiB strides.
+                strides = {}
+                for l in desc["layers"]:
+                    n = l.get("n_units", 1 if l["kind"] == "blob" else 0)
+                    ub = sum(p["bytes"] for p in l["parts"]) if n else 0
+                    for u in range(n):
+                        strides[f"L{l['index']}.U{u}"] = (ub + 4095) // 4096 * 4096
+                want_pinned = sum(strides[k] for k, t in theirs.tiers.items() if t == "pinned")
                 same_tot = (ours["resident_bytes"] == theirs.resident_bytes and ours["ring_bytes"] == theirs.stream_bytes
-                            and ours["disk_bytes"] == theirs.disk_bytes and ours["peak_bytes"] == theirs.peak_bytes)
+                            and ours["disk_bytes"] == theirs.disk_bytes and ours["peak_bytes"] == theirs.peak_bytes
+                            and ours["pinned_bytes"] == want_pinned)
                 if diff or not same_tot:
                     bad += 1
                     print(f"MISMATCH {tag}: {len(diff)} units differ (first {diff[:3]}); totals ours "

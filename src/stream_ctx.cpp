@@ -580,30 +580,44 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
   require(!in_forward_ && !fwd_open_, SS_E_INVALID, "seed: only between forwards");
   LayerState& s = L_[size_t(layer)];
   require(s.rs != nullptr, SS_E_INVALID, "seed: layer has no units");
+  require(n >= 0 && (units || n == 0), SS_E_INVALID, "seed: bad unit list");
+  for (int i = 0; i < n; ++i)  // the whole list is valid before anything is placed
+    require(units[i] >= 0 && units[i] < d_.layers[size_t(layer)].n_units, SS_E_INVALID, "seed: unit out of range");
   std::vector<JobPtr> jobs;
-  for (int i = 0; i < n; ++i) {
-    int u = units[i];
-    require(u >= 0 && u < d_.layers[size_t(layer)].n_units, SS_E_INVALID, "seed: unit out of range");
-    if (s.rs->slot(u) >= 0 || plan_.tier[size_t(gidx(layer, u))] == SS_TIER_PAIR) continue;
-    int slot = s.rs->place(u, false);
-    if (slot < 0) break;  // no free slot left: seeds never evict
-    JobPtr j = make_job(layer, u, at(s.pool, uint64_t(slot) * d_.unit_stride(layer)), false);
-    jobs.push_back(j);
-    submit(j);
-  }
-  // A seed whose read failed is not resident (it would be a hit on garbage): drop it, then report the first error.
+  std::vector<int32_t> placed;
   ss_status failed = SS_OK;
   std::string err;
-  for (const JobPtr& j : jobs) {
-    wait_job_quiet(*j);
-    if (j->state.load() != Job::Done) {
-      s.rs->drop(j->unit);
-      if (failed == SS_OK) {
-        failed = j->err_status;
-        err = j->err;
-      }
+  try {
+    for (int i = 0; i < n; ++i) {
+      int u = units[i];
+      if (s.rs->slot(u) >= 0 || plan_.tier[size_t(gidx(layer, u))] == SS_TIER_PAIR) continue;
+      int slot = s.rs->place(u, false);
+      if (slot < 0) break;  // no free slot left: seeds never evict
+      placed.push_back(u);
+      JobPtr j = make_job(layer, u, at(s.pool, uint64_t(slot) * d_.unit_stride(layer)), false);
+      jobs.push_back(j);
+      submit(j);
     }
+  } catch (const Error& e) {
+    failed = e.status();
+    err = e.what();
   }
+  // A placed seed without a finished read (never submitted, or failed) must not stay resident.
+  for (int32_t u : placed) {
+    bool ok = false;
+    for (const JobPtr& j : jobs)
+      if (j->unit == u) {
+        wait_job_quiet(*j);
+        ok = j->state.load() == Job::Done;
+      }
+    if (!ok) s.rs->drop(u);
+  }
+  // Report the first failed read (its unit was dropped above: it would be a hit on garbage).
+  for (const JobPtr& j : jobs)
+    if (j->state.load() != Job::Done && failed == SS_OK) {
+      failed = j->err_status;
+      err = j->err;
+    }
   for (const JobPtr& j : jobs)
     if (j->done_ev) ev_pool_.push_back(j->done_ev);
   be_->stream_sync(nullptr);

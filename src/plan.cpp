@@ -134,7 +134,8 @@ void finalize(const Desc& d, const ss_budget& b, Plan& p) {
                    d.unit_stride(int(L));
   }
   p.pinned = pinned_layout(d, p.tier).total;
-  for (const auto& n : d.host_fixed) p.pinned += n.bytes;
+  for (const auto& n : d.host_fixed) p.pinned += n.bytes;  // sum validated not to overflow (desc_validate)
+  require(p.pinned >= pinned_layout(d, p.tier).total, SS_E_INVALID, "plan: host byte total overflows");
   p.rings = rings_for(d, b, streamed);
   p.ring = ring_bytes(p.rings);
   require(p.pinned <= b.host_pinned_bytes, SS_E_CAPACITY,

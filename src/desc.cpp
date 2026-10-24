@@ -314,7 +314,8 @@ void desc_validate(Desc& d) {
   {
     uint64_t t = 0;
     for (const auto& n : d.fixed_device) t = add_checked(t, n.bytes, "desc.fixed_device");
-    for (const auto& n : d.host_fixed) add_checked(0, n.bytes, "desc.host_fixed");
+    uint64_t h = 0;
+    for (const auto& n : d.host_fixed) h = add_checked(h, n.bytes, "desc.host_fixed");
     for (size_t L = 0; L < d.layers.size(); ++L) {
       t = add_checked(t, d.layers[L].fixed_bytes, at("desc.layers", L) + ".fixed_bytes");
       if (!d.layers[L].streamable)

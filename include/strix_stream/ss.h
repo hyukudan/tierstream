@@ -18,9 +18,10 @@
  *     a graph host node. Capture only the work between ss_acquire and ss_release, and pass tables by pointer
  *     indirection the graph reads at run time (table_dev changes between forwards).
  *
- * Versioning: ss_budget and ss_options start with struct_size. Fill them with ss_*_defaults (which sets
- * struct_size = sizeof); the library reads only struct_size bytes and defaults the rest, so a caller built against
- * an older header keeps working when fields are appended.
+ * Versioning: ss_budget and ss_options start with struct_size. ss_budget_defaults / ss_options_defaults are inline
+ * wrappers that pass the caller's sizeof to the library, which writes only that many bytes; every call that takes the
+ * struct reads min(struct_size, its own size) bytes and defaults the rest. Fields are only ever appended, so callers
+ * built against an older or newer header keep working.
  *
  * Exactness: the library never changes bytes. A unit's bytes on the device are identical whether it is resident,
  * landed from the pinned tier or read from a file. Which slot holds a unit, and when it landed, is visible to the
@@ -117,7 +118,9 @@ typedef struct ss_budget {
 
 typedef struct ss_plan ss_plan;
 
-SS_API void ss_budget_defaults(ss_budget* b);
+/* Writes the defaults into the first `size` bytes of *b (struct_size = size). Use the inline ss_budget_defaults. */
+SS_API void ss_budget_defaults_sized(ss_budget* b, uint32_t size);
+static inline void ss_budget_defaults(ss_budget* b) { ss_budget_defaults_sized(b, (uint32_t)sizeof *b); }
 /* benefit: optional per-unit benefit (global unit order, see ss_desc_unit_index), NULL = descriptor benefit. */
 SS_API ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benefit, size_t n_benefit,
                               ss_plan** out);
@@ -177,7 +180,8 @@ typedef struct ss_options {
 
 typedef struct ss_ctx ss_ctx;
 
-SS_API void ss_options_defaults(ss_options* o);
+SS_API void ss_options_defaults_sized(ss_options* o, uint32_t size);
+static inline void ss_options_defaults(ss_options* o) { ss_options_defaults_sized(o, (uint32_t)sizeof *o); }
 /* Opens the sources named by the descriptor, allocates the resident pool, ring and pinned tier per the plan, fills
  * residents and the pinned tier. plan may be NULL (made from budget with descriptor benefits); a given plan must have
  * been made with this budget (SS_E_INVALID otherwise). The placement is fixed for the context's lifetime: a new
