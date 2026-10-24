@@ -309,6 +309,9 @@ TEST(readahead_partial_and_hash_fallback) {
   CHECK_EQ(stat_u64(s, "failed"), uint64_t(2));
   CHECK_EQ(stat_u64(s, "fallback"), uint64_t(2));
   CHECK_EQ(stat_u64(s, "bytes"), uint64_t(3000 + 11000));
+  // The next forward after the hash-failure fallback works, read-ahead included.
+  layer_major(r, fx, 2);
+  CHECK(stat_u64(stats(r.c), "landed") > 0);
 }
 
 // File bytes: a read whose hash fails still read its bytes (counted once), and its ordinary fallback counts its own.
