@@ -1321,6 +1321,14 @@ void Ctx::test_hold_readers(bool hold) {
   q_cv_.notify_all();
 }
 
+void Ctx::test_fill_free_blocks(int byte) {
+  require(excl_ && !in_forward_, SS_E_INVALID, "test_fill_free_blocks: exclusive mode, between forwards");
+  for (size_t k = 0; k < free_blocks_.size(); ++k)
+    for (void* b : free_blocks_[k]) std::memset(b, byte, size_t(block_bytes_[k]));
+}
+
+void Ctx::test_sync_copy() { be_->stream_sync(nullptr); }
+
 void Ctx::test_gate_writeback(void* ev) {
   require(excl_ && !be_->unified(), SS_E_INVALID, "test_gate_writeback: exclusive mode on a discrete device only");
   be_->stream_wait(wb_stream_, ev);

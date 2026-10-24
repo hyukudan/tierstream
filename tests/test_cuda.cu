@@ -25,6 +25,8 @@ using sstest::Fixture;
 extern "C" ss_status ss_test_check_exclusive(ss_ctx* c);
 extern "C" ss_status ss_test_gate_writeback(ss_ctx* c, void* event);
 extern "C" ss_status ss_test_hold_readers(ss_ctx* c, int hold);
+extern "C" ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte);
+extern "C" ss_status ss_test_sync_copy(ss_ctx* c);
 
 namespace {
 
@@ -371,6 +373,10 @@ void exclusive_same_forward(const char* name, uint32_t spares) {
 // evicts 0 into the only spare; the routes {0, 7}: no block left, both deferred to the ring; 0's copy out of its block
 // is issued at once on the copy stream and nothing but its source wait orders it after 0's write-back. Without that
 // wait it copies the spare block's stale bytes (the mutation build SS_MUTATION_NO_SRC_WAIT must fail this case).
+// The spare is filled with 0xEE first (stale bytes whose checksum differs from unit 0's). After the routes the host
+// waits for the copy stream while the write-back stream is still gated (~200 ms spin): with the source wait the copy
+// stream cannot finish before the gate (the sync outlasts it); without it, 0's copy completes while the gate is
+// still pending, which the test reports ("copy finished while gated") before the checksum fails on (2, 0).
 TEST(cuda_exclusive_source_wait_only) {
   Fixture fx("cuda-x-src");
   Gpu gpu;
@@ -389,13 +395,15 @@ TEST(cuda_exclusive_source_wait_only) {
   r.o.backend = SS_BACKEND_CUDA;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;  // a few MiB pinned in all
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
+  CHECK_OK(ss_test_fill_free_blocks(r.c, 0xEE));
   cudaStream_t gate_s = nullptr;
   cudaEvent_t gate = nullptr;
   CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
   CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
-  spin<<<1, 1, 0, gate_s>>>(40000000);  // ~20 ms
+  spin<<<1, 1, 0, gate_s>>>(400000000);  // ~200 ms
   CU(cudaEventRecord(gate, gate_s));
   CHECK_OK(ss_test_gate_writeback(r.c, gate));
   CHECK_OK(ss_test_hold_readers(r.c, 1));
@@ -407,10 +415,13 @@ TEST(cuda_exclusive_source_wait_only) {
   ss_exclusive_stats x{};
   CHECK_OK(ss_stats_exclusive(r.c, &x));
   CHECK(cudaEventQuery(gate) == cudaErrorNotReady);  // 0's copy was issued while its write-back was still gated
+  CHECK_OK(ss_test_sync_copy(r.c));  // the copy stream holds only 0's copy (readers held)
+  const bool done_while_gated = cudaEventQuery(gate) == cudaErrorNotReady;
+  std::printf("  copy finished while gated: %s\n", done_while_gated ? "yes (no source wait)" : "no (it waited)");
   CHECK_OK(ss_test_hold_readers(r.c, 0));
   ss_layer_view v{};
   CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
-  gpu.check(v, fx, 2, {0, 6, 7}, false);
+  gpu.check(v, fx, 2, {0, 7}, false);
   CHECK_OK(ss_release(r.c, 2, gpu.s));
   CHECK_OK(ss_end(r.c));
   CHECK_OK(ss_test_check_exclusive(r.c));

@@ -416,6 +416,14 @@ ss_status ss_test_check_exclusive(ss_ctx* c) {
   });
 }
 
+// Test hooks (CUDA test): known bytes in every free block; host-wait the library's copy stream.
+ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte) {
+  return ctx_guard(c, [&] { c->c->test_fill_free_blocks(byte); });
+}
+ss_status ss_test_sync_copy(ss_ctx* c) {
+  return ctx_guard(c, [&] { c->c->test_sync_copy(); });
+}
+
 // Test hook (CUDA test): reader threads take no job while held.
 ss_status ss_test_hold_readers(ss_ctx* c, int hold) {
   return ctx_guard(c, [&] { c->c->test_hold_readers(hold != 0); });

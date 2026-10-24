@@ -77,6 +77,9 @@ class Ctx {
   void test_gate_writeback(void* ev);
   // Tests: reader threads take no job while held (queued file reads wait; pinned copies are issued at submission).
   void test_hold_readers(bool hold);
+  // Tests: fill every free pinned block with `byte` (known stale bytes); host-wait the copy stream.
+  void test_fill_free_blocks(int byte);
+  void test_sync_copy();
 
  private:
   enum Loc : int8_t { None = 0, Persistent = 1, Ring = 2 };
