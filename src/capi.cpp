@@ -249,11 +249,41 @@ int ss_source_direct(const ss_ctx* c, int source) {
   return c->c->source_direct(source) ? 1 : 0;
 }
 
-#define CTX_CALL(expr)                              \
-  return guard([&] {                                \
-    need(c != nullptr, "null context");             \
-    c->c->expr;                                     \
-  })
+// Context calls: a poisoned context refuses everything; an allocation failure or a non-library exception poisons it
+// (library errors - bad arguments, IO, hash, capacity - leave the context consistent and usable).
+extern "C++" {
+template <class F>
+ss_status ctx_guard(ss_ctx* c, F&& f) {
+  if (!c) {
+    g_err = "null context";
+    return SS_E_INVALID;
+  }
+  if (c->c->poisoned()) {
+    g_err = "context poisoned by an earlier out-of-memory or internal failure: close it";
+    return SS_E_BACKEND;
+  }
+  try {
+    f();
+    return SS_OK;
+  } catch (const ss::Error& e) {
+    // A device or allocation error mid-call may leave half-updated bookkeeping (and CUDA errors are sticky).
+    if (e.status() == SS_E_BACKEND || e.status() == SS_E_NOMEM) c->c->poison();
+    g_err = e.what();
+    return e.status();
+  } catch (const std::bad_alloc&) {
+    c->c->poison();
+    g_err = "out of host memory (context poisoned)";
+    return SS_E_NOMEM;
+  } catch (const std::exception& e) {
+    c->c->poison();
+    g_err = e.what();
+    return SS_E_BACKEND;
+  }
+}
+
+}  // extern "C++"
+
+#define CTX_CALL(expr) return ctx_guard(c, [&] { c->c->expr; })
 
 ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n) { CTX_CALL(seed(layer, units, n)); }
 ss_status ss_begin(ss_ctx* c, const uint32_t* rows, int n_layers) { CTX_CALL(begin(rows, n_layers)); }
@@ -267,14 +297,14 @@ ss_status ss_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n, ss_prefet
 }
 ss_status ss_prefetch_layer(ss_ctx* c, int layer) { CTX_CALL(prefetch_layer(layer)); }
 ss_status ss_acquire(ss_ctx* c, int layer, void* s, ss_layer_view* out) {
-  return guard([&] {
-    need(c && out, "ss_acquire: null argument");
+  return ctx_guard(c, [&] {
+    need(out != nullptr, "ss_acquire: null view");
     c->c->acquire(layer, s, true, out);
   });
 }
 ss_status ss_acquire_groups(ss_ctx* c, int layer, void* s, ss_layer_view* out) {
-  return guard([&] {
-    need(c && out, "ss_acquire_groups: null argument");
+  return ctx_guard(c, [&] {
+    need(out != nullptr, "ss_acquire_groups: null view");
     c->c->acquire(layer, s, false, out);
   });
 }

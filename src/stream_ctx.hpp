@@ -60,6 +60,10 @@ class Ctx {
   void stats_reset();
   void set_hook(ss_stats_hook h, void* user) { hook_ = h; hook_user_ = user; }
   int n_layers() const { return int(d_.layers.size()); }
+  // After an allocation failure or an unexpected exception inside a call, the context's bookkeeping may be
+  // half-updated (a unit admitted without its read, a job nobody owns): it refuses every further call but close.
+  void poison() noexcept { poisoned_ = true; }
+  bool poisoned() const { return poisoned_; }
   bool source_direct(int i) const { return files_[size_t(i)]->direct(); }
   int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
@@ -164,6 +168,7 @@ class Ctx {
 
   void* fwd_stream_ = nullptr;
   bool fwd_stream_set_ = false;
+  bool poisoned_ = false;
   bool in_forward_ = false;
   bool fwd_open_ = false;  // per-forward state reset (prefetch may open the next forward before ss_begin)
   uint64_t forward_ = 0;

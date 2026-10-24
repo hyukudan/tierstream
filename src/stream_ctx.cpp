@@ -528,12 +528,12 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
 void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec) {
   LayerState& s = L_[size_t(layer)];
   JobPtr j = make_job(layer, unit, at(s.pool, uint64_t(slot) * d_.unit_stride(layer)), spec);
+  fwd_jobs_.push_back(j);  // tracked before anything points at it (end() drains and rolls back what it tracks)
   s.loc[size_t(unit)] = Persistent;
   s.slot[size_t(unit)] = slot;
   s.job[size_t(unit)] = j;
   (j->from_pinned ? fwd_stats_[size_t(layer)].bytes_pinned : fwd_stats_[size_t(layer)].bytes_disk) +=
       d_.layers[size_t(layer)].unit_bytes;
-  fwd_jobs_.push_back(j);
   submit(j);
 }
 
@@ -548,6 +548,7 @@ bool Ctx::fetch_into_ring(int layer, int unit, bool spec) {
     rc->cursor = (i - rc->first + 1) % rc->count;
     LayerState& s = L_[size_t(layer)];
     JobPtr j = make_job(layer, unit, ring_[i].dev, spec);
+    fwd_jobs_.push_back(j);
     // The slot's previous reader is the layer that released it last (its latest record is at or after that use).
     j->dst_release_ev = ring_owner_ev_[i];
     ring_[i].owner = layer;
@@ -557,7 +558,6 @@ bool Ctx::fetch_into_ring(int layer, int unit, bool spec) {
     s.job[size_t(unit)] = j;
     (j->from_pinned ? fwd_stats_[size_t(layer)].bytes_pinned : fwd_stats_[size_t(layer)].bytes_disk) +=
         d_.layers[size_t(layer)].unit_bytes;
-    fwd_jobs_.push_back(j);
     submit(j);
     return true;
   }
@@ -680,7 +680,7 @@ void Ctx::seed(int layer, const int32_t* units, int n) {
   } catch (const Error& e) {
     if (failed == SS_OK) {
       failed = e.status();
-      err = e.what();
+      keep_message(err, e.what());
     }
   }
   if (failed != SS_OK) fail(failed, err);

@@ -23,6 +23,11 @@
  * struct reads min(struct_size, its own size) bytes and defaults the rest. Fields are only ever appended, so callers
  * built against an older or newer header keep working.
  *
+ * Failures: a library error (SS_E_INVALID, SS_E_IO, SS_E_HASH, SS_E_CAPACITY) leaves the context consistent: a failed
+ * read is reported at ss_acquire / ss_end and the unit is read again at its next use. An out-of-memory, device
+ * (SS_E_BACKEND / SS_E_NOMEM) or internal failure inside a context call poisons the context: every later call except
+ * ss_close returns an error.
+ *
  * Exactness: the library never changes bytes. A unit's bytes on the device are identical whether it is resident,
  * landed from the pinned tier or read from a file. Which slot holds a unit, and when it landed, is visible to the
  * engine only through the pointer table; kernels must give the same bits whatever the table says (design.md §4).
