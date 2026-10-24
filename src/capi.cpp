@@ -426,6 +426,7 @@ ss_status ss_host_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n) {
 ss_status ss_host_prefetch_layer(ss_ctx* c, int layer) {
   return ctx_guard(c, [&] {
     need(layer >= 0 && layer < c->c->n_layers(), "ss_host_prefetch_layer: layer out of range");
+    if (!c->c->ra_enabled()) return;  // read-ahead off: a no-op that allocates nothing
     std::vector<int32_t> ids(size_t(c->c->layer_units(layer)));
     for (size_t u = 0; u < ids.size(); ++u) ids[u] = int32_t(u);
     c->c->host_prefetch(layer, ids.data(), int(ids.size()));
@@ -439,6 +440,12 @@ ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte) {
 ss_status ss_test_sync_copy(ss_ctx* c) {
   return ctx_guard(c, [&] { c->c->test_sync_copy(); });
 }
+
+// Test hooks: wait until this forward's read-ahead reads ended; reads handed to the readers since open.
+ss_status ss_test_ra_quiesce(ss_ctx* c) {
+  return ctx_guard(c, [&] { c->c->test_ra_quiesce(); });
+}
+uint64_t ss_test_ra_started(ss_ctx* c) { return c ? c->c->ra_started() : 0; }
 
 // Test hook: one-shot read-ahead fault injection (Ctx::test_inject).
 ss_status ss_test_inject(ss_ctx* c, int what) {

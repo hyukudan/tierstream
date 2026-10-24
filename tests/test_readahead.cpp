@@ -1,11 +1,9 @@
 // Host read-ahead (wave4/gapfix/wstream-readahead/design.md §7-11) on the CPU backend: byte identity against
 // readahead_units = 0, both completion / landing orders, failures with and without a waiting landing, cancellation,
 // shutdown without ss_end, deduplication, one reader, ABI and the R = 0 boundary.
-#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "check.hpp"
@@ -17,6 +15,8 @@ using sstest::Fixture;
 // Test hooks (capi.cpp, not in ss.h).
 extern "C" ss_status ss_test_hold_readers(ss_ctx* c, int hold);
 extern "C" ss_status ss_test_inject(ss_ctx* c, int what);
+extern "C" ss_status ss_test_ra_quiesce(ss_ctx* c);
+extern "C" uint64_t ss_test_ra_started(ss_ctx* c);
 
 namespace {
 
@@ -105,7 +105,6 @@ uint64_t disk_bytes(ss_ctx* c) {
   return t.bytes_disk;
 }
 
-void wait_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 }  // namespace
 
@@ -157,7 +156,7 @@ TEST(readahead_landing_orders) {
   // (b) Landing after the read finished (Ready).
   CHECK_OK(ss_begin(r.c, nullptr, 0));
   CHECK_OK(ss_host_prefetch_layer(r.c, 3));
-  wait_ms(200);
+  CHECK_OK(ss_test_ra_quiesce(r.c));
   CHECK_OK(ss_layer_all(r.c, 3));
   CHECK_OK(ss_acquire(r.c, 3, nullptr, &v));
   CHECK(same(v, fx, 3, 0));
@@ -196,7 +195,7 @@ TEST(readahead_failures) {
   CHECK_OK(ss_begin(q.c, nullptr, 0));
   CHECK_OK(ss_test_inject(q.c, 5));
   CHECK_OK(ss_host_prefetch_layer(q.c, 3));
-  wait_ms(200);
+  CHECK_OK(ss_test_ra_quiesce(q.c));
   CHECK_OK(ss_layer_all(q.c, 3));
   CHECK_OK(ss_acquire(q.c, 3, nullptr, &v));
   CHECK(same(v, fx, 3, 0));
@@ -217,7 +216,7 @@ TEST(readahead_failures) {
   // Landing copy fails before any copy: reported, the buffer comes back (4 buffers still serve 4 reads).
   CHECK_OK(ss_begin(q.c, nullptr, 0));
   CHECK_OK(ss_host_prefetch_layer(q.c, 3));
-  wait_ms(200);
+  CHECK_OK(ss_test_ra_quiesce(q.c));
   CHECK_OK(ss_test_inject(q.c, 3));
   CHECK_OK(ss_layer_all(q.c, 3));
   CHECK_EQ(int(ss_acquire(q.c, 3, nullptr, &v)), int(SS_E_IO));
@@ -225,22 +224,83 @@ TEST(readahead_failures) {
   // Landing copy fails after its first piece: that buffer is quarantined; the others keep working.
   CHECK_OK(ss_begin(q.c, nullptr, 0));
   CHECK_OK(ss_host_prefetch_layer(q.c, 3));
-  wait_ms(200);
+  CHECK_OK(ss_test_ra_quiesce(q.c));
   CHECK_OK(ss_test_inject(q.c, 4));
   CHECK_OK(ss_layer_all(q.c, 3));
   CHECK_EQ(int(ss_acquire(q.c, 3, nullptr, &v)), int(SS_E_IO));
   CHECK(ss_end(q.c) != SS_OK);
   for (int pass = 0; pass < 2; ++pass) layer_major(q, fx, 3);  // 3 buffers left
-  // Queueing a landing fails (injected, Ready): the fetch falls back to the file.
-  CHECK_OK(ss_begin(q.c, nullptr, 0));
-  CHECK_OK(ss_host_prefetch_layer(q.c, 3));
-  wait_ms(200);
-  CHECK_OK(ss_test_inject(q.c, 2));
-  CHECK_OK(ss_layer_all(q.c, 3));
-  CHECK_OK(ss_acquire(q.c, 3, nullptr, &v));
-  CHECK(same(v, fx, 3, 0));
-  CHECK_OK(ss_release(q.c, 3, nullptr));
-  CHECK_OK(ss_end(q.c));
+}
+
+// Queueing a landing fails (injected), in both orders: the landing fails terminally with SS_E_NOMEM (it poisons the
+// context, per the context-call rule), and the poisoned context closes with its buffers back (ASan: no leak).
+TEST(readahead_landing_enqueue_failure_both_orders) {
+  for (int order = 0; order < 2; ++order) {
+    Fixture fx(order ? "ra-enq-reading" : "ra-enq-ready");
+    Run r;
+    if (!open_run(r, fx, 4, 16)) return;
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    if (order == 0) {  // the read is Ready when the slot is given
+      CHECK_OK(ss_host_prefetch_layer(r.c, 3));
+      CHECK_OK(ss_test_ra_quiesce(r.c));
+      CHECK_OK(ss_test_inject(r.c, 2));
+      CHECK_OK(ss_layer_all(r.c, 3));
+    } else {  // the read is still queued: the landing is parked, the read's epilogue queues it
+      CHECK_OK(ss_test_hold_readers(r.c, 1));
+      CHECK_OK(ss_host_prefetch_layer(r.c, 3));
+      CHECK_OK(ss_layer_all(r.c, 3));
+      CHECK_OK(ss_test_inject(r.c, 2));
+      CHECK_OK(ss_test_hold_readers(r.c, 0));
+    }
+    ss_layer_view v{};
+    CHECK_EQ(int(ss_acquire(r.c, 3, nullptr, &v)), int(SS_E_NOMEM));
+    CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));  // poisoned: only close works
+  }
+}
+
+// The MiniMax prefill pattern: a full ring (layer 1 holds all 16 slots of its size) and the next layer queued by a
+// certain whole-layer prefetch (k = 1) or ss_layer_all: its units wait for slots, and their reads start at once.
+TEST(readahead_k1_full_ring_starts_reads) {
+  for (int how = 0; how < 2; ++how) {
+    Fixture fx(how ? "ra-k1-all" : "ra-k1-pf");
+    Run r;
+    if (!open_run(r, fx, 4, 16)) return;
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    CHECK_OK(ss_layer_all(r.c, 1));
+    ss_layer_view v{};
+    CHECK_OK(ss_acquire(r.c, 1, nullptr, &v));
+    const uint64_t before = ss_test_ra_started(r.c);
+    if (how == 0) CHECK_OK(ss_prefetch_layer(r.c, 4));
+    else CHECK_OK(ss_layer_all(r.c, 4));
+    CHECK_EQ(ss_test_ra_started(r.c) - before, uint64_t(4));  // one read per buffer, before layer 1 releases
+    CHECK_OK(ss_release(r.c, 1, nullptr));
+    if (how == 0) CHECK_OK(ss_layer_all(r.c, 4));
+    CHECK_OK(ss_acquire(r.c, 4, nullptr, &v));
+    for (int u = 0; u < Fixture::kE1; ++u) CHECK(same(v, fx, 4, u));
+    CHECK_OK(ss_release(r.c, 4, nullptr));
+    CHECK_OK(ss_end(r.c));
+    CHECK(stat_u64(stats(r.c), "landed") >= 4);
+  }
+}
+
+// File bytes: a read whose hash fails still read its bytes (counted once), and its ordinary fallback counts its own.
+TEST(readahead_byte_accounting) {
+  Fixture bad("ra-bytes", /*corrupt_hash=*/true);
+  Run r;
+  if (!open_run(r, bad, 4, 16)) return;
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t three[1] = {3};
+  CHECK_OK(ss_host_prefetch(r.c, 1, three, 1));
+  CHECK_OK(ss_test_ra_quiesce(r.c));  // the read failed its hash
+  CHECK_OK(ss_layer_routes(r.c, 1, three, 1));  // fallback: an ordinary read, which fails its hash too
+  ss_layer_view v{};
+  CHECK_EQ(int(ss_acquire(r.c, 1, nullptr, &v)), int(SS_E_HASH));
+  CHECK(ss_end(r.c) != SS_OK);
+  CHECK_EQ(disk_bytes(r.c), uint64_t(2 * 11000));
+  const std::string s = stats(r.c);
+  CHECK_EQ(stat_u64(s, "bytes"), uint64_t(11000));
+  CHECK_EQ(stat_u64(s, "failed"), uint64_t(1));
+  CHECK_EQ(stat_u64(s, "fallback"), uint64_t(1));
 }
 
 TEST(readahead_cancellation) {
@@ -260,7 +320,7 @@ TEST(readahead_cancellation) {
   // A landing already queued (read Ready, readers held) and cancelled before it ran.
   CHECK_OK(ss_begin(r.c, nullptr, 0));
   CHECK_OK(ss_host_prefetch_layer(r.c, 3));
-  wait_ms(200);
+  CHECK_OK(ss_test_ra_quiesce(r.c));
   CHECK_OK(ss_test_hold_readers(r.c, 1));
   CHECK_OK(ss_layer_all(r.c, 3));
   CHECK_OK(ss_acquire_groups(r.c, 3, nullptr, &v));
@@ -271,7 +331,7 @@ TEST(readahead_cancellation) {
   CHECK_OK(ss_begin(r.c, nullptr, 0));
   CHECK_OK(ss_host_prefetch_layer(r.c, 1));
   CHECK_OK(ss_host_prefetch_layer(r.c, 4));
-  wait_ms(100);
+  CHECK_OK(ss_test_ra_quiesce(r.c));
   CHECK_OK(ss_end(r.c));
   CHECK(stat_u64(stats(r.c), "unused") > 0);
   for (int pass = 0; pass < 2; ++pass) layer_major(r, fx, 2);
@@ -302,7 +362,7 @@ TEST(readahead_close_without_end) {
     if (!open_run(r, fx, 1, 16)) return;
     CHECK_OK(ss_host_prefetch_layer(r.c, 1));
     CHECK_OK(ss_host_prefetch_layer(r.c, 3));
-    wait_ms(50);
+    CHECK_OK(ss_test_ra_quiesce(r.c));
   }
   {
     Fixture fx("ra-close2");
@@ -343,7 +403,7 @@ TEST(readahead_exclusive_persistent_admission) {
   CHECK_OK(ss_begin(r.c, nullptr, 0));
   int32_t ids[2] = {5, 6};
   CHECK_OK(ss_host_prefetch(r.c, 2, ids, 2));
-  wait_ms(100);
+  CHECK_OK(ss_test_ra_quiesce(r.c));
   CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));  // both admitted (evicting residents 0, 1): their requests are abandoned
   ss_layer_view v{};
   CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));

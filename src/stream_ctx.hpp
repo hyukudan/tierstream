@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +44,7 @@ struct Job {
   bool ra_producer = false;
   bool ra_child = false;
   bool issued_piece = false;          // child: at least one copy out of the buffer was issued
+  uint64_t bytes_read = 0;            // producer: file bytes it read (also when its hash check then failed)
   int8_t ran_as = AsDemand;           // the queue a worker took it from (its running counter)
   std::shared_ptr<RaEntry> ra;        // keeps the entry alive through the worker's last access
 };
@@ -104,6 +106,10 @@ class Ctx {
   // Tests: one-shot read-ahead fault injection (1 = queueing a read throws, 2 = queueing a landing throws,
   // 3 = the next landing copy fails before any copy, 4 = it fails after its first piece, 5 = the next read fails).
   void test_inject(int what) { test_inject_.store(what); }
+  // Tests: wait until every read-ahead read of this forward has ended (a deterministic Ready state).
+  void test_ra_quiesce();
+  bool ra_enabled() const { return ra_on(); }
+  uint64_t ra_started() const { return ra_started_; }
   // Tests: fill every free pinned block with `byte` (known stale bytes); host-wait the copy stream.
   void test_fill_free_blocks(int byte);
   void test_sync_copy();
@@ -191,6 +197,8 @@ class Ctx {
   void ra_child_epilogue_locked(Job& j);
   void ra_sweep_locked();
   void ra_drain_and_reconcile();
+  void ra_reconcile();
+  void ra_teardown();
   void fail_job_locked(Job& j, ss_status st, const char* msg) noexcept;
   void run_ra_child(Job& j);
   int64_t gidx(int layer, int unit) const { return d_.unit_base[size_t(layer)] + unit; }
@@ -238,7 +246,8 @@ class Ctx {
   std::mutex q_mu_;
   std::condition_variable q_cv_;
   std::condition_variable done_cv_;
-  std::deque<JobPtr> demand_q_, spec_q_, ra_q_;
+  std::deque<JobPtr> demand_q_, spec_q_;
+  std::list<JobPtr> ra_q_;           // a list: allocates nothing while read-ahead is off
   int demand_running_ = 0;
   int ra_running_ = 0;               // unattached read-ahead reads running (capped at max(1, readers - 1))
   bool stop_ = false;
@@ -250,9 +259,10 @@ class Ctx {
   std::vector<void*> ra_ev_;          // per buffer: last H2D out of it (dedicated, never pooled)
   std::vector<uint32_t> ra_free_;     // capacity reserved at open: a push never allocates
   uint64_t ra_bytes_ = 0;
-  std::deque<std::shared_ptr<RaEntry>> ra_wait_;  // engine thread: requests waiting for a buffer, in call order
+  std::list<std::shared_ptr<RaEntry>> ra_wait_;  // engine thread: requests waiting for a buffer, in call order
   std::vector<JobPtr> ra_jobs_;       // producers of this forward (auxiliary: never reported by ss_end)
   bool ra_frozen_ = false;
+  uint64_t ra_started_ = 0;           // reads handed to the readers since open (live; for tests and stats)
   struct RaStats {
     uint64_t requested = 0, read = 0, landed = 0, unused = 0, failed = 0, fallback = 0, bytes = 0;
   } ra_st_;

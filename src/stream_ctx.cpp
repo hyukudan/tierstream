@@ -202,7 +202,12 @@ void Ctx::init() {
     ra_bytes_ = ra_buffer_bytes(d_, plan_.tier);
     require(ra_bytes_ <= uint64_t(SIZE_MAX), SS_E_INVALID, "open: read-ahead buffer bytes overflow size_t");
     if (ra_bytes_) {
+      require(ra_bytes_ <= UINT64_MAX / o_.readahead_units &&
+                  ra_bytes_ * o_.readahead_units <= uint64_t(SIZE_MAX),
+              SS_E_INVALID, "open: readahead_units x buffer bytes overflow");
       ra_free_.reserve(o_.readahead_units);
+      ra_ev_.reserve(o_.readahead_units);  // reserved first: a created resource is always registered for cleanup
+      ra_host_.reserve(o_.readahead_units);
       ra_jobs_.reserve(size_t(d_.total_units));
       for (uint32_t i = 0; i < o_.readahead_units; ++i) {
         ra_ev_.push_back(be_->event_create());
@@ -261,15 +266,11 @@ void Ctx::cleanup() {
     ra_sweep_locked();
   }
   stop_workers();
-  // Workers are joined: break the entry <-> job references (a close without ss_end never reconciled them).
-  for (auto& s : L_)
-    for (auto& e : s.ra)
-      if (e) {
-        e->producer.reset();
-        e->child.reset();
-        e.reset();
-      }
-  ra_jobs_.clear();
+  // Workers are joined: reconcile what a close without ss_end left, then break the entry <-> job references.
+  if (ra_on()) {
+    ra_reconcile();
+    ra_teardown();
+  }
   if (!be_) return;
   try {
     be_->stream_sync(nullptr);
@@ -497,7 +498,8 @@ void Ctx::run_job(Job& j) {
     return;
   }
   if (j.ra_producer) {
-    be_->event_sync(ra_ev_[size_t(j.ra->buf)]);  // the buffer's last H2D out has finished
+    // The buffer's last H2D out has finished. Test-only mutation 7 (must make the CUDA test fail): skip it once.
+    if (!(test_inject_.load() == 7 && test_inject_.exchange(0) == 7)) be_->event_sync(ra_ev_[size_t(j.ra->buf)]);
     if (test_inject_.load() == 5 && test_inject_.exchange(0) == 5) fail(SS_E_IO, "read-ahead: injected read failure");
   }
   const Layer& l = d_.layers[size_t(j.layer)];
@@ -505,6 +507,7 @@ void Ctx::run_job(Job& j) {
   uint64_t digest = 0;
   if (j.host_dst) {
     read_unit_host(j.layer, j.unit, j.dst, want_hash, &digest);
+    if (j.ra_producer) j.bytes_read = l.unit_bytes;  // the file was read, whatever the hash check says
   } else if (be_->unified()) {
     be_->event_sync(j.dst_release_ev);  // the slot's previous reader is done
     be_->event_sync(j.dst_wb_ev);
@@ -681,6 +684,10 @@ int Ctx::block_class(int layer) const { return excl_ ? layer_class_[size_t(layer
 
 // ---- host read-ahead (wave4/gapfix/wstream-readahead/design.md §7-11) -------------------------------------------------
 
+void Ctx::test_ra_quiesce() {
+  for (const JobPtr& p : ra_jobs_) wait_job_quiet(*p);
+}
+
 void Ctx::fail_job_locked(Job& j, ss_status st, const char* msg) noexcept {
   j.err_status = st;
   try {
@@ -774,15 +781,23 @@ void Ctx::ra_sweep_locked() {
 // After the forward's producers and jobs ended: count each entry once, then drop the entries (a job that still holds
 // one keeps it alive).
 void Ctx::ra_drain_and_reconcile() {
+  ra_reconcile();
+  ra_teardown();
+}
+
+// Once per entry, after its producer and child ended: requests, reads, landings, and the file bytes actually read
+// (a read whose hash failed still read its bytes).
+void Ctx::ra_reconcile() {
   for (size_t L = 0; L < L_.size(); ++L) {
     for (auto& e : L_[L].ra) {
       if (!e) continue;
       ++ra_st_.requested;
       const int ps = e->producer ? e->producer->state.load() : Job::Cancelled;
+      const uint64_t b = e->producer ? e->producer->bytes_read : 0;
+      ra_st_.bytes += b;
+      fwd_stats_[L].bytes_disk += b;
       if (ps == Job::Done) {
         ++ra_st_.read;
-        ra_st_.bytes += d_.layers[L].unit_bytes;
-        fwd_stats_[L].bytes_disk += d_.layers[L].unit_bytes;
         if (e->st == RaEntry::Consumed) ++ra_st_.landed;
         else ++ra_st_.unused;
       } else if (ps == Job::Failed) {
@@ -790,6 +805,9 @@ void Ctx::ra_drain_and_reconcile() {
       }
     }
   }
+}
+
+void Ctx::ra_teardown() {
   {
     // Break the entry <-> job references (a cycle otherwise); every producer and child has ended.
     std::lock_guard<std::mutex> lk(q_mu_);
@@ -861,6 +879,7 @@ void Ctx::ra_pump() {
         if (test_inject_.load() == 1 && test_inject_.exchange(0) == 1) throw std::bad_alloc();
         ra_q_.push_back(p);
         started = true;
+        ++ra_started_;
       } catch (...) {  // never left nonterminal: the unit's fetch reads its file
         fail_job_locked(*p, SS_E_NOMEM, "read-ahead: queueing a read failed");
         ra_take_buf_locked(*e);
@@ -880,7 +899,7 @@ bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
   std::shared_ptr<RaEntry> ep = L_[size_t(layer)].ra[size_t(unit)];
   if (!ep) return false;
   RaEntry& e = *ep;
-  bool attached = false, failed_read = false;
+  bool attached = false, failed_read = false, failed_child = false;
   {
     std::lock_guard<std::mutex> lk(q_mu_);
     switch (e.st) {
@@ -897,12 +916,12 @@ bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
           e.child_queued = true;
           e.st = RaEntry::Landing;
           attached = true;
-        } catch (...) {
-          child->ra_child = false;
-          child->ra.reset();
-          e.child.reset();
+        } catch (...) {  // as in the producer's epilogue: the landing fails terminally (no timing-dependent fallback)
+          fail_job_locked(*child, SS_E_NOMEM, "read-ahead: queueing a landing failed");
           ra_take_buf_locked(e);
-          e.st = RaEntry::Abandoned;
+          e.st = RaEntry::Failed;
+          attached = true;
+          failed_child = true;
         }
         break;
       case RaEntry::Reading:
@@ -931,6 +950,7 @@ bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
     }
   }
   if (attached) q_cv_.notify_all();
+  if (failed_child) done_cv_.notify_all();
   if (failed_read) ++ra_st_.fallback;
   return attached;
 }
@@ -949,7 +969,8 @@ void Ctx::run_ra_child(Job& j) {
     return;
   }
   std::lock_guard<std::mutex> lk(copy_mu_);
-  be_->stream_wait(nullptr, j.dst_release_ev);
+  // Test-only mutation 6 (must make the CUDA test fail): skip this landing's wait for the slot's previous reader.
+  if (!(test_inject_.load() == 6 && test_inject_.exchange(0) == 6)) be_->stream_wait(nullptr, j.dst_release_ev);
   for (uint64_t off = 0; off < l.unit_bytes; off += o_.copy_piece_bytes) {
     be_->copy_h2d(at(j.dst, off), src + off, size_t(std::min<uint64_t>(o_.copy_piece_bytes, l.unit_bytes - off)),
                   nullptr);
@@ -1317,6 +1338,7 @@ void Ctx::routes_all(int layer) {
   std::vector<int32_t> ids(static_cast<size_t>(n));
   for (int u = 0; u < n; ++u) ids[size_t(u)] = u;
   ingest_routes(layer, ids.data(), n);
+  ra_pump();
 }
 
 void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {

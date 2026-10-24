@@ -27,6 +27,8 @@ extern "C" ss_status ss_test_gate_writeback(ss_ctx* c, void* event);
 extern "C" ss_status ss_test_hold_readers(ss_ctx* c, int hold);
 extern "C" ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte);
 extern "C" ss_status ss_test_sync_copy(ss_ctx* c);
+extern "C" ss_status ss_test_inject(ss_ctx* c, int what);
+extern "C" ss_status ss_test_ra_quiesce(ss_ctx* c);
 
 namespace {
 
@@ -133,22 +135,26 @@ struct Gpu {
     }
     used += n;
   }
-  void verify() {
+  // Returns the (layer, unit) of every wrong checksum; expect_clean = false for a mutation that must produce some.
+  std::vector<std::pair<int, int>> verify(bool expect_clean = true) {
     CU(cudaStreamSynchronize(s));
     std::vector<unsigned long long> got(static_cast<size_t>(used));
     CU(cudaMemcpy(got.data(), sums, size_t(used) * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    int bad = 0;
+    std::vector<std::pair<int, int>> wrong;
     for (int k = 0; k < used; ++k)
       if (got[size_t(k)] != want[size_t(k)]) {
-        if (bad++ < 10) std::printf("  check %d: layer %d unit %d: device checksum differs\n", k, who[size_t(k)].first,
-                                    who[size_t(k)].second);
+        if (wrong.size() < 10) std::printf("  check %d: layer %d unit %d: device checksum differs\n", k,
+                                           who[size_t(k)].first, who[size_t(k)].second);
+        wrong.push_back(who[size_t(k)]);
       }
+    const int bad = int(wrong.size());
     std::printf("  %d device checksums, %d wrong\n", used, bad);
-    CHECK_EQ(bad, 0);
+    if (expect_clean) CHECK_EQ(bad, 0);
     CU(cudaMemset(sums, 0, kMax * sizeof(unsigned long long)));
     want.clear();
     who.clear();
     used = 0;
+    return wrong;
   }
 };
 
@@ -301,7 +307,7 @@ TEST(cuda_decode_lru_spec_persistent_backed) { decode_variant("lru-specp-backed"
 //     ring, 0 read from the block its pending write-back fills.
 // A missing wait reads a block before it is written (stale spare bytes) or overwrites a slot before it is written
 // back: the device checksums of 0 and 5 (now and in the next forward) catch both.
-void exclusive_same_forward(const char* name, uint32_t spares) {
+void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = false) {
   Fixture fx(std::string("cuda-") + name);
   Gpu gpu;
   Run r;
@@ -314,11 +320,15 @@ void exclusive_same_forward(const char* name, uint32_t spares) {
   r.b.host_pinned_bytes = 4 << 20;
   r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
   r.b.host_spare_units = spares;
-  plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"});
+  // Read-ahead variant: units 4-7 of layer 2 come from the file, so 5 can hold a read-ahead request when its certain
+  // prefetch admits it into a persistent slot (the request is abandoned; the ordinary path keeps its waits).
+  if (readahead) plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRDDDD", "P", "PPPPPPPPPPPPPPPP"});
+  else plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"});
   ss_options_defaults(&r.o);
   r.o.backend = SS_BACKEND_CUDA;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
+  if (readahead) r.o.readahead_units = 2;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   if (!r.c) return;
   cudaStream_t gate_s = nullptr;
@@ -329,6 +339,10 @@ void exclusive_same_forward(const char* name, uint32_t spares) {
   CU(cudaEventRecord(gate, gate_s));
   CHECK_OK(ss_test_gate_writeback(r.c, gate));
   CHECK_OK(ss_begin(r.c, nullptr, 0));
+  if (readahead) {
+    int32_t ra_ids[2] = {5, 6};
+    CHECK_OK(ss_host_prefetch(r.c, 2, ra_ids, 2));
+  }
   int32_t pre[1] = {5};
   CHECK_OK(ss_prefetch(r.c, 2, pre, 1, SS_PREFETCH_CERTAIN));
   std::vector<int32_t> ids = spares == 1 ? std::vector<int32_t>{0, 6} : std::vector<int32_t>{0, 5};
@@ -482,7 +496,82 @@ TEST(cuda_readahead_layer_major_async) {
   ss_free(js);
 }
 
+// Read-ahead copy dependencies, deterministic (Sol sol-7 readahead #1). Layer 1 fills the 16-slot ring and its
+// checksums wait behind a ~200 ms spin. (a) Layer 4 unit 8 is read ahead (Ready), then routed: it lands in slot 0,
+// which still holds layer 1 unit 0 for that queued checksum (different bytes); the copy must wait the slot's release.
+// (b) With one buffer, unit 9's read reuses that buffer while unit 8's H2D out of it is still pending (it waits the
+// same release); the read must wait the buffer's event. mutation 6 skips (a)'s wait (layer 1 unit 0 must come out
+// wrong); mutation 7 skips (b)'s (layer 4 unit 8 must come out wrong); the normal run must be clean.
+std::vector<std::pair<int, int>> ra_dependency_run(int mutation, bool* landed_while_pending) {
+  Fixture fx(std::string("cuda-ra-dep-") + std::to_string(mutation));
+  Gpu gpu;
+  Run r;
+  std::vector<std::pair<int, int>> wrong;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 16;
+  r.b.host_pinned_bytes = 4 << 20;
+  plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;
+  r.o.readahead_units = 1;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return wrong;
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  CHECK_OK(ss_layer_all(r.c, 1));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 1, gpu.s, &v));
+  std::vector<int32_t> all(Fixture::kE1);
+  for (int u = 0; u < Fixture::kE1; ++u) all[size_t(u)] = u;
+  gpu.spin_cycles = 400000000;  // ~200 ms before layer 1's checksums
+  gpu.check(v, fx, 1, all);
+  gpu.spin_cycles = 2000000;
+  cudaEvent_t l1_read = nullptr;
+  CU(cudaEventCreateWithFlags(&l1_read, cudaEventDisableTiming));
+  CU(cudaEventRecord(l1_read, gpu.s));
+  CHECK_OK(ss_release(r.c, 1, gpu.s));
+  int32_t u8[1] = {8}, u9[1] = {9};
+  CHECK_OK(ss_host_prefetch(r.c, 4, u8, 1));
+  CHECK_OK(ss_test_ra_quiesce(r.c));  // unit 8 is Ready in the only buffer
+  if (mutation) CHECK_OK(ss_test_inject(r.c, mutation));
+  CHECK_OK(ss_layer_routes(r.c, 4, u8, 1));  // lands in slot 0 (ring cursor wrapped)
+  CHECK_OK(ss_acquire(r.c, 4, gpu.s, &v));   // the landing copy is issued
+  CHECK_OK(ss_host_prefetch(r.c, 4, u9, 1)); // reuses the buffer while unit 8's H2D out of it waits the release
+  CHECK_OK(ss_test_ra_quiesce(r.c));
+  CHECK_OK(ss_test_sync_copy(r.c));
+  *landed_while_pending = cudaEventQuery(l1_read) == cudaErrorNotReady;
+  gpu.check(v, fx, 4, {8}, false);
+  CHECK_OK(ss_release(r.c, 4, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  wrong = gpu.verify(mutation == 0);
+  cudaEventDestroy(l1_read);
+  return wrong;
+}
+
+TEST(cuda_readahead_copy_dependencies) {
+  bool pending = false;
+  auto w0 = ra_dependency_run(0, &pending);
+  std::printf("  normal: landing finished while layer 1 was still reading: %s\n", pending ? "yes" : "no");
+  CHECK(w0.empty());
+  CHECK(!pending);  // the copy waited for the release, which waited for the ~200 ms spin
+  auto w6 = ra_dependency_run(6, &pending);
+  std::printf("  mutation 6 (no destination wait): landed while pending: %s, wrong %zu\n", pending ? "yes" : "no",
+              w6.size());
+  CHECK(pending);
+  CHECK(w6.size() == 1 && w6[0] == std::make_pair(1, 0));
+  auto w7 = ra_dependency_run(7, &pending);
+  std::printf("  mutation 7 (no buffer-event wait): wrong %zu\n", w7.size());
+  CHECK(w7.size() == 1 && w7[0] == std::make_pair(4, 8));
+}
+
 TEST(cuda_exclusive_same_forward_persistent) { exclusive_same_forward("x-same-persistent", 0); }
+// Read-ahead on, exclusive, write-back gated: every eviction and persistent admission keeps its waits.
+TEST(cuda_readahead_exclusive_persistent) { exclusive_same_forward("ra-x-same-persistent", 0, true); }
 TEST(cuda_exclusive_same_forward_ring) { exclusive_same_forward("x-same-ring", 1); }
 
 TEST(cuda_exclusive_lru_async) { decode_variant("x-lru", SS_POLICY_LRU, 0, false, true, 0); }
