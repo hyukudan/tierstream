@@ -20,8 +20,11 @@
 
 namespace ss {
 
+struct RaEntry;
+
 struct Job {
   enum State { Queued = 0, Running = 1, Done = 2, Cancelled = 3, Failed = 4 };
+  enum RanAs : int8_t { AsDemand = 0, AsSpec = 1, AsRa = 2 };
   int layer = 0;
   int unit = 0;
   bool spec = false;
@@ -36,8 +39,27 @@ struct Job {
   std::atomic<int> state{Queued};
   ss_status err_status = SS_OK;
   std::string err;
+  // Host read-ahead: a producer reads the unit's file into an RA buffer; a child copies that buffer into a ring slot.
+  bool ra_producer = false;
+  bool ra_child = false;
+  bool issued_piece = false;          // child: at least one copy out of the buffer was issued
+  int8_t ran_as = AsDemand;           // the queue a worker took it from (its running counter)
+  std::shared_ptr<RaEntry> ra;        // keeps the entry alive through the worker's last access
 };
 using JobPtr = std::shared_ptr<Job>;
+
+// One host read-ahead request of a forward (design §8-11). Every field is read and written under Ctx::q_mu_ once the
+// entry is published, except buf, which only the engine thread sets before the producer is queued.
+struct RaEntry {
+  enum St { Waiting, Reading, Ready, Landing, Consumed, Failed, Abandoned };
+  St st = Waiting;
+  int layer = 0;
+  int unit = 0;
+  int32_t buf = -1;              // RA buffer index, -1 = none (never held / taken back)
+  bool quarantined = false;      // a copy out of buf failed after issuing pieces: buf is never reused
+  bool child_queued = false;     // the child was pushed to the demand queue
+  JobPtr producer, child;
+};
 
 class Ctx {
  public:
@@ -62,6 +84,7 @@ class Ctx {
   void stats_reset();
   void set_hook(ss_stats_hook h, void* user) { hook_ = h; hook_user_ = user; }
   int n_layers() const { return int(d_.layers.size()); }
+  int layer_units(int layer) const { return d_.layers[size_t(layer)].n_units; }
   // After an allocation failure or an unexpected exception inside a call, the context's bookkeeping may be
   // half-updated (a unit admitted without its read, a job nobody owns): it refuses every further call but close.
   void poison() noexcept { poisoned_ = true; }
@@ -73,10 +96,14 @@ class Ctx {
   // Exclusive tier mode, between forwards (tests): every unit in a slot XOR a block XOR only its file, every block
   // owned exactly once (a unit or a free list). Throws SS_E_INVALID naming the first broken rule.
   void check_exclusive() const;
+  void host_prefetch(int layer, const int32_t* ids, int n);
   // Tests: the write-back stream waits for this event before its next copies (makes a pending write-back certain).
   void test_gate_writeback(void* ev);
   // Tests: reader threads take no job while held (queued file reads wait; pinned copies are issued at submission).
   void test_hold_readers(bool hold);
+  // Tests: one-shot read-ahead fault injection (1 = queueing a read throws, 2 = queueing a landing throws,
+  // 3 = the next landing copy fails before any copy, 4 = it fails after its first piece, 5 = the next read fails).
+  void test_inject(int what) { test_inject_.store(what); }
   // Tests: fill every free pinned block with `byte` (known stale bytes); host-wait the copy stream.
   void test_fill_free_blocks(int byte);
   void test_sync_copy();
@@ -117,6 +144,7 @@ class Ctx {
     int32_t* ids_host = nullptr;         // pinned buffer for device routes
     size_t ids_cap = 0;
     int ids_n = -1;                      // pending device routes (>= 0)
+    std::vector<std::shared_ptr<RaEntry>> ra;  // host read-ahead entry per unit this forward (tombstones until end)
     void* ids_ev = nullptr;
     int version = 0;
   };
@@ -151,6 +179,20 @@ class Ctx {
   int eviction_cap(int layer, bool speculative) const;
   void free_block(int layer, int unit);
   int block_class(int layer) const;
+  // Host read-ahead (all engine-thread unless *_locked: then q_mu_ is held).
+  bool ra_on() const { return !ra_host_.empty(); }
+  bool ra_eligible(int layer, int unit, bool pending_ok) const;
+  void ra_request(int layer, int unit, bool pending_ok);
+  void ra_pump();
+  bool ra_land(int layer, int unit, const JobPtr& child);
+  void ra_take_buf_locked(RaEntry& e);
+  void ra_abandon_locked(RaEntry& e);
+  void ra_producer_epilogue_locked(Job& j);
+  void ra_child_epilogue_locked(Job& j);
+  void ra_sweep_locked();
+  void ra_drain_and_reconcile();
+  void fail_job_locked(Job& j, ss_status st, const char* msg) noexcept;
+  void run_ra_child(Job& j);
   int64_t gidx(int layer, int unit) const { return d_.unit_base[size_t(layer)] + unit; }
 
   Desc d_;
@@ -196,10 +238,24 @@ class Ctx {
   std::mutex q_mu_;
   std::condition_variable q_cv_;
   std::condition_variable done_cv_;
-  std::deque<JobPtr> demand_q_, spec_q_;
+  std::deque<JobPtr> demand_q_, spec_q_, ra_q_;
   int demand_running_ = 0;
+  int ra_running_ = 0;               // unattached read-ahead reads running (capped at max(1, readers - 1))
   bool stop_ = false;
   bool hold_ = false;  // test_hold_readers
+  std::atomic<int> test_inject_{0};
+
+  // Host read-ahead buffers (readahead_units; empty = off).
+  std::vector<void*> ra_host_;
+  std::vector<void*> ra_ev_;          // per buffer: last H2D out of it (dedicated, never pooled)
+  std::vector<uint32_t> ra_free_;     // capacity reserved at open: a push never allocates
+  uint64_t ra_bytes_ = 0;
+  std::deque<std::shared_ptr<RaEntry>> ra_wait_;  // engine thread: requests waiting for a buffer, in call order
+  std::vector<JobPtr> ra_jobs_;       // producers of this forward (auxiliary: never reported by ss_end)
+  bool ra_frozen_ = false;
+  struct RaStats {
+    uint64_t requested = 0, read = 0, landed = 0, unused = 0, failed = 0, fallback = 0, bytes = 0;
+  } ra_st_;
   std::vector<std::thread> workers_;
 
   void* fwd_stream_ = nullptr;

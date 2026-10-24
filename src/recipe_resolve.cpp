@@ -398,7 +398,7 @@ void RecipeStack::rebuild(const std::vector<RecipeLayer>& layers) {
                     one_of(s[4], {"device_gib", "host_pinned_gib", "workspace_gib", "max_context_tokens", "max_batch",
                                   "margin_gib", "margin_fraction", "dynamic_slots_per_layer", "ring_slots",
                                   "pinned_backing", "host_spare_units", "staging_buffers", "staging_mib",
-                                  "tier_mode"});
+                                  "tier_mode", "readahead_units"});
       bool hit = s[0] == "match";
       for (const auto& t : tuned) hit = hit || (budget && pin_covers(t, e.first));
       require(!hit, SS_E_RECIPE,

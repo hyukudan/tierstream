@@ -106,7 +106,10 @@ void options_defaults(ss_options* o) {
 
 // Bytes that were padding in older headers carry whatever the caller's compiler left there: never read.
 void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
-void clear_reserved(ss_options&) {}
+void clear_reserved(ss_options& o) {
+  o.reserved0 = 0;
+  o.reserved1 = 0;
+}
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
 // (an older caller's missing fields keep their defaults; a newer caller's extra fields are not read).
@@ -416,12 +419,30 @@ ss_status ss_test_check_exclusive(ss_ctx* c) {
   });
 }
 
+ss_status ss_host_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n) {
+  return ctx_guard(c, [&] { c->c->host_prefetch(layer, ids, n); });
+}
+
+ss_status ss_host_prefetch_layer(ss_ctx* c, int layer) {
+  return ctx_guard(c, [&] {
+    need(layer >= 0 && layer < c->c->n_layers(), "ss_host_prefetch_layer: layer out of range");
+    std::vector<int32_t> ids(size_t(c->c->layer_units(layer)));
+    for (size_t u = 0; u < ids.size(); ++u) ids[u] = int32_t(u);
+    c->c->host_prefetch(layer, ids.data(), int(ids.size()));
+  });
+}
+
 // Test hooks (CUDA test): known bytes in every free block; host-wait the library's copy stream.
 ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte) {
   return ctx_guard(c, [&] { c->c->test_fill_free_blocks(byte); });
 }
 ss_status ss_test_sync_copy(ss_ctx* c) {
   return ctx_guard(c, [&] { c->c->test_sync_copy(); });
+}
+
+// Test hook: one-shot read-ahead fault injection (Ctx::test_inject).
+ss_status ss_test_inject(ss_ctx* c, int what) {
+  return ctx_guard(c, [&] { c->c->test_inject(what); });
 }
 
 // Test hook (CUDA test): reader threads take no job while held.
@@ -565,6 +586,10 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
              budget->struct_size >= offsetof(ss_budget, host_spare_units) + sizeof(bout.host_spare_units),
          "ss_recipe_plan: the route's placement is tier_mode = exclusive, which this caller's ss_budget (an older "
          "header) cannot hold");
+    need(oout.readahead_units == 0 ||
+             options->struct_size >= offsetof(ss_options, readahead_units) + sizeof(oout.readahead_units),
+         "ss_recipe_plan: the route's placement sets readahead_units, which this caller's ss_options (an older header) "
+         "cannot hold");
     if (plan) made = new ss_plan{std::move(rp.plan), desc};
     s = ss::json_write(rp.doc);
   });

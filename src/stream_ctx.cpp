@@ -194,6 +194,25 @@ void Ctx::init() {
 
   stats_.assign(d_.layers.size(), ss_layer_stats{});
   fwd_stats_.assign(d_.layers.size(), ss_layer_stats{});
+
+  // Host read-ahead (design §2/§9): R pinned buffers of the largest unit that can be read from its file, each with its
+  // own event. None when no unit can be (every streamable unit pinned or computed by a peer).
+  if (o_.readahead_units) {
+    require(o_.readahead_units <= 64, SS_E_INVALID, "open: readahead_units must be <= 64");
+    ra_bytes_ = ra_buffer_bytes(d_, plan_.tier);
+    require(ra_bytes_ <= uint64_t(SIZE_MAX), SS_E_INVALID, "open: read-ahead buffer bytes overflow size_t");
+    if (ra_bytes_) {
+      ra_free_.reserve(o_.readahead_units);
+      ra_jobs_.reserve(size_t(d_.total_units));
+      for (uint32_t i = 0; i < o_.readahead_units; ++i) {
+        ra_ev_.push_back(be_->event_create());
+        ra_host_.push_back(be_->alloc_pinned(size_t(ra_bytes_)));
+        ra_free_.push_back(i);
+      }
+      for (size_t L = 0; L < d_.layers.size(); ++L)
+        if (L_[L].rs) L_[L].ra.assign(size_t(d_.layers[L].n_units), nullptr);
+    }
+  }
   start_workers();
 
   // Fill: the pinned tier first (host), then residents (from their pinned copy when they have one, else the file).
@@ -236,6 +255,11 @@ void Ctx::init() {
 }
 
 void Ctx::cleanup() {
+  if (ra_on()) {  // shutdown sweep (also with no forward begun and on a poisoned context): nothing waits on a buffer
+    std::lock_guard<std::mutex> lk(q_mu_);
+    ra_frozen_ = true;
+    ra_sweep_locked();
+  }
   stop_workers();
   if (!be_) return;
   try {
@@ -262,6 +286,10 @@ void Ctx::cleanup() {
   for (const RingRange& r : ring_classes_) be_->free_device(r.base);
   for (void* c : pinned_chunks_) be_->free_pinned(c);
   for (void* c : spare_chunks_) be_->free_pinned(c);
+  for (void* b : ra_host_) be_->free_pinned(b);  // quarantined ones too: the streams were synchronized above
+  for (void* e : ra_ev_) be_->event_destroy(e);
+  ra_host_.clear();
+  ra_ev_.clear();
   for (void* e : wb_evs_) be_->event_destroy(e);
   if (blocks_ev_) be_->event_destroy(blocks_ev_);
   if (wb_mark_ev_) be_->event_destroy(wb_mark_ev_);
@@ -310,24 +338,37 @@ void Ctx::worker() {
     JobPtr j;
     {
       std::unique_lock<std::mutex> lk(q_mu_);
-      // A speculative read runs only while no demand is queued and at most one demand is running.
+      // Priority: demands (ready read-ahead landings included) > read-ahead reads > speculative reads. Unattached
+      // read-ahead reads run on at most max(1, readers - 1) readers; a speculative read runs only while no demand is
+      // queued and at most one demand is running.
+      const int ra_cap = std::max(1, int(o_.reader_threads) - 1);
       q_cv_.wait(lk, [&] {
-        return stop_ || (!hold_ && (!demand_q_.empty() || (!spec_q_.empty() && demand_running_ <= 1)));
+        return stop_ || (!hold_ && (!demand_q_.empty() || (!ra_q_.empty() && ra_running_ < ra_cap) ||
+                                    (!spec_q_.empty() && demand_running_ <= 1)));
       });
-      if (stop_ && demand_q_.empty() && spec_q_.empty()) return;
+      if (stop_ && demand_q_.empty() && spec_q_.empty() && ra_q_.empty()) return;
       if (!demand_q_.empty()) {
         j = demand_q_.front();
         demand_q_.pop_front();
         ++demand_running_;
+        j->ran_as = Job::AsDemand;
+      } else if (!ra_q_.empty() && (ra_running_ < ra_cap || stop_)) {
+        j = ra_q_.front();
+        ra_q_.pop_front();
+        ++ra_running_;
+        j->ran_as = Job::AsRa;
       } else if (!spec_q_.empty() && demand_running_ <= 1) {
         j = spec_q_.front();
         spec_q_.pop_front();
+        j->ran_as = Job::AsSpec;
       } else {
         continue;
       }
       int expect = Job::Queued;
       if (!j->state.compare_exchange_strong(expect, Job::Running)) {
-        if (!j->spec) --demand_running_;
+        if (j->ran_as == Job::AsDemand) --demand_running_;
+        else if (j->ran_as == Job::AsRa) --ra_running_;
+        if (j->ra_child && j->ra) ra_child_epilogue_locked(*j);  // cancelled after it was queued: its buffer goes back
         done_cv_.notify_all();
         continue;  // cancelled while queued
       }
@@ -356,7 +397,11 @@ void Ctx::worker() {
     {
       std::lock_guard<std::mutex> lk(q_mu_);
       j->state.store(final_state);
-      if (!j->spec) --demand_running_;
+      if (j->ran_as == Job::AsDemand) --demand_running_;
+      else if (j->ran_as == Job::AsRa) --ra_running_;
+      // Read-ahead: the terminal state and its consequences (landing queued, buffer back) in one section.
+      if (j->ra_producer) ra_producer_epilogue_locked(*j);
+      else if (j->ra_child) ra_child_epilogue_locked(*j);
     }
     done_cv_.notify_all();
     q_cv_.notify_all();
@@ -438,6 +483,14 @@ void Ctx::wait_job(Job& j) {
 }
 
 void Ctx::run_job(Job& j) {
+  if (j.ra_child) {
+    run_ra_child(j);
+    return;
+  }
+  if (j.ra_producer) {
+    be_->event_sync(ra_ev_[size_t(j.ra->buf)]);  // the buffer's last H2D out has finished
+    if (test_inject_.load() == 5 && test_inject_.exchange(0) == 5) fail(SS_E_IO, "read-ahead: injected read failure");
+  }
   const Layer& l = d_.layers[size_t(j.layer)];
   bool want_hash = o_.verify_hash && !l.hash.empty();
   uint64_t digest = 0;
@@ -600,6 +653,10 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
 
 void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* dst_wb_ev) {
   LayerState& s = L_[size_t(layer)];
+  if (ra_on() && s.ra[size_t(unit)]) {  // read-ahead lands only in ring slots: this unit takes the ordinary path
+    std::lock_guard<std::mutex> lk(q_mu_);
+    ra_abandon_locked(*s.ra[size_t(unit)]);
+  }
   JobPtr j = make_job(layer, unit, at(s.pool, uint64_t(slot) * d_.unit_stride(layer)), spec);
   j->dst_wb_ev = dst_wb_ev;
   fwd_jobs_.push_back(j);  // tracked before anything points at it (end() drains and rolls back what it tracks)
@@ -612,6 +669,287 @@ void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* 
 }
 
 int Ctx::block_class(int layer) const { return excl_ ? layer_class_[size_t(layer)] : -1; }
+
+// ---- host read-ahead (wave4/gapfix/wstream-readahead/design.md §7-11) -------------------------------------------------
+
+void Ctx::fail_job_locked(Job& j, ss_status st, const char* msg) noexcept {
+  j.err_status = st;
+  try {
+    j.err = msg;
+  } catch (...) {
+  }
+  j.state.store(Job::Failed);
+}
+
+// The one way a buffer goes back: consumes the handle, so a second call is a no-op. Quarantined buffers never return.
+void Ctx::ra_take_buf_locked(RaEntry& e) {
+  if (e.buf < 0 || e.quarantined) return;
+  ra_free_.push_back(uint32_t(e.buf));  // capacity = every buffer, reserved at open: never allocates
+  e.buf = -1;
+}
+
+void Ctx::ra_abandon_locked(RaEntry& e) {
+  switch (e.st) {
+    case RaEntry::Waiting:
+      e.st = RaEntry::Abandoned;
+      break;
+    case RaEntry::Ready:  // a retained result nobody will land
+      ra_take_buf_locked(e);
+      e.st = RaEntry::Abandoned;
+      break;
+    case RaEntry::Reading: {
+      int expect = Job::Queued;
+      if (e.producer->state.compare_exchange_strong(expect, Job::Cancelled)) {
+        auto it = std::find(ra_q_.begin(), ra_q_.end(), e.producer);
+        if (it != ra_q_.end()) ra_q_.erase(it);
+        ra_take_buf_locked(e);
+      }  // Running: its epilogue sees Abandoned and takes the buffer back
+      e.st = RaEntry::Abandoned;
+      break;
+    }
+    default:  // Landing (its child decides), Consumed, Failed, Abandoned
+      break;
+  }
+}
+
+void Ctx::ra_producer_epilogue_locked(Job& j) {
+  RaEntry& e = *j.ra;
+  if (j.state.load() == Job::Done) {
+    if (e.st == RaEntry::Landing && e.child && !e.child_queued) {
+      if (e.child->state.load() == Job::Queued) {
+        try {
+          if (test_inject_.load() == 2 && test_inject_.exchange(0) == 2) throw std::bad_alloc();
+          demand_q_.push_front(e.child);
+          e.child_queued = true;
+        } catch (...) {
+          fail_job_locked(*e.child, SS_E_NOMEM, "read-ahead: queueing a landing failed");
+          ra_take_buf_locked(e);
+          e.st = RaEntry::Failed;
+        }
+      } else {  // the child was cancelled while it waited for this read
+        ra_take_buf_locked(e);
+      }
+    } else if (e.st == RaEntry::Abandoned) {
+      ra_take_buf_locked(e);
+    } else if (e.st == RaEntry::Reading) {
+      e.st = RaEntry::Ready;  // kept for a later landing
+    }
+  } else {  // Failed: a failed buffer is never copied
+    if (e.child && e.child->state.load() == Job::Queued) fail_job_locked(*e.child, j.err_status, j.err.c_str());
+    ra_take_buf_locked(e);
+    if (e.st != RaEntry::Abandoned) e.st = RaEntry::Failed;
+  }
+}
+
+void Ctx::ra_child_epilogue_locked(Job& j) {
+  RaEntry& e = *j.ra;
+  const int st = j.state.load();
+  if (st == Job::Failed && j.issued_piece) {  // copies out of the buffer may still be in flight: never reuse it
+    e.quarantined = true;
+    e.st = RaEntry::Failed;
+    return;
+  }
+  // Done (its buffer event is recorded), failed before any copy, or cancelled: it no longer reads the buffer.
+  const int ps = e.producer ? e.producer->state.load() : Job::Done;  // cleared at reconcile: it had ended
+  if (ps == Job::Done || ps == Job::Failed || ps == Job::Cancelled) ra_take_buf_locked(e);
+  e.st = st == Job::Done ? RaEntry::Consumed : st == Job::Failed ? RaEntry::Failed : RaEntry::Abandoned;
+}
+
+void Ctx::ra_sweep_locked() {
+  for (auto& s : L_)
+    for (auto& e : s.ra)
+      if (e) ra_abandon_locked(*e);
+  ra_wait_.clear();
+}
+
+// After the forward's producers and jobs ended: count each entry once, then drop the entries (a job that still holds
+// one keeps it alive).
+void Ctx::ra_drain_and_reconcile() {
+  for (size_t L = 0; L < L_.size(); ++L) {
+    for (auto& e : L_[L].ra) {
+      if (!e) continue;
+      ++ra_st_.requested;
+      const int ps = e->producer ? e->producer->state.load() : Job::Cancelled;
+      if (ps == Job::Done) {
+        ++ra_st_.read;
+        ra_st_.bytes += d_.layers[L].unit_bytes;
+        fwd_stats_[L].bytes_disk += d_.layers[L].unit_bytes;
+        if (e->st == RaEntry::Consumed) ++ra_st_.landed;
+        else ++ra_st_.unused;
+      } else if (ps == Job::Failed) {
+        ++ra_st_.failed;
+      }
+    }
+  }
+  {
+    // Break the entry <-> job references (a cycle otherwise); every producer and child has ended.
+    std::lock_guard<std::mutex> lk(q_mu_);
+    for (auto& s : L_)
+      for (auto& e : s.ra)
+        if (e) {
+          e->producer.reset();
+          e->child.reset();
+        }
+  }
+  for (auto& s : L_)
+    for (auto& e : s.ra) e.reset();
+  ra_jobs_.clear();
+}
+
+bool Ctx::ra_eligible(int layer, int unit, bool pending_ok) const {
+  const LayerState& s = L_[size_t(layer)];
+  const Layer& l = d_.layers[size_t(layer)];
+  if (!s.rs || !l.streamable || unit < 0 || unit >= l.n_units || s.ra[size_t(unit)]) return false;
+  const int64_t g = gidx(layer, unit);
+  if (plan_.tier[size_t(g)] == SS_TIER_PAIR || pinned_of_[size_t(g)] || s.rs->slot(unit) >= 0) return false;
+  if (s.job[size_t(unit)]) return false;
+  if (s.loc[size_t(unit)] != None) return pending_ok && s.loc[size_t(unit)] == Ring;  // waiting for a ring slot
+  return true;
+}
+
+void Ctx::ra_request(int layer, int unit, bool pending_ok) {
+  if (!ra_on() || ra_frozen_ || !ra_eligible(layer, unit, pending_ok)) return;
+  auto e = std::make_shared<RaEntry>();
+  e->layer = layer;
+  e->unit = unit;
+  L_[size_t(layer)].ra[size_t(unit)] = e;  // a tombstone from here to ss_end: never requested twice this forward
+  ra_wait_.push_back(e);
+}
+
+// Starts waiting requests while buffers are free (engine thread, at its calls; never inside ss_end).
+void Ctx::ra_pump() {
+  if (!ra_on() || ra_frozen_) return;
+  while (!ra_wait_.empty()) {
+    std::shared_ptr<RaEntry> e = ra_wait_.front();
+    const LayerState& s = L_[size_t(e->layer)];
+    const int64_t g = gidx(e->layer, e->unit);
+    const bool miss = s.rs->slot(e->unit) < 0 && !s.job[size_t(e->unit)] && !pinned_of_[size_t(g)];
+    if (e->st != RaEntry::Waiting || !miss) {
+      {
+        std::lock_guard<std::mutex> lk(q_mu_);
+        if (e->st == RaEntry::Waiting) e->st = RaEntry::Abandoned;
+      }
+      ra_wait_.pop_front();
+      continue;
+    }
+    JobPtr p = std::make_shared<Job>();  // allocated outside the lock
+    p->layer = e->layer;
+    p->unit = e->unit;
+    p->host_dst = true;
+    p->ra_producer = true;
+    p->ra = e;
+    bool started = false, failed = false;
+    {
+      std::lock_guard<std::mutex> lk(q_mu_);
+      if (ra_free_.empty()) return;  // no buffer: the next engine call tries again
+      e->buf = int32_t(ra_free_.back());
+      ra_free_.pop_back();
+      p->dst = ra_host_[size_t(e->buf)];
+      e->producer = p;
+      e->st = RaEntry::Reading;
+      ra_jobs_.push_back(p);  // reserved for every unit at open: never reallocates
+      try {
+        if (test_inject_.load() == 1 && test_inject_.exchange(0) == 1) throw std::bad_alloc();
+        ra_q_.push_back(p);
+        started = true;
+      } catch (...) {  // never left nonterminal: the unit's fetch reads its file
+        fail_job_locked(*p, SS_E_NOMEM, "read-ahead: queueing a read failed");
+        ra_take_buf_locked(*e);
+        e->st = RaEntry::Failed;
+        failed = true;
+      }
+    }
+    ra_wait_.pop_front();
+    if (started) q_cv_.notify_all();
+    if (failed) done_cv_.notify_all();
+  }
+}
+
+// The unit got ring slot `child`: land from its read-ahead buffer when it has one (true), else the caller reads the
+// file (false).
+bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
+  std::shared_ptr<RaEntry> ep = L_[size_t(layer)].ra[size_t(unit)];
+  if (!ep) return false;
+  RaEntry& e = *ep;
+  bool attached = false, failed_read = false;
+  {
+    std::lock_guard<std::mutex> lk(q_mu_);
+    switch (e.st) {
+      case RaEntry::Waiting:  // not started: the ordinary read starts as early
+        e.st = RaEntry::Abandoned;
+        break;
+      case RaEntry::Ready:
+        child->ra_child = true;
+        child->ra = ep;
+        e.child = child;
+        try {
+          if (test_inject_.load() == 2 && test_inject_.exchange(0) == 2) throw std::bad_alloc();
+          demand_q_.push_front(child);
+          e.child_queued = true;
+          e.st = RaEntry::Landing;
+          attached = true;
+        } catch (...) {
+          child->ra_child = false;
+          child->ra.reset();
+          e.child.reset();
+          ra_take_buf_locked(e);
+          e.st = RaEntry::Abandoned;
+        }
+        break;
+      case RaEntry::Reading:
+        child->ra_child = true;
+        child->ra = ep;
+        e.child = child;
+        e.st = RaEntry::Landing;
+        attached = true;  // the producer's epilogue queues the child
+        if (e.producer->state.load() == Job::Queued) {  // a demand now waits behind it: promote it
+          auto it = std::find(ra_q_.begin(), ra_q_.end(), e.producer);
+          if (it != ra_q_.end()) {
+            try {
+              demand_q_.push_front(e.producer);
+              ra_q_.erase(std::find(ra_q_.begin(), ra_q_.end(), e.producer));
+            } catch (...) {
+              // stays in the read-ahead queue: still runs, only later
+            }
+          }
+        }
+        break;
+      case RaEntry::Failed:
+        failed_read = true;
+        break;
+      default:
+        break;
+    }
+  }
+  if (attached) q_cv_.notify_all();
+  if (failed_read) ++ra_st_.fallback;
+  return attached;
+}
+
+// FromRA copy: the RA buffer into the ring slot, after the slot's previous reader (ring owner release).
+void Ctx::run_ra_child(Job& j) {
+  const Layer& l = d_.layers[size_t(j.layer)];
+  const size_t b = size_t(j.ra->buf);  // stable while this job runs: only a terminal child gives it back
+  const char* src = static_cast<const char*>(ra_host_[b]);
+  if (test_inject_.load() == 3 && test_inject_.exchange(0) == 3) fail(SS_E_IO, "read-ahead: injected copy failure");
+  if (be_->unified()) {
+    be_->event_sync(j.dst_release_ev);
+    j.issued_piece = true;
+    std::memcpy(j.dst, src, size_t(l.unit_bytes));
+    if (test_inject_.load() == 4 && test_inject_.exchange(0) == 4) fail(SS_E_IO, "read-ahead: injected copy failure");
+    return;
+  }
+  std::lock_guard<std::mutex> lk(copy_mu_);
+  be_->stream_wait(nullptr, j.dst_release_ev);
+  for (uint64_t off = 0; off < l.unit_bytes; off += o_.copy_piece_bytes) {
+    be_->copy_h2d(at(j.dst, off), src + off, size_t(std::min<uint64_t>(o_.copy_piece_bytes, l.unit_bytes - off)),
+                  nullptr);
+    j.issued_piece = true;
+    if (test_inject_.load() == 4 && test_inject_.exchange(0) == 4) fail(SS_E_IO, "read-ahead: injected copy failure");
+  }
+  be_->event_record(ra_ev_[b], nullptr);  // the next read into this buffer host-waits it
+  be_->event_record(j.done_ev, nullptr);
+}
 
 // Exclusive tier mode: evictions this admission may make, one free block per victim. A speculative admission
 // (spec_persistent) leaves half of the class's spares to demands.
@@ -719,6 +1057,9 @@ bool Ctx::fetch_into_ring(int layer, int unit, bool spec) {
     s.loc[size_t(unit)] = Ring;
     s.slot[size_t(unit)] = int32_t(i);
     s.job[size_t(unit)] = j;
+    // Read-ahead: the unit's bytes are (being) read into a host buffer; the job copies them from there. Its file bytes
+    // are counted once, at ss_end; the copy counts in neither bytes_disk nor bytes_pinned.
+    if (ra_on() && !spec && ra_land(layer, unit, j)) return true;
     (j->from_pinned ? fwd_stats_[size_t(layer)].bytes_pinned : fwd_stats_[size_t(layer)].bytes_disk) +=
         d_.layers[size_t(layer)].unit_bytes;
     submit(j);
@@ -918,6 +1259,7 @@ void Ctx::ingest_routes(int layer, const int32_t* ids, int n) {
     if (!fetch_into_ring(layer, u, false)) {
       s.pending.push_back(u);
       s.loc[size_t(u)] = Ring;  // placed when a ring slot frees
+      ra_request(layer, u, true);
     }
   st.admitted += a.admitted.size();
   st.transient += a.transient.size();
@@ -930,6 +1272,7 @@ void Ctx::routes(int layer, const int32_t* ids, int n) {
   require(in_forward_, SS_E_INVALID, "routes: outside a forward (call ss_begin)");
   require(n >= 0 && (ids || n == 0), SS_E_INVALID, "routes: bad ids");
   ingest_routes(layer, ids, n);
+  ra_pump();
 }
 
 void Ctx::routes_dev(int layer, const int32_t* ids_dev, int n, void* stream) {
@@ -995,6 +1338,7 @@ void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {
       if (speculative) break;  // ring full: speculation never waits
       s.pending.push_back(u);
       s.loc[size_t(u)] = Ring;
+      ra_request(layer, u, true);
     }
     busy[size_t(u)] = 1;
     if (speculative) {
@@ -1003,6 +1347,17 @@ void Ctx::prefetch(int layer, const int32_t* ids, int n, bool speculative) {
     }
     ++issued;
   }
+  ra_pump();
+}
+
+void Ctx::host_prefetch(int layer, const int32_t* ids, int n) {
+  check_layer(layer, "host_prefetch");
+  require(n >= 0 && (ids || n == 0), SS_E_INVALID, "host_prefetch: bad ids");
+  if (!ra_on()) return;  // readahead_units = 0 (or nothing can be read from a file): a no-op
+  open_forward();        // allowed between forwards: the requests belong to the next forward
+  require(L_[size_t(layer)].rs != nullptr, SS_E_INVALID, "host_prefetch: layer has no units");
+  for (int i = 0; i < n; ++i) ra_request(layer, ids[i], false);
+  ra_pump();
 }
 
 void Ctx::prefetch_layer(int layer) {
@@ -1022,6 +1377,7 @@ void Ctx::acquire(int layer, void* stream, bool wait_all, ss_layer_view* out) {
   require(!s.acquired, SS_E_INVALID, "acquire: layer acquired twice in one forward");
   check_stream(stream, "acquire");
   ingest_dev_routes(layer);
+  ra_pump();
   require(s.routes_given, SS_E_INVALID, "acquire: no routes for layer " + std::to_string(layer) +
                                             " (ss_layer_routes / ss_layer_all first)");
   dispatch_pending();
@@ -1103,7 +1459,21 @@ void Ctx::retire_ring(int layer) {
     if (ring_[i].owner != layer) continue;
     Job& j = *ring_[i].job;
     int expect = Job::Queued;
-    if (!j.state.compare_exchange_strong(expect, Job::Cancelled)) wait_job_quiet(j);
+    if (j.ra_child) {
+      std::unique_lock<std::mutex> lk(q_mu_);
+      if (j.state.compare_exchange_strong(expect, Job::Cancelled)) {
+        if (j.ra->child_queued) {
+          auto it = std::find(demand_q_.begin(), demand_q_.end(), ring_[i].job);
+          if (it != demand_q_.end()) demand_q_.erase(it);
+        }
+        ra_child_epilogue_locked(j);
+      } else {
+        lk.unlock();
+        wait_job_quiet(j);
+      }
+    } else if (!j.state.compare_exchange_strong(expect, Job::Cancelled)) {
+      wait_job_quiet(j);
+    }
     done_cv_.notify_all();
     ring_owner_ev_[i] = s.release_ev;
     ring_[i].owner = -1;
@@ -1128,6 +1498,7 @@ void Ctx::release(int layer, void* stream) {
     }
   retire_ring(layer);
   dispatch_pending();
+  ra_pump();
 }
 
 void Ctx::wait_job_quiet(Job& j) {
@@ -1143,6 +1514,17 @@ void Ctx::end() {
   for (size_t L = 0; L < L_.size(); ++L)
     require(!L_[L].acquired || L_[L].released, SS_E_INVALID,
             "end: layer " + std::to_string(L) + " acquired but not released");
+  // Read-ahead: no new request from here on; unused, waiting and unattached work is abandoned; producers are drained
+  // (auxiliary: their failures are not this forward's).
+  if (ra_on()) {
+    {
+      std::lock_guard<std::mutex> lk(q_mu_);
+      ra_frozen_ = true;
+      ra_sweep_locked();
+    }
+    done_cv_.notify_all();
+    for (const JobPtr& p : ra_jobs_) wait_job_quiet(*p);
+  }
   // Layers never acquired: cancel what has not started, wait for the rest, free their ring slots.
   ss_status failed = SS_OK;
   std::string err;
@@ -1156,6 +1538,7 @@ void Ctx::end() {
     }
   }
   done_cv_.notify_all();
+  if (ra_on()) ra_drain_and_reconcile();
   for (size_t L = 0; L < L_.size(); ++L) {
     LayerState& s = L_[L];
     if (!s.rs) continue;
@@ -1230,6 +1613,7 @@ void Ctx::end() {
   if (hook_) hook_(hook_user_, &tot, fwd_stats_.data(), n_layers());
   in_forward_ = false;
   fwd_open_ = false;
+  ra_frozen_ = false;
   ++forward_;
   if (failed != SS_OK) fail(failed, err);
 }
@@ -1268,7 +1652,10 @@ ss_layer_stats Ctx::total() const {
   return t;
 }
 
-void Ctx::stats_reset() { std::fill(stats_.begin(), stats_.end(), ss_layer_stats{}); }
+void Ctx::stats_reset() {
+  std::fill(stats_.begin(), stats_.end(), ss_layer_stats{});
+  ra_st_ = RaStats{};
+}
 
 Json Ctx::stats_json() const {
   auto one = [](const ss_layer_stats& s) {
@@ -1298,6 +1685,19 @@ Json Ctx::stats_json() const {
   Json layers = Json::array();
   for (const auto& s : stats_) layers.push(one(s));
   j["layers"] = layers;
+  if (ra_on()) {  // readahead_units = 0: the JSON is today's
+    Json r = Json::object();
+    r["buffers"] = Json::number(uint64_t(ra_host_.size()));
+    r["buffer_bytes"] = Json::number(ra_bytes_);
+    r["requested"] = Json::number(ra_st_.requested);
+    r["read"] = Json::number(ra_st_.read);
+    r["landed"] = Json::number(ra_st_.landed);
+    r["unused"] = Json::number(ra_st_.unused);
+    r["failed"] = Json::number(ra_st_.failed);
+    r["fallback"] = Json::number(ra_st_.fallback);
+    r["bytes"] = Json::number(ra_st_.bytes);
+    j["readahead"] = r;
+  }
   if (excl_) {
     Json x = Json::object();
     x["writebacks"] = Json::number(xst_.writebacks);

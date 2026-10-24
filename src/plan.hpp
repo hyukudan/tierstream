@@ -59,6 +59,9 @@ Plan plan_make(const Desc& d, const ss_budget& b, const std::vector<double>& ben
 Plan plan_from_tiers(const Desc& d, const ss_budget& b, const std::vector<uint8_t>& tiers);
 // The planner's arithmetic for placements decided outside plan_make (recipes, docs/recipes.md §5.2).
 uint64_t host_stride(uint64_t bytes);  // pinned host bytes of a unit (4 KiB stride)
+// Host read-ahead buffer bytes: the largest host stride among the streamable, non-pair units whose tier is not PINNED
+// (every unit that can be read from its file); 0 when there is none.
+uint64_t ra_buffer_bytes(const Desc& d, const std::vector<uint8_t>& tier);
 // cap - margin - fixed - workspace - dynamic-slot bound (throws SS_E_CAPACITY like plan_make when negative).
 uint64_t plan_room(const Desc& d, const ss_budget& b);
 // Device bytes of the stream rings for these streamed units (global indices).

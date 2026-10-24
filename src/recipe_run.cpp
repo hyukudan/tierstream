@@ -1003,6 +1003,7 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   o.direct_io = p.get("direct_io") != 0;
   o.group_units = uint32_t(p.get("group_units"));
   o.spec_persistent = p.get("spec_persistent") != 0;
+  o.readahead_units = uint32_t(p.get("readahead_units"));
   if (p.get("tier_mode") == kTierExclusive) {
     require(o.backend != SS_BACKEND_HIP, SS_E_RECIPE,
             w + ".tier_mode: \"exclusive\" needs a discrete device; on unified memory a slot and a pinned block are "
@@ -1131,7 +1132,11 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   }
   // Device tables are inside workspace_bytes (budget_for), so peak + margin is the whole device requirement.
   const uint64_t device_bytes = add_ck(out.plan.peak, out.plan.margin, w);
+  // Host read-ahead buffers: the library's own rule for their size (ra_buffer_bytes), none when no unit can be read
+  // from its file.
+  const uint64_t readahead = o.readahead_units ? mul_ck(ra_buffer_bytes(desc, tiers), o.readahead_units, w) : 0;
   uint64_t host = add_ck(add_ck(add_ck(out.plan.pinned, staging, w), add_ck(tables, ids, w), w), meta, w);
+  host = add_ck(host, readahead, w);
   if (dev->unified()) host = add_ck(host, device_bytes, w);
   // Commit: host memory plus, on a discrete device, its allocations (Windows WDDM bills them to commit).
   const uint64_t commit = dev->unified() ? host : add_ck(host, device_bytes, w);
@@ -1182,9 +1187,12 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   oj["direct_io"] = Json::boolean(o.direct_io != 0);
   oj["group_units"] = Json::number(uint64_t(o.group_units));
   oj["spec_persistent"] = Json::boolean(o.spec_persistent != 0);
+  if (o.readahead_units) oj["readahead_units"] = Json::number(uint64_t(o.readahead_units));  // 0: today's keys
   j["options"] = oj;
   Json ej = Json::object();
   ej["prefetch_layers"] = Json::number(uint64_t(pf));
+  if (p.get("host_prefetch_layers") != 0)
+    ej["host_prefetch_layers"] = Json::number(uint64_t(p.get("host_prefetch_layers")));
   ej["chunk_tokens"] = Json::number(uint64_t(p.get("chunk_tokens")));
   ej["routed_only_max_tokens"] = Json::number(uint64_t(p.get("routed_only_max_tokens")));
   ej["idle_preload_layers"] = Json::number(uint64_t(p.get("idle_preload_layers")));
@@ -1197,6 +1205,7 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   rj["device_bytes"] = Json::number(device_bytes);
   rj["host_pinned_bytes"] = Json::number(out.plan.pinned);
   rj["staging_bytes"] = Json::number(staging);
+  if (readahead) rj["readahead_bytes"] = Json::number(readahead);
   rj["tables_bytes"] = Json::number(add_ck(tables, ids, w));
   rj["metadata_bytes"] = Json::number(meta);
   rj["host_bytes"] = Json::number(host);

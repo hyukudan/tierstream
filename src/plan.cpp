@@ -180,7 +180,25 @@ Plan start(const Desc& d, const ss_budget& b) {
 
 }  // namespace
 
-uint64_t host_stride(uint64_t bytes) { return (bytes + kHostStride - 1) / kHostStride * kHostStride; }
+uint64_t host_stride(uint64_t bytes) {
+  require(bytes <= UINT64_MAX - (kHostStride - 1), SS_E_INVALID, "plan: unit bytes overflow the host stride");
+  return (bytes + kHostStride - 1) / kHostStride * kHostStride;
+}
+
+uint64_t ra_buffer_bytes(const Desc& d, const std::vector<uint8_t>& tier) {
+  uint64_t m = 0;
+  for (size_t L = 0; L < d.layers.size(); ++L) {
+    const Layer& l = d.layers[L];
+    if (!l.streamable) continue;
+    for (int u = 0; u < l.n_units; ++u) {
+      const uint8_t t = tier[size_t(d.unit_base[L] + u)];
+      if (t == SS_TIER_PINNED || t == SS_TIER_PAIR) continue;
+      m = std::max(m, host_stride(l.unit_bytes));
+      break;  // every unit of a layer has the same bytes
+    }
+  }
+  return m;
+}
 
 std::vector<SpareClass> spare_classes(const Desc& d, const ss_budget& b, uint64_t host_left) {
   std::vector<SpareClass> out;

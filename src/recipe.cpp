@@ -304,7 +304,9 @@ const std::vector<PlacementField>& placement_fields() {
       {"verify_hash", FieldType::Bool, 0, 1, 0},
       {"group_units", FieldType::Int, 0, 65536, 0},
       {"spec_persistent", FieldType::Bool, 0, 1, 0},
+      {"readahead_units", FieldType::Int, 0, 64, 0},
       {"prefetch_layers", FieldType::Int, 0, 8, 1},
+      {"host_prefetch_layers", FieldType::Int, 0, 64, 0},
       {"chunk_tokens", FieldType::Int, 0, 1048576, 0},
       {"routed_only_max_tokens", FieldType::Int, 0, 1048576, 0},
       {"idle_preload_layers", FieldType::Int, 0, 64, 0},
@@ -758,7 +760,10 @@ Json recipe_to_json(const Recipe& r) {
         if (std::string(f.key) == "workspace_gib" && !p.has_workspace) continue;
         // Added after recipe-v1 shipped: written only when set, so existing recipes keep their canonical bytes (and
         // the effective hash their profiles and compiled plans are bound to).
-        if (std::string(f.key) == "host_spare_units" && p.v[k] == 0) continue;
+        if ((std::string(f.key) == "host_spare_units" || std::string(f.key) == "readahead_units" ||
+             std::string(f.key) == "host_prefetch_layers") &&
+            p.v[k] == 0)
+          continue;
         switch (f.type) {
           case FieldType::Gib:
           case FieldType::Float:

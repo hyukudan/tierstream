@@ -257,6 +257,7 @@ Streaming knobs (`ss_options`; `backend` comes from the set's `kind`; `device` i
 | `verify_hash` | bool | false | `verify_hash` |
 | `group_units` | integer 0..65536 | 0 | `group_units` |
 | `spec_persistent` | bool | false | `spec_persistent` |
+| `readahead_units` | integer 0..64 | 0 | `readahead_units`: pinned host read-ahead buffers, each the size of the largest unit that can be read from its file; billed in `resources.readahead_bytes` / `host_bytes` / commit |
 | `tier_mode` | `"inclusive"` \| `"exclusive"` | `"inclusive"` | `tier_mode` of the budget. inclusive: a promoted unit keeps its pinned copy. exclusive: each unit lives in exactly one place (a device slot, a pinned block, or only its file); a promotion frees its block and an evicted unit is written back into a free block (design.md §3.4). Exclusive is refused on a `hip` set, with `fill_residents = false` and with `pinned_backing = true`. Pick it for a decode route with dynamic residency (`pin_planned = false`) whose device + host bytes cover the model only when no unit is held twice. |
 
 Engine knobs (in the compiled plan's `engine` section; the library does not read them; every value has one concrete
@@ -265,6 +266,7 @@ meaning, and an engine refuses a value outside its legal set rather than substit
 | field | type | default | meaning |
 |---|---|---|---|
 | `prefetch_layers` | integer 0..8 | 1 | whole-layer prefetch distance (`ss_prefetch_layer` of L+k during L); 0 = none |
+| `host_prefetch_layers` | integer 0..64 | 0 | host-only read-ahead distance (`ss_host_prefetch_layer` of L+1..L+H during L; needs `readahead_units` > 0); 0 = none |
 | `chunk_tokens` | integer 0..1048576 | 0 | prefill chunk rows; 0 = the whole prompt is one chunk |
 | `routed_only_max_tokens` | integer 0..1048576 | 0 | prefill prompts up to this many tokens upload only the routed units of a streamed layer, longer ones the whole layer; 0 = always the whole layer (decode is always routed-only) |
 | `idle_preload_layers` | integer 0..64 | 0 | streamed layers a resident service loads ahead while idle between requests; 0 = none |

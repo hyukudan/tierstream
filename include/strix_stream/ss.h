@@ -204,6 +204,12 @@ typedef struct ss_options {
   /* 0 (default) = speculative reads land only in ring slots and never evict a resident; 1 = they go through
    * admission into persistent slots (only after a trace shows the extra evictions pay). */
   int spec_persistent;
+  uint32_t reserved0;             /* never read: the bytes where older callers' structs had padding */
+  /* Host read-ahead (design: wave4/gapfix/wstream-readahead): pinned host buffers, each as large as the largest unit
+   * that can be read from its file. ss_host_prefetch* and units waiting for a ring slot read their file into one
+   * ahead of time; the unit then lands in its ring slot from that buffer. 0 = off (default), at most 64. */
+  uint32_t readahead_units;
+  uint32_t reserved1;             /* explicit padding (never read) */
 } ss_options;
 
 typedef struct ss_ctx ss_ctx;
@@ -242,6 +248,13 @@ typedef enum ss_prefetch_kind {
 SS_API ss_status ss_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n, ss_prefetch_kind kind);
 /* Whole-layer prefetch (layer-major prefill: issue layer L+k's streamed part during layer L). */
 SS_API ss_status ss_prefetch_layer(ss_ctx* c, int layer);
+
+/* Host-only lookahead (readahead_units > 0, else a no-op): start reading these file-backed units of layer L into host
+ * read-ahead buffers now, without a device slot. A later fetch of the unit into a ring slot (routes, ss_layer_all,
+ * ss_prefetch*) lands it from that buffer. Repeats in the same forward are ignored; allowed between forwards. Units that
+ * are resident, in flight, computed by a peer or have a pinned source are skipped. */
+SS_API ss_status ss_host_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n);
+SS_API ss_status ss_host_prefetch_layer(ss_ctx* c, int layer);
 
 /* Lookahead helper (host): rows x n_experts scores of layer L+1's router applied to layer L's input; per row its
  * top_k, union ordered by (best rank, best score, id). Writes up to max_out ids, returns the count in *n_out. */
