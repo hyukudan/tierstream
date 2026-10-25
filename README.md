@@ -17,28 +17,30 @@ so where a unit lives never changes a single output bit.
      engine kernels ── read unit u of layer L at table[L][u] ──┐
                                                                v
   ┌─ 1. GPU memory (VRAM) ──────────────────────────────────────────────────────────┐
-  │  resident slots (the plan's units) │ dynamic slots (adaptive) │ ring (temporary)  │
+  │  resident slots (the plan's units) │ dynamic slots (adaptive) │ ring (temporary)│
   └─────────────────────────────────────────────────────────────────────────────────┘
         ^ promote: copy RAM -> VRAM          │ evict
         │                                    v   inclusive: drop it (RAM or the file still has it)
         │                                        exclusive: write it back VRAM -> RAM into a free block
   ┌─ 2. pinned host RAM ────────────────────────────────────────────────────────────┐
-  │  blocks of the plan's pinned units │ staging buffers │ read-ahead buffers (opt.) │
+  │  unit blocks │ staging buffers │ read-ahead buffers (optional)                  │
   └─────────────────────────────────────────────────────────────────────────────────┘
         ^ on a miss: read the file into a staging buffer, then copy it to VRAM
         │ ahead of time (opt.): read-ahead fills its buffers before the GPU slot is free
   ┌─ 3. model files on NVMe ────────────────────────────────────────────────────────┐
-  │  GGUF / safetensors / packed records; unbuffered (direct I/O) by default,        │
-  │  buffered when the file system refuses it                                        │
+  │  GGUF / safetensors / packed records; unbuffered (direct I/O) by default,       │
+  │  buffered when the file system refuses it                                       │
   └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Ring.** A small set of temporary GPU slots, used by misses that do not get a persistent slot and by prefetches.
 - **Inclusive vs exclusive RAM.** In inclusive mode (the default), a unit can be in RAM and in VRAM at once. In
-  exclusive mode, RAM holds only units that are not on the GPU (below).
+  exclusive mode, RAM holds the units that are not in a persistent GPU slot; during a forward a unit can briefly be in
+  both (below).
 - **Unified memory (Strix Halo).** Tiers 1 and 2 are the same memory, and there is no separate pinned tier. A
-  resident unit is mapped host memory. A miss is read from NVMe straight into its slot when the file offsets and the
-  slot are aligned, otherwise through a staging buffer and a memcpy.
+  resident unit is mapped host memory, and a miss is read from NVMe into its slot. Buffered reads land directly in
+  the slot. With direct I/O, each part's file offset, length and destination address must be aligned; otherwise the
+  read goes through a staging buffer and a memcpy.
 
 A **descriptor** lists the model's units: their files, offsets, sizes and parts (for example an expert's gate, up and
 down matrices). A **plan** assigns each unit a starting tier from a memory budget:
@@ -46,7 +48,8 @@ down matrices). A **plan** assigns each unit a starting tier from a memory budge
 - Then it fills the rest of VRAM:
   - with `order = ranked`, the units with the highest benefit per byte (by default every unit is worth the same; a
     measured routing frequency makes it smarter);
-  - with `order = prefix`, the longest model-order prefix of layers that fits.
+  - with `order = prefix`, the longest model-order prefix of units that fits (units are walked layer by layer, so
+    with one blob per layer this is a prefix of whole layers).
 - Then pinned RAM; the rest stays on disk.
 
 `ss-plan` prints a plan; `ss_plan_from_tiers` takes your own.
@@ -124,7 +127,7 @@ own memory, which is much faster.
 
 | workload | streaming | why |
 |---|---|---|
-| **MoE decode** (DeepSeek, MiniMax, Qwen MoE, GLM) | usually pays | A token uses only the top-k experts of each layer (6 of 384 for DeepSeek V4.1). When routing has a hot set, as on our DeepSeek traces (95-98 % LRU hits), most lookups need no transfer and a miss costs one expert copy. |
+| **MoE decode** (DeepSeek, MiniMax, Qwen MoE, GLM) | can pay, with a hot set | A token uses only the top-k experts of each layer (6 of 384 for DeepSeek V4.1). When routing has a hot set, as on our DeepSeek traces (95-98 % LRU hits), most lookups need no transfer and a miss costs one expert copy. |
 | **Prefill and large batches** (dense or MoE) | can pay | Many tokens reuse every weight byte, so the copy of layer L+1 can hide behind layer L's compute, as long as that compute takes longer than the copy. |
 | **Models that do not fit at all** | makes them run | The alternative is not running, or splitting across machines. That is a capacity gain, not a speed gain. Exclusive mode removes disk reads only when VRAM + RAM cover the units. |
 | **Dense decode** (one or a few tokens per step) | does **not** pay | Every token reads every weight. Whatever is not resident crosses PCIe on every token, far slower than VRAM, so the streamed fraction dominates the step time. Use a smaller quantization, more GPUs, or a unified-memory machine instead. |
@@ -309,7 +312,7 @@ in one short window. Exclusive mode and host read-ahead are opt-in.
 The HIP backend for Strix Halo (unified memory) is still a stub: it has not been built or run yet. Building and
 testing it with the nodes' ROCm toolchain is the next step.
 
-In development: a device-gated decode mode for graph-captured MoE decode. Route -> slot resolution and the residency
+In development (design approved, not in this version): a device-gated decode mode for graph-captured MoE decode. Route -> slot resolution and the residency
 check run inside the engine's CUDA graph, and the host is touched only on a miss.
 
 ## Credits
