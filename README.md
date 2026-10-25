@@ -460,21 +460,41 @@ budgets, DMA timing, and two protocol mutations that the test must catch). The f
 comparison against the replica's own cache and the speed-parity gate both passed. Device-gated decode is merged;
 the DeepSeek replica now uses tierstream as its only expert cache. This qualification does not cover unmerged features.
 
-As of 25 October 2026 evening:
+As of 25 October 2026 late evening:
 
 | Work | State | Scope / qualification |
 |---|---|---|
 | Device-gated decode | Merged, opt-in | CUDA decode; full-model bit-for-bit and speed-parity gates passed. |
-| Deferred, bounded write-backs (`wbsched`) | In development | Carries pending victims across token boundaries and budgets background submissions so they do not flood the shared copy engine. Preserves exact bytes and slot ownership; GPU tests passed on the RTX PRO 6000. Full-model performance qualification is in progress. |
-| Priced window prefetch (`winpf`) | In development, in qualification | Deduplicates multi-row predictions, prices candidates by observed usefulness and copy cost, and bounds speculative traffic behind demand. No accepted full-model speed gain yet. |
+| Deferred, bounded write-backs (`wbsched`) | Adopted in the DeepSeek RTX engine | Carries pending victims across token boundaries and bounds background submissions on the shared copy engine. Exact full-model gates pass; results below include the warm controller, now the engine default. |
+| Priced window prefetch (`winpf`) | Implemented in development, default off | Exact; gain not established and still under investigation. |
 | Adaptive budgets, usage tables and NVMe placement (`adaptive`) | In development | Trace-replay measurements above; not an end-to-end engine result. |
-| Pipelined cold-start loader (`coldload`) | In development, in progress | Bounded overlap of reads, staging and device copies; no measured saving yet. |
+| Pipelined startup loader (`coldload`) | In development branches | Overlaps reads, staging and device copies with bounded buffers; measured load-time reduction below. |
+| Persistent loaded worker and cache reset-to-open | In development branches | Reuses one loaded process across requests; reset restores the fresh-load cache state. Each request is bitwise identical to a fresh process. |
 
-Cold-start loading is still serial. Recent DeepSeek V4.1 Flash RTX runs with the same GGUF expert formats took
-92-104 s to initialize, including about 79 s in the serial expert-fill phase in one measured run. Loading precedes
-prompt execution; that run then continued from an imported 2,048-token state. These are internal load timers across
-different builds/configurations, not a controlled cold/warm-disk comparison or request TTFT. Expert loading includes
-allocation, file reads and device copies; their individual times have not been isolated.
+Measured with DeepSeek V4.1 Flash on an RTX PRO 6000 (96 GB, Windows WDDM) alone: Q2 GGUF
+(IQ2_XXS gate/up, Q2_K down, Q8_0 dense), exclusive VRAM + pinned expert cache, and a speculative drafter
+pruned to the 64 most-used experts per stage. All results below passed exact/bitwise checks. Context lengths
+and prompt contents are not specified in the measurement summary; these are workload results, not context-scaling tests.
+
+| Decode prompt kind | Warm controller + bounded write-backs, within one load |
+|---|---:|
+| Code | 82.3 tok/s |
+| English | 87.7 tok/s |
+| Spanish | 94.4 tok/s |
+
+These same-load results reach 51-58 % of the throughput ceiling set by the 6.18 ms/token all-hit floor.
+Across the evening's loads, code reached 82-95 tok/s; loads drifted by up to about 10 %, so performance
+comparisons must stay within one load. These results qualify the combined engine configuration, not an isolated
+write-back scheduling speedup.
+
+| Startup / request operation (development branches) | Measured result |
+|---|---|
+| Full model load, serial → pipelined | 108.7 → 61.8 s; bitwise-identical placement and outputs |
+| Expert fill, serial → pipelined | 83.1 → 38.0 s; 2.25 → 6.73 GB/s, disk-bound |
+| Request in the persistent loaded worker, without reload | 8-18 s for the test workloads; bitwise identical to a fresh process |
+| Cache reset to fresh-load state | 3.4 s |
+
+Load and reset timers are separate from request execution; the load measurements are not request TTFT.
 
 ## Credits
 

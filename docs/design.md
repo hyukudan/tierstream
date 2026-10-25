@@ -471,6 +471,10 @@ the host-controlled per-layer pools described in §3. See [the engine contract i
 The older 31-32.5 GB/s transfer measurements above are not a fixed platform limit; see
 [the current PCIe conditions](../README.md#when-it-pays-and-when-it-does-not).
 
+Deferred, bounded write-backs (`wbsched`) are adopted in the DeepSeek RTX engine: pending victims carry across
+token boundaries and background submissions are bounded to limit copy-engine queueing. Exact full-model gates pass
+with the warm controller, now the engine default; see [results and conditions](../README.md#status).
+
 ## 9. Versioning
 
 - `SS_ABI_VERSION` = 1. Structs are passed by pointer and filled with `*_defaults`.
@@ -487,11 +491,13 @@ The older 31-32.5 GB/s transfer measurements above are not a fixed platform limi
 - **Mapped-flag gates** (`cuStreamWaitValue32` / `hipStreamWaitValue64`) instead of host waits for file jobs.
 - **Per-layer row splits** from miss curves (dynamic slots per layer instead of a uniform count).
 - **A rate-tally file across runs.** Measured to generalize poorly in the study, so only as an opt-in.
-- **Deferred, bounded write-backs** (`wbsched`, in development): carry pending victims across token boundaries
-  and limit copy-engine queueing; exact-byte GPU tests pass, full-model timing qualification is in progress.
-- **Priced window prefetch** (`winpf`, in development): bound multi-row speculative copies by observed usefulness
-  and copy cost; still in qualification.
+- **Priced window prefetch** (`winpf`, implemented in development, default off): bound multi-row speculative
+  copies by observed usefulness and copy cost. Exact; gain not established and still under investigation.
 - **Adaptive memory planning** (`adaptive`, in development): usage tables rank VRAM / pinned / NVMe homes after
   reserving context state. The measured replay and its limits are in the [README](../README.md#adaptive-memory-and-nvme-measurements-in-development).
-- **Pipelined startup loading** (`coldload`, in progress): overlap reads, staging and device copies with bounded
-  buffers. No measured load-time saving yet.
+- **Pipelined startup loading** (`coldload`, in development branches): overlap reads, staging and device copies
+  with bounded buffers; measured load-time reduction with bitwise-identical placement and outputs.
+- **Persistent loaded worker and cache reset-to-open** (in development branches): reuse a loaded process and
+  restore its fresh-load cache state; requests are bitwise identical to a fresh process.
+
+The measured startup and reset timings and their conditions are in the [README](../README.md#status).
