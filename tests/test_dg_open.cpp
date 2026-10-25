@@ -76,8 +76,17 @@ TEST(dg_open_refusals) {
   expect(try_open(m, [](B&, O&, T&) {}, 16, 0), SS_E_INVALID, "dynamic_slots_per_layer > 0");
   // ring too small for the banks + guard
   expect(try_open(m, [](B& b, O&, T&) { b.ring_slots = 16; }), SS_E_CAPACITY, "set ring_slots = 2 x dg_max_ids + 1");
-  // fewer granted spare blocks than spare slots (the request is only a request)
-  expect(try_open(m, [](B& b, O&, T&) { b.host_spare_units = 3; }), SS_E_CAPACITY, "spare blocks");
+  // a global spare count above the non-resident units
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_spare_slots = 6 * 48 + 1; }), SS_E_INVALID, "above the non-resident");
+}
+
+// Spares as the engine caches have them: one global count of spare slots (not a multiple of the layers), and fewer
+// spare blocks than spare slots; both valid layouts (they reach the backend refusal on the CPU).
+TEST(dg_open_global_spares) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_spare_slots = 7; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_spare_slots = 7; }, 16, 0), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B& b, O&, T&) { b.host_spare_units = 3; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
 }
 
 TEST(dg_open_shape_refusals) {

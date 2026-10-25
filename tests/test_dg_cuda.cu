@@ -380,6 +380,28 @@ TEST(dg_cuda_pressure) {
   CHECK(x.covered > 0);
 }
 
+// Spares as the engine caches have them (Sol rtx-vram-plan 2.7): a global count of 20 spare slots (not a multiple of the
+// 6 layers) on the plan's 12 spare blocks (dyn 2 x 6): Q < D, so boundaries write back at most the free blocks and keep
+// the other victims resident (evict_short). Exact under pressure, invariants at every boundary.
+TEST(dg_cuda_global_spares) {
+  Rig r("gspares", 8, 2, 8, 10000, true, [](ss_options& o) { o.dg_spare_slots = 20; });
+  if (!r.c) return;
+  CHECK_OK(ss_test_dg_pressure(r.c, 2, 6));
+  r.capture(true);
+  Tally k;
+  for (int t = 0; t < 200; ++t) {
+    k.add(r.token(true, true));
+    CHECK_OK(ss_test_dg_check(r.c));
+  }
+  const ss_dg_stats x = r.stats();
+  print("global spares", x);
+  CHECK_EQ(k.failed, 0);
+  CHECK_EQ(k.wrong, 0);
+  CHECK_EQ(x.blocks, uint64_t(6 * (64 - 8) + 12));  // P + Q
+  CHECK(x.evict_short > 0);
+  CHECK(x.evicted > 0);
+}
+
 // A stopped service: the device's waits end on host_abort within a round trip, ss_end fails, close frees.
 TEST(dg_cuda_stopped_service) {
   Rig r("stop", 4, 4, 8, 10000);

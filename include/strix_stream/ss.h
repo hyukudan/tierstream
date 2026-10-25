@@ -232,6 +232,11 @@ typedef struct ss_options {
    * device slots go to the first distinct entries (then the plan's residents, then key order), and that order is the
    * initial recency order. The plan's per-unit tiers then give the counts, not which units are resident. */
   const struct ss_dg_unit* dg_seed;
+  /* appended: the spare slots D as one global count (the engine caches' --spares), instead of the plan's
+   * dynamic_slots_per_layer summed over the gated layers; 0 = that sum. At most the non-resident gated units; the
+   * arena is admitted with this D. */
+  uint32_t dg_spare_slots;
+  uint32_t reserved2_opt; /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;

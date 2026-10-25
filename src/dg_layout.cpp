@@ -107,7 +107,15 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   }
   x.keys = uint32_t(keys);
   x.R = uint32_t(x.residents.size());
-  if (x.D < 1) refuse(SS_E_INVALID, "needs dynamic_slots_per_layer > 0 (the spare slots; the boundary keeps them free)");
+  if (o.dg_spare_slots) {  // one global count, as the engine caches (the plan bills per layer)
+    if (o.dg_spare_slots > x.P)
+      refuse(SS_E_INVALID, "dg_spare_slots " + std::to_string(o.dg_spare_slots) + " above the non-resident units (" +
+                               std::to_string(x.P) + ")");
+    x.D = o.dg_spare_slots;
+  }
+  if (x.D < 1)
+    refuse(SS_E_INVALID, "needs dynamic_slots_per_layer > 0 or dg_spare_slots > 0 (the spare slots; the boundary keeps "
+                         "them free)");
 
   // Banks + guard from the billed ring of the expert size.
   const uint64_t stride = d.unit_stride(x.gated[0]);
@@ -121,10 +129,12 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   // Spare blocks the planner granted and billed for this host stride.
   for (const SpareClass& sc : p.spares)
     if (sc.block_bytes == x.host_stride) x.Q = sc.blocks;
-  if (x.Q < x.D)
-    refuse(SS_E_CAPACITY, "the plan granted " + std::to_string(x.Q) + " spare blocks (host_spare_units asked " +
-                              std::to_string(b.host_spare_units) + "), the " + std::to_string(x.D) +
-                              " spare slots need as many (raise host_spare_units or the host budget)");
+  // Q may be below D (the engine caches run 96 spare slots on 48 spare blocks): a boundary then writes back at most
+  // the free blocks and keeps the other victims resident (evict_short), so fewer slots are free, never a wrong one.
+  if (x.Q < 1)
+    refuse(SS_E_CAPACITY, "the plan granted no spare blocks (host_spare_units asked " +
+                              std::to_string(b.host_spare_units) + "): a write-back needs a free block (raise "
+                              "host_spare_units or the host budget)");
   require(uint64_t(x.P) + x.Q < 0x7fffffffull, SS_E_INVALID, "device-gated: more than 2^31 - 1 host blocks");
   x.blocks = x.P + x.Q;
 

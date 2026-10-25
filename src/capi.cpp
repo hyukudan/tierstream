@@ -121,6 +121,7 @@ void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
+  o.reserved2_opt = 0;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
