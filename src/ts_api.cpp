@@ -61,9 +61,15 @@ ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n,
 ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream) { return ss_dg_enqueue_wait(c, g, stream); }
 ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream) { return ss_dg_enqueue_end(c, stream); }
 ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) { return ss_dg_keep(c, g, ids, n); }
+ss_status ts_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total) { return ss_dg_residency(c, out, cap, total); }
+ss_status ts_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready) { return ss_dg_set_sched(c, wb_defer, flush_ready); }
 ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token) { return ss_dg_set_budgets(c, spare_target, prefetch_per_layer, prefetch_per_token); }
 ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) { return ss_dg_timeline_sized(c, g, out, size); }
+ss_status ts_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size) { return ss_dg_boundary_timeline_sized(c, out, size); }
 ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) { return ss_stats_dg_sized(c, out, size); }
+void ts_dg_winpf_defaults_sized(ss_dg_winpf_params* p, uint32_t size) { ss_dg_winpf_defaults_sized(p, size); }
+ss_status ts_dg_winpf_set(ss_ctx* c, const ss_dg_winpf_params* p) { return ss_dg_winpf_set(c, p); }
+ss_status ts_dg_window_hint(ss_ctx* c, const int32_t* symbols, const float* weights, uint32_t rows) { return ss_dg_window_hint(c, symbols, weights, rows); }
 ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) { return ss_recipe_from_text(text, len, origin, out); }
 ss_status ts_recipe_from_file(const char* path, ss_recipe** out) { return ss_recipe_from_file(path, out); }
 void ts_recipe_free(ss_recipe* r) { ss_recipe_free(r); }
@@ -75,5 +81,6 @@ ss_status ts_recipe_explain(const ss_recipe* r, char** out, size_t* len) { retur
 ss_status ts_recipe_match(const ss_recipe* r, const char* probe_json, size_t len, char** out, size_t* olen) { return ss_recipe_match(r, probe_json, len, out, olen); }
 ss_status ts_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen) { return ss_recipe_select(r, state_json, len, out, olen); }
 ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member, const char* device_id, const ss_desc* desc, const double* benefit, size_t n_benefit, const ss_desc* const* ref_descs, const double* const* ref_benefits, const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options, ss_plan** plan, char** out, size_t* olen) { return ss_recipe_plan(r, route, set, member, device_id, desc, benefit, n_benefit, ref_descs, ref_benefits, ref_n_benefits, n_refs, budget, options, plan, out, olen); }
+ss_status ts_dg_reset_open(ss_ctx* c) { return ss_dg_reset_open(c); }
 
 }  // extern "C"

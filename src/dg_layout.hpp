@@ -31,6 +31,9 @@ struct DgLayout {
   uint64_t device_ctl_bytes = 0;    // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1]
   uint64_t bounce_bytes = 0;        // pinned: the covering aligned reads of unaligned parts
   uint64_t staging_bytes = 0;       // pinned: one resident's bytes on their way to the arena at open
+  bool load_serial = false;
+  uint32_t load_readers = 0, load_buffers = 0;
+  uint64_t load_buffer_bytes = 0;  // additional temporary pinned ring, admitted at open
   // Exactly what the context allocates, so admission bills what it allocates.
   // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1], absent_err
   static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1) + 1; }

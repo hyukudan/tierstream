@@ -694,7 +694,7 @@ void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* 
 
 int Ctx::block_class(int layer) const { return excl_ ? layer_class_[size_t(layer)] : -1; }
 
-// ---- host read-ahead (wave4/gapfix/wstream-readahead/design.md §7-11) -------------------------------------------------
+// ---- host read-ahead (design notes §7-11) -------------------------------------------------
 
 void Ctx::test_ra_quiesce() {
   for (const JobPtr& p : ra_jobs_) wait_job_quiet(*p);

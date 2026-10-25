@@ -5,7 +5,7 @@ resident set of weight units in device memory. It streams the rest from a pinned
 unbuffered, and it reads every streamed or resident unit through one pointer table per layer. The library holds no
 model or engine code. A model plugs in with a **descriptor** (§2) and a small **adapter** in the engine (§6).
 
-Sources: the weight-streaming study (`wave4/wstream/study.md`), the RTX prefill spec §6 (`spec-rtx-prefill.md`, the
+Sources: the weight-streaming study (the weight-streaming study notes), the RTX prefill spec §6 (`spec-rtx-prefill.md`, the
 `ss_` names come from there unchanged), the DeepSeek and MiniMax streaming specs, and hyperloom vramplan's third
 tier (the planner rule of §5).
 
@@ -154,7 +154,7 @@ lower id.
     - age is counted in routes.
   - Hits do not refresh recency; misses do.
   - Misses below the cut are transient. Residents below the cut are evicted only as needed.
-  - It has to beat LRU on our traces (the hit-rate curves in wave4/vramplan/curves) before it becomes a default.
+  - It has to beat LRU on our traces (the hit-rate curves in the cache hit-rate curves) before it becomes a default.
 - **Seed** (`ss_seed`): load ranked units into free slots between forwards (usage profile, warm start). It never
   evicts.
 
@@ -249,6 +249,27 @@ that can be read from its file.
   bytes count once in `bytes_disk`.
 - **Cost.** R x buffer bytes of pinned host memory, billed by recipes in `resources.readahead_bytes`. The adapter
   must take them out of the host budget before placement.
+
+### 3.7 Device-gated write-back scheduling
+
+In device-gated decode (README, "Device-gated decode") each boundary evicts least recently used experts into free
+pinned blocks. With `dg_wb_defer = 1` the boundary still chooses the victims, reserves their blocks and unpublishes
+them in the table upload, but copies nothing. Each victim waits in a FIFO of records: unsubmitted, partly submitted
+(only the oldest, with a part cursor), or submitted with its completion event recorded after its last part. Only
+submitted records are ever queried for completion. The service thread submits parts after a layer's ready signal and
+prefetches, on the demand stream by default (stream order keeps them behind the ready), under a per-layer byte credit
+that may go into debt for a part larger than the budget. It submits nothing after the last gated layer, stops as soon
+as the next layer has exported (checked before every part), and holds back while the bytes in flight reach a cap. A
+demand without a free slot waits for the oldest write-back in flight, or with none finishes the oldest record, until
+a persistent slot is free, before the usual bank fallback. A boundary counts deferred victims as in flight in its
+spare-target arithmetic, carries up to the larger of its own and the previous boundary's victim count into the next
+token, and submits the older excess after its table upload. A victim routed or predicted again
+before any part was submitted is cancelled: its record goes, its block returns unread, and it is published again on
+the demand stream as any resurrection. A partly submitted one gets its event after the parts already sent and is
+discarded, so its block returns once those copies finish and the remaining parts are never sent. Exactness rests on
+the existing rules: a victim's slot is not written until its write-back's event completes, the device never reads an
+unpublished slot, and a block becomes a unit's home only after every part landed. Close drops unsubmitted records
+without new device work and frees memory only after the submitted copies are drained.
 
 ## 4. Sources and the copy path
 

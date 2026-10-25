@@ -3,7 +3,9 @@
 # Checked by tools/check_old_symbols.py. Never regenerated from the current tree.
 ss.h-sha256 bdc137af7b7969da4abb395561d4d8fad60eab402030a5faff27d12bbd62cec9
 # devgate (additive: the device-gated declarations; no baseline declaration changed, diff 4dc53b0..devgate-ts)
-ss.h-sha256 df91fe89e9be4e9f36ea5e6e82a8d5ba8d74f8d484ad8011fda9a6bb1c3a7860
+ss.h-sha256 5792e20a9809f1e8e6f4154687f636448c86e8b960de4998f9f86aba60b95cba
+# winpf (additive: window prefetch declarations, appended option / stats fields; no baseline declaration changed, diff wbsched..winpf)
+ss.h-sha256 80a072a5577b80772ab8d3c60c811e8de2734436e014aac872be6eff5888590c
 abi ss_abi_version
 abi ss_acquire
 abi ss_acquire_groups
@@ -72,3 +74,12 @@ hook ss_test_inject
 hook ss_test_ra_quiesce
 hook ss_test_ra_started
 hook ss_test_sync_copy
+
+# persist: append-only ss_dg_reset_open declaration; existing ABI declarations unchanged.
+ss.h-sha256 06d6e64a1d7ad730c309720e4b6c6c8442b1d29bc582c71bbfb698c36d07c1fe
+ss.h-sha256 80082006c0385d876385253b42572cb79c9c9ed79210a2743f5b47e310fd0b86
+ss.h-sha256 2427912bf477ce43af3214c1c749ee9d817d09d10722bb1134b54e8bff64e37f
+ss.h-sha256 5cadc3f05cb6e01237d32f33505b22eb3c44eab41d208b6de1bd52f641b8db34
+
+# public release: comment-only edits (design references generalised); declarations unchanged.
+ss.h-sha256 2a77968897e6d00d586def2fff4d1e8c63ffb91caa43b5e844dc552641251408

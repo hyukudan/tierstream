@@ -1,4 +1,4 @@
-// The tierstream names, from C++ (wave4/wstream/rename/design.md §2.1): ts.h first, then ss.h (the other order is
+// The tierstream names, from C++ (design notes §2.1): ts.h first, then ss.h (the other order is
 // tests/test_ts_names.c). Every ts_ function has exactly its ss_ counterpart's type, every ts_ type is the ss_ type
 // (so the C++ mangling of a consumer's ss_budget* parameter does not change), and a consumer's own members named after
 // either survive.

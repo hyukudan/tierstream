@@ -17,11 +17,13 @@ typedef ss_backend_kind ts_backend_kind;
 typedef ss_budget ts_budget;
 typedef ss_ctx ts_ctx;
 typedef ss_desc ts_desc;
+typedef ss_dg_boundary_timeline ts_dg_boundary_timeline;
 typedef ss_dg_device_view ts_dg_device_view;
 typedef ss_dg_layer_timeline ts_dg_layer_timeline;
 typedef ss_dg_part ts_dg_part;
 typedef ss_dg_stats ts_dg_stats;
 typedef ss_dg_unit ts_dg_unit;
+typedef ss_dg_winpf_params ts_dg_winpf_params;
 typedef ss_exclusive_stats ts_exclusive_stats;
 typedef ss_forward_mode ts_forward_mode;
 typedef ss_group ts_group;
@@ -70,6 +72,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
+#define TS_DG_RESET_OPEN SS_DG_RESET_OPEN
+#define TS_DG_RESIDENCY SS_DG_RESIDENCY
+#define TS_DG_SET_SCHED SS_DG_SET_SCHED
 #define TS_HAVE_STATS_SNAPSHOT SS_HAVE_STATS_SNAPSHOT
 #define TS_SNAPSHOT_EXCLUSIVE SS_SNAPSHOT_EXCLUSIVE
 #define TS_SNAPSHOT_READAHEAD SS_SNAPSHOT_READAHEAD
@@ -136,9 +141,15 @@ TS_API ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev,
 TS_API ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
 TS_API ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream);
 TS_API ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
+TS_API ss_status ts_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total);
+TS_API ss_status ts_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready);
 TS_API ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token);
 TS_API ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
+TS_API ss_status ts_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size);
 TS_API ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
+TS_API void ts_dg_winpf_defaults_sized(ss_dg_winpf_params* p, uint32_t size);
+TS_API ss_status ts_dg_winpf_set(ss_ctx* c, const ss_dg_winpf_params* p);
+TS_API ss_status ts_dg_window_hint(ss_ctx* c, const int32_t* symbols, const float* weights, uint32_t rows);
 TS_API ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out);
 TS_API ss_status ts_recipe_from_file(const char* path, ss_recipe** out);
 TS_API void ts_recipe_free(ss_recipe* r);
@@ -150,6 +161,7 @@ TS_API ss_status ts_recipe_explain(const ss_recipe* r, char** out, size_t* len);
 TS_API ss_status ts_recipe_match(const ss_recipe* r, const char* probe_json, size_t len, char** out, size_t* olen);
 TS_API ss_status ts_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen);
 TS_API ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member, const char* device_id, const ss_desc* desc, const double* benefit, size_t n_benefit, const ss_desc* const* ref_descs, const double* const* ref_benefits, const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options, ss_plan** plan, char** out, size_t* olen);
+TS_API ss_status ts_dg_reset_open(ss_ctx* c);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }
@@ -157,8 +169,10 @@ static inline ss_status ts_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* 
 static inline ss_status ts_stats_snapshot(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out) { return ss_stats_snapshot(c, total_out, info_out); }
 static inline ss_status ts_dg_get_device_view(const ss_ctx* c, ss_dg_device_view* out) { return ss_dg_get_device_view(c, out); }
 static inline ss_status ts_stats_dg(const ss_ctx* c, ss_dg_stats* out) { return ss_stats_dg(c, out); }
+static inline void ts_dg_winpf_defaults(ss_dg_winpf_params* p) { ss_dg_winpf_defaults(p); }
 #if defined(__CUDACC__)
 static __device__ __forceinline__ int32_t ts_dg_slot(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot(v, g, id); }
+static __device__ __forceinline__ int32_t ts_dg_slot_if_ready(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot_if_ready(v, g, id); }
 #endif
 
 #ifdef __cplusplus

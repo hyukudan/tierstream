@@ -393,7 +393,7 @@ const Json* field_of(const Json& explain, const std::string& path) {
 
 }  // namespace
 
-// The rename (wave4/wstream/rename/design.md §3): the tierstream spellings of the recipe, profile and overrides
+// The rename (design notes §3): the tierstream spellings of the recipe, profile and overrides
 // schemas are accepted and give exactly what the strix-stream spellings give (one canonical JSON, one effective hash,
 // the same explain); the canonical output keeps the old id; the profile binds to the recipe file's raw bytes, so a
 // respelled recipe is another file for its old profile.
@@ -972,7 +972,7 @@ TEST(select_routes_and_fallbacks) {
   lab.state["prompt_tokens"] = Json::number(uint64_t(1024));
   CHECK_EQ(lab.route(), std::string("prefill_nodes"));
   lab.state["prompt_tokens"] = Json::number(uint64_t(8192));
-  // PC-BIG busy -> fallback to the nodes.
+  // Discrete GPU busy -> fallback to the nodes.
   lab.state["devices"]["GPU-PRO"]["available"] = Json::boolean(false);
   CHECK_EQ(lab.route(), std::string("prefill_nodes"));
   Json t = recipe_select(lab.s.effective(), lab.s.effective_sha256(), lab.state);

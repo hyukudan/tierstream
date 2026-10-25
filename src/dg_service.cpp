@@ -188,7 +188,7 @@ void DgService::run(uint32_t seen) {
 void DgService::serve_token(uint32_t seq) {
   const uint32_t G = core_->gated();
   core_->begin_token(seq);
-  auto t_prev = t_served_;
+  auto t_prev = new_origin_.exchange(false, std::memory_order_acquire) ? clock_type::now() : t_served_;
   wait_began(seq);  // every flag deadline starts once the step began
   for (uint32_t g = 0; g < G; ++g) {
     DgLayerTimeline t;
@@ -222,9 +222,13 @@ void DgService::serve_token(uint32_t seq) {
               "device-gated: gated layer " + std::to_string(g) + " predicted " + std::to_string(pr.n_pred) +
                   " ids, its export promised " + std::to_string(n_pred));
       pred_.assign(pr.pred, pr.pred + n_pred);
-      core_->serve_prediction(g + 1, pred_.data(), n_pred);
+      core_->serve_prediction(g + 1, pred_.data(), n_pred, n, dg_load_acquire(&m_.flag[g + 1]) == seq);
       t.prefetch_us = us_since(t_pw, clock_type::now());
     }
+    // dg_wb_defer: deferred write-back parts behind this layer's ready and prefetches; no more once the next layer
+    // exported (the device ran ahead over layers without a miss: its demand comes first), asked before every part
+    if (core_->deferred() && g + 1 < G)
+      core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.flag[g + 1]) == seq; });
     const auto t_end = clock_type::now();
     t.serve_us = us_since(t_seen, t_end);
     if (cfg_.diag) {

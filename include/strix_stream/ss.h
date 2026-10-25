@@ -206,7 +206,7 @@ typedef struct ss_options {
    * admission into persistent slots (only after a trace shows the extra evictions pay). */
   int spec_persistent;
   uint32_t reserved0;             /* never read: the bytes where older callers' structs had padding */
-  /* Host read-ahead (design: wave4/gapfix/wstream-readahead): pinned host buffers, each as large as the largest unit
+  /* Host read-ahead (design notes): pinned host buffers, each as large as the largest unit
    * that can be read from its file. ss_host_prefetch* and units waiting for a ring slot read their file into one
    * ahead of time; the unit then lands in its ring slot from that buffer. 0 = off (default), at most 64. */
   uint32_t readahead_units;
@@ -236,7 +236,29 @@ typedef struct ss_options {
    * dynamic_slots_per_layer summed over the gated layers; 0 = that sum. At most the non-resident gated units; the
    * arena is admitted with this D. */
   uint32_t dg_spare_slots;
-  uint32_t reserved2_opt; /* explicit padding (never read) */
+  /* 1 = right after each layer's ready signal, push the demand stream's queued work to the GPU (a stream query: under
+   * WDDM it flushes the driver's batch; it never waits); 0 (default) = leave batching to the driver */
+  uint32_t dg_flush_ready;
+  /* appended: 1 = a boundary's write-backs are not enqueued at the boundary: the service submits them part by part
+   * after the layers it serves (after the layer's ready and prefetches, where the copy engine is idle; never after
+   * the last gated layer); a boundary carries what is left into the next token, up to the larger of its own and the
+   * previous boundary's victim count, and submits the older excess; a victim demanded or prefetched before any of its parts was submitted costs no
+   * copy at all. 0 (default) = every write-back is enqueued at the boundary, right after the table upload. (The
+   * timeline's wb_left_ms measures the boundary's write-backs: meaningful with 0 only.) */
+  uint32_t dg_wb_defer;
+  /* dg_wb_defer = 1: 0 (default) = the parts go on the demand stream right after the layer's ready (stream order
+   * keeps them behind it); 1 = on the write-back stream, made to wait for the ready by an event */
+  uint32_t dg_wb_stream;
+  /* dg_wb_defer = 1: write-back bytes submitted per served layer (no more parts once the next layer has exported);
+   * a part larger than what is left still goes and the excess is repaid by the next layers. 0 (default) = the bytes
+   * of a unit's first part */
+  uint32_t dg_wb_layer_bytes;
+  /* dg_wb_defer = 1: no part is submitted while this many write-back bytes are in flight; 0 (default) = two units */
+  uint32_t dg_wb_max_outstanding;
+  /* appended, window prefetch (ss.h: Window prefetch): a tierstream/hint-prior-v1 file's bytes, read only during
+   * ss_open (validated, copied into the context); 0 / NULL = no prior */
+  uint64_t dg_prior_len;
+  const void* dg_prior;
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -467,21 +489,44 @@ SS_API ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
 /* Between tokens: the spare target (<= the billed spares; the next boundary's evictions) and the prefetch budgets
  * (from the next token). The default prefetch reserve follows the spare target, min(24, spare_target / 4); an
  * explicit dg_prefetch_reserve stays. */
+/* Between tokens: dg_wb_defer and dg_flush_ready at runtime (0 / 1 each; the same meaning as at open; turning
+ * deferral off submits the deferred write-backs first). Placement / submission only: the same bytes. */
+#define SS_DG_SET_SCHED 1
+/* Between tokens: the device-resident units in recency order, most recent first (*total = how many; at most cap
+ * written). A file of them written at shutdown seeds the next ss_open (dg_seed): the hot experts first. */
+#define SS_DG_RESIDENCY 1
+SS_API ss_status ss_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total);
+SS_API ss_status ss_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready);
 SS_API ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
                                    uint32_t prefetch_per_token);
 /* Per-layer timeline of the last completed token (dg_diag = 1), between tokens; the replica's definitions: ids = unique
  * ids, misses = unique ids with a masked occurrence, covered / fetched per masked occurrence in export order (covered =
  * on the device or coming at service time), seen_us of layer 0 from the previous token's end, demand_us = flag seen ->
  * demand copies + ready enqueued, dma_ms = device time of those copies + ready (-1 = no miss or no diag),
- * predicted_true = unique ids found in the previous layer's prediction, covered_waits = demand waits on a prefetch. */
+ * predicted_true = unique ids found in the previous layer's prediction, covered_waits = demand waits on a prefetch.
+ * Appended, from the device's clock (layers with a miss; -1 otherwise): gpu_wait_us = the wait kernel's entry -> ready
+ * seen (the exposed stall), gpu_export_ready_us = the export kernel's flag write -> ready seen (the whole miss path:
+ * service, enqueue, submission, copies, ready). wb_left_ms = how long the previous boundary's write-backs still ran
+ * after this layer's demand copies were submitted (0 = already done; -2 = still running at this boundary; -1 = no
+ * miss, none issued, or not measurable). dma_first_ms = demand submission -> the first fetched unit's copies done (-1 =
+ * no fetch): under a FIFO copy engine about wb_left_ms + one unit's copy time. */
 typedef struct ss_dg_layer_timeline {
   uint32_t struct_size, layer;
   double seen_us, demand_us, pred_wait_us, prefetch_us, serve_us;
   uint32_t ids, misses, covered, fetched, prefetched, reserved0;
   double dma_ms;
   uint32_t predicted_true, covered_waits;
+  double gpu_wait_us, gpu_export_ready_us, wb_left_ms, dma_first_ms;
 } ss_dg_layer_timeline;
 SS_API ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
+/* The last successful boundary (ss_end) of a dg_diag context, host microseconds: sync = the demand and prefetch
+ * streams' synchronize, select = admissions, completed write-backs and victim selection, upload = the table upload
+ * and its synchronize, issue = enqueueing the write-backs; writebacks = how many were issued. */
+typedef struct ss_dg_boundary_timeline {
+  uint32_t struct_size, writebacks;
+  double sync_us, select_us, upload_us, issue_us;
+} ss_dg_boundary_timeline;
+SS_API ss_status ss_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size);
 /* Counters since open (or the last ss_stats_reset), folded at each ss_end. */
 typedef struct ss_dg_stats {
   uint32_t struct_size, reserved0;
@@ -491,11 +536,78 @@ typedef struct ss_dg_stats {
   /* appended: predicted (deduplicated valid predicted ids), predicted_true, miss_layers (gated layers with >= 1 miss,
    * per token), device_timeouts (device waits that timed out: since open, not reset by ss_stats_reset), covered_waits */
   uint64_t predicted, predicted_true, miss_layers, device_timeouts, covered_waits;
+  /* appended, write-back scheduling (dg_wb_defer = 1; 0 otherwise unless noted): wb_deferred = victims whose
+   * write-back was deferred at a boundary; wb_cancelled = of those, demanded or prefetched before any part was
+   * submitted (no copy; also counted in resurrected); wb_forced = submitted early and waited for because a demand
+   * found no free slot; wb_boundary_flushed = not fully submitted by the next boundary, submitted there. Bytes:
+   * issued = every write-back copy submitted (both modes), completed = of those, collected; cancelled = never copied
+   * (cancelled victims, and the unsent parts of a partly submitted victim that was resurrected); boundary_flushed =
+   * submitted by a boundary's flush; outstanding = submitted, not collected yet, at the last boundary (both modes);
+   * forced_wait_ns = the host's waits of the forced path */
+  uint64_t wb_deferred, wb_cancelled, wb_forced, wb_boundary_flushed;
+  uint64_t wb_issued_bytes, wb_completed_bytes, wb_cancelled_bytes, wb_boundary_flushed_bytes, wb_outstanding_bytes;
+  uint64_t wb_forced_wait_ns;
+  /* appended, window prefetch (winpf; 0 when off): hints and hinted rows; prior (between tokens) and l+1 (in-token)
+   * prefetch copies issued, used by their token, late (a demand of their token met the copy in flight and waited for
+   * it), reverted (unused, back to the host block at the boundary); l+1 candidates ranked and priced out by their
+   * bucket, skipped because layer l+1 had already exported. Wasted bytes = (issued - used) x the unit bytes. */
+  uint64_t winpf_hints, winpf_hint_rows, prior_issued, prior_used, prior_late, prior_reverted;
+  uint64_t l1_candidates, l1_issued, l1_used, l1_late, l1_reverted, l1_priced_out, l1_skipped_ahead;
+  uint64_t prior_budget_stops;  /* hints whose prior prefetches stopped at the copy-engine byte budget */
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
   return ss_stats_dg_sized(c, out, (uint32_t)sizeof *out);
 }
+/* Window prefetch (winpf; design notes): an opt-in placement policy for multi-row (speculative verify)
+ * windows. Off until ss_dg_winpf_set enables it; off = today's prefetch byte for byte. Only placement changes (which
+ * units are copied when): the copies, the table protocol and the engine's arithmetic are those of every prefetch.
+ * - l+1, for a token that got a window hint (otherwise today's prefetch): the prediction an export promised (rows x K
+ *   ids, row-major, the predictor's order inside a row; rows = the export's ids / top_k; an export whose ids or
+ *   predicted ids are not such multiples fails the token) is ranked by weighted row votes, then by the best rank; the
+ *   head is admitted while votes >= l1_min_votes, at most l1_cap per layer per token (and under the generic prefetch
+ *   budgets), skipping a (votes, rank) bucket whose online precision (prefetches their token used) is below l1_pmin
+ *   (every 64th skipped candidate is still admitted so the estimate can recover; the buckets live as long as the
+ *   context, ss_stats_reset does not touch them). Nothing is issued when layer l+1 already exported (the device ran
+ *   ahead). Order on the copy engine: after the layer's demand and ready, before deferred write-back parts.
+ * - Prior: the ss_open option dg_prior (tierstream/hint-prior-v1, below) maps a symbol (token id) to ranked (unit,
+ *   P(used)) entries for gated layers 0..P-1. ss_dg_window_hint, between tokens (after ss_end, before ss_begin), appends
+ *   the next window's rows (symbols + weights in [0, 1]; call it for the bonus row right after ss_end and again with the
+ *   drafts after the draft step) and issues prior prefetches at once: per gated layer < min(prior_layers, P) the units
+ *   with P(used by a hinted row) = 1 - prod(1 - w p) >= prior_pmin, best first, at most prior_cap new ones per call,
+ *   while the write-back bytes already queued + this window's prior bytes stay <= prior_window_us x the copy rate
+ *   (copy_gbps, replaced by the context's own first-copy measurements under dg_diag). A step queued before ss_begin
+ *   (a future pre-launch) may export before a prior copy lands: it then reads -1 and its demand waits for the copy
+ *   (exact, as any covered prefetch).
+ * - revert_unused: in a hinted window, a prefetch its token did not use goes back to its host block at the boundary
+ *   (no write-back). A hinted window's exports must hold rows x top_k ids (else the token fails); at most 64 rows may be
+ *   hinted per window (SS_E_INVALID).
+ * Prior file (little endian, frozen): "TSHPRIO1", u32 version 1, u32 n_gated, u32 units[n_gated], identity[32],
+ * u32 prov_len (<= 4096), prov[prov_len], u32 layers (1..n_gated), u32 k (1..64), u32 symbols, then per symbol: i32
+ * symbol, layers x k u16 units (0xFFFF = none), layers x k u16 P(used) x 65535 (best first per layer); then sha256[32]
+ * of every byte before it. identity = sha256 of u32 n_gated, then per gated layer: u32 model layer index, u32 units,
+ * u64 unit_bytes, per part u64 offset, u64 stride, u64 bytes, then the descriptor's per-unit xxh64 list if it has one.
+ * Any mismatch (size, magic, version, units, identity, checksum, a duplicate symbol) fails ss_open. */
+typedef struct ss_dg_winpf_params {
+  uint32_t struct_size;
+  uint32_t enable;           /* 1 = on (default 0) */
+  uint32_t prior_layers;     /* default 4 */
+  uint32_t prior_cap;        /* default 1 (0 = no prior prefetch) */
+  float prior_pmin;          /* default 0.7 */
+  uint32_t prior_window_us;  /* default 1500 (the copy-engine time the draft step leaves before the first export) */
+  float copy_gbps;           /* default 30 (bytes -> copy-engine time for the prior budget) */
+  uint32_t l1_cap;           /* default 1 */
+  float l1_min_votes;        /* default 1 */
+  float l1_pmin;             /* default 0.4 (0 = no precision floor) */
+  uint32_t revert_unused;    /* default 1 */
+  uint32_t top_k;            /* ids per row in every export (the engine's top_k): required (1..64) when enable = 1 */
+} ss_dg_winpf_params;
+SS_API void ss_dg_winpf_defaults_sized(ss_dg_winpf_params* p, uint32_t size);
+static inline void ss_dg_winpf_defaults(ss_dg_winpf_params* p) { ss_dg_winpf_defaults_sized(p, (uint32_t)sizeof *p); }
+/* Between tokens. NULL = the defaults (enable 0). */
+SS_API ss_status ss_dg_winpf_set(ss_ctx* c, const ss_dg_winpf_params* p);
+/* Between tokens (see above). weights may be NULL (all 1). At most SS_DG_MAX_IDS rows per window. */
+SS_API ss_status ss_dg_window_hint(ss_ctx* c, const int32_t* symbols, const float* weights, uint32_t rows);
 #if defined(__CUDACC__)
 /* The slot an engine kernel reads exported unit `id` of gated layer g from, after ss_dg_enqueue_wait(g): the zeroed
  * guard slot when the token was aborted or the id is out of range (every read stays in bounds; the token is then
@@ -511,6 +623,19 @@ static __device__ __forceinline__ int32_t ss_dg_slot(const ss_dg_device_view* v,
       v->absent_err)
     atomicOr(v->absent_err, 1u);
   return (int32_t)v->guard_slot;
+}
+/* Before ss_dg_enqueue_wait(g) (resident-first execution): the slot of exported unit `id` of gated layer g if its
+ * bytes are already complete, else -1 (wait, then use ss_dg_slot); the guard slot when the token was aborted or the
+ * id is out of range. Inside a token an entry only changes from -1 to a slot, published after its copies, so a slot
+ * returned here stays valid until the token ends (readers of g still finish before the export of g + 1). The load is
+ * an acquire at system scope; an absent entry is not reported. */
+static __device__ __forceinline__ int32_t ss_dg_slot_if_ready(const ss_dg_device_view* v, uint32_t g, int32_t id) {
+  if (*(volatile const uint32_t*)v->abort) return (int32_t)v->guard_slot;
+  const uint32_t b = v->unit_base[g];
+  if ((uint32_t)id >= v->unit_base[g + 1] - b) return (int32_t)v->guard_slot;
+  int32_t s;
+  asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(s) : "l"(v->slot_of + b + (uint32_t)id) : "memory");
+  return s >= 0 ? s : -1;
 }
 #endif
 
@@ -554,6 +679,17 @@ SS_API ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const cha
                                 const ss_desc* const* ref_descs, const double* const* ref_benefits,
                                 const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options,
                                 ss_plan** plan, char** out, size_t* olen);
+
+/* Opt-in device-gated cache reset, engine thread between tokens only. Restores the resolved ss_open placement,
+   canonical slot/block numbering, recency, budgets and policy learning in place; captured device addresses and
+   sequence/protocol words stay valid. Drains/collects outstanding work and invalidates previous-token diagnostics.
+   Moves only misplaced units. Refuses non-gated, in-token and poisoned contexts; a reset failure poisons the context.
+   Core counters remain lifetime counters. Resettable statistics are rebased as by ss_stats_reset (exclusive lifetime
+   counters retain their existing semantics). Consumers computing deltas must rebase their own before snapshots.
+   Identical reset state does not promise identical live timing-dependent scheduler decisions/counters. */
+/* feature macro: engines built against older trees compile the reset out */
+#define SS_DG_RESET_OPEN 1
+SS_API ss_status ss_dg_reset_open(ss_ctx* c);
 
 #ifdef __cplusplus
 }

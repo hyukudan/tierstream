@@ -20,6 +20,7 @@
 #include <thread>
 
 #include "dg_core.hpp"
+#include "dg_load.hpp"
 #include "dg_kernels.hpp"
 #include "dg_service.hpp"
 #include "file_reader.hpp"
@@ -60,8 +61,8 @@ uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) / a * a; }
 class CudaTransport final : public DgTransport {
  public:
   CudaTransport(const DgLayout& x, const std::vector<char*>& arena, int32_t* slot_of_dev, uint32_t* ready_dev,
-                const std::vector<char*>& blocks)
-      : x_(x), arena_(arena), slot_of_(slot_of_dev), ready_(ready_dev), blocks_(blocks) {
+                const std::vector<char*>& blocks, char* staging, bool flush_ready)
+      : x_(x), arena_(arena), slot_of_(slot_of_dev), ready_(ready_dev), blocks_(blocks), staging_(staging), flush_ready_(flush_ready) {
     try {
       int lo = 0, hi = 0;
       ck(cudaDeviceGetStreamPriorityRange(&lo, &hi), "cudaDeviceGetStreamPriorityRange");
@@ -83,6 +84,10 @@ class CudaTransport final : public DgTransport {
       if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : dma_b_)
       if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : dma_f_)
+      if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : wb_end_)
+      if (e) cudaEventDestroy(e);
     for (cudaStream_t s : s_)
       if (s) cudaStreamDestroy(s);
   }
@@ -90,37 +95,108 @@ class CudaTransport final : public DgTransport {
   void enable_diag(uint32_t G) {
     dma_a_.assign(G, nullptr);
     dma_b_.assign(G, nullptr);
+    dma_f_.assign(G, nullptr);
     dma_used_.assign(G, 0);
+    dma_ms_.assign(G, -1);
+    dma_first_ms_.assign(G, -1);
+    wb_left_ms_.assign(G, -1);
     for (uint32_t g = 0; g < G; ++g) {
       ck(cudaEventCreate(&dma_a_[g]), "cudaEventCreate (dma)");
       ck(cudaEventCreate(&dma_b_[g]), "cudaEventCreate (dma)");
+      ck(cudaEventCreate(&dma_f_[g]), "cudaEventCreate (dma)");
     }
+    for (cudaEvent_t& e : wb_end_) ck(cudaEventCreate(&e), "cudaEventCreate (write-back end)");
   }
+  // which: 0 before the layer's first demand copy, 2 after the first fetched unit's copies, 1 after the ready.
   void diag_mark(uint32_t g, int which) override {
     if (g >= dma_a_.size()) return;
-    ck(cudaEventRecord(which == 0 ? dma_a_[g] : dma_b_[g], s_[kDem]), "cudaEventRecord (dma)");
+    cudaEvent_t e = which == 0 ? dma_a_[g] : which == 2 ? dma_f_[g] : dma_b_[g];
+    ck(cudaEventRecord(e, s_[kDem]), "cudaEventRecord (dma)");
     if (which == 0) dma_used_[g] = 1;
+    if (which == 2) dma_used_[g] = 2;
   }
-  // After the demand stream is synced (the boundary): the layer's marked device time, -1 when it was not marked.
-  double take_dma_ms(uint32_t g) {
-    if (g >= dma_used_.size() || !dma_used_[g]) return -1;
-    dma_used_[g] = 0;
-    float ms = 0;
-    ck(cudaEventElapsedTime(&ms, dma_a_[g], dma_b_[g]), "cudaEventElapsedTime (dma)");
-    return double(ms);
+  // The boundary (no device calls): the write-back end event of the previous boundary becomes the one the token just
+  // served is compared against; this boundary's write-backs, if any, record into the other event.
+  void diag_boundary() override {
+    wb_prev_ = wb_cur_;
+    wb_prev_valid_ = wb_cur_valid_;
+    wb_cur_ ^= 1u;
+    wb_cur_valid_ = false;
   }
+  void diag_writebacks_issued() override {
+    if (!wb_end_[wb_cur_]) return;
+    wb_cur_valid_ = cudaEventRecord(wb_end_[wb_cur_], s_[kD2h]) == cudaSuccess;
+  }
+  // After ss_end's boundary (the demand stream synced), never throwing: per marked layer its demand device time, the
+  // time to the first fetched unit's copies, and how long the previous boundary's write-backs still ran after its
+  // demand copies were submitted (0 = already done; -2 = still running at this boundary, not measurable; -1 = not
+  // marked, none issued, or a timing error).
+  void diag_collect() {
+    int wb = 0;  // 1 measurable, -2 still running
+    if (wb_prev_valid_) {
+      const cudaError_t q = cudaEventQuery(wb_end_[wb_prev_]);
+      wb = q == cudaSuccess ? 1 : q == cudaErrorNotReady ? -2 : 0;
+    }
+    auto elapsed = [](cudaEvent_t a, cudaEvent_t b) {
+      float ms = 0;
+      return cudaEventElapsedTime(&ms, a, b) == cudaSuccess ? double(ms) : -1.0;
+    };
+    for (size_t g = 0; g < dma_used_.size(); ++g) {
+      dma_ms_[g] = dma_first_ms_[g] = wb_left_ms_[g] = -1;
+      if (!dma_used_[g]) continue;
+      dma_ms_[g] = elapsed(dma_a_[g], dma_b_[g]);
+      if (dma_used_[g] == 2) dma_first_ms_[g] = elapsed(dma_a_[g], dma_f_[g]);
+      dma_used_[g] = 0;
+      if (wb == 1) {
+        const double ms = elapsed(dma_a_[g], wb_end_[wb_prev_]);
+        wb_left_ms_[g] = ms == -1.0 ? -1.0 : ms > 0 ? ms : 0.0;
+      } else if (wb == -2) {
+        wb_left_ms_[g] = -2;
+      }
+    }
+  }
+  double dma_ms(uint32_t g) const { return g < dma_ms_.size() ? dma_ms_[g] : -1; }
+  double dma_first_ms(uint32_t g) const { return g < dma_first_ms_.size() ? dma_first_ms_[g] : -1; }
+  double wb_left_ms(uint32_t g) const { return g < wb_left_ms_.size() ? wb_left_ms_[g] : -1; }
   void h2d(Stream s, int32_t slot, int32_t block) override {
     for (size_t p = 0; p < x_.part_bytes.size(); ++p)
-      ck(cudaMemcpyAsync(at(arena_[p], uint64_t(slot) * x_.part_bytes[p]), at(blocks_[size_t(block)], x_.part_offset[p]),
+      ck(cudaMemcpyAsync(at(arena_[p], uint64_t(slot) * x_.part_bytes[p]), at(host_block(block), x_.part_offset[p]),
                          size_t(x_.part_bytes[p]), cudaMemcpyHostToDevice, s_[s]),
          "cudaMemcpyAsync (fetch)");
   }
   void d2h(int32_t slot, int32_t block) override {
     for (size_t p = 0; p < x_.part_bytes.size(); ++p)
-      ck(cudaMemcpyAsync(at(blocks_[size_t(block)], x_.part_offset[p]), at(arena_[p], uint64_t(slot) * x_.part_bytes[p]),
+      ck(cudaMemcpyAsync(at(host_block(block), x_.part_offset[p]), at(arena_[p], uint64_t(slot) * x_.part_bytes[p]),
                          size_t(x_.part_bytes[p]), cudaMemcpyDeviceToHost, s_[kD2h]),
          "cudaMemcpyAsync (write-back)");
   }
+  void d2h_part(Stream s, int32_t slot, int32_t block, uint32_t p) override {
+    ck(cudaMemcpyAsync(at(host_block(block), x_.part_offset[p]), at(arena_[p], uint64_t(slot) * x_.part_bytes[p]),
+                       size_t(x_.part_bytes[p]), cudaMemcpyDeviceToHost, s_[s]),
+       "cudaMemcpyAsync (write-back part)");
+  }
+  void d2d(int32_t src, int32_t dst) override {
+    for (size_t p = 0; p < x_.part_bytes.size(); ++p)
+      ck(cudaMemcpyAsync(at(arena_[p], uint64_t(dst) * x_.part_bytes[p]),
+                         at(arena_[p], uint64_t(src) * x_.part_bytes[p]), size_t(x_.part_bytes[p]),
+                         cudaMemcpyDeviceToDevice, s_[kDem]), "cudaMemcpyAsync (reset D2D)");
+    sync(kDem);
+  }
+  void h2h(int32_t src, int32_t dst) override {
+    std::memcpy(host_block(dst), host_block(src), size_t(x_.unit_bytes));
+  }
+  void set_flush_ready(bool on) override { flush_ready_ = on; }
+  void diag_reset() override {
+    std::fill(dma_used_.begin(), dma_used_.end(), uint8_t(0));
+    std::fill(dma_ms_.begin(), dma_ms_.end(), -1);
+    std::fill(dma_first_ms_.begin(), dma_first_ms_.end(), -1);
+    std::fill(wb_left_ms_.begin(), wb_left_ms_.end(), -1);
+    wb_cur_ = 0;
+    wb_prev_ = 1;
+    wb_cur_valid_ = wb_prev_valid_ = false;
+  }
+  uint32_t parts() const override { return uint32_t(x_.part_bytes.size()); }
+  uint64_t part_bytes(uint32_t p) const override { return x_.part_bytes[p]; }
   // Default flags: a system-scope fence before the write (the release the kernels' acquire loads pair with).
   void write_entry(Stream s, uint32_t key, int32_t v) override {
     ck_drv(cuStreamWriteValue32(reinterpret_cast<CUstream>(s_[s]), reinterpret_cast<CUdeviceptr>(slot_of_ + key),
@@ -131,6 +207,14 @@ class CudaTransport final : public DgTransport {
     ck_drv(cuStreamWriteValue32(reinterpret_cast<CUstream>(s_[kDem]), reinterpret_cast<CUdeviceptr>(ready_ + g),
                                 cuuint32_t(seq), CU_STREAM_WRITE_VALUE_DEFAULT),
            "cuStreamWriteValue32 (ready)");
+    if (flush_ready_) {  // submit now (WDDM batches); not ready yet is the normal answer
+      const CUresult r = cuStreamQuery(reinterpret_cast<CUstream>(s_[kDem]));
+      if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (ready flush)");
+    }
+  }
+  void flush(Stream s) override {
+    const CUresult r = cuStreamQuery(reinterpret_cast<CUstream>(s_[s]));
+    if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (prefetch flush)");
   }
   void* event_create() override {
     cudaEvent_t e = nullptr;
@@ -160,21 +244,56 @@ class CudaTransport final : public DgTransport {
     sync(kDem);
   }
   void gate(Stream s, void* ev) { wait(s, ev); }
-  std::vector<cudaEvent_t> dma_a_, dma_b_;
-  std::vector<uint8_t> dma_used_;
+  std::vector<cudaEvent_t> dma_a_, dma_b_, dma_f_;
+  std::vector<uint8_t> dma_used_;  // 0 unmarked, 1 marked, 2 marked with a first-fetch mark
+  std::vector<double> dma_ms_, dma_first_ms_, wb_left_ms_;  // the last token's per-layer results (diag_collect)
+  cudaEvent_t wb_end_[2] = {nullptr, nullptr};  // after a boundary's write-backs on kD2h, alternating
+  uint32_t wb_cur_ = 0, wb_prev_ = 1;
+  bool wb_cur_valid_ = false, wb_prev_valid_ = false;
   void drain_all() noexcept {
     for (cudaStream_t s : s_)
       if (s) cudaStreamSynchronize(s);
   }
 
  private:
+  char* host_block(int32_t b) const { return b == -1 ? staging_ : blocks_[size_t(b)]; }
   const DgLayout& x_;
   std::vector<char*> arena_;
   int32_t* slot_of_;
   uint32_t* ready_;
   const std::vector<char*>& blocks_;
+  char* staging_;
   cudaStream_t s_[3] = {nullptr, nullptr, nullptr};
   int32_t* table_pin_ = nullptr;  // keys entries
+  bool flush_ready_ = false;
+};
+
+// Startup resources cannot outlive their pending DMA, including exceptional exits.
+struct LoadRing {
+  cudaStream_t stream = nullptr;
+  std::vector<char*> buffers;
+  std::vector<cudaEvent_t> events;
+  ~LoadRing() { release(); }
+  void release() noexcept {
+    if (stream) cudaStreamSynchronize(stream);
+    for (auto e : events) if (e) cudaEventDestroy(e);
+    for (auto p : buffers) cudaFreeHost(p);
+    if (stream) cudaStreamDestroy(stream);
+    buffers.clear(); events.clear(); stream = nullptr;
+  }
+  void allocate(const DgLayout& x) {
+    if (x.load_serial) return;
+    buffers.reserve(x.load_buffers); events.reserve(x.load_buffers);
+    ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "startup stream");
+    for (uint32_t i = 0; i < x.load_buffers; ++i) {
+      void* p = nullptr;
+      ck(cudaHostAlloc(&p, size_t(x.load_buffer_bytes), cudaHostAllocPortable), "startup staging");
+      buffers.push_back(static_cast<char*>(p));
+      cudaEvent_t e = nullptr;
+      ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "startup event");
+      events.push_back(e);
+    }
+  }
 };
 
 class CudaDgCtx final : public DgCtx {
@@ -284,9 +403,84 @@ class CudaDgCtx final : public DgCtx {
     std::vector<uint32_t> keep;
     for (const auto& k : keep_) keep.insert(keep.end(), k.begin(), k.end());
     core_->end_token(keep);  // syncs the demand stream: the diagnostics marks have completed
-    if (o_.dg_diag)
-      for (uint32_t g = 0; g < uint32_t(dma_ms_.size()); ++g) dma_ms_[g] = transport_->take_dma_ms(g);
+    if (o_.dg_diag) {
+      transport_->diag_collect();
+      for (uint32_t g = 0; g < uint32_t(diag_.size()); ++g) {
+        LayerDiag& d = diag_[g];
+        d.dma_ms = transport_->dma_ms(g);
+        d.dma_first_ms = transport_->dma_first_ms(g);
+        d.wb_left_ms = transport_->wb_left_ms(g);
+        // the device's stamps (the end kernel ran after every wait kernel; done was observed)
+        const volatile unsigned long long* t = gts_h_ + 4u * g;
+        const unsigned long long ex = t[0], in = t[1], rd = t[2];
+        const bool ok = ex && in && rd && rd >= in && rd >= ex;
+        d.gpu_wait_us = ok ? double(rd - in) / 1000.0 : -1;
+        d.gpu_export_ready_us = ok ? double(rd - ex) / 1000.0 : -1;
+      }
+      // winpf: the least queued first-copy time of the token -> the copy-rate estimate
+      double best = -1;
+      for (const LayerDiag& d : diag_)
+        if (d.dma_first_ms > 0 && (best < 0 || d.dma_first_ms < best)) best = d.dma_first_ms;
+      core_->observe_copy(best);
+    }
+    timeline_valid_ = true;
     fold();
+  }
+
+  uint32_t residency(ss_dg_unit* out, uint32_t cap) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_residency: between tokens only");
+    const std::vector<uint32_t> keys = core_->residency();
+    const uint32_t n = uint32_t(std::min<size_t>(keys.size(), cap));
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t g = core_->gated_of(keys[i]);
+      out[i] = ss_dg_unit{int32_t(g), int32_t(keys[i] - core_->key(g, 0))};
+    }
+    return uint32_t(keys.size());
+  }
+
+  void set_sched(uint32_t wb_defer, uint32_t flush_ready) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_set_sched: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_set_sched: poisoned context");
+    require(wb_defer <= 1 && flush_ready <= 1, SS_E_INVALID, "ss_dg_set_sched: flags are 0 or 1");
+    try {
+      core_->set_wb_defer(wb_defer != 0);
+      transport_->set_flush_ready(flush_ready != 0);
+      o_.dg_wb_defer = wb_defer;
+      o_.dg_flush_ready = flush_ready;
+    } catch (...) {
+      poisoned_ = true;
+      throw;
+    }
+  }
+
+  void reset_open() override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_reset_open: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_reset_open: poisoned context");
+    // ss_end has returned service ownership; at open the service has not been given a token yet.
+    try {
+      require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_,
+              SS_E_BACKEND, "ss_dg_reset_open: device sequence desync");
+      const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
+      require(seq_ ? state == DgService::kServed : state == DgService::kIdle,
+              SS_E_BACKEND, "ss_dg_reset_open: service does not have terminal ownership");
+      core_->reset_open();
+      for (auto& k : keep_) k.clear();
+      svc_->invalidate_timeline();
+      std::fill(diag_.begin(), diag_.end(), LayerDiag{});
+      timeline_valid_ = false;
+      if (gts_h_) std::memset(gts_h_, 0, x_.gated.size() * 4 * sizeof(unsigned long long));
+      // Incorporate quiescence counters before rebasing; never zero the core's lifetime counters.
+      fold_ = core_->stats();
+      std::copy(core_->layer_counts().begin(), core_->layer_counts().end(), fold_l_.begin());
+      std::copy(fold_l_.begin(), fold_l_.end(), prev_l_.begin());
+      fold_free_slots_ = core_->free_slots();
+      fold_free_blocks_ = core_->free_blocks();
+      fold_wb_outstanding_ = core_->wb_outstanding_bytes();
+      stats_reset();
+    } catch (...) {
+      poisoned_ = true;
+      throw;
+    }
   }
 
   void seed(int layer, const int32_t* units, int n) override {
@@ -331,8 +525,9 @@ class CudaDgCtx final : public DgCtx {
     } else {
       std::memcpy(got.data(), blocks_[size_t(core_->block_of(k))], got.size());
     }
-    read_unit(layer, unit, staging_, false, nullptr);
-    require(std::memcmp(got.data(), staging_, got.size()) == 0, SS_E_HASH,
+    std::vector<char> expected(size_t(x_.unit_bytes));
+    read_unit(layer, unit, expected.data(), false, nullptr);
+    require(std::memcmp(got.data(), expected.data(), got.size()) == 0, SS_E_HASH,
             "check_unit: the bytes of (" + std::to_string(layer) + ", " + std::to_string(unit) +
                 ") differ from the source");
     core_->check();
@@ -384,6 +579,18 @@ class CudaDgCtx final : public DgCtx {
     ck_launch(dgk::launch_end(dev_, s), "end kernel");
   }
 
+  void winpf_set(const DgWinpf& w) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_winpf_set: between tokens only");
+    core_->set_winpf(w);
+  }
+  void window_hint(const int32_t* symbols, const float* weights, uint32_t rows) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_window_hint: between tokens only (after ss_end, before ss_begin)");
+    for (uint32_t r = 0; weights && r < rows; ++r)
+      require(weights[r] >= 0.0f && weights[r] <= 1.0f, SS_E_INVALID, "ss_dg_window_hint: weights must be in [0, 1]");
+    require(core_->hinted_rows() + rows <= kDgMaxIds, SS_E_INVALID,
+            "ss_dg_window_hint: more than 64 rows hinted for one window");
+    core_->window_hint(symbols, weights, rows);
+  }
   void set_budgets(uint32_t spare, uint32_t per_layer, uint32_t per_token) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_set_budgets: between tokens only");
     require(spare <= x_.D, SS_E_INVALID,
@@ -402,6 +609,11 @@ class CudaDgCtx final : public DgCtx {
     hooks("test_pressure");
     require(!in_token_, SS_E_INVALID, "test_pressure: between tokens");
     core_->set_pressure(f, r);
+  }
+  uint32_t test_coming() override {
+    hooks("test_coming");
+    require(!in_token_, SS_E_INVALID, "test_coming: between tokens");
+    return core_->coming();
   }
   void test_check() override {
     hooks("test_check");
@@ -453,6 +665,30 @@ class CudaDgCtx final : public DgCtx {
     out->predicted_true = a.predicted_true;
     out->miss_layers = a.miss_layers;
     out->covered_waits = a.covered_waits;
+    out->wb_deferred = a.wb_deferred;
+    out->wb_cancelled = a.wb_cancelled;
+    out->wb_forced = a.wb_forced;
+    out->wb_boundary_flushed = a.wb_boundary_flushed;
+    out->wb_issued_bytes = a.wb_issued_bytes;
+    out->wb_completed_bytes = a.wb_completed_bytes;
+    out->wb_cancelled_bytes = a.wb_cancelled_bytes;
+    out->wb_boundary_flushed_bytes = a.wb_boundary_flushed_bytes;
+    out->wb_forced_wait_ns = a.wb_forced_wait_ns;
+    out->winpf_hints = a.winpf_hints;
+    out->winpf_hint_rows = a.winpf_hint_rows;
+    out->prior_issued = a.prior_issued;
+    out->prior_used = a.prior_used;
+    out->prior_late = a.prior_late;
+    out->prior_reverted = a.prior_reverted;
+    out->l1_candidates = a.l1_candidates;
+    out->l1_issued = a.l1_issued;
+    out->l1_used = a.l1_used;
+    out->l1_late = a.l1_late;
+    out->l1_reverted = a.l1_reverted;
+    out->l1_priced_out = a.l1_priced_out;
+    out->l1_skipped_ahead = a.l1_skipped_ahead;
+    out->prior_budget_stops = a.prior_budget_stops;
+    out->wb_outstanding_bytes = fold_wb_outstanding_;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
@@ -471,8 +707,8 @@ class CudaDgCtx final : public DgCtx {
     const DgStats& a = fold_;  // since open: the exclusive counters are never reset (ss.h)
     ss_exclusive_stats x{};
     x.struct_size = uint32_t(sizeof x);
-    x.writebacks = a.evicted;
-    x.writeback_bytes = a.evicted * x_.unit_bytes;
+    x.writebacks = a.evicted - a.wb_cancelled;  // a cancelled deferred write-back copied nothing
+    x.writeback_bytes = a.wb_issued_bytes;       // the bytes copied (a resurrected partial one: its sent parts)
     x.promoted = a.fetched - a.bank_serves + a.prefetched;  // copies into persistent slots
     x.free_blocks = fold_free_blocks_;
     x.min_free_blocks = min_free_blocks_;
@@ -504,8 +740,8 @@ class CudaDgCtx final : public DgCtx {
       info->flags = SS_SNAPSHOT_EXCLUSIVE;
       info->sequence = snap_.seq;
       info->forwards = snap_.s.tokens;
-      info->exclusive_writebacks = snap_.life.evicted;
-      info->exclusive_writeback_bytes = snap_.life.evicted * x_.unit_bytes;
+      info->exclusive_writebacks = snap_.life.evicted - snap_.life.wb_cancelled;
+      info->exclusive_writeback_bytes = snap_.life.wb_issued_bytes;
       info->exclusive_promoted = snap_.life.fetched - snap_.life.bank_serves + snap_.life.prefetched;
       info->exclusive_free_blocks = snap_.free_blocks;
       info->exclusive_min_free_blocks = snap_.min_free_blocks;
@@ -524,10 +760,24 @@ class CudaDgCtx final : public DgCtx {
     *out = format(p.s, p.life, p.layers, p.free_slots, p.free_blocks, p.min_free_blocks);
     return true;
   }
+  void boundary_timeline(ss_dg_boundary_timeline* out) const override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_boundary_timeline: between tokens only");
+    require(o_.dg_diag, SS_E_INVALID, "ss_dg_boundary_timeline: open with dg_diag = 1");
+    require(core_->boundary_times().boundaries > 0, SS_E_INVALID, "ss_dg_boundary_timeline: no token completed yet");
+    const DgBoundaryTimes& b = core_->boundary_times();
+    std::memset(out, 0, sizeof *out);
+    out->struct_size = uint32_t(sizeof *out);
+    out->writebacks = b.writebacks;
+    out->sync_us = b.sync_us;
+    out->select_us = b.select_us;
+    out->upload_us = b.upload_us;
+    out->issue_us = b.issue_us;
+  }
   void timeline(int g, ss_dg_layer_timeline* out) const override {
     require(!in_token_, SS_E_INVALID, "ss_dg_timeline: between tokens only");
     require(o_.dg_diag, SS_E_INVALID, "ss_dg_timeline: open with dg_diag = 1");
     check_g(g, "ss_dg_timeline");
+    require(timeline_valid_, SS_E_INVALID, "ss_dg_timeline: no token completed since reset");
     const auto& tl = svc_->timeline();
     require(size_t(g) < tl.size(), SS_E_INVALID, "ss_dg_timeline: no token completed yet");
     const DgLayerTimeline& t = tl[size_t(g)];
@@ -544,7 +794,12 @@ class CudaDgCtx final : public DgCtx {
     out->covered = t.covered;
     out->fetched = t.fetched;
     out->prefetched = t.prefetched;
-    out->dma_ms = size_t(g) < dma_ms_.size() ? dma_ms_[size_t(g)] : -1;
+    const LayerDiag d = size_t(g) < diag_.size() ? diag_[size_t(g)] : LayerDiag{};
+    out->dma_ms = d.dma_ms;
+    out->gpu_wait_us = d.gpu_wait_us;
+    out->gpu_export_ready_us = d.gpu_export_ready_us;
+    out->wb_left_ms = d.wb_left_ms;
+    out->dma_first_ms = d.dma_first_ms;
     out->predicted_true = t.predicted_true;
     out->covered_waits = t.covered_waits;
   }
@@ -580,6 +835,29 @@ class CudaDgCtx final : public DgCtx {
     d.miss_layers = a.miss_layers - b.miss_layers;
     d.stalled = a.stalled - b.stalled;
     d.pred_invalid = a.pred_invalid - b.pred_invalid;
+    d.wb_deferred = a.wb_deferred - b.wb_deferred;
+    d.wb_cancelled = a.wb_cancelled - b.wb_cancelled;
+    d.wb_forced = a.wb_forced - b.wb_forced;
+    d.wb_boundary_flushed = a.wb_boundary_flushed - b.wb_boundary_flushed;
+    d.wb_issued_bytes = a.wb_issued_bytes - b.wb_issued_bytes;
+    d.wb_completed_bytes = a.wb_completed_bytes - b.wb_completed_bytes;
+    d.wb_cancelled_bytes = a.wb_cancelled_bytes - b.wb_cancelled_bytes;
+    d.wb_boundary_flushed_bytes = a.wb_boundary_flushed_bytes - b.wb_boundary_flushed_bytes;
+    d.wb_forced_wait_ns = a.wb_forced_wait_ns - b.wb_forced_wait_ns;
+    d.winpf_hints = a.winpf_hints - b.winpf_hints;
+    d.winpf_hint_rows = a.winpf_hint_rows - b.winpf_hint_rows;
+    d.prior_issued = a.prior_issued - b.prior_issued;
+    d.prior_used = a.prior_used - b.prior_used;
+    d.prior_late = a.prior_late - b.prior_late;
+    d.prior_reverted = a.prior_reverted - b.prior_reverted;
+    d.l1_candidates = a.l1_candidates - b.l1_candidates;
+    d.l1_issued = a.l1_issued - b.l1_issued;
+    d.l1_used = a.l1_used - b.l1_used;
+    d.l1_late = a.l1_late - b.l1_late;
+    d.l1_reverted = a.l1_reverted - b.l1_reverted;
+    d.l1_priced_out = a.l1_priced_out - b.l1_priced_out;
+    d.l1_skipped_ahead = a.l1_skipped_ahead - b.l1_skipped_ahead;
+    d.prior_budget_stops = a.prior_budget_stops - b.prior_budget_stops;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -658,9 +936,10 @@ class CudaDgCtx final : public DgCtx {
     j["total"] = one(t);
     j["layers"] = ls;
     Json x = Json::object();
-    x["writebacks"] = Json::number(life.evicted);
-    x["writeback_bytes"] = Json::number(life.evicted * x_.unit_bytes);
-    x["deferred"] = Json::number(uint64_t(0));
+    x["writebacks"] = Json::number(life.evicted - life.wb_cancelled);
+    x["writeback_bytes"] = Json::number(life.wb_issued_bytes);
+    x["deferred"] = Json::number(life.evict_short);  // the host contract's: victims kept for want of a block
+    x["wb_deferred"] = Json::number(life.wb_deferred);  // write-backs deferred into the next token (dg_wb_defer)
     x["rereads"] = Json::number(uint64_t(0));
     x["promoted"] = Json::number(life.fetched - life.bank_serves + life.prefetched);
     x["free_blocks"] = Json::number(uint64_t(free_blocks));
@@ -674,7 +953,25 @@ class CudaDgCtx final : public DgCtx {
         {"prefetch_used", s.prefetch_used}, {"pred_invalid", s.pred_invalid}, {"resurrected", s.resurrected},
         {"bank_serves", s.bank_serves}, {"collected_mid", s.collected_mid}, {"evicted", s.evicted},
         {"evict_short", s.evict_short}, {"writebacks_done", s.writebacks_done}, {"stalled", s.stalled},
-        {"free_slots", uint64_t(free_slots)}, {"blocks", uint64_t(x_.blocks)}, {"slots", uint64_t(x_.slots)}};
+        {"free_slots", uint64_t(free_slots)}, {"blocks", uint64_t(x_.blocks)}, {"slots", uint64_t(x_.slots)},
+        {"wb_deferred", s.wb_deferred}, {"wb_cancelled", s.wb_cancelled}, {"wb_forced", s.wb_forced},
+        {"wb_boundary_flushed", s.wb_boundary_flushed}, {"wb_issued_bytes", s.wb_issued_bytes},
+        {"wb_completed_bytes", s.wb_completed_bytes}, {"wb_cancelled_bytes", s.wb_cancelled_bytes},
+        {"wb_boundary_flushed_bytes", s.wb_boundary_flushed_bytes}, {"wb_forced_wait_ns", s.wb_forced_wait_ns},
+        {"winpf_hints", s.winpf_hints},
+        {"winpf_hint_rows", s.winpf_hint_rows},
+        {"prior_issued", s.prior_issued},
+        {"prior_used", s.prior_used},
+        {"prior_late", s.prior_late},
+        {"prior_reverted", s.prior_reverted},
+        {"l1_candidates", s.l1_candidates},
+        {"l1_issued", s.l1_issued},
+        {"l1_used", s.l1_used},
+        {"l1_late", s.l1_late},
+        {"l1_reverted", s.l1_reverted},
+        {"l1_priced_out", s.l1_priced_out},
+        {"l1_skipped_ahead", s.l1_skipped_ahead},
+        {"prior_budget_stops", s.prior_budget_stops}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
     j["device_gated"] = g;
     return j;
@@ -689,6 +986,7 @@ class CudaDgCtx final : public DgCtx {
     std::copy(lc.begin(), lc.end(), fold_l_.begin());
     fold_free_slots_ = core_->free_slots();
     fold_free_blocks_ = core_->free_blocks();
+    fold_wb_outstanding_ = core_->wb_outstanding_bytes();
     min_free_blocks_ = std::min(min_free_blocks_, fold_free_blocks_);
     if (hook_) {
       std::fill(hook_fwd_.begin(), hook_fwd_.end(), ss_layer_stats{});
@@ -734,8 +1032,13 @@ class CudaDgCtx final : public DgCtx {
 
   // One unit's bytes (its parts back to back) into dst, with the covering aligned range through the staging buffer
   // when the direct-I/O alignment rules are not met.
-  void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest) {
+  void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest, DgLoadStats* stats = nullptr) {
     const Layer& l = d_.layers[size_t(layer)];
+    auto read = [&](const File& file, void* out, uint64_t n, uint64_t off) {
+      const uint64_t got = file.pread(out, n, off);
+      if (stats) { stats->read_bytes += got; ++stats->read_calls; }
+      return got;
+    };
     Xxh64 h;
     uint64_t pos = 0;
     for (const Part& part : l.parts) {
@@ -747,42 +1050,60 @@ class CudaDgCtx final : public DgCtx {
                                                        ") part " + part.name + " is past the end of its source");
       const bool in_place = !f.direct() || (F % al == 0 && part.bytes % al == 0 && uintptr_t(out) % al == 0);
       if (in_place) {
-        require(f.pread(out, part.bytes, F) == part.bytes, SS_E_IO, "short read");
+        require(read(f, out, part.bytes, F) == part.bytes, SS_E_IO, "short read");
       } else {
+        if (stats) stats->bounce_bytes += part.bytes;
         const uint64_t cap = (bounce_bytes_ - 2 * al) / al * al;
         for (uint64_t c = 0; c < part.bytes;) {
           const uint64_t len = std::min(cap, part.bytes - c);
           const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = round_up(F + c + len, al);
-          require(f.pread(bounce_, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
+          require(read(f, bounce_, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
           std::memcpy(out + c, at(bounce_, delta), size_t(len));
           c += len;
         }
       }
-      if (hash) h.update(out, size_t(part.bytes));
+      if (hash) {
+        const auto hash_start = std::chrono::steady_clock::now();
+        h.update(out, size_t(part.bytes));
+        if (stats) stats->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now()-hash_start).count();
+      }
       pos += part.bytes;
     }
     if (digest) *digest = h.digest();
   }
 
-  void read_checked(int layer, int unit, void* dst) {
+  void read_checked(int layer, int unit, void* dst, DgLoadStats* stats = nullptr) {
     const Layer& l = d_.layers[size_t(layer)];
     const bool want = o_.verify_hash && !l.hash.empty();
     uint64_t digest = 0;
-    read_unit(layer, unit, dst, want, &digest);
+    read_unit(layer, unit, dst, want, &digest, stats);
     if (want && digest != l.hash[size_t(unit)])
       fail(SS_E_HASH, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
                           ") bytes differ from the descriptor hash");
   }
 
   void init() {
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    auto elapsed = [&] { return std::chrono::duration<double>(Clock::now()-start).count(); };
+    // Dense weights belong to the caller; entry is the expert-loader boundary.
+    std::fprintf(stderr, "dg_load dense_done=external expert_start_s=0 mode=%s\n",
+                 x_.load_serial ? "serial" : "pipeline");
+    LoadRing ring;
+    double pinned_alloc_s = 0;
+    auto pin = [&](void** p, size_t n, unsigned flags, const char* what) {
+      const auto t = Clock::now();
+      ck(cudaHostAlloc(p, n, flags), what);
+      pinned_alloc_s += std::chrono::duration<double>(Clock::now()-t).count();
+    };
     device_ = o_.device;
     ck(cudaSetDevice(device_), "cudaSetDevice");
     ck_launch(dgk::preload(), "loading the kernels");
     for (const auto& s : d_.sources) files_.push_back(std::make_unique<File>(s.path, o_.direct_io != 0));
     bounce_bytes_ = x_.bounce_bytes;  // the sizes admission billed (dg_layout)
-    ck(cudaHostAlloc(&bounce_, size_t(bounce_bytes_), cudaHostAllocPortable), "cudaHostAlloc (bounce)");
-    ck(cudaHostAlloc(reinterpret_cast<void**>(&staging_), size_t(x_.staging_bytes), cudaHostAllocPortable),
-       "cudaHostAlloc (staging)");
+    pin(&bounce_, size_t(bounce_bytes_), cudaHostAllocPortable, "cudaHostAlloc (bounce)");
+    pin(reinterpret_cast<void**>(&staging_), size_t(x_.staging_bytes), cudaHostAllocPortable,  // also the reset spare
+        "cudaHostAlloc (staging)");
 
     // Device: the arena (one array per part; the guard slot last, zeroed), the table, the controls.
     for (uint64_t pb : x_.part_bytes) {
@@ -811,7 +1132,7 @@ class CudaDgCtx final : public DgCtx {
 
     // Mapped control area.
     void* mh = nullptr;
-    ck(cudaHostAlloc(&mh, size_t(x_.mapped_bytes), cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc (mapped)");
+    pin(&mh, size_t(x_.mapped_bytes), cudaHostAllocMapped | cudaHostAllocPortable, "cudaHostAlloc (mapped)");
     mapped_ = mh;
     std::memset(mh, 0, size_t(x_.mapped_bytes));
     void* md = nullptr;
@@ -853,14 +1174,27 @@ class CudaDgCtx final : public DgCtx {
     for (uint64_t left = x_.blocks; left > 0;) {
       const uint64_t n = std::min(per_chunk, left);
       void* c = nullptr;
-      ck(cudaHostAlloc(&c, size_t(n * hs), cudaHostAllocPortable), "cudaHostAlloc (blocks)");
+      pin(&c, size_t(n * hs), cudaHostAllocPortable, "cudaHostAlloc (blocks)");
       chunks_.push_back(c);
       for (uint64_t i = 0; i < n; ++i) blocks_.push_back(at(c, i * hs));
       left -= n;
     }
 
+    const auto ring_start = Clock::now();
+    ring.allocate(x_);
+    pinned_alloc_s += std::chrono::duration<double>(Clock::now()-ring_start).count();
+    std::fprintf(stderr, "dg_load pinned_alloc_done_s=%.6f pinned_alloc_s=%.6f readers=%u buffers=%u buffer_bytes=%llu\n",
+                 elapsed(), pinned_alloc_s,
+                 x_.load_readers, x_.load_buffers, (unsigned long long)x_.load_buffer_bytes);
+
+    const auto touch_start = Clock::now();
+    // Reads first-touch payload pages in parallel; spare blocks are filled on use.
+    // cudaHostAlloc already locks the pages. No serial write sweep is needed.
+    std::fprintf(stderr, "dg_load first_touch_done_s=%.6f first_touch_s=%.6f first_touch=read\n", elapsed(),
+                 std::chrono::duration<double>(Clock::now()-touch_start).count());
+
     // The core: residents in slots 0..R-1, every other unit in a block (key order), spares free.
-    transport_ = std::make_unique<CudaTransport>(x_, arena_, slot_of_, dev_.ready, blocks_);
+    transport_ = std::make_unique<CudaTransport>(x_, arena_, slot_of_, dev_.ready, blocks_, staging_, o_.dg_flush_ready != 0);
     DgConfig c;
     for (int L : x_.gated) c.n_units.push_back(uint32_t(d_.layers[size_t(L)].n_units));
     c.persistent_slots = x_.persistent_slots;
@@ -875,6 +1209,10 @@ class CudaDgCtx final : public DgCtx {
     c.prefetch_reserve = c.prefetch_reserve_auto ? std::min<uint32_t>(24, T / 4) : o_.dg_prefetch_reserve;
     c.prefetch_per_layer = o_.dg_prefetch_per_layer;
     c.prefetch_per_token = o_.dg_prefetch_per_token;
+    c.wb_defer = o_.dg_wb_defer != 0;
+    c.wb_on_d2h = o_.dg_wb_stream == 1;
+    c.wb_layer_bytes = o_.dg_wb_layer_bytes;
+    c.wb_max_outstanding = o_.dg_wb_max_outstanding;
     core_ = std::make_unique<DgCore>(c, transport_.get());
     // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()
     // keeps the first persistent_slots - T distinct keys, and that order is the recency order.
@@ -895,28 +1233,91 @@ class CudaDgCtx final : public DgCtx {
     order.insert(order.end(), x_.residents.begin(), x_.residents.end());
     for (uint32_t k = 0; k < x_.keys; ++k) order.push_back(k);
     core_->place(order);
+    if (o_.dg_prior_len) {  // winpf: validated and copied now, before the service starts (ss.h: Window prefetch)
+      require(o_.dg_prior != nullptr, SS_E_INVALID, "device-gated: dg_prior_len > 0 with a null dg_prior");
+      core_->set_prior(parse_hint_prior(o_.dg_prior, o_.dg_prior_len, d_, x_.gated));
+    }
+    o_.dg_prior = nullptr;  // read only during ss_open
+    o_.dg_prior_len = 0;
     if (o_.dg_diag) {
       transport_->enable_diag(G);
       core_->set_diag(true);
+      // the kernels' stamps: a small mapped buffer of its own (diagnostics only, not billed)
+      void* h = nullptr;
+      ck(cudaHostAlloc(&h, size_t(G) * 4 * sizeof(unsigned long long), cudaHostAllocMapped | cudaHostAllocPortable),
+         "cudaHostAlloc (diag stamps)");
+      gts_h_ = static_cast<unsigned long long*>(h);
+      std::memset(h, 0, size_t(G) * 4 * sizeof(unsigned long long));
+      void* d = nullptr;
+      ck(cudaHostGetDevicePointer(&d, h, 0), "cudaHostGetDevicePointer (diag stamps)");
+      dev_.gts = static_cast<unsigned long long*>(d);
     }
-    dma_ms_.assign(G, -1);
+    diag_.assign(G, LayerDiag{});
 
-    // Fill: blocks read in place, residents through the staging buffer and one H2D per part.
-    for (uint32_t g = 0; g < G; ++g) {
-      const int L = x_.gated[g];
-      for (uint32_t u = 0; u < core_->units(g); ++u) {
-        const uint32_t k = core_->key(g, u);
-        if (core_->slot_of(k) >= 0) {
-          read_checked(L, int(u), staging_);
-          for (size_t p = 0; p < x_.part_bytes.size(); ++p)
-            ck(cudaMemcpy(at(arena_[p], uint64_t(core_->slot_of(k)) * x_.part_bytes[p]), staging_ + x_.part_offset[p],
-                          size_t(x_.part_bytes[p]), cudaMemcpyHostToDevice),
-               "cudaMemcpy (fill)");
-        } else {
-          read_checked(L, int(u), blocks_[size_t(core_->block_of(k))]);
+    const auto fill_start = Clock::now();
+    auto read_start = fill_start;
+    DgLoadStats load;
+    uint64_t pipeline_h2d_bytes = 0;
+    if (x_.load_serial) {
+      for (uint32_t g = 0; g < G; ++g) {
+        const int L = x_.gated[g];
+        for (uint32_t u = 0; u < core_->units(g); ++u) {
+          const uint32_t k = core_->key(g, u);
+          if (core_->slot_of(k) >= 0) {
+            read_checked(L, int(u), staging_, &load);
+            for (size_t p = 0; p < x_.part_bytes.size(); ++p) {
+              ck(cudaMemcpy(at(arena_[p], uint64_t(core_->slot_of(k)) * x_.part_bytes[p]), staging_ + x_.part_offset[p],
+                            size_t(x_.part_bytes[p]), cudaMemcpyHostToDevice),
+                 "cudaMemcpy (fill)");
+              load.h2d_bytes += x_.part_bytes[p];
+            }
+          } else {
+            read_checked(L, int(u), blocks_[size_t(core_->block_of(k))], &load);
+          }
         }
       }
+      load.payload_bytes = uint64_t(x_.keys) * x_.unit_bytes;
+      load.read_seconds = std::chrono::duration<double>(Clock::now()-fill_start).count();
+    } else {
+      std::vector<DgLoadUnit> units;
+      units.reserve(x_.keys);
+      for (uint32_t g = 0; g < G; ++g) {
+        for (uint32_t u = 0; u < core_->units(g); ++u) {
+          const uint32_t k = core_->key(g, u);
+          const int32_t slot = core_->slot_of(k);
+          units.push_back({x_.gated[g], int(u), slot,
+                           slot >= 0 ? nullptr : blocks_[size_t(core_->block_of(k))]});
+        }
+      }
+      read_start = Clock::now();
+      load = dg_load_pipeline(d_, units, ring.buffers, x_.load_buffer_bytes, x_.load_readers,
+          o_.direct_io != 0, o_.verify_hash != 0,
+          [&](size_t i) {
+            ck(cudaSetDevice(device_), "startup reader device");
+            ck(cudaEventSynchronize(ring.events[i]), "startup buffer reuse");
+          },
+          [&](size_t i, const std::vector<DgLoadCopy>& copies) {
+            for (const auto& cpy : copies) {
+              ck(cudaMemcpyAsync(at(arena_[cpy.part], uint64_t(cpy.slot)*cpy.bytes), cpy.data,
+                                 size_t(cpy.bytes), cudaMemcpyHostToDevice, ring.stream), "startup H2D");
+              pipeline_h2d_bytes += cpy.bytes;
+            }
+            ck(cudaEventRecord(ring.events[i], ring.stream), "startup buffer event");
+          });
+      load.h2d_bytes = pipeline_h2d_bytes;
+      ck(cudaStreamSynchronize(ring.stream), "startup H2D done");
     }
+    const double read_done = std::chrono::duration<double>(read_start-start).count()+load.read_seconds;
+    std::fprintf(stderr, "dg_load expert_read_done_s=%.6f payload_bytes=%llu read_bytes=%llu read_calls=%llu read_s=%.6f read_GBps=%.3f payload_GBps=%.3f h2d_bytes=%llu h2d_done_s=%.6f bounce_bytes=%llu hash_s=%.6f\n",
+                 read_done, (unsigned long long)load.payload_bytes,
+                 (unsigned long long)load.read_bytes, (unsigned long long)load.read_calls,
+                 load.read_seconds, load.read_seconds > 0 ? double(load.read_bytes)/load.read_seconds/1e9 : 0,
+                 load.read_seconds > 0 ? double(load.payload_bytes)/load.read_seconds/1e9 : 0,
+                 (unsigned long long)load.h2d_bytes, elapsed(),
+                 (unsigned long long)load.bounce_bytes, load.hash_seconds);
+    for (size_t i = 0; i < files_.size(); ++i)
+      std::fprintf(stderr, "dg_load source=%llu direct=%d\n", (unsigned long long)i, files_[i]->direct() ? 1 : 0);
+    ring.release();
     transport_->upload_table(core_->table().data(), x_.keys);
     core_->check();
     keep_.resize(G);
@@ -941,6 +1342,7 @@ class CudaDgCtx final : public DgCtx {
     sc.bind = [dev] { ck(cudaSetDevice(dev), "cudaSetDevice (service)"); };
     svc_ = std::make_unique<DgService>(core_.get(), m_, sc);
     svc_->start();
+    std::fprintf(stderr, "dg_load total_s=%.6f\n", elapsed());
   }
 
   // Close (design §5): stop and join the service first; free only when the device is known to be done with the
@@ -974,6 +1376,10 @@ class CudaDgCtx final : public DgCtx {
       transport_.release();
       return;
     }
+    // dg_wb_defer, healthy or poisoned: no new copy here (noexcept, the device may be failing). Write-backs nothing was
+    // submitted for are dropped (their blocks are freed below, never read); submitted copies, whole or partial, finish
+    // in drain_all before any memory is freed. (A healthy drain that submits them all is DgCore::drain.)
+    if (core_) core_->abandon_writebacks();
     if (transport_) transport_->drain_all();
     svc_.reset();
     core_.reset();
@@ -986,11 +1392,14 @@ class CudaDgCtx final : public DgCtx {
     for (void* c : chunks_) cudaFreeHost(c);
     if (bounce_) cudaFreeHost(bounce_);
     if (staging_) cudaFreeHost(staging_);
+    if (gts_h_) cudaFreeHost(gts_h_);
     slot_of_ = nullptr;
     ctl_ = nullptr;
     mapped_ = nullptr;
     bounce_ = nullptr;
     staging_ = nullptr;
+    gts_h_ = nullptr;
+    dev_.gts = nullptr;
     chunks_.clear();
   }
 
@@ -1014,12 +1423,19 @@ class CudaDgCtx final : public DgCtx {
   std::unique_ptr<DgCore> core_;
   std::unique_ptr<DgService> svc_;
   std::vector<std::vector<uint32_t>> keep_;
-  std::vector<double> dma_ms_;  // dg_diag: the last token's per-layer demand device time (-1 = not measured)
+  // dg_diag: the last token's per-layer device timings (-1 = not measured)
+  struct LayerDiag {
+    double dma_ms = -1, dma_first_ms = -1, wb_left_ms = -1, gpu_wait_us = -1, gpu_export_ready_us = -1;
+  };
+  std::vector<LayerDiag> diag_;
+  bool timeline_valid_ = false;
+  unsigned long long* gts_h_ = nullptr;  // dg_diag: the kernels' mapped stamps (dgk::Dev::gts), 4 per gated layer
   DgStats fold_, base_;
   std::vector<DgLayerCounts> fold_l_, prev_l_, base_l_;
   std::vector<ss_layer_stats> hook_fwd_;
   Published pending_;
   uint32_t fold_free_slots_ = 0, fold_free_blocks_ = 0, min_free_blocks_ = UINT32_MAX;
+  uint64_t fold_wb_outstanding_ = 0;
   ss_stats_hook hook_ = nullptr;
   void* hook_user_ = nullptr;
   mutable std::atomic<bool> snap_armed_{false};

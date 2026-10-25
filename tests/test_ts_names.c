@@ -1,4 +1,4 @@
-/* The tierstream names, from C (wave4/wstream/rename/design.md §2.1): ss.h first, then ts.h (the other order is
+/* The tierstream names, from C (design notes §2.1): ss.h first, then ts.h (the other order is
  * tests/test_ts_names.cpp). The old names stay real: a consumer may name its own members ss_budget / ts_budget, paste
  * tokens onto ss_, and call either name; the ts_ functions give what the ss_ ones give. */
 #include <stdio.h>

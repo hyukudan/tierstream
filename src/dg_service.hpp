@@ -54,6 +54,12 @@ class DgService {
   std::string error() const;
   // The timeline of the last Served token (diag), engine thread, between tokens.
   const std::vector<DgLayerTimeline>& timeline() const { return tl_done_; }
+  // Engine thread with terminal ownership (or before the first begin). Sequence/protocol words are retained.
+  void invalidate_timeline() {
+    for (auto& t : tl_) t = DgLayerTimeline{};
+    for (auto& t : tl_done_) t = DgLayerTimeline{};
+    new_origin_.store(true, std::memory_order_release);
+  }
   uint32_t gated() const { return core_->gated(); }
 
  private:
@@ -82,6 +88,7 @@ class DgService {
   std::string err_;
   std::vector<uint32_t> ids_, pred_;
   std::vector<DgLayerTimeline> tl_, tl_done_;
+  std::atomic<bool> new_origin_{false};
   bool boosted_ = false;
   void* av_ = nullptr;  // the MMCSS task handle (Windows)
 };
