@@ -54,15 +54,45 @@ target_link_libraries(tierstream PUBLIC Threads::Threads)
 add_library(strix_stream ALIAS tierstream)
 # The copy is a step of the library's own build, so every build of tierstream (targeted or not, any configuration)
 # refreshes it, in the directory of that configuration's archive.
-# (Computed as CMake places the archive: BYPRODUCTS cannot name the target's own $<TARGET_FILE_DIR>.)
-if(CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
-  set(ts_archive_dir ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
-else()
-  set(ts_archive_dir ${CMAKE_CURRENT_BINARY_DIR})
-endif()
+# Computed as CMake places the archive (BYPRODUCTS cannot name the target's own $<TARGET_FILE_DIR>): the target's
+# ARCHIVE_OUTPUT_DIRECTORY_<CONFIG> as given, else ARCHIVE_OUTPUT_DIRECTORY (+ /<CONFIG> under a multi-config
+# generator unless it holds a generator expression), else the binary directory (+ /<CONFIG> likewise). Both
+# properties are initialized from the CMAKE_* variables when the target is created. CTest ts-old-archive-location
+# checks the result against $<TARGET_FILE_DIR:tierstream>.
 get_property(ts_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(ts_multi_config)
-  string(APPEND ts_archive_dir "/$<CONFIG>")
+  set(ts_configs ${CMAKE_CONFIGURATION_TYPES})
+else()
+  set(ts_configs ${CMAKE_BUILD_TYPE})
+endif()
+get_target_property(ts_generic_dir tierstream ARCHIVE_OUTPUT_DIRECTORY)
+set(ts_archive_dir "")
+foreach(cfg ${ts_configs})
+  string(TOUPPER ${cfg} ucfg)
+  get_target_property(d tierstream ARCHIVE_OUTPUT_DIRECTORY_${ucfg})
+  if(NOT d)
+    if(ts_generic_dir)
+      set(d ${ts_generic_dir})
+    else()
+      set(d ${CMAKE_CURRENT_BINARY_DIR})
+    endif()
+    string(GENEX_STRIP "${d}" d_plain)
+    if(ts_multi_config AND d_plain STREQUAL d)
+      string(APPEND d "/${cfg}")
+    endif()
+  endif()
+  if(ts_multi_config)
+    string(APPEND ts_archive_dir "$<$<CONFIG:${cfg}>:${d}>")
+  else()
+    set(ts_archive_dir ${d})
+  endif()
+endforeach()
+if(ts_archive_dir STREQUAL "")  # single-config with no CMAKE_BUILD_TYPE
+  if(ts_generic_dir)
+    set(ts_archive_dir ${ts_generic_dir})
+  else()
+    set(ts_archive_dir ${CMAKE_CURRENT_BINARY_DIR})
+  endif()
 endif()
 set(TS_OLD_ARCHIVE ${ts_archive_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}strix_stream${CMAKE_STATIC_LIBRARY_SUFFIX})
 add_custom_command(TARGET tierstream POST_BUILD
@@ -148,6 +178,10 @@ if(TS_TESTS)
   target_link_libraries(ts-test-old-abi PRIVATE ${TS_OLD_ARCHIVE} ${ts_old_abi_deps})
   set_target_properties(ts-test-old-abi PROPERTIES LINKER_LANGUAGE CXX)
   add_test(NAME ts-old-abi COMMAND ts-test-old-abi)
+  # the copy is where the library really is, and identical to it
+  add_test(NAME ts-old-archive-location
+           COMMAND ${CMAKE_COMMAND} -E compare_files $<TARGET_FILE:tierstream>
+                   $<TARGET_FILE_DIR:tierstream>/${CMAKE_STATIC_LIBRARY_PREFIX}strix_stream${CMAKE_STATIC_LIBRARY_SUFFIX})
   # (3) ts.h is generated from ss.h: regenerate and compare
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_FOUND)
