@@ -719,14 +719,14 @@ TEST(dg_cuda_absent_old_view_and_order) {
     CU(cudaStreamSynchronize(r.s));
   }
   {
-    // layer 0 routes residents only (no wait) and meets an unpublished entry: absent_err set, no abort; layer 1
-    // routes non-residents whose demand copies are held past the wait deadline: a timeout (abort) at layer 1. The end
-    // kernel folds ABSENT only without abort, so the timeout is what ss_end reports.
+    // layer 0 routes residents only (no wait) and meets an unpublished entry: absent_err set, no abort; the LAST layer
+    // routes non-residents whose demand copies are held past the wait deadline: a timeout (abort) there (the last, so
+    // no service flag wait follows it). The end kernel folds ABSENT only without abort: the timeout is reported.
     Rig r("absent-order", 16, 8, 8, 300);
     if (!r.c) return;
     std::vector<int32_t> ids(size_t(r.m.G) * r.n);
     for (int g = 0; g < r.m.G; ++g)
-      for (uint32_t i = 0; i < r.n; ++i) ids[size_t(g) * r.n + i] = int32_t(g == 1 ? 40 + i : i);  // residents: 0..15
+      for (uint32_t i = 0; i < r.n; ++i) ids[size_t(g) * r.n + i] = int32_t(g == r.m.G - 1 ? 40 + i : i);  // residents: 0..15
     CU(cudaMemcpy(r.ids_dev, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
     CU(cudaMemset(r.sums_dev, 0, ids.size() * 8));
     cudaStream_t gs = nullptr;
@@ -747,7 +747,7 @@ TEST(dg_cuda_absent_old_view_and_order) {
     CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
     CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
     std::printf("  absent then timeout: %s\n", ss_last_error());
-    CHECK(std::string(ss_last_error()).find("a wait timed out at gated layer 1") != std::string::npos);
+    CHECK(std::string(ss_last_error()).find("a wait timed out at gated layer " + std::to_string(r.m.G - 1)) != std::string::npos);
     CHECK(std::string(ss_last_error()).find("absent") == std::string::npos);
     CU(cudaStreamSynchronize(r.s));
     CU(cudaStreamSynchronize(gs));
