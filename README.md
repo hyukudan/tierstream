@@ -70,6 +70,59 @@ Units already resident need no weight transfer. The others are *misses*, copied 
 into a free slot. `ss_acquire_groups` lets the engine start on the resident units while the misses are still coming
 ("hits first").
 
+### Device-gated decode (graph-captured MoE decode)
+
+In normal mode, the host handles each layer's routes and supplies its address table. Device-gated decode
+(`forward_mode = SS_FORWARD_DEVICE_GATED`) lets the engine capture a whole token in a CUDA graph: a recorded sequence
+of GPU operations. The GPU exports routes and waits for missing weights. A host service thread still processes every
+layer, but a layer whose weights are already available needs no host reply.
+
+```text
+ engine's CUDA graph                         tierstream service thread (host)
+ -------------------                         --------------------------------
+ begin
+ router for layer g
+ export(g, ids) ---- mapped route record ----> validate ids; serve any misses
+       |                                      demand copies and slot-table writes
+       |                                      run on the demand copy stream
+       |
+ wait(g) <---------- ready flag -------------- written on that same stream,
+       |                                      after the required copies
+       |  No misses: wait returns without a host reply.
+       v
+ experts read slot = ss_dg_slot(&view, g, id)
+ part address = part base + slot x part stride
+
+ optional engine prediction for layer g+1:
+ predict(g, ids) --- mapped prediction record -> prefetch on a separate copy stream,
+                                                within slot and prefetch limits
+ ... next layer ...
+
+ end -------------- completion word ---------> ss_end waits for device and service;
+                                                maintains the cache and folds stats
+```
+
+- **On the device:** `slot_of` maps each expert id to a slot. Each weight part has its own array. Kernels read it at
+  `part base + slot x part stride`.
+- **On the host:** the service reads a record for every layer from mapped host memory, which both CPU and GPU can
+  access. It validates ids and updates usage counts and recency. For misses, it arranges copies from pinned RAM and
+  publishes slot-table entries. The demand copy stream writes the ready flag after the required copies and table
+  updates. The engine can also supply predicted ids for the next layer. The service prefetches them within its slot
+  reserve and per-layer and per-token limits.
+- **Failure handling:** a wait timeout or an invalid routed id sets a persistent abort flag. Every weight lookup must
+  use `ss_dg_slot` (`ts_dg_slot` in `tierstream/ts.h`); after abort, it returns a zero-filled guard slot. `ss_end`
+  returns an error and poisons the context. The engine must discard that token's outputs. Every layer's weight readers
+  must finish before the next layer's export. The end kernel must follow all readers and joined branches.
+- **Budgets and statistics:** it uses the existing planner, then checks the gated layout at open. Every weight unit
+  must fit in GPU memory or pinned RAM; decode does not fetch weights from disk. The checks include device tables and
+  controls, mapped records, staging buffers, and enough spare host blocks. Existing statistics APIs remain available.
+  Counters update after successful `ss_end` calls; snapshots expose the last publication. Statistics reset is allowed
+  only between tokens.
+
+It is opt-in and CUDA only, for decode. It requires exclusive placement and LRU eviction, with `pin_planned = 0`.
+Before an engine makes it the default, it must pass the bit-for-bit correctness and performance checks against that
+engine's own cache, then receive maintainer approval.
+
 ### Promotion and eviction, in both directions
 
 - **Promotion (RAM -> VRAM, disk -> VRAM).** A miss is copied into a slot.
@@ -340,8 +393,10 @@ in one short window. Exclusive mode and host read-ahead are opt-in.
 The HIP backend for Strix Halo (unified memory) is still a stub: it has not been built or run yet. Building and
 testing it with the nodes' ROCm toolchain is the next step.
 
-In development (design approved, not in this version): a device-gated decode mode for graph-captured MoE decode. Route -> slot resolution and the residency
-check run inside the engine's CUDA graph, and the host is touched only on a miss.
+Device-gated decode is opt-in and CUDA only. Its GPU unit test passes on the RTX PRO 6000 (7 cases: graph-captured
+decode with prediction, statistics, memory pressure, a stopped service, an out-of-range id, and two protocol
+mutations that the test must catch). The bit-for-bit correctness and performance checks against the DeepSeek
+replica's own cache are still pending.
 
 ## Credits
 
