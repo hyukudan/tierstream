@@ -442,13 +442,13 @@ counters, flags saying which apply) or `ss_stats_snapshot_json` (the same `strix
 `ss_stats_to_json` gave at that moment, byte for byte, per-layer counters included).
 
 - Armed on demand: until the first snapshot call, the engine thread does one relaxed load of a false flag per
-  `ss_end` and per `ss_stats_reset`, nothing else. The first call arms and returns `SS_E_INVALID` (nothing published
-  yet); from then on the engine thread publishes at every `ss_end` that folds a forward (also one that reports a
+  `ss_end` and per `ss_stats_reset`, nothing else. The first call arms and returns `SS_E_INVALID` while nothing is
+  published; from then on the engine thread publishes at every `ss_end` that folds a forward (also one that reports a
   read failure) and every `ss_stats_reset` between forwards.
 - A publication is a copy of the per-layer counters, the read-ahead counters, the exclusive counters and the forward
   count under a small mutex, into storage sized at open: no allocation, no formatting, O(layers) per forward.
-  Readers copy it under the same mutex and sum or format outside it; backend, sources, read-ahead buffers and block
-  count are fixed at open.
+  Readers copy it under the same mutex (`ss_stats_snapshot` also sums the per-layer counters there, O(layers)) and
+  format outside it; backend, sources, read-ahead buffers and block count are fixed at open.
 - Every publication is the live state at a forward boundary. Changes made between boundaries (inside a forward,
   `ss_seed` promotions, read-ahead requested between forwards, a reset during a forward) appear at the next one; an
   `ss_end` that fails before folding, and anything after the context is poisoned, publish nothing, so the last

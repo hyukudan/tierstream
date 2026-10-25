@@ -1653,7 +1653,7 @@ void Ctx::end() {
   fwd_open_ = false;
   ra_frozen_ = false;
   ++forward_;
-  // A forward whose read failed is still folded above: it is published like any other (design.md ง7.1).
+  // A forward whose read failed is still folded above: it is published like any other (design.md ยง7.1).
   maybe_publish();
   if (failed != SS_OK) fail(failed, err);
 }

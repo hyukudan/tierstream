@@ -95,7 +95,7 @@ class Ctx {
   int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
   ss_exclusive_stats exclusive_stats() const;
-  // Stats snapshot (any thread, design.md ง7.1). False (outputs untouched) while nothing is published; the first
+  // Stats snapshot (any thread, design.md ยง7.1). False (outputs untouched) while nothing is published; the first
   // call arms publication. total / info / json may each be null.
   bool snapshot(ss_layer_stats* total, ss_snapshot_info* info) const;
   bool snapshot_json(Json* out) const;
@@ -273,7 +273,7 @@ class Ctx {
     uint64_t requested = 0, read = 0, landed = 0, unused = 0, failed = 0, fallback = 0, bytes = 0;
   } ra_st_;
 
-  // Stats snapshot (design.md ง7.1). The engine thread publishes a copy of the counters at each ss_end and
+  // Stats snapshot (design.md ยง7.1). The engine thread publishes a copy of the counters at each ss_end and
   // ss_stats_reset once a reader armed it; readers copy it under snap_mu_ and format outside. Everything else a
   // document needs (backend, sources, read-ahead buffers, block count) is fixed at open.
   struct StatsView {

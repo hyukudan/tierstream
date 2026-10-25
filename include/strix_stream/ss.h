@@ -335,10 +335,10 @@ static inline ss_status ss_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* 
  * thread, concurrently with any call on the context and with each other, but never concurrently with or after
  * ss_close (stop the readers first). They work on a poisoned context and return the last publication.
  *
- * The first call arms the context and returns SS_E_INVALID (outputs untouched): from then on the engine thread
- * publishes an immutable copy of the counters at the end of each ss_end that folds a forward's numbers (also one that
- * reports a read failure) and of each ss_stats_reset between forwards. Until the first publication every call
- * returns SS_E_INVALID. Unarmed, the only added work is one relaxed load per ss_end / ss_stats_reset. A publication
+ * The first call arms the context: from then on the engine thread publishes an immutable copy of the counters at the
+ * end of each ss_end that folds a forward's numbers (also one that reports a read failure) and of each ss_stats_reset
+ * between forwards. While nothing is published (so normally on that first call) every call returns SS_E_INVALID with
+ * its outputs untouched. Unarmed, the only added work is one relaxed load per ss_end / ss_stats_reset. A publication
  * holds every counter since open (or since the last reset) exactly as ss_stats_total / ss_stats_exclusive /
  * ss_stats_to_json gave them on the engine thread at that moment. Live changes between publications (inside a
  * forward, ss_seed promotions, read-ahead requested between forwards, a reset during a forward) appear at the next
