@@ -89,7 +89,8 @@ into a free slot. `ss_acquire_groups` lets the engine start on the resident unit
     - **Promotion.** When a miss is promoted into a persistent slot, its RAM block is freed at `ss_end`. A miss
       served from the ring keeps its block.
     - **Eviction.** The victim is written back from VRAM into a free RAM block of its size: a device-to-host copy on
-      its own stream, the opposite PCIe direction. With no free block, the miss is served from the ring and the
+      its own stream. On a GPU with one copy engine (the RTX PRO 6000 here reports one), that copy shares the
+      engine with the misses' copies, so it is not free. With no free block, the miss is served from the ring and the
       victim stays. With full slots and no spare blocks, the resident set stops adapting, but nothing falls back to
       disk.
     - **Capacity.** VRAM + RAM can then hold the whole model when, after the fixed bytes, workspace, ring and
@@ -308,8 +309,8 @@ The same calls are in the C ABI (`ss_recipe_*`).
 **Example recipes** are in [recipes/examples/](recipes/examples/README.md), calibrated on the lab's measured setups
 (two Strix Halo nodes on USB4 and a PC with an RTX PRO 6000 96 GB):
 
-- deployable: DeepSeek V4.1 Flash (pair, and the measured RTX + pair hetero placement), MiniMax M3.1 Flash, Qwen3.8
-  Flash Next;
+- validated by `ts-recipe` (admission on a given machine may still refuse them): DeepSeek V4.1 Flash (pair, and the
+  measured RTX + pair hetero placement), MiniMax M3.1 Flash, Qwen3.8 Flash Next;
 - `pending/`: recipes that wait for an engine run, a descriptor or hardware: a DeepSeek RTX decode replica, DeepSeek
   and MiniMax on a 32 GB card, MiniMax with >= 192 GB of host RAM, GLM 5.3 Flash.
 
@@ -337,8 +338,12 @@ The old names are removed in a later release, once every consumer has moved.
 v1. The CPU tests pass on MSVC and on GCC with ASan, UBSan and TSan. The CUDA backend is built and its GPU test runs
 in one short window. Exclusive mode and host read-ahead are opt-in.
 
-The HIP backend for Strix Halo (unified memory) is still a stub: it has not been built or run yet. Building and
-testing it with the nodes' ROCm toolchain is the next step.
+The HIP backend for Strix Halo (unified memory) is built with the nodes' ROCm toolchain (`-DTS_HIP=ON`) and its GPU
+test passes on a Strix Halo node (gfx1151). `ts-test-hip` is the CUDA GPU test compiled for HIP. Decode, prefill and
+read-ahead reads all check out on the device, and a read failure is reported and recovered. The test also measures
+landing throughput into GPU-mapped host memory: about 29 GB/s from the pinned tier and about 6 GB/s from an unbuffered
+file. Exclusive mode requires a discrete device in this implementation and is refused by the unified-memory HIP
+backend.
 
 In development (design approved, not in this version): a device-gated decode mode for graph-captured MoE decode. Route -> slot resolution and the residency
 check run inside the engine's CUDA graph, and the host is touched only on a miss.

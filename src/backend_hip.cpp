@@ -1,5 +1,5 @@
 // HIP backend for Strix Halo (gfx1151, unified LPDDR5X). Built with the nodes' ROCm toolchain; its GPU test is
-// ss-test-hip (tests/test_cuda.cu through tests/gpu_runtime.hpp).
+// ts-test-hip (tests/test_cuda.cu through tests/gpu_runtime.hpp).
 //
 // Model: unified memory. "Device" slots are host-pinned, GPU-mapped memory (hipHostMalloc, coherent), so:
 //   - resident = mapped: the GPU reads the slot at full memory bandwidth; there is no H2D copy and no pinned tier
