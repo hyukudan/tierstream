@@ -7,7 +7,7 @@
 //   ts-adapt curve TRACE USAGE --actives A,B,.. [--labels code=:code:,all=] [--eval val-] [--file F] [--spares S]
 //                  [--rows R] [--evict lru|file-last] [-o OUT]
 //   ts-adapt xval TRACE --active A [--folds 5] [--file F] [--spares S] [--rows R] [--half-life H] [--evict E]
-//                  k-fold cross-validation as wstream's g0impl.py: fold f = sequences i % folds == f, ranked by a
+//                  k-fold cross-validation as the offline reference implementation: fold f = sequences i % folds == f, ranked by a
 //                  usage table of the other folds, one arena per fold
 //   ts-adapt solve INPUT.json [-o OUT] [--table]
 //   ts-adapt ref FIXTURE.json            (placement contract §3.9 arithmetic alone, = golden/solver_ref.py)

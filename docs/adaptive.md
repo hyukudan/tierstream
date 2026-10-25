@@ -17,11 +17,11 @@ is off until `ts_usage_attach`.
 | online updater | `ts_usage_attach(ctx, table)` | every `ss_layer_routes[_dev]` observed, one tick per row at `ss_end` |
 | tiers | `ts_usage_tiers`, `ts-adapt tiers` | top `active` RESIDENT, next `host` PINNED, tail DISK (file homes), for `ts_plan_from_tiers` |
 | simulator | `src/adapt_sim.*`, `ts-adapt sim / xval / curve` | device-gated cache semantics (global arena, free-slot admission else bank, boundary LRU to the spare target, write-back latency, FILE victims discarded); counts misses by home; `tierstream/miss-curve-v1` |
-| what-if solver | `src/adapt_solve.*`, `ts_adapt_solve`, `ts-adapt solve` | `tierstream/adapt-solve-v1` -> `tierstream/adapt-whatif-v1` (NOT `tierstream/solver-v1`: the operator solver `ts-recipe solve` is claudeadmin-placement's): per choice (mode, context, batch) charges the device lines + state for that context, arena = rest of the device budget, pinned = host budget after aux, spare blocks and (when there is a FILE tier) `file_staging_bytes`, NVMe = tail; tok/s by the placement contract 3.9 arithmetic (curve + cold-rate bound) and, given a trace, by simulating that exact (active, file) pair; rows with batch > 1 are unpredicted. The device-gated mode's spares and 2 x B bank slots are NOT added by the solver: give them as device or mode lines (the DS input does: `spares_96`, `banks_guard`) |
+| what-if solver | `src/adapt_solve.*`, `ts_adapt_solve`, `ts-adapt solve` | `tierstream/adapt-solve-v1` -> `tierstream/adapt-whatif-v1` (NOT `tierstream/solver-v1`: the operator solver `ts-recipe solve` belongs to the placement planner): per choice (mode, context, batch) charges the device lines + state for that context, arena = rest of the device budget, pinned = host budget after aux, spare blocks and (when there is a FILE tier) `file_staging_bytes`, NVMe = tail; tok/s by the placement contract 3.9 arithmetic (curve + cold-rate bound) and, given a trace, by simulating that exact (active, file) pair; rows with batch > 1 are unpredicted. The device-gated mode's spares and 2 x B bank slots are NOT added by the solver: give them as device or mode lines (the DS input does: `spares_96`, `banks_guard`) |
 | contract arithmetic | `solve_ref`, `ts-adapt ref` | placement contract 3.9 exactly as `golden/solver_ref.py` (sha256 5722f6e2): sequences == 1, both applicability key sets complete and equal to the choice's `calib`, missing curve -> unpredicted; frozen goldens SV1 / SV1b in `tests/data/adapt`, byte for byte |
 | bench | `ts-bench-adapt` (CUDA) | replays routes through a real descriptor with usage-ranked homes, compute stub per layer, next-layer lookahead (`ss_host_prefetch` for disk units), bitwise sample check |
 
-The arithmetic of `solve_ref` equals `wave4/placement/golden/solver_ref.py` (frozen goldens in `tests/data/adapt`).
+The arithmetic of `solve_ref` equals the placement contract's reference solver (frozen goldens in `tests/data/adapt`).
 
 ## Simulator scope
 
@@ -52,6 +52,5 @@ does not match is never served, later requests fail again, other units stay exac
 
 ## Not here
 
-The device-gated mode's FILE homes (`file-homes.md`, branch `file`, claudesoporte-wstream) and the operator-facing
-`ts-recipe solve` / `ts_place` (claudeadmin-placement) consume the usage table and the solver; their lookahead stage
-is proposed in `wave4/adaptive/file-prefetch.md`.
+The device-gated mode's FILE homes and the operator-facing `ts-recipe solve` / `ts_place` (the placement planner)
+consume the usage table and the solver; a lookahead stage for them is future work.

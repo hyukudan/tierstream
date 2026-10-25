@@ -346,7 +346,7 @@ Json miss_curve(const Trace& t, const std::vector<std::pair<std::string, std::st
                                                     " consecutive committed tokens (rejected draft rows not modelled)");
   if (folds >= 2) {
     pol["ranking"] = Json::string(std::to_string(folds) + "-fold: sequence i in fold i % " + std::to_string(folds) +
-                                  ", ranked by a usage table of the other folds (as g0impl.py)");
+                                  ", ranked by a usage table of the other folds (as the offline reference implementation)");
   } else {
     pol["ranking"] = Json::string("usage table " + u.sha256());
     j["usage_sha256"] = Json::string(u.sha256());

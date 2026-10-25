@@ -75,7 +75,7 @@ struct SimResult {
 
 SimResult simulate(const Trace& t, const std::string& filter, const std::vector<int64_t>& order, const SimConfig& c);
 
-// k-fold cross-validation (as wstream's g0impl.py): sequence i is in fold i % folds; each fold is simulated with its
+// k-fold cross-validation (as the offline reference implementation): sequence i is in fold i % folds; each fold is simulated with its
 // own arena, ranked by a usage table of the other folds; results summed.
 SimResult simulate_xval(const Trace& t, const std::string& filter, const SimConfig& c, int folds, uint32_t half_life);
 

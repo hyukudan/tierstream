@@ -1,6 +1,6 @@
 // Adaptive memory plan (include/tierstream/ts_adapt.h): usage table (fixed point, ranking, canonical file, merge,
 // online updater), tiers from the ranking, trace parsing and the tier simulator, the solver against the placement
-// contract's frozen goldens (SV1 and S1, made by wave4/placement/golden/solver_ref.py), the solver's budget split, and
+// contract's frozen goldens (SV1 and S1, made by the contract's reference solver), the solver's budget split, and
 // on the CPU backend: the file (DISK) tier against the pinned tier, bit for bit, with host lookahead prefetch of the
 // next layer, and fail-closed reads.
 #include <cstring>
@@ -267,7 +267,7 @@ TEST(adapt_simulator_hand_case) {
 }
 
 TEST(adapt_solver_goldens) {
-  // SV1 / SV1b = the placement contract's frozen goldens (wave4/placement/golden/sv1, solver_ref.py sha256
+  // SV1 / SV1b = the placement contract's frozen goldens (reference solver sha256
   // 5722f6e2...: applicability / calib / sequences rules, incomplete calibration -> unpredicted), byte for byte.
   for (const char* name : {"sv1", "sv1b"}) {
     const std::string dir = "tests/data/adapt/";

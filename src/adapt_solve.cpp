@@ -298,7 +298,7 @@ Json solve(const Json& in, const std::string& base) {
 
   Json out = Json::object();
   // A what-if document, deliberately NOT tierstream/solver-v1: the operator solver (ts-recipe solve, placement
-  // contract 3.9) is claudeadmin-placement's; solve_ref above is its arithmetic for the goldens.
+  // contract 3.9) belongs to the placement planner; solve_ref above is its arithmetic for the goldens.
   out["schema"] = Json::string("tierstream/adapt-whatif-v1");
   out["usage_sha256"] = Json::string(usage.sha256());
   if (curves) out["curves_source"] = Json::string(str_or(*curves, "schema", "?"));

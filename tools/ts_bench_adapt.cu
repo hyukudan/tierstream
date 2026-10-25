@@ -11,7 +11,7 @@
 // Shared-GPU safety: --device-gib / --host-gib are required (no defaults); the device must be an RTX PRO 6000 unless
 // --force 1; the plan's device peak + 1 GiB must fit the device's free memory and the plan's pinned bytes must fit
 // --host-gib, else nothing is allocated; the replay stops after --max-seconds (default 600). Run it only inside a
-// PC-BIG slot.
+// slot reserved for the shared workstation GPU.
 //
 // --active: units placed RESIDENT (top of the usage ranking), --host: next units PINNED, the rest DISK (file homes).
 // Lookahead: after layer L's routes, layer L+1..L+K's ids are hinted (the true ids, each replaced by a wrong one with
