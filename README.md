@@ -111,13 +111,39 @@ layer, but a layer whose weights are already available needs no host reply.
   reserve and per-layer and per-token limits.
 - **Failure handling:** a wait timeout or an invalid routed id sets a persistent abort flag. Every weight lookup must
   use `ss_dg_slot` (`ts_dg_slot` in `tierstream/ts.h`); after abort, it returns a zero-filled guard slot. `ss_end`
-  returns an error and poisons the context. The engine must discard that token's outputs. Every layer's weight readers
-  must finish before the next layer's export. The end kernel must follow all readers and joined branches.
+  returns an error and poisons the context. The engine must commit its KV, carry, and speculative state only after a
+  successful `ss_end`. On failure, discard the token's outputs and, once outstanding work can no longer write model
+  state, restore the last committed state or terminate the session. Reopening the cache alone does not repair state
+  written by the failed step. Every layer's weight readers must finish before the next layer's export. The end kernel
+  must follow all readers and joined branches.
+  - Each `ss_begin` authorizes exactly one gated step. The step's begin kernel advances the device sequence and checks
+    it against the host authorization; a mismatch aborts the step, so lookups return the guard slot. A stray step
+    still queued when `ss_begin` runs can consume that authorization: `ss_end` may succeed for that token, with the
+    desync reported at a later `ss_begin` or `ss_end`. Never launch extra gated steps outside the pair, and
+    stream-synchronize any prior warm-up before starting a pair.
+  - After the layer's wait, `ss_dg_slot` returns the guard slot for an unexpected absent table entry. If the view
+    includes a non-null `absent_err` field, the lookup sets that word; `ss_end` then fails the token and poisons the
+    context. Older, smaller views return the guard without reporting the absent entry.
+  - Before an eager gated step, load every kernel that may first launch while a wait kernel is spinning. CUDA lazy
+    loading can otherwise block that launch until the wait deadline. Set `CUDA_MODULE_LOADING=EAGER` before CUDA
+    initialization, or call `cudaFuncGetAttributes` on each such kernel before launching the step. Any full gated
+    warm-up token must use its own `ss_begin`/`ss_end` pair and finish before the next pair. Captured graphs load their
+    kernels during instantiation.
 - **Budgets and statistics:** it uses the existing planner, then checks the gated layout at open. Every weight unit
   must fit in GPU memory or pinned RAM; decode does not fetch weights from disk. The checks include device tables and
   controls, mapped records, staging buffers, and enough spare host blocks. Existing statistics APIs remain available.
   Counters update after successful `ss_end` calls; snapshots expose the last publication. Statistics reset is allowed
   only between tokens.
+- **Warm start and limits:** `dg_seed` supplies `(gated ordinal, unit index)` entries in priority order, most recent
+  first. At open, resident slots are filled from distinct seed entries, then planned residents, then remaining units in
+  key order, up to the persistent-slot count minus the spare target. Out-of-range seed entries are rejected; keep the
+  array valid through `ss_open`.
+  - `dg_spare_slots` sets one global spare-slot count; zero uses the plan's per-layer counts summed across gated
+    layers. `dg_spare_target` is the boundary's free-slot target, at most the billed spare count; its default is that
+    full count. Between tokens, `ss_dg_set_budgets` changes the target for the next boundary and prefetch limits for
+    the next token. The default prefetch reserve follows the target; an explicit reserve stays fixed. Boundary
+    write-backs are limited by available free pinned RAM blocks, so remaining victims stay resident and the target may
+    not be reached.
 
 It is opt-in and CUDA only, for decode. It requires exclusive placement and LRU eviction, with `pin_planned = 0`.
 Before an engine makes it the default, it must pass the bit-for-bit correctness and performance checks against that
@@ -393,10 +419,12 @@ in one short window. Exclusive mode and host read-ahead are opt-in.
 The HIP backend for Strix Halo (unified memory) is still a stub: it has not been built or run yet. Building and
 testing it with the nodes' ROCm toolchain is the next step.
 
-Device-gated decode is opt-in and CUDA only. Its GPU unit test passes on the RTX PRO 6000 (7 cases: graph-captured
-decode with prediction, statistics, memory pressure, a stopped service, an out-of-range id, and two protocol
-mutations that the test must catch). The bit-for-bit correctness and performance checks against the DeepSeek
-replica's own cache are still pending.
+Device-gated decode is opt-in and CUDA only. Its GPU unit test passes on the RTX PRO 6000 (18 cases: graph-captured
+decode with prediction, statistics, memory pressure, global spares with fewer spare blocks than spare slots, a stopped
+service, an out-of-range id, sequence desyncs, an absent entry, open-time refusals and seeding, test-hook gating,
+budgets, DMA timing, and two protocol mutations that the test must catch). The full-model DeepSeek bit-for-bit
+comparison against the replica's own cache passed gate 3 in window w4. Gate 4, speed parity against that cache, has not
+yet been accepted.
 
 ## Credits
 
