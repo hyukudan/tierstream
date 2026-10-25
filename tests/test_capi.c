@@ -4,6 +4,13 @@
 
 #include "strix_stream/ss.h"
 
+/* ss_snapshot_info layout as a C caller sees it (append-only). */
+typedef char snapshot_flags_at_4[offsetof(ss_snapshot_info, flags) == 4 ? 1 : -1];
+typedef char snapshot_sequence_at_8[offsetof(ss_snapshot_info, sequence) == 8 ? 1 : -1];
+typedef char snapshot_readahead_at_24[offsetof(ss_snapshot_info, readahead_buffers) == 24 ? 1 : -1];
+typedef char snapshot_exclusive_at_96[offsetof(ss_snapshot_info, exclusive_writebacks) == 96 ? 1 : -1];
+typedef char snapshot_size_160[sizeof(ss_snapshot_info) == 160 ? 1 : -1];
+
 int main(void) {
   const char* js =
       "{\"schema\":\"strix-stream/desc-v1\",\"engine\":\"c\",\"sources\":[{\"path\":\"none.bin\"}],"
@@ -14,7 +21,10 @@ int main(void) {
   ss_budget b;
   char* out = NULL;
   int rc = 0;
+  ss_snapshot_info info;
+  ss_layer_stats total;
   if (ss_abi_version() != SS_ABI_VERSION) return 1;
+  if (ss_stats_snapshot(NULL, &total, &info) != SS_E_INVALID) return 1; /* the inline wrapper compiles from C */
   if (ss_desc_from_json(js, strlen(js), &d) != SS_OK) {
     printf("desc: %s\n", ss_last_error());
     return 1;
