@@ -478,8 +478,8 @@ trace (every route visited: `no match` / `admitted` / why not).
 ### 7.2 Availability and bounds
 
 From the request state (§8.3):
-- a set is available when every one of its members' devices is `available` (false when busy, e.g. the PC-BIG
-  ledger taken, or down);
+- a set is available when every one of its members' devices is `available` (false while another workload uses
+  the device, or when it is down);
 - a link is up when `up`; a set with an `internal_link` also needs the link `<set>.internal` up;
 - a route whose compiled plan reads from disk (`disk_bytes` > 0) needs `disk_available: true` on each such member's
   device (false when the disk is busy, e.g. over its duty limit);

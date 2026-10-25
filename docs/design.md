@@ -462,8 +462,14 @@ counters, flags saying which apply) or `ss_stats_snapshot_json` (the same `strix
 | backend | status | notes |
 |---|---|---|
 | CPU | done, tested | host memory, unified; the reference for the in-place path |
-| CUDA | done, CPU-built; GPU test `ts-test-cuda` (one short PC-BIG) | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream for H2D: one DMA engine reaches 31-32.5 GB/s and a second H2D stream adds nothing (spec-rtx-prefill §2.1); exclusive mode adds a write-back (D2H) stream |
-| HIP | stub: compiles only with `-DTS_HIP=ON` on a ROCm host; not built or run yet | unified: slots are mapped host memory, misses are read in place from the local NVMe, host waits in v1 |
+| CUDA | built and GPU-tested, `ts-test-cuda` | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream for H2D: one DMA engine reaches 31-32.5 GB/s and a second H2D stream adds nothing (spec-rtx-prefill §2.1); exclusive mode adds a write-back (D2H) stream |
+| HIP | built and GPU-tested on Strix Halo (gfx1151), `-DTS_HIP=ON` | unified: slots are mapped host memory, misses are read in place from local NVMe; exclusive mode is refused |
+
+CUDA device-gated decode is merged and opt-in; its GPU tests and the DeepSeek full-model bit-for-bit and
+speed-parity gates pass. It uses a global slot arena and boundary eviction to a spare-slot target, separate from
+the host-controlled per-layer pools described in §3. See [the engine contract in the README](../README.md#device-gated-decode-graph-captured-moe-decode).
+The older 31-32.5 GB/s transfer measurements above are not a fixed platform limit; see
+[the current PCIe conditions](../README.md#when-it-pays-and-when-it-does-not).
 
 ## 9. Versioning
 
@@ -481,7 +487,11 @@ counters, flags saying which apply) or `ss_stats_snapshot_json` (the same `strix
 - **Mapped-flag gates** (`cuStreamWaitValue32` / `hipStreamWaitValue64`) instead of host waits for file jobs.
 - **Per-layer row splits** from miss curves (dynamic slots per layer instead of a uniform count).
 - **A rate-tally file across runs.** Measured to generalize poorly in the study, so only as an opt-in.
-- **One slot arena across layers** (exclusive decode): wdsrtx's G0 gives 8.0 misses/token with a global LRU vs 8.6
-  with per-layer pools at 80 GiB.
-- **Boundary eviction into spare device slots** (wdsrtx's engine-side store): takes the write-back off the miss
-  path; worth it if the write-back wait shows in the stats.
+- **Deferred, bounded write-backs** (`wbsched`, in development): carry pending victims across token boundaries
+  and limit copy-engine queueing; exact-byte GPU tests pass, full-model timing qualification is in progress.
+- **Priced window prefetch** (`winpf`, in development): bound multi-row speculative copies by observed usefulness
+  and copy cost; still in qualification.
+- **Adaptive memory planning** (`adaptive`, in development): usage tables rank VRAM / pinned / NVMe homes after
+  reserving context state. The measured replay and its limits are in the [README](../README.md#adaptive-memory-and-nvme-measurements-in-development).
+- **Pipelined startup loading** (`coldload`, in progress): overlap reads, staging and device copies with bounded
+  buffers. No measured load-time saving yet.

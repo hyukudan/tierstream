@@ -215,7 +215,11 @@ write-back logic lives here once:
 
 The question is how many weight bytes each token must move across PCIe, compared with what the GPU reads from its
 own memory, which is much faster.
-- Pinned RAM to VRAM measured 31-32.5 GB/s on the RTX PRO 6000 with one copy engine (design.md §8).
+- On an RTX PRO 6000 (96 GB, Windows WDDM), pinned RAM ↔ VRAM microbenchmarks measured about 22 GB/s
+  with a busy PC and 34-40 GB/s with a quieter PC: 40 % and 62-73 % of the lab's 55 GB/s practical PCIe reference,
+  respectively (not the theoretical link rate). The unchanged comparison benchmark shows the same effect, so the
+  load-dependent loss is not specific to tierstream. Host-memory contention is suspected but not isolated.
+  The device exposes one copy engine; queued write-backs can delay demand copies across streams.
 - NVMe is slower still.
 
 | workload | streaming | why |
@@ -226,6 +230,31 @@ own memory, which is much faster.
 | **Dense decode** (one or a few tokens per step) | does **not** pay | Every token reads every weight. Whatever is not resident crosses PCIe on every token, far slower than VRAM, so the streamed fraction dominates the step time. Use a smaller quantization, more GPUs, or a unified-memory machine instead. |
 | **MoE decode with near-uniform routing** | pays less | With no hot set, the miss rate approaches the fraction of experts that are not resident. |
 | **KV cache, adapters** (later) | not yet | The same tiers fit other large, unevenly used byte ranges. Units today are weights only. |
+
+### Adaptive memory and NVMe measurements (in development)
+
+The `adaptive` branch treats expert memory and KV/state as one device budget: reserve state for the selected
+context, then place experts across VRAM, pinned RAM and NVMe. A `tierstream/usage-v1` table ranks experts by measured
+use, decayed recency and stable unit order. It includes a usage updater, miss-curve simulator and what-if solver;
+these are not yet shipped. The generic file tier already exists; device-gated NVMe support is separate development.
+
+Measured on an RTX PRO 6000 (96 GB, Windows WDDM): replay of held-out code decode routes from DeepSeek V4.1 Flash,
+using real GGUF experts (IQ2_XXS gate/up, Q2_K down) and a compute stub sized to a 6.18 ms all-hit floor.
+The context labels below are **memory budgets**, not full-model context-length benchmarks. Sampled expert bytes
+matched bit for bit (924 checks, no failures); this does not qualify full-model logits or generated tokens.
+
+| Context budget / state allocation | Experts: VRAM / pinned / NVMe | ms/token | Throughput as % of stub ceiling | Pinned / NVMe misses per token |
+|---|---:|---:|---:|---:|
+| 8K, maximum expert capacity | 8,594 / 6,766 / 0 | 9.06 | 68.2 % | 8.39 / 0 |
+| 128K, lean state allocation | 7,713 / 7,215 / 432 | 10.43 | 59.2 % | 11.71 / 0.036 |
+| 128K, current state buffers | 5,113 / 7,233 / 3,014 | 32.7 | 18.9 % | 78.5 / 4.5 |
+
+Host read-ahead did not help this decode replay: persistent-slot admissions re-read the file instead of consuming
+ready read-ahead buffers. That path needs repair before claiming a decode prefetch gain.
+
+Retained host-copy pools did not justify their memory cost in CPU trace simulation. Lossless compression also gave
+no useful gain: 298 sampled experts across all 40 DeepSeek V4.1 Flash MoE layers, with the same IQ2_XXS/Q2_K bytes,
+compressed only 1.008× with zstd levels 1-19 and round-tripped bit for bit. Neither approach is being adopted.
 
 ## Recipe knobs at a glance
 
@@ -386,7 +415,7 @@ ts-recipe plan     RECIPE --route R --device-set S --desc DESC.json   # budget, 
 The same calls are in the C ABI (`ss_recipe_*`).
 
 **Example recipes** are in [recipes/examples/](recipes/examples/README.md), calibrated on the lab's measured setups
-(two Strix Halo nodes on USB4 and a PC with an RTX PRO 6000 96 GB):
+(two Strix Halo nodes over USB4 and an RTX PRO 6000 (96 GB, Windows WDDM)):
 
 - validated by `ts-recipe` (admission on a given machine may still refuse them): DeepSeek V4.1 Flash (pair, and the
   measured RTX + pair hetero placement), MiniMax M3.1 Flash, Qwen3.8 Flash Next;
@@ -428,8 +457,24 @@ Device-gated decode is opt-in and CUDA only. Its GPU unit test passes on the RTX
 decode with prediction, statistics, memory pressure, global spares with fewer spare blocks than spare slots, a stopped
 service, an out-of-range id, sequence desyncs, an absent entry, open-time refusals and seeding, test-hook gating,
 budgets, DMA timing, and two protocol mutations that the test must catch). The full-model DeepSeek bit-for-bit
-comparison against the replica's own cache passed gate 3 in window w4. Gate 4, speed parity against that cache, has not
-yet been accepted.
+comparison against the replica's own cache and the speed-parity gate both passed. Device-gated decode is merged;
+the DeepSeek replica now uses tierstream as its only expert cache. This qualification does not cover unmerged features.
+
+As of 25 October 2026 evening:
+
+| Work | State | Scope / qualification |
+|---|---|---|
+| Device-gated decode | Merged, opt-in | CUDA decode; full-model bit-for-bit and speed-parity gates passed. |
+| Deferred, bounded write-backs (`wbsched`) | In development | Carries pending victims across token boundaries and budgets background submissions so they do not flood the shared copy engine. Preserves exact bytes and slot ownership; GPU tests passed on the RTX PRO 6000. Full-model performance qualification is in progress. |
+| Priced window prefetch (`winpf`) | In development, in qualification | Deduplicates multi-row predictions, prices candidates by observed usefulness and copy cost, and bounds speculative traffic behind demand. No accepted full-model speed gain yet. |
+| Adaptive budgets, usage tables and NVMe placement (`adaptive`) | In development | Trace-replay measurements above; not an end-to-end engine result. |
+| Pipelined cold-start loader (`coldload`) | In development, in progress | Bounded overlap of reads, staging and device copies; no measured saving yet. |
+
+Cold-start loading is still serial. Recent DeepSeek V4.1 Flash RTX runs with the same GGUF expert formats took
+92-104 s to initialize, including about 79 s in the serial expert-fill phase in one measured run. Loading precedes
+prompt execution; that run then continued from an imported 2,048-token state. These are internal load timers across
+different builds/configurations, not a controlled cold/warm-disk comparison or request TTFT. Expert loading includes
+allocation, file reads and device copies; their individual times have not been isolated.
 
 ## Credits
 
