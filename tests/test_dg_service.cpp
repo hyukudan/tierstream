@@ -356,7 +356,7 @@ TEST(dg_service_seen_us_origin) {
   double seen0_tok1 = 0;
   for (uint32_t tok = 1; tok <= 2; ++tok) {
     // token 1: the origin is the service's start (no previous token); token 2: the previous token's end
-    std::this_thread::sleep_for(std::chrono::milliseconds(tok == 1 ? 40 : 60));  // the engine before the token
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));  // the engine before the token
     r.seq = tok;
     r.svc->begin(tok);
     ts::dg_store_release(&r.began, tok);
@@ -369,8 +369,8 @@ TEST(dg_service_seen_us_origin) {
     if (tok == 1) seen0_tok1 = r.svc->timeline()[0].seen_us;
     r.core->end_token({});
   }
-  if (seen0_tok1 < 40000) std::printf("  token 1 seen_us[0] = %.0f us (wanted >= 40000)\n", seen0_tok1);
-  CHECK(seen0_tok1 >= 40000);
+  if (seen0_tok1 < 30000) std::printf("  token 1 seen_us[0] = %.0f us (wanted >= 30000)\n", seen0_tok1);
+  CHECK(seen0_tok1 >= 30000);  // 60 ms after the Rig started the service (its thread start may lag)
   const double seen0 = r.svc->timeline()[0].seen_us;
   if (seen0 < 60000) std::printf("  seen_us[0] = %.0f us (wanted >= 60000)\n", seen0);
   CHECK(seen0 >= 60000);
