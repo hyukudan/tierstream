@@ -28,14 +28,23 @@ __device__ __forceinline__ int32_t ld_acquire_sys(const int32_t* p) {
   return v;
 }
 
-// The first error of the token wins the code; abort is sticky (a failed token poisons the context).
+// The first error of the token wins the code; abort is sticky (a failed token poisons the context). err_count counts
+// the wait timeouts (ss_dg_stats.device_timeouts).
 __device__ void set_error(const Dev& d, uint32_t code, uint32_t g) {
   if (atomicCAS(d.err_code, 0u, code) == 0u) *d.err_aux = g;
-  atomicAdd(d.err_count, 1u);
+  if (code == kDgTimeout) atomicAdd(d.err_count, 1u);
   atomicExch(d.abort, 1u);
 }
 
-__global__ void begin_kernel(Dev d) { *d.seq = *d.seq + 1u; }
+// design rev 3.4 §11.1: the step is authorized only if its sequence is the one ss_begin wrote; any other step is
+// aborted here, so every slot lookup it makes returns the guard and every wait returns at once.
+__global__ void begin_kernel(Dev d) {
+  const uint32_t seq = *d.seq + 1u;
+  *d.seq = seq;
+  if (ld_acquire_sys(d.host_seq) != seq) set_error(d, kDgDesync, seq);
+  __threadfence_system();
+  *reinterpret_cast<volatile uint32_t*>(d.began) = seq;
+}
 
 __global__ __launch_bounds__(64) void export_kernel(Dev d, uint32_t g, const int32_t* ids, uint32_t n, uint32_t n_pred) {
   __shared__ unsigned long long mask;
@@ -102,6 +111,10 @@ __global__ void wait_kernel(Dev d, uint32_t g) {
 }
 
 __global__ void end_kernel(Dev d) {
+  // an absent entry met without abort (design rev 3.4 §11.3): first code wins, never over an earlier one
+  if (*reinterpret_cast<volatile uint32_t*>(d.absent_err) && !*reinterpret_cast<volatile uint32_t*>(d.abort))
+    set_error(d, kDgAbsent, 0);
+  *reinterpret_cast<volatile uint32_t*>(d.m_err_count) = *d.err_count;
   *reinterpret_cast<volatile uint32_t*>(d.m_err_code) = *d.err_code;
   *reinterpret_cast<volatile uint32_t*>(d.m_err_aux) = *d.err_aux;
   __threadfence_system();

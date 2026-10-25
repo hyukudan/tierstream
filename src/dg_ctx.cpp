@@ -75,8 +75,35 @@ class CudaTransport final : public DgTransport {
     }
   }
   ~CudaTransport() override {
+    for (cudaEvent_t e : dma_a_)
+      if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : dma_b_)
+      if (e) cudaEventDestroy(e);
     for (cudaStream_t s : s_)
       if (s) cudaStreamDestroy(s);
+  }
+  // dg_diag: two timing events per gated layer on the demand stream (separate from the protocol's untimed events).
+  void enable_diag(uint32_t G) {
+    dma_a_.assign(G, nullptr);
+    dma_b_.assign(G, nullptr);
+    dma_used_.assign(G, 0);
+    for (uint32_t g = 0; g < G; ++g) {
+      ck(cudaEventCreate(&dma_a_[g]), "cudaEventCreate (dma)");
+      ck(cudaEventCreate(&dma_b_[g]), "cudaEventCreate (dma)");
+    }
+  }
+  void diag_mark(uint32_t g, int which) override {
+    if (g >= dma_a_.size()) return;
+    ck(cudaEventRecord(which == 0 ? dma_a_[g] : dma_b_[g], s_[kDem]), "cudaEventRecord (dma)");
+    if (which == 0) dma_used_[g] = 1;
+  }
+  // After the demand stream is synced (the boundary): the layer's marked device time, -1 when it was not marked.
+  double take_dma_ms(uint32_t g) {
+    if (g >= dma_used_.size() || !dma_used_[g]) return -1;
+    dma_used_[g] = 0;
+    float ms = 0;
+    ck(cudaEventElapsedTime(&ms, dma_a_[g], dma_b_[g]), "cudaEventElapsedTime (dma)");
+    return double(ms);
   }
   void h2d(Stream s, int32_t slot, int32_t block) override {
     for (size_t p = 0; p < x_.part_bytes.size(); ++p)
@@ -126,6 +153,8 @@ class CudaTransport final : public DgTransport {
     sync(kDem);
   }
   void gate(Stream s, void* ev) { wait(s, ev); }
+  std::vector<cudaEvent_t> dma_a_, dma_b_;
+  std::vector<uint8_t> dma_used_;
   void drain_all() noexcept {
     for (cudaStream_t s : s_)
       if (s) cudaStreamSynchronize(s);
@@ -166,9 +195,23 @@ class CudaDgCtx final : public DgCtx {
         require(rows[size_t(L)] > 0, SS_E_INVALID,
                 "ss_begin: gated layer " + std::to_string(L) + " has 0 rows (every gated layer runs in every token)");
     }
+    // design rev 3.4 §11.1: no step ran outside a pair (every word still holds the last token's sequence)
+    bool clean = dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_;
+    for (size_t g = 0; clean && g < x_.gated.size(); ++g)
+      clean = dg_load_acquire(m_.flag + g) == seq_ && int32_t(dg_load_acquire(m_.pflag + g) - seq_) <= 0;
+    if (!clean) {
+      dg_store_release(m_.host_abort, 1);
+      svc_->stop_join();
+      poisoned_ = true;
+      fail(SS_E_BACKEND, "device-gated: sequence desync at ss_begin: a gated step ran outside ss_begin / ss_end (done " +
+                             std::to_string(dg_load_acquire(m_.done)) + ", began " +
+                             std::to_string(dg_load_acquire(m_.began)) + ", last token " + std::to_string(seq_) +
+                             "; the context is poisoned)");
+    }
     ++seq_;
     in_token_ = true;
     device_busy_ = true;  // until its end kernel is seen
+    dg_store_release(m_.host_seq, seq_);  // the begin kernel authorizes exactly this sequence
     svc_->begin(seq_);
   }
 
@@ -183,13 +226,23 @@ class CudaDgCtx final : public DgCtx {
       return now < deadline ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
                             : std::chrono::milliseconds(0);
     };
-    // 1. The completion edge: the end kernel ran after every reader of the token (test mutation 2 skips it).
-    if (!skip_edge_ && !wait_word(m_.done, seq_, left())) {
-      dg_store_release(m_.host_abort, 1);
-      svc_->stop_join();
-      poisoned_ = true;
-      fail(SS_E_BACKEND, "device-gated: the device did not finish token " + std::to_string(seq_) +
-                             " (no end kernel: the context is poisoned, the token's outputs must be discarded)");
+    // 1. The completion edge: the end kernel ran after every reader of the token (test mutation 2 skips it). A done
+    //    past this token, or a later step's begin, is a step outside the pair: fail at once (design rev 3.4 §11.1).
+    if (!skip_edge_) {
+      const Seen w = wait_seq(m_.done, seq_, left());
+      const uint32_t began = dg_load_acquire(m_.began);
+      if (w != kAt || began != seq_) {
+        dg_store_release(m_.host_abort, 1);
+        svc_->stop_join();
+        poisoned_ = true;
+        if (w == kBefore)
+          fail(SS_E_BACKEND, "device-gated: the device did not finish token " + std::to_string(seq_) +
+                                 " (no end kernel: the context is poisoned, the token's outputs must be discarded)");
+        fail(SS_E_BACKEND, "device-gated: sequence desync at ss_end: another gated step ran in token " +
+                               std::to_string(seq_) + " (done " + std::to_string(dg_load_acquire(m_.done)) +
+                               ", began " + std::to_string(began) +
+                               "; the context is poisoned, the token's outputs must be discarded)");
+      }
     }
     device_busy_ = false;
     // 2. The service's terminal word for this token: the core is the engine thread's again.
@@ -207,8 +260,11 @@ class CudaDgCtx final : public DgCtx {
     const uint32_t code = dg_load_acquire(m_.err_code);
     if (code != kDgOk) {
       poisoned_ = true;
-      const char* what = code == kDgTimeout ? "a wait timed out" : code == kDgBadId ? "an id was out of range"
-                                                                                     : "the host aborted the token";
+      const char* what = code == kDgTimeout   ? "a wait timed out"
+                         : code == kDgBadId   ? "an id was out of range"
+                         : code == kDgDesync  ? "a step ran outside ss_begin / ss_end (sequence desync)"
+                         : code == kDgAbsent  ? "a slot lookup met an absent entry"
+                                              : "the host aborted the token";
       fail(SS_E_BACKEND, std::string("device-gated: token ") + std::to_string(seq_) + ": " + what + " at gated layer " +
                              std::to_string(dg_load_acquire(m_.err_aux)) +
                              " (the context is poisoned, the token's outputs must be discarded)");
@@ -216,7 +272,9 @@ class CudaDgCtx final : public DgCtx {
     // 4. The boundary.
     std::vector<uint32_t> keep;
     for (const auto& k : keep_) keep.insert(keep.end(), k.begin(), k.end());
-    core_->end_token(keep);
+    core_->end_token(keep);  // syncs the demand stream: the diagnostics marks have completed
+    if (o_.dg_diag)
+      for (uint32_t g = 0; g < uint32_t(dma_ms_.size()); ++g) dma_ms_[g] = transport_->take_dma_ms(g);
     fold();
   }
 
@@ -281,6 +339,7 @@ class CudaDgCtx final : public DgCtx {
     v->unit_base = dev_.unit_base;
     v->abort = dev_.abort;
     for (size_t p = 0; p < x_.part_bytes.size(); ++p) v->parts[p] = {arena_[p], x_.part_bytes[p], x_.part_bytes[p]};
+    v->absent_err = dev_.absent_err;
   }
 
   void enqueue_begin(void* s) override {
@@ -314,27 +373,48 @@ class CudaDgCtx final : public DgCtx {
     ck_launch(dgk::launch_end(dev_, s), "end kernel");
   }
 
+  void set_budgets(uint32_t spare, uint32_t per_layer, uint32_t per_token) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_set_budgets: between tokens only");
+    require(spare <= x_.D, SS_E_INVALID,
+            "ss_dg_set_budgets: spare_target " + std::to_string(spare) + " above the billed spares (" +
+                std::to_string(x_.D) + ")");
+    core_->set_spare_target(spare);
+    core_->set_prefetch_budget(per_layer, per_token);
+  }
+
   void test_mutate(int m) override {
+    hooks("test_mutate");
     require(!in_token_, SS_E_INVALID, "test_mutate: between tokens");
     core_->set_mutation(m);
   }
   void test_pressure(uint32_t f, uint32_t r) override {
+    hooks("test_pressure");
     require(!in_token_, SS_E_INVALID, "test_pressure: between tokens");
     core_->set_pressure(f, r);
   }
   void test_check() override {
+    hooks("test_check");
     require(!in_token_, SS_E_INVALID, "test_check: between tokens");
     core_->check();
   }
   void test_gate(int stream, void* ev) override {
+    hooks("test_gate");
     require(!in_token_ && (stream == 0 || stream == 1), SS_E_INVALID, "test_gate: between tokens, stream 0 or 1");
     transport_->gate(stream == 0 ? DgTransport::kDem : DgTransport::kPf, ev);
   }
   void test_flags(uint32_t f) override {
+    hooks("test_flags");
     dev_.test_flags = f & dgk::kSkipWait;
     skip_edge_ = (f & 2u) != 0;
   }
-  void test_stop_service() override { svc_->stop_join(); }
+  void test_stop_service() override {
+    hooks("test_stop_service");
+    svc_->stop_join();
+  }
+  // Test-only hooks act only on a context opened with dg_test_hooks = 1 (design rev 3.4 §11.5).
+  void hooks(const char* what) const {
+    require(o_.dg_test_hooks != 0, SS_E_INVALID, std::string(what) + ": open the context with dg_test_hooks = 1");
+  }
 
   void stats(ss_dg_stats* out) const override {
     const DgStats a = diff(fold_, base_);
@@ -358,6 +438,12 @@ class CudaDgCtx final : public DgCtx {
     out->free_slots = fold_free_slots_;
     out->blocks = x_.blocks;
     out->slots = x_.slots;
+    out->predicted = a.predicted;
+    out->predicted_true = a.predicted_true;
+    out->miss_layers = a.miss_layers;
+    out->covered_waits = a.covered_waits;
+    // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
+    out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
   void layer_stats(int layer, ss_layer_stats* out) const override {
     require(layer >= 0 && size_t(layer) < d_.layers.size(), SS_E_INVALID, "ss_stats_layer: layer out of range");
@@ -447,6 +533,9 @@ class CudaDgCtx final : public DgCtx {
     out->covered = t.covered;
     out->fetched = t.fetched;
     out->prefetched = t.prefetched;
+    out->dma_ms = size_t(g) < dma_ms_.size() ? dma_ms_[size_t(g)] : -1;
+    out->predicted_true = t.predicted_true;
+    out->covered_waits = t.covered_waits;
   }
 
  private:
@@ -474,6 +563,10 @@ class CudaDgCtx final : public DgCtx {
     d.evicted = a.evicted - b.evicted;
     d.evict_short = a.evict_short - b.evict_short;
     d.writebacks_done = a.writebacks_done - b.writebacks_done;
+    d.covered_waits = a.covered_waits - b.covered_waits;
+    d.predicted = a.predicted - b.predicted;
+    d.predicted_true = a.predicted_true - b.predicted_true;
+    d.miss_layers = a.miss_layers - b.miss_layers;
     d.stalled = a.stalled - b.stalled;
     d.pred_invalid = a.pred_invalid - b.pred_invalid;
     return d;
@@ -615,11 +708,15 @@ class CudaDgCtx final : public DgCtx {
     require(g >= 0 && uint32_t(g) < x_.gated.size(), SS_E_INVALID, std::string(what) + ": gated layer out of range");
   }
 
-  static bool wait_word(const uint32_t* w, uint32_t seq, std::chrono::milliseconds limit) {
+  // A device-written sequence word against seq (signed): at it, past it (a later step), or still before at the limit.
+  enum Seen { kBefore, kAt, kPast };
+  static Seen wait_seq(const uint32_t* w, uint32_t seq, std::chrono::milliseconds limit) {
     const auto end = std::chrono::steady_clock::now() + limit;
     for (uint32_t spins = 0;; ++spins) {
-      if (dg_load_acquire(w) == seq) return true;
-      if ((spins & 1023u) == 0 && std::chrono::steady_clock::now() > end) return false;
+      const int32_t d = int32_t(dg_load_acquire(w) - seq);
+      if (d == 0) return kAt;
+      if (d > 0) return kPast;
+      if ((spins & 1023u) == 0 && std::chrono::steady_clock::now() > end) return kBefore;
       if (spins > 20000) std::this_thread::yield();
     }
   }
@@ -694,6 +791,7 @@ class CudaDgCtx final : public DgCtx {
     dev_.err_code = ctl_ + 3;
     dev_.err_aux = ctl_ + 4;
     dev_.any_miss = ctl_ + 5;
+    dev_.absent_err = ctl_ + 5 + G + (G + 1);  // the last control word (design rev 3.4 §11.3)
     uint32_t* ub = ctl_ + 5 + G;
     ck(cudaMemcpy(ub, x_.unit_base.data(), (G + 1) * 4, cudaMemcpyHostToDevice), "cudaMemcpy (unit_base)");
     dev_.unit_base = ub;
@@ -721,16 +819,22 @@ class CudaDgCtx final : public DgCtx {
     carve(off, uint64_t(G) * 4, &m_.ready, &dev_.ready);
     uint32_t* words_h = nullptr;
     uint32_t* words_d = nullptr;
-    carve(off, 16, &words_h, &words_d);
+    carve(off, 7 * 4, &words_h, &words_d);
     require(off <= x_.mapped_bytes, SS_E_BACKEND, "device-gated: mapped layout (internal)");
     m_.done = words_h;
     m_.err_code = words_h + 1;
     m_.err_aux = words_h + 2;
     m_.host_abort = words_h + 3;
+    m_.host_seq = words_h + 4;
+    m_.began = words_h + 5;
+    m_.err_count = words_h + 6;
     dev_.done = words_d;
     dev_.m_err_code = words_d + 1;
     dev_.m_err_aux = words_d + 2;
     dev_.host_abort = words_d + 3;
+    dev_.host_seq = words_d + 4;
+    dev_.began = words_d + 5;
+    dev_.m_err_count = words_d + 6;
 
     // Pinned blocks: P + Q of the host stride, in chunks of at most 1 GiB.
     const uint64_t hs = x_.host_stride;
@@ -751,12 +855,40 @@ class CudaDgCtx final : public DgCtx {
     c.persistent_slots = x_.persistent_slots;
     c.bank_slots = x_.B;
     c.blocks = x_.blocks;
-    c.spare_target = x_.D;
-    c.prefetch_reserve = o_.dg_prefetch_reserve == 0xFFFFFFFFu ? std::min<uint32_t>(24, x_.D / 4) : o_.dg_prefetch_reserve;
+    const uint32_t T = o_.dg_spare_target == 0xFFFFFFFFu ? x_.D : o_.dg_spare_target;
+    require(T <= x_.D, SS_E_INVALID,
+            "device-gated: dg_spare_target " + std::to_string(T) + " above the billed spares (" + std::to_string(x_.D) +
+                ")");
+    c.spare_target = T;
+    c.prefetch_reserve_auto = o_.dg_prefetch_reserve == 0xFFFFFFFFu;  // follows the spare target (cache.cpp:171)
+    c.prefetch_reserve = c.prefetch_reserve_auto ? std::min<uint32_t>(24, T / 4) : o_.dg_prefetch_reserve;
     c.prefetch_per_layer = o_.dg_prefetch_per_layer;
     c.prefetch_per_token = o_.dg_prefetch_per_token;
     core_ = std::make_unique<DgCore>(c, transport_.get());
-    core_->place(x_.residents);
+    // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()
+    // keeps the first persistent_slots - T distinct keys, and that order is the recency order.
+    std::vector<uint32_t> order;
+    if (o_.dg_seed_n) {
+      require(o_.dg_seed != nullptr, SS_E_INVALID, "device-gated: dg_seed_n > 0 with a null dg_seed");
+      for (uint32_t i = 0; i < o_.dg_seed_n; ++i) {
+        const ss_dg_unit& e = o_.dg_seed[i];
+        require(e.gated >= 0 && uint32_t(e.gated) < G && e.unit >= 0 && uint32_t(e.unit) < core_->units(uint32_t(e.gated)),
+                SS_E_INVALID,
+                "device-gated: dg_seed entry " + std::to_string(i) + " (" + std::to_string(e.gated) + ", " +
+                    std::to_string(e.unit) + ") is out of range");
+        order.push_back(core_->key(uint32_t(e.gated), uint32_t(e.unit)));
+      }
+    }
+    o_.dg_seed = nullptr;  // read only during ss_open
+    o_.dg_seed_n = 0;
+    order.insert(order.end(), x_.residents.begin(), x_.residents.end());
+    for (uint32_t k = 0; k < x_.keys; ++k) order.push_back(k);
+    core_->place(order);
+    if (o_.dg_diag) {
+      transport_->enable_diag(G);
+      core_->set_diag(true);
+    }
+    dma_ms_.assign(G, -1);
 
     // Fill: blocks read in place, residents through the staging buffer and one H2D per part.
     for (uint32_t g = 0; g < G; ++g) {
@@ -809,7 +941,14 @@ class CudaDgCtx final : public DgCtx {
     if (svc_) svc_->stop_join();
     bool device_done = !device_busy_;  // also after an ss_end that failed before seeing the end kernel
     if (!device_done && m_.done)
-      device_done = wait_word(m_.done, seq_, std::chrono::milliseconds(uint64_t(o_.dg_wait_timeout_ms) + 5000));
+      device_done = wait_seq(m_.done, seq_, std::chrono::milliseconds(uint64_t(o_.dg_wait_timeout_ms) + 5000)) != kBefore;
+    // a step that began and has not ended (outside any pair) may still reach the memory
+    if (device_done && m_.began && int32_t(dg_load_acquire(m_.began) - dg_load_acquire(m_.done)) > 0) {
+      const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(uint64_t(o_.dg_wait_timeout_ms) + 5000);
+      while (int32_t(dg_load_acquire(m_.began) - dg_load_acquire(m_.done)) > 0 && std::chrono::steady_clock::now() < end)
+        std::this_thread::yield();
+      device_done = int32_t(dg_load_acquire(m_.began) - dg_load_acquire(m_.done)) <= 0;
+    }
     release_all(device_done);
   }
 
@@ -864,6 +1003,7 @@ class CudaDgCtx final : public DgCtx {
   std::unique_ptr<DgCore> core_;
   std::unique_ptr<DgService> svc_;
   std::vector<std::vector<uint32_t>> keep_;
+  std::vector<double> dma_ms_;  // dg_diag: the last token's per-layer demand device time (-1 = not measured)
   DgStats fold_, base_;
   std::vector<DgLayerCounts> fold_l_, prev_l_, base_l_;
   std::vector<ss_layer_stats> hook_fwd_;

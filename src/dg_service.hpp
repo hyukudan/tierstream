@@ -29,7 +29,8 @@ struct DgServiceConfig {
 // The replica's per-layer timeline (StreamSite): microseconds on the service thread.
 struct DgLayerTimeline {
   double seen_us = 0, demand_us = 0, pred_wait_us = 0, prefetch_us = 0, serve_us = 0;
-  uint32_t ids = 0, misses = 0, covered = 0, fetched = 0, prefetched = 0;
+  double dma_ms = -1;  // filled by ss_end from the transport's marks (-1 = not measured)
+  uint32_t ids = 0, misses = 0, covered = 0, fetched = 0, prefetched = 0, predicted_true = 0, covered_waits = 0;
 };
 
 class DgService {
@@ -63,6 +64,7 @@ class DgService {
   // every token): any value other than seq - 1 or seq is a desync. The prediction flag is written only on tokens that
   // predict, so it may hold any older token.
   void wait_word(const uint32_t* w, uint32_t seq, const char* what, uint32_t g, bool strict);
+  void wait_began(uint32_t seq);
   void publish(State s, uint32_t seq);
   void fail_with(const std::string& msg);
   void boost_on();
@@ -72,6 +74,7 @@ class DgService {
   DgMapped m_;
   DgServiceConfig cfg_;
   std::thread th_;
+  std::chrono::steady_clock::time_point t_served_{};  // the previous token's end (seen_us[0]'s origin)
   std::atomic<uint32_t> host_seq_{0};
   std::atomic<uint64_t> term_{0};  // (state << 32) | seq
   std::atomic<bool> stop_{false};

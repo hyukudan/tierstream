@@ -25,9 +25,10 @@ std::string gib(uint64_t b) { return std::to_string(double(b) / double(kGiB)); }
 }  // namespace
 
 uint64_t dg_mapped_bytes(uint32_t G) {
-  // Record[G], PredRecord[G], flag[G], pflag[G], ready[G], then done / err_code / err_aux / host_abort
+  // Record[G], PredRecord[G], flag[G], pflag[G], ready[G], then done / err_code / err_aux / host_abort / host_seq /
+  // began / err_count
   return align64(uint64_t(G) * sizeof(DgRecord)) + align64(uint64_t(G) * sizeof(DgPredRecord)) +
-         3 * align64(uint64_t(G) * 4) + align64(16);
+         3 * align64(uint64_t(G) * 4) + align64(7 * 4);
 }
 
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
@@ -124,6 +125,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     refuse(SS_E_CAPACITY, "the plan granted " + std::to_string(x.Q) + " spare blocks (host_spare_units asked " +
                               std::to_string(b.host_spare_units) + "), the " + std::to_string(x.D) +
                               " spare slots need as many (raise host_spare_units or the host budget)");
+  require(uint64_t(x.P) + x.Q < 0x7fffffffull, SS_E_INVALID, "device-gated: more than 2^31 - 1 host blocks");
   x.blocks = x.P + x.Q;
 
   x.persistent_slots = x.R + x.D;

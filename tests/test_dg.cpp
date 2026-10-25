@@ -142,11 +142,17 @@ class Scripted final : public DgTransport {
   void set_table(const std::vector<int32_t>& t) { table_ = t; }
   void set_slow_d2h(bool on) { slow_d2h_ = on; }
   void begin_read(const std::set<int32_t>& slots) { reading_ = slots; }
+  // The kinds of the operations in the order they were issued (not run), since the last clear.
+  const std::vector<Kind>& issued() const { return issued_; }
+  void clear_issued() { issued_.clear(); }
   void end_read() { reading_.clear(); }
   std::mt19937_64& rng() { return rng_; }
 
  private:
-  void push(Stream s, Op o) { q_[s].push_back(std::move(o)); }
+  void push(Stream s, Op o) {
+    issued_.push_back(o.kind);
+    q_[s].push_back(std::move(o));
+  }
   void run(const Op& o) {
     switch (o.kind) {
       case H2D:
@@ -178,6 +184,7 @@ class Scripted final : public DgTransport {
   std::vector<int32_t> table_, slot_, block_;
   std::vector<uint32_t> ready_;
   std::set<int32_t> reading_;
+  std::vector<Kind> issued_;
   bool slow_d2h_ = false;
   std::mt19937_64 rng_;
   Violation* v_;
@@ -290,8 +297,15 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         t.end_read();
         (void)pred;
       }
-      // the end edge, then the boundary
+      // the end edge, then the boundary: the table is uploaded before any write-back is issued (design rev 3.4 §11.4)
+      t.clear_issued();
       core.end_token({});
+      {
+        const auto& is = t.issued();
+        const auto up = std::find(is.begin(), is.end(), Scripted::Upload);
+        if (std::find(is.begin(), up, Scripted::D2H) != up)
+          v.set("a write-back was issued before the boundary's table upload");
+      }
       core.check();
       t.steps(jitter);
       // every home holds its unit's bytes (a write-back in flight: the slot is authoritative)
@@ -445,3 +459,151 @@ TEST(dg_ids_validated) {
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }
+
+// ---- design rev 3.4 §11.6-11.8: the replica's counter definitions, seed order, run-time budgets ----
+namespace {
+
+// 3 gated layers x 16 units; R persistent residents + D spares (target T), 2 x 4 bank slots, enough blocks.
+struct Mini {
+  static constexpr uint32_t G = 3, U = 16, K = G * U;
+  Violation v;
+  ts::DgConfig c;
+  std::unique_ptr<Scripted> t;
+  std::unique_ptr<DgCore> core;
+  Mini(uint32_t R, uint32_t D, uint32_t T, const std::vector<uint32_t>& order, uint32_t pf_layer = 4,
+       bool reserve_auto = false) {
+    c.n_units.assign(G, U);
+    c.persistent_slots = R + D;
+    c.bank_slots = 4;
+    c.blocks = K - R + D;
+    c.spare_target = T;
+    c.prefetch_reserve_auto = reserve_auto;
+    c.prefetch_reserve = reserve_auto ? 0 : 1;
+    c.prefetch_per_layer = pf_layer;
+    c.prefetch_per_token = 48;
+    t = std::make_unique<Scripted>(K, c.persistent_slots + 2 * c.bank_slots, c.blocks, G, 7, &v);
+    core = std::make_unique<DgCore>(c, t.get());
+    core->place(order);
+    for (uint32_t k = 0; k < K; ++k) {
+      if (core->slot_of(k) >= 0) t->fill_slot(core->slot_of(k), int32_t(k));
+      if (core->block_of(k) >= 0) t->fill_block(core->block_of(k), int32_t(k));
+    }
+    t->set_table(core->table());
+  }
+  // the export's mask from the published table
+  uint64_t mask(uint32_t g, const std::vector<uint32_t>& ids) const {
+    uint64_t m = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+      if (t->entry(core->key(g, ids[i])) < 0) m |= 1ull << i;
+    return m;
+  }
+  void serve(uint32_t g, const std::vector<uint32_t>& ids) { core->serve(g, ids.data(), uint32_t(ids.size()), mask(g, ids)); }
+};
+
+std::vector<uint32_t> keys_in_order(uint32_t n) {
+  std::vector<uint32_t> v(n);
+  for (uint32_t k = 0; k < n; ++k) v[k] = k;
+  return v;
+}
+
+}  // namespace
+
+// A repeated masked id is fetched at its first occurrence and covered at the later ones (site.cu, export order).
+TEST(dg_counters_occurrence_order) {
+  Mini m(8, 8, 8, keys_in_order(8));  // keys 0..7 resident: layer 1 is all absent
+  m.core->begin_token(1);
+  const ts::DgStats a = m.core->stats();
+  m.serve(1, {5, 5, 9});  // 5 twice (masked twice), 9 once
+  const ts::DgStats b = m.core->stats();
+  CHECK_EQ(b.fetched - a.fetched, 2ull);  // 5 (first), 9
+  CHECK_EQ(b.covered - a.covered, 1ull);  // 5 (second: coming)
+  CHECK_EQ(b.covered_waits - a.covered_waits, 0ull);  // a demand copy, not a prefetch to wait for
+  CHECK_EQ(b.misses - a.misses, 2ull);  // unique ids with a masked occurrence
+  CHECK_EQ(b.lookups - a.lookups, 2ull);
+  m.core->end_token({});
+  m.core->check();
+  CHECK(m.v.what.empty());
+}
+
+// predicted = the deduplicated valid prediction (whatever the budget lets through); predicted_true = unique ids of
+// the next layer found in it; a prediction is for the next layer only; miss_layers counts layers with a miss.
+TEST(dg_counters_prediction_and_miss_layers) {
+  for (uint32_t budget : {4u, 0u}) {
+    Mini m(8, 8, 8, keys_in_order(8), budget);
+    m.core->begin_token(1);
+    m.serve(0, {0, 1});  // resident: no miss
+    m.core->serve_prediction(1, std::vector<uint32_t>{3, 4, 4, 99}.data(), 4);
+    CHECK_EQ(m.core->stats().predicted, 2ull);
+    CHECK_EQ(m.core->stats().pred_invalid, 1ull);
+    m.serve(1, {3, 7, 3});
+    CHECK_EQ(m.core->stats().predicted_true, 1ull);  // 3 (unique), not 7
+    m.serve(2, {3, 4});  // no prediction was made for layer 2
+    CHECK_EQ(m.core->stats().predicted_true, 1ull);
+    CHECK_EQ(m.core->stats().miss_layers, 2ull);  // layers 1 and 2
+    if (budget == 0) CHECK_EQ(m.core->stats().prefetched, 0ull);
+    m.core->end_token({});
+    m.core->begin_token(2);
+    m.serve(1, {3});  // a new token: the old prediction is gone
+    CHECK_EQ(m.core->stats().predicted_true, 1ull);
+    m.core->end_token({});
+    m.core->check();
+    CHECK(m.v.what.empty());
+  }
+}
+
+// The seed order picks the residents (the first persistent_slots - T distinct keys) and is the recency order: the
+// first evictions are its last entries (cache.cpp:236-256).
+TEST(dg_seed_order_residents_and_lru) {
+  std::vector<uint32_t> order = {40, 3, 17, 40, 29, 8, 33, 12, 5};  // 40 twice: skipped the second time
+  for (uint32_t k = 0; k < Mini::K; ++k) order.push_back(k);
+  Mini m(8, 4, 4, order);
+  const uint32_t want[8] = {40, 3, 17, 29, 8, 33, 12, 5};
+  for (uint32_t k : want) CHECK(m.core->slot_of(k) >= 0);
+  CHECK_EQ(m.core->on_device(), 8u);
+  // target 7: the miss below takes one of the 4 spares (3 free left), so the boundary evicts the four least recent =
+  // the last four seed entries, and the fifth from the end stays
+  m.core->set_spare_target(7);
+  m.core->begin_token(1);
+  m.serve(0, {0});  // a miss into one spare (most recent now)
+  m.core->end_token({});
+  for (uint32_t k : {5u, 12u, 33u, 8u}) CHECK(m.core->home(k) == DgCore::Home::Evicting);
+  CHECK(m.core->home(29) == DgCore::Home::Device);
+  CHECK(m.core->home(0) == DgCore::Home::Device);
+  m.t->drain_all();
+  m.core->check();
+  CHECK(m.v.what.empty());
+}
+
+// An open-time spare target T < D places R + D - T units (cache.cpp:204); the blocks are not short.
+TEST(dg_spare_target_below_d_at_open) {
+  Mini m(8, 8, 3, keys_in_order(Mini::K));
+  CHECK_EQ(m.core->on_device(), 13u);
+  CHECK_EQ(m.core->free_slots(), 3u);
+  m.core->check();
+}
+
+// The default reserve follows the spare target, min(24, target / 4); an explicit one stays; the setters are bounded.
+TEST(dg_budgets_reserve_rule) {
+  Mini a(8, 120, 120, keys_in_order(8), 4, true);
+  CHECK_EQ(a.core->prefetch_reserve(), 24u);
+  a.core->set_spare_target(40);
+  CHECK_EQ(a.core->prefetch_reserve(), 10u);
+  CHECK_EQ(a.core->spare_target(), 40u);
+  Mini b(8, 120, 120, keys_in_order(8), 4, false);
+  b.core->set_spare_target(40);
+  CHECK_EQ(b.core->prefetch_reserve(), 1u);  // explicit: unchanged
+  bool threw = false;
+  try {
+    b.core->set_spare_target(129);
+  } catch (const ts::Error&) {
+    threw = true;
+  }
+  CHECK(threw);
+  // a zero prefetch budget: no prefetch copy, the prediction is still counted
+  b.core->set_prefetch_budget(0, 0);
+  b.core->begin_token(1);
+  b.core->serve_prediction(1, std::vector<uint32_t>{1, 2}.data(), 2);
+  CHECK_EQ(b.core->stats().prefetched, 0ull);
+  CHECK_EQ(b.core->stats().predicted, 2ull);
+  b.core->end_token({});
+}

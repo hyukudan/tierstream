@@ -33,7 +33,9 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
   table_.assign(keys_, -1);
   bank_key_.assign(2u * size_t(c_.bank_slots), kNone);
   pf_layer_.assign(gated(), 0);
+  layer_missed_.assign(gated(), 0);
   lc_.assign(gated(), DgLayerCounts{});
+  if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, c_.spare_target / 4);
 }
 
 uint32_t DgCore::gated_of(uint32_t k) const {
@@ -171,6 +173,9 @@ void DgCore::begin_token(uint32_t seq) {
   pf_token_ = 0;
   demand_free_used_ = 0;
   std::fill(pf_layer_.begin(), pf_layer_.end(), 0);
+  std::fill(layer_missed_.begin(), layer_missed_.end(), uint8_t(0));
+  pred_.clear();
+  pred_layer_ = kNone;
 }
 
 bool DgCore::on_device_or_coming(uint32_t g, uint32_t unit) const {
@@ -277,7 +282,7 @@ void DgCore::cover(uint32_t g, uint32_t unit) {
   // only this key's copies land before ready
   if (x.home == Home::Coming && x.via_prefetch && x.pf_done && mut_ != kNoCover) {
     t_->wait(DgTransport::kDem, x.pf_done);
-    ++st_.covered;
+    ++st_.covered_waits;
   }
 }
 
@@ -289,6 +294,10 @@ void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
   if (was_miss) {
     ++st_.misses;
     ++lc_[g].misses;
+    if (!layer_missed_[g]) {
+      layer_missed_[g] = 1;
+      ++st_.miss_layers;
+    }
   }
   if (x.via_prefetch && !x.used) {
     x.used = true;
@@ -301,20 +310,30 @@ void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
   }
 }
 
-void DgCore::serve(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
+void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
   const uint32_t nu = units(g);
   for (uint32_t i = 0; i < n; ++i)  // before any key is computed (the export kernel already aborted the token)
     require(ids[i] < nu, SS_E_INVALID,
             "device-gated: layer " + std::to_string(g) + " exported id " + std::to_string(ids[i]) + " of " +
                 std::to_string(nu));
-  for (uint32_t i = 0; i < n; ++i) {  // true misses first: the device waits for them
+  if (diag_ && mask) t_->diag_mark(g, 0);
+  // true misses first (the device waits for them), per masked occurrence in export order: a repeated id is fetched at
+  // its first occurrence and covered at the later ones (site.cu)
+  for (uint32_t i = 0; i < n; ++i) {
     if (!(mask >> i & 1u)) continue;
-    if (on_device_or_coming(g, ids[i]))
+    if (on_device_or_coming(g, ids[i])) {
       cover(g, ids[i]);
-    else
+      ++st_.covered;
+    } else {
       fetch(g, ids[i], false);
+    }
   }
   if (mask) signal(g);
+  if (diag_ && mask) t_->diag_mark(g, 1);
+}
+
+void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
+  const bool have_pred = pred_layer_ == g;
   uniq_.assign(ids, ids + n);
   std::sort(uniq_.begin(), uniq_.end());
   uniq_.erase(std::unique(uniq_.begin(), uniq_.end()), uniq_.end());
@@ -323,7 +342,10 @@ void DgCore::serve(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
     for (uint32_t i = 0; i < n; ++i)
       if (ids[i] == id && (mask >> i & 1u)) miss = true;
     use(g, id, miss);
+    if (have_pred && std::find(pred_.begin(), pred_.end(), id) != pred_.end()) ++st_.predicted_true;
   }
+  pred_.clear();  // a prediction is for the next layer only (the replica clears it at every layer)
+  pred_layer_ = kNone;
 }
 
 void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n) {
@@ -337,6 +359,9 @@ void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n)
     }
     if (std::find(uniq_.begin(), uniq_.end(), pred[i]) == uniq_.end()) uniq_.push_back(pred[i]);
   }
+  st_.predicted += uniq_.size();  // counted whatever the budget lets through (the replica's definition)
+  pred_.assign(uniq_.begin(), uniq_.end());
+  pred_layer_ = g_next;
   for (uint32_t id : uniq_) fetch(g_next, id, true);
 }
 
@@ -404,6 +429,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
       ++n;
     }
   }
+  size_t n_evict = 0;
   for (uint32_t k : victims) {
     if (free_blocks_.empty()) {  // stays on the device: coverage kept
       ++st_.evict_short;
@@ -418,15 +444,23 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
     x.block = b;
     x.wb_pending = true;
     table_[k] = -1;
-    t_->d2h(x.slot, b);
-    if (mut_ == kEarlyWritebackBlock) free_blocks_.push_back(b);
+    ++n_evict;
+  }
+  // The table first, then the write-backs, so the upload never queues behind them on a shared copy engine (as the
+  // reference, cache.cpp:552-566). The device is done with the token, and an evicting slot is reused only after its
+  // write-back's event.
+  t_->upload_table(table_.data(), keys_);  // the device table = the host mirror
+  for (size_t i = 0; i < n_evict; ++i) {
+    const uint32_t k = victims[i];
+    Entry& x = e_[k];
+    t_->d2h(x.slot, x.block);
+    if (mut_ == kEarlyWritebackBlock) free_blocks_.push_back(x.block);
     void* ev = event();
     t_->record(ev, DgTransport::kD2h);
-    wbs_.push_back({k, x.slot, b, ev, false});
+    wbs_.push_back({k, x.slot, x.block, ev, false});
     ++st_.evicted;
     ++lc_[gated_of(k)].evicted;
   }
-  t_->upload_table(table_.data(), keys_);  // the device table = the host mirror (the device is done with the token)
   ++st_.tokens;
 }
 
@@ -463,6 +497,17 @@ void DgCore::set_pressure(uint32_t free_per_token, uint32_t evict_recent) {
   pressure_ = free_per_token != 0 || evict_recent != 0;
   pressure_free_ = free_per_token;
   pressure_recent_ = evict_recent;
+}
+
+void DgCore::set_spare_target(uint32_t n) {
+  require(n <= c_.persistent_slots, SS_E_INVALID, "device-gated: spare target above the persistent slots");
+  c_.spare_target = n;
+  if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, n / 4);  // cache.cpp:171
+}
+
+void DgCore::set_prefetch_budget(uint32_t per_layer, uint32_t per_token) {
+  c_.prefetch_per_layer = per_layer;
+  c_.prefetch_per_token = per_token;
 }
 
 void DgCore::check() const {

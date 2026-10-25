@@ -32,6 +32,12 @@ class DgTransport {
   virtual void event_sync(void* ev) = 0;
   virtual void sync(Stream s) = 0;
   virtual void upload_table(const int32_t* table, uint32_t n) = 0;  // the whole table on kDem, then sync
+  // Diagnostics (dg_diag): a timing mark on kDem, which = 0 before the first demand copy of layer g, 1 after its
+  // ready. Only called for a layer with a non-zero mask. Default: nothing.
+  virtual void diag_mark(uint32_t g, int which) {
+    (void)g;
+    (void)which;
+  }
 };
 
 struct DgConfig {
@@ -41,6 +47,7 @@ struct DgConfig {
   uint32_t blocks = 0;
   uint32_t spare_target = 0;
   uint32_t prefetch_reserve = 0;
+  bool prefetch_reserve_auto = false;  // the reserve follows the spare target: min(24, spare_target / 4)
   uint32_t prefetch_per_layer = 4;
   uint32_t prefetch_per_token = 48;
 };
@@ -49,6 +56,11 @@ struct DgStats {
   uint64_t tokens = 0, lookups = 0, misses = 0, covered = 0, fetched = 0, prefetched = 0, prefetch_used = 0;
   uint64_t resurrected = 0, bank_serves = 0, collected_mid = 0, evicted = 0, evict_short = 0, writebacks_done = 0;
   uint64_t stalled = 0, pred_invalid = 0;
+  // design rev 3.4 §11.6 (the replica's definitions): covered = masked occurrences on the device or coming at service
+  // time; covered_waits = the demand stream's waits on a prefetch's copies; predicted = deduplicated valid predicted
+  // ids; predicted_true = unique ids of a layer found in the prediction made at the layer before; miss_layers =
+  // gated layers with >= 1 miss, per token.
+  uint64_t covered_waits = 0, predicted = 0, predicted_true = 0, miss_layers = 0;
 };
 
 // Per gated layer (folded into the context's per-layer stats at each successful boundary).
@@ -95,10 +107,16 @@ class DgCore {
   // A true use (recency + stats); was_miss = its export saw -1.
   void use(uint32_t g, uint32_t unit, bool was_miss);
   void signal(uint32_t g) { t_->signal_ready(g, seq_); }
-  // The service's work for one exported layer (StreamSite::serve): the true misses first (fetch, or cover a unit
-  // coming from a prefetch), then ready if any, then recency. An id outside the layer throws SS_E_INVALID before any
-  // key is computed (the export kernel already aborted the token for it).
-  void serve(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask);
+  // The service's work for one exported layer (StreamSite::serve): serve_demand = the masked occurrences in export
+  // order (cover a unit on the device or coming, else fetch it), then ready if any; serve_use = recency and stats over
+  // the unique ids. serve = both. An id outside the layer throws SS_E_INVALID before any key is computed (the export
+  // kernel already aborted the token for it).
+  void serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask);
+  void serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask);
+  void serve(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
+    serve_demand(g, ids, n, mask);
+    serve_use(g, ids, n, mask);
+  }
   // The prediction exported at layer g for layer g + 1: deduplicated, in order, under the prefetch budgets.
   void serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n);
   // Test-only fault injection (tests/test_dg.cpp, the model checker): each must be caught.
@@ -120,6 +138,13 @@ class DgCore {
   // Test-only (qualification of the rare paths): demand misses take at most free_per_token free slots per token and
   // every boundary also evicts the evict_recent most recently used keys. 0, 0 = off.
   void set_pressure(uint32_t free_per_token, uint32_t evict_recent);
+  // Between tokens (design rev 3.4 §11.8): the spare target takes effect at the next boundary, the budgets from the
+  // next token's prefetches. spare_target <= persistent_slots (the caller bounds it by the billed spares).
+  void set_spare_target(uint32_t n);
+  void set_prefetch_budget(uint32_t per_layer, uint32_t per_token);
+  uint32_t spare_target() const { return c_.spare_target; }
+  uint32_t prefetch_reserve() const { return c_.prefetch_reserve; }
+  void set_diag(bool on) { diag_ = on; }
 
  private:
   static constexpr uint32_t kNone = 0xffffffffu;
@@ -166,6 +191,10 @@ class DgCore {
   uint32_t pressure_free_ = 0, pressure_recent_ = 0, demand_free_used_ = 0;
   uint32_t head_ = kNone, tail_ = kNone, on_device_ = 0;
   std::vector<uint32_t> coming_, banked_;
+  std::vector<uint32_t> pred_;     // the deduplicated valid prediction for gated layer pred_layer_
+  uint32_t pred_layer_ = kNone;
+  std::vector<uint8_t> layer_missed_;  // per gated layer, this token
+  bool diag_ = false;
   uint32_t seq_ = 0;
   DgStats st_;
   std::vector<DgLayerCounts> lc_;

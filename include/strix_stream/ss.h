@@ -185,6 +185,7 @@ typedef enum ss_policy {
   SS_POLICY_SCORED = 1   /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency */
 } ss_policy;
 
+struct ss_dg_unit; /* device-gated seed entry (below) */
 typedef struct ss_options {
   uint32_t struct_size;           /* sizeof(ss_options), set by ss_options_defaults */
   ss_backend_kind backend;
@@ -222,7 +223,15 @@ typedef struct ss_options {
   uint32_t dg_service_boost;      /* service thread: 0 off, 1 thread priority + MMCSS (default on Windows), 2 + process
                                      priority class */
   uint32_t dg_diag;               /* 1 = keep the per-layer timeline of the last token (ss_dg_timeline) */
-  uint32_t reserved2;             /* explicit padding (never read) */
+  uint32_t dg_test_hooks;         /* test-only: 1 lets the ss_test_dg_* hooks (ss_test.h) act on this context; 0 */
+  /* The open-time spare target: free slots each boundary keeps; 0xFFFFFFFF (default) = every billed spare (D);
+   * otherwise <= D (ss_dg_set_budgets changes it between tokens). */
+  uint32_t dg_spare_target;
+  uint32_t dg_seed_n;             /* entries of dg_seed (0 = none) */
+  /* Read only during ss_open (the array must stay valid for that call): gated units by priority, best first. The
+   * device slots go to the first distinct entries (then the plan's residents, then key order), and that order is the
+   * initial recency order. The plan's per-unit tiers then give the counts, not which units are resident. */
+  const struct ss_dg_unit* dg_seed;
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -391,6 +400,13 @@ SS_API ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t
 /* ---------------------------------------------------------------------------------------------------------------
  * Device-gated decode (docs/design.md §3.7; CUDA backend, tier_mode EXCLUSIVE, policy LRU, pin_planned 0).
  *
+ * Sequence: ss_begin authorizes exactly one step (its begin kernel compares its sequence with the host's; any other
+ * step is aborted on the device and reads only the guard slot). ss_begin and ss_end also check that no step ran
+ * outside a pair and fail at once if one did. Residual: a step outside the pair that is still queued when ss_begin
+ * runs can take the authorization, leaving the engine's real step to read only the guard slot; ss_end may then return
+ * OK for that token, and the error surfaces at the next ss_begin / ss_end. So stream-synchronize any warm-up step
+ * before ss_begin.
+ *
  * Every streamable layer is a gated layer g = 0..G-1 (descriptor order; ss_dg_gated_index maps a layer). Their units
  * share one device arena per part: unit (g, u) is at parts[p].base + slot * parts[p].stride for
  * slot = slot_of[unit_base[g] + u] (-1: not on the device). Per token, inside the engine's graph (capturable, no host
@@ -417,9 +433,18 @@ typedef struct ss_dg_device_view {  /* passed by value to the engine's kernels *
   uint32_t n_gated, n_parts, guard_slot, slots;
   const int32_t* slot_of;           /* device, unit_base[n_gated] entries */
   const uint32_t* unit_base;        /* device, n_gated + 1 entries */
-  const uint32_t* abort;            /* device word: set once a wait timed out or an id was out of range */
+  /* device word, sticky: a wait timed out, an id was out of range, the host aborted the token, the step was not
+   * authorized (sequence desync), or a lookup met an absent entry */
+  const uint32_t* abort;
   ss_dg_part parts[SS_DG_MAX_PARTS];
+  /* device word (appended, versioned by struct_size): a reader that meets an entry < 0 without abort sets it; ss_end
+   * then fails the token. An engine kernel that reads slot_of itself must apply ss_dg_slot's two rules: abort set ->
+   * the guard slot; an entry < 0 -> atomicOr(absent_err, 1) and the guard slot. */
+  uint32_t* absent_err;
 } ss_dg_device_view;
+typedef struct ss_dg_unit {  /* a gated unit: gated ordinal and unit index */
+  int32_t gated, unit;
+} ss_dg_unit;
 SS_API ss_status ss_dg_get_device_view_sized(const ss_ctx* c, ss_dg_device_view* out, uint32_t size);
 static inline ss_status ss_dg_get_device_view(const ss_ctx* c, ss_dg_device_view* out) {
   return ss_dg_get_device_view_sized(c, out, (uint32_t)sizeof *out);
@@ -434,11 +459,22 @@ SS_API ss_status ss_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
 SS_API ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream);
 /* Between tokens: units of gated layer g the next boundary must not evict (opt-in; replaces the previous set of g). */
 SS_API ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
-/* Per-layer timeline of the last completed token (dg_diag = 1), between tokens; the replica's definitions. */
+/* Between tokens: the spare target (<= the billed spares; the next boundary's evictions) and the prefetch budgets
+ * (from the next token). The default prefetch reserve follows the spare target, min(24, spare_target / 4); an
+ * explicit dg_prefetch_reserve stays. */
+SS_API ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
+                                   uint32_t prefetch_per_token);
+/* Per-layer timeline of the last completed token (dg_diag = 1), between tokens; the replica's definitions: ids = unique
+ * ids, misses = unique ids with a masked occurrence, covered / fetched per masked occurrence in export order (covered =
+ * on the device or coming at service time), seen_us of layer 0 from the previous token's end, demand_us = flag seen ->
+ * demand copies + ready enqueued, dma_ms = device time of those copies + ready (-1 = no miss or no diag),
+ * predicted_true = unique ids found in the previous layer's prediction, covered_waits = demand waits on a prefetch. */
 typedef struct ss_dg_layer_timeline {
   uint32_t struct_size, layer;
   double seen_us, demand_us, pred_wait_us, prefetch_us, serve_us;
   uint32_t ids, misses, covered, fetched, prefetched, reserved0;
+  double dma_ms;
+  uint32_t predicted_true, covered_waits;
 } ss_dg_layer_timeline;
 SS_API ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
 /* Counters since open (or the last ss_stats_reset), folded at each ss_end. */
@@ -447,20 +483,29 @@ typedef struct ss_dg_stats {
   uint64_t tokens, lookups, misses, covered, fetched, prefetched, prefetch_used, pred_invalid;
   uint64_t resurrected, bank_serves, collected_mid, evicted, evict_short, writebacks_done, stalled;
   uint64_t free_slots, blocks, slots;
+  /* appended: predicted (deduplicated valid predicted ids), predicted_true, miss_layers (gated layers with >= 1 miss,
+   * per token), device_timeouts (device waits that timed out), covered_waits */
+  uint64_t predicted, predicted_true, miss_layers, device_timeouts, covered_waits;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
   return ss_stats_dg_sized(c, out, (uint32_t)sizeof *out);
 }
 #if defined(__CUDACC__)
-/* The slot an engine kernel reads unit `id` of gated layer g from, after ss_dg_enqueue_wait(g): the zeroed guard slot
- * when the token was aborted or the id is out of range (every read stays in bounds; the token is then refused). */
+/* The slot an engine kernel reads exported unit `id` of gated layer g from, after ss_dg_enqueue_wait(g): the zeroed
+ * guard slot when the token was aborted or the id is out of range (every read stays in bounds; the token is then
+ * refused). An absent entry without abort cannot happen when the protocol is followed: it is reported (absent_err)
+ * and read as the guard. */
 static __device__ __forceinline__ int32_t ss_dg_slot(const ss_dg_device_view* v, uint32_t g, int32_t id) {
   if (*(volatile const uint32_t*)v->abort) return (int32_t)v->guard_slot;
   const uint32_t b = v->unit_base[g];
   if ((uint32_t)id >= v->unit_base[g + 1] - b) return (int32_t)v->guard_slot;
   const int32_t s = ((volatile const int32_t*)v->slot_of)[b + (uint32_t)id];
-  return s < 0 ? (int32_t)v->guard_slot : s;
+  if (s >= 0) return s;
+  if ((uint32_t)((const char*)&v->absent_err - (const char*)v) + (uint32_t)sizeof(void*) <= v->struct_size &&
+      v->absent_err)
+    atomicOr(v->absent_err, 1u);
+  return (int32_t)v->guard_slot;
 }
 #endif
 

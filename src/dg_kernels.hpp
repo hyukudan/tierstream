@@ -17,6 +17,7 @@ struct Dev {
   uint32_t* err_code = nullptr;
   uint32_t* err_aux = nullptr;
   uint32_t* any_miss = nullptr;  // [G]
+  uint32_t* absent_err = nullptr;  // set by a slot lookup that met an absent entry without abort (ss_dg_slot)
   const int32_t* slot_of = nullptr;
   const uint32_t* unit_base = nullptr;  // [G + 1]
   // mapped host memory, device addresses
@@ -29,6 +30,9 @@ struct Dev {
   uint32_t* m_err_code = nullptr;
   uint32_t* m_err_aux = nullptr;
   uint32_t* host_abort = nullptr;
+  uint32_t* host_seq = nullptr;     // written by ss_begin: the one sequence the host authorized
+  uint32_t* began = nullptr;        // the begin kernel's seq, after a system fence
+  uint32_t* m_err_count = nullptr;  // the device's wait timeouts, copied by the end kernel
   unsigned long long timeout_ns = 0;
   uint32_t test_flags = 0;  // test-only mutations (kSkipWait)
 };

@@ -56,6 +56,7 @@ class DgCtx {
   // Test hooks (tests/test_dg_cuda.cu), between tokens: core mutation and pressure, the invariant check, a stream
   // gate (the demand / prefetch stream waits `event` before its next operations), kernel-level mutations (flags:
   // 1 = skip the ready wait, 2 = ss_end skips the completion edge), and stopping the service now.
+  virtual void set_budgets(uint32_t spare_target, uint32_t per_layer, uint32_t per_token) = 0;
   virtual void test_mutate(int m) = 0;
   virtual void test_pressure(uint32_t free_per_token, uint32_t evict_recent) = 0;
   virtual void test_check() = 0;

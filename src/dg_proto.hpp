@@ -23,7 +23,9 @@ struct DgPredRecord {
 static_assert(sizeof(DgRecord) == 288 && sizeof(DgPredRecord) == 272, "the device layout");
 
 // Device error codes (err_code; err_aux = the gated layer).
-enum DgErrCode : uint32_t { kDgOk = 0, kDgTimeout = 1, kDgBadId = 2, kDgHostAbort = 3 };
+// kDgDesync: a step the host did not open (its begin kernel's seq != host_seq; err_aux = that seq); kDgAbsent: a
+// slot lookup met an entry < 0 without abort (design rev 3.4 §11.1, §11.3).
+enum DgErrCode : uint32_t { kDgOk = 0, kDgTimeout = 1, kDgBadId = 2, kDgHostAbort = 3, kDgDesync = 4, kDgAbsent = 5 };
 
 // Host addresses of the mapped control area (cudaHostAlloc mapped, or plain memory in the CPU tests).
 struct DgMapped {
@@ -36,6 +38,9 @@ struct DgMapped {
   uint32_t* err_code = nullptr;   // device-written before done
   uint32_t* err_aux = nullptr;
   uint32_t* host_abort = nullptr;  // host-written, read by the wait kernel
+  uint32_t* host_seq = nullptr;    // host-written by ss_begin (release), read by the begin kernel
+  uint32_t* began = nullptr;       // device-written by the begin kernel (its seq), after a system fence
+  uint32_t* err_count = nullptr;   // device-written by the end kernel: wait timeouts since open
 };
 
 // Acquire / release on a shared 32-bit word. GCC / Clang builtins (TSan sees them); MSVC volatile accesses are

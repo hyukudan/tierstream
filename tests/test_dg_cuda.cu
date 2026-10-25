@@ -18,13 +18,8 @@
 #include "check.hpp"
 #include "dg_fixture.hpp"
 #include "strix_stream/ss.h"
+#include "strix_stream/ss_test.h"
 
-extern "C" ss_status ss_test_dg_mutate(ss_ctx* c, int m);
-extern "C" ss_status ss_test_dg_pressure(ss_ctx* c, uint32_t free_per_token, uint32_t evict_recent);
-extern "C" ss_status ss_test_dg_check(ss_ctx* c);
-extern "C" ss_status ss_test_dg_gate(ss_ctx* c, int stream, void* event);
-extern "C" ss_status ss_test_dg_flags(ss_ctx* c, uint32_t flags);
-extern "C" ss_status ss_test_dg_stop_service(ss_ctx* c);
 
 using sstest::DgModel;
 
@@ -64,6 +59,13 @@ __global__ void checksum(ss_dg_device_view v, uint32_t g, const int32_t* ids, un
   atomicAdd(out + blockIdx.x, s);
 }
 
+// Test-only host bug (design rev 3.4 §11.3): after layer g's wait, unpublish the slot of its first routed id.
+__global__ void unpublish_first(ss_dg_device_view v, uint32_t g, const int32_t* ids) {
+  int32_t* table = const_cast<int32_t*>(v.slot_of);
+  table[v.unit_base[g] + uint32_t(ids[0])] = -1;
+  __threadfence_system();
+}
+
 uint64_t host_sum(const std::vector<uint8_t>& v) {
   uint64_t s = 0;
   for (size_t i = 0; i < v.size(); ++i) s += uint64_t(v[i]) * (i % 251 + 1);
@@ -89,7 +91,8 @@ struct Rig {
   unsigned long long last_spin_ns = 0;  // a delay before the last layer's checksum (in the captured graph)
   uint64_t distinct = 0;  // distinct routed ids summed over layers and tokens (the service dedups each layer's ids)
 
-  Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000)
+  Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000,
+      bool hooks = true)
       : m(tag), n(max_ids) {
     CHECK_OK(ss_desc_from_json(m.json.data(), m.json.size(), &d));
     sstest::dg_budget(b, m, dyn, max_ids);
@@ -98,6 +101,7 @@ struct Rig {
     sstest::dg_options(o, max_ids, SS_BACKEND_CUDA);
     o.dg_wait_timeout_ms = timeout_ms;
     o.dg_diag = 1;
+    o.dg_test_hooks = hooks ? 1u : 0u;  // the mutation / pressure / gate hooks (ss_test.h)
     CHECK_OK(ss_open(d, &b, p, &o, &c));
     if (!c) return;
     CHECK_OK(ss_dg_get_device_view(c, &v));
@@ -199,6 +203,25 @@ struct Rig {
         if (sums_host[size_t(g) * n + i] != want[size_t(g)][size_t(id)]) ++wrong;
       }
     return wrong;
+  }
+  // Fills the ids (no step), returns nothing; the caller enqueues.
+  void fill_ids() {
+    for (int g = 0; g < m.G; ++g)
+      for (uint32_t i = 0; i < n; ++i) {
+        ids_host[size_t(g) * n + i] = int32_t(pick(g));
+        pred_host[size_t(g) * n + i] = int32_t(pick(g < m.G - 1 ? g + 1 : g));
+      }
+    const size_t cells = size_t(m.G) * n;
+    CU(cudaMemcpyAsync(ids_dev, ids_host, cells * 4, cudaMemcpyHostToDevice, s));
+    CU(cudaMemcpyAsync(pred_dev, pred_host, cells * 4, cudaMemcpyHostToDevice, s));
+    CU(cudaMemsetAsync(sums_dev, 0, cells * 8, s));
+  }
+  bool sums_all_zero() {
+    const size_t cells = size_t(m.G) * n;
+    CU(cudaMemcpy(sums_host, sums_dev, cells * 8, cudaMemcpyDeviceToHost));
+    for (size_t i = 0; i < cells; ++i)
+      if (sums_host[i] != 0) return false;
+    return true;
   }
   ss_dg_stats stats() {
     ss_dg_stats x{};
@@ -435,4 +458,124 @@ int main(int argc, char** argv) {
   std::printf("device %d: %s, %.1f GiB, async engines %d\n", dev, p.name, double(p.totalGlobalMem) / double(1ull << 30),
               p.asyncEngineCount);
   return sstest::run_all(only);
+}
+
+// design rev 3.4 §11.1: an eager step outside any pair (stream-synchronized before ss_begin) is not authorized: its
+// reads all return the zeroed guard, and the next ss_begin fails at once.
+TEST(dg_cuda_desync_warmup) {
+  Rig r("desync1", 16, 8, 8);
+  if (!r.c) return;
+  Tally k;
+  for (int t = 0; t < 5; ++t) k.add(r.token(false, false));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  r.fill_ids();
+  r.enqueue_step(false);  // no ss_begin
+  CU(cudaStreamSynchronize(r.s));
+  CHECK(r.sums_all_zero());
+  CHECK_EQ(int(ss_begin(r.c, nullptr, 0)), int(SS_E_BACKEND));
+  std::printf("  warm-up outside the pair: %s\n", ss_last_error());
+  CHECK(std::string(ss_last_error()).find("sequence desync at ss_begin") != std::string::npos);
+  expect_poisoned(r);
+}
+
+// Two steps inside one pair: the second is not authorized (guard reads); ss_end fails at once, not after a timeout.
+TEST(dg_cuda_desync_two_steps) {
+  Rig r("desync2", 16, 8, 8);
+  if (!r.c) return;
+  Tally k;
+  for (int t = 0; t < 5; ++t) k.add(r.token(false, false));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  r.fill_ids();
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  r.enqueue_step(false);
+  r.enqueue_step(false);
+  CU(cudaStreamSynchronize(r.s));
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
+  const double s_end = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  two steps in one pair: ss_end failed in %.3f s: %s\n", s_end, ss_last_error());
+  CHECK(s_end < 2.0);
+  CHECK(std::string(ss_last_error()).find("sequence desync at ss_end") != std::string::npos);
+  expect_poisoned(r);
+}
+
+// design rev 3.4 §11.3: a reader that meets an entry < 0 without abort (a host bug, injected) reports it; ss_end fails.
+TEST(dg_cuda_absent_entry) {
+  Rig r("absent", 16, 8, 8);
+  if (!r.c) return;
+  Tally k;
+  for (int t = 0; t < 5; ++t) k.add(r.token(false, false));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  r.fill_ids();
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
+  for (int g = 0; g < r.m.G; ++g) {
+    CHECK_OK(ss_dg_enqueue_export(r.c, g, r.ids_dev + size_t(g) * r.n, int(r.n), 0, r.s));
+    CHECK_OK(ss_dg_enqueue_wait(r.c, g, r.s));
+    if (g == 1) unpublish_first<<<1, 1, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n);
+    checksum<<<r.n, 128, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
+  }
+  CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+  CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
+  std::printf("  absent entry: %s\n", ss_last_error());
+  CHECK(std::string(ss_last_error()).find("absent entry") != std::string::npos);
+  CU(cudaStreamSynchronize(r.s));
+  expect_poisoned(r);
+}
+
+// design rev 3.4 §11.6: dma_ms on the layers with misses (-1 on the others), the new counters, device_timeouts 0.
+TEST(dg_cuda_dma_and_counters) {
+  Rig r("dma", 16, 8, 8);
+  if (!r.c) return;
+  r.capture(true);
+  Tally k;
+  int measured = 0, unmeasured = 0, bad = 0;
+  for (int t = 0; t < 60; ++t) {
+    k.add(r.token(true, true));
+    for (int g = 0; g < r.m.G; ++g) {
+      ss_dg_layer_timeline tl{};
+      CHECK_OK(ss_dg_timeline_sized(r.c, g, &tl, uint32_t(sizeof tl)));
+      if (tl.misses > 0) {
+        ++measured;
+        if (!(tl.dma_ms >= 0)) ++bad;
+      } else {
+        ++unmeasured;
+        if (tl.dma_ms != -1) ++bad;
+      }
+    }
+  }
+  CHECK_EQ(k.wrong + k.failed, 0);
+  CHECK_EQ(bad, 0);
+  CHECK(measured > 0);
+  const ss_dg_stats x = r.stats();
+  std::printf("  dma: %d layers measured, %d without a miss; predicted %llu (true %llu), miss_layers %llu, covered "
+              "%llu (waits %llu), device_timeouts %llu\n",
+              measured, unmeasured, (unsigned long long)x.predicted, (unsigned long long)x.predicted_true,
+              (unsigned long long)x.miss_layers, (unsigned long long)x.covered, (unsigned long long)x.covered_waits,
+              (unsigned long long)x.device_timeouts);
+  CHECK(x.predicted > 0 && x.miss_layers > 0);
+  CHECK(x.predicted_true <= x.predicted);
+  CHECK_EQ(x.device_timeouts, 0ull);
+}
+
+// design rev 3.4 §11.5 / §11.8: hooks refused without dg_test_hooks; ss_dg_set_budgets bounded and between tokens.
+TEST(dg_cuda_hooks_and_budgets) {
+  Rig r("hooks", 16, 8, 8, 10000, false);
+  if (!r.c) return;
+  CHECK_EQ(int(ss_test_dg_check(r.c)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_test_dg_pressure(r.c, 1, 1)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_dg_set_budgets(r.c, 1u << 30, 4, 48)), int(SS_E_INVALID));  // above the billed spares
+  CHECK_OK(ss_dg_set_budgets(r.c, 2, 0, 0));
+  Tally k;
+  for (int t = 0; t < 30; ++t) k.add(r.token(false, true));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  CHECK_EQ(r.stats().prefetched, 0ull);  // budget 0: no prefetch copy
+  CHECK(r.stats().predicted > 0);        // but the predictions are counted
+  // inside a token: refused, and the token still completes
+  r.fill_ids();
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  CHECK_EQ(int(ss_dg_set_budgets(r.c, 2, 4, 48)), int(SS_E_INVALID));
+  r.enqueue_step(false);
+  CHECK_OK(ss_end(r.c));
+  CU(cudaStreamSynchronize(r.s));
 }

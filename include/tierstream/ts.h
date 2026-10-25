@@ -21,6 +21,7 @@ typedef ss_dg_device_view ts_dg_device_view;
 typedef ss_dg_layer_timeline ts_dg_layer_timeline;
 typedef ss_dg_part ts_dg_part;
 typedef ss_dg_stats ts_dg_stats;
+typedef ss_dg_unit ts_dg_unit;
 typedef ss_exclusive_stats ts_exclusive_stats;
 typedef ss_forward_mode ts_forward_mode;
 typedef ss_group ts_group;
@@ -135,6 +136,7 @@ TS_API ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev,
 TS_API ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
 TS_API ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream);
 TS_API ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
+TS_API ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token);
 TS_API ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
 TS_API ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 TS_API ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out);

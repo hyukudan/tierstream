@@ -66,13 +66,15 @@ struct Rig {
   std::vector<ts::DgPredRecord> prec{G};
   std::vector<uint32_t> flag = std::vector<uint32_t>(G, 0), pflag = std::vector<uint32_t>(G, 0),
                         ready = std::vector<uint32_t>(G, 0);
-  uint32_t done = 0, err_code = 0, err_aux = 0, host_abort = 0;
+  uint32_t done = 0, err_code = 0, err_aux = 0, host_abort = 0, began = 0;
   std::unique_ptr<Immediate> t;
   std::unique_ptr<DgCore> core;
   std::unique_ptr<DgService> svc;
   uint32_t seq = 0;
 
-  explicit Rig(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000), uint32_t max_ids = 8) {
+  // with_began: the service waits for the begin kernel's word before any flag (design rev 3.4 §11.2).
+  explicit Rig(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000), uint32_t max_ids = 8,
+               bool with_began = false) {
     ts::DgConfig c;
     c.n_units.assign(G, U);
     c.persistent_slots = 48 + 12;
@@ -100,6 +102,7 @@ struct Rig {
     m.err_code = &err_code;
     m.err_aux = &err_aux;
     m.host_abort = &host_abort;
+    if (with_began) m.began = &began;
     ts::DgServiceConfig sc;
     sc.max_ids = max_ids;
     sc.timeout = timeout;
@@ -304,3 +307,66 @@ TEST(dg_service_host_abort_ends_device_wait) {
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }
+
+// design rev 3.4 §11.2: the begin kernel may come long after ss_begin (a graph captured and instantiated in between);
+// no flag deadline runs before it. The export after it is served as usual.
+TEST(dg_service_slow_launch_is_not_a_failure) {
+  Rig r(std::chrono::milliseconds(150), 8, true);
+  r.seq = 1;
+  r.svc->begin(1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(450));  // 3x the flag deadline
+  CHECK_EQ(int(r.svc->wait_terminal(1, std::chrono::milliseconds(1))), int(DgService::kIdle));
+  ts::dg_store_release(&r.began, 1u);
+  for (uint32_t g = 0; g < Rig::G; ++g) {
+    const uint64_t mask = r.do_export(g, {g, g + 1}, 0, 1);
+    if (mask) CHECK(r.do_wait(g));
+  }
+  ts::dg_store_release(&r.done, 1u);
+  CHECK_EQ(int(r.svc->wait_terminal(1, std::chrono::milliseconds(5000))), int(DgService::kServed));
+  // after the begin kernel, the flag deadline applies again
+  r.core->end_token({});
+  r.seq = 2;
+  r.svc->begin(2);
+  ts::dg_store_release(&r.began, 2u);
+  expect_failure(r, "export flag of gated layer 0 never came");
+}
+
+TEST(dg_service_began_past_is_a_desync) {
+  Rig r(std::chrono::milliseconds(2000), 8, true);
+  r.seq = 1;
+  r.svc->begin(1);
+  ts::dg_store_release(&r.began, 2u);  // a later step began: one ran outside the pair
+  expect_failure(r, "a gated step began with seq 2 while serving token 1");
+}
+
+TEST(dg_service_stop_while_waiting_for_began) {
+  Rig r(std::chrono::milliseconds(100), 8, true);
+  r.seq = 1;
+  r.svc->begin(1);
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  const auto t0 = std::chrono::steady_clock::now();
+  r.svc->stop_join();
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+  CHECK_EQ(int(r.svc->wait_terminal(1, std::chrono::milliseconds(1))), int(DgService::kStopped));
+}
+
+// seen_us of layer 0 starts at the previous token's end (site.cu), so host time between tokens shows in it.
+TEST(dg_service_seen_us_origin) {
+  Rig r(std::chrono::milliseconds(2000), 8, true);
+  for (uint32_t tok = 1; tok <= 2; ++tok) {
+    if (tok == 2) std::this_thread::sleep_for(std::chrono::milliseconds(60));  // the engine between tokens
+    r.seq = tok;
+    r.svc->begin(tok);
+    ts::dg_store_release(&r.began, tok);
+    for (uint32_t g = 0; g < Rig::G; ++g) {
+      const uint64_t mask = r.do_export(g, {g}, 0, tok);
+      if (mask) CHECK(r.do_wait(g));
+    }
+    ts::dg_store_release(&r.done, tok);
+    CHECK_EQ(int(r.svc->wait_terminal(tok, std::chrono::milliseconds(5000))), int(DgService::kServed));
+    r.core->end_token({});
+  }
+  const double seen0 = r.svc->timeline()[0].seen_us;
+  if (seen0 < 60000) std::printf("  seen_us[0] = %.0f us (wanted >= 60000)\n", seen0);
+  CHECK(seen0 >= 60000);
+}

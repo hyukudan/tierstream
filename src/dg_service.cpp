@@ -115,10 +115,29 @@ void DgService::wait_word(const uint32_t* w, uint32_t seq, const char* what, uin
   }
 }
 
+// The step's begin kernel (design rev 3.4 §11.2): no deadline (a legal step may capture and instantiate its graph
+// between ss_begin and the launch; a step that never launches is caught by ss_end's own deadline), but stop is polled,
+// and a began past seq is a desync at once. Spins briefly, then yields like the idle wait.
+void DgService::wait_began(uint32_t seq) {
+  if (!m_.began) return;  // CPU tests without a device word
+  for (uint32_t spins = 0;; ++spins) {
+    const uint32_t v = dg_load_acquire(m_.began);
+    if (v == seq) return;
+    if (int32_t(v - seq) > 0)
+      fail(SS_E_BACKEND, "device-gated: sequence desync: a gated step began with seq " + std::to_string(v) +
+                             " while serving token " + std::to_string(seq) +
+                             " (a step ran outside ss_begin / ss_end)");
+    if ((spins & 1023u) == 0 && stop_.load(std::memory_order_acquire)) throw Stop{};
+    if (spins < 20000) SS_PAUSE();
+    else std::this_thread::yield();
+  }
+}
+
 void DgService::run(uint32_t seen) {
   try {
     if (cfg_.bind) cfg_.bind();
     boost_on();
+    t_served_ = clock_type::now();  // token 1's seen_us[0] origin: the service's start
   } catch (const std::exception& e) {
     fail_with(e.what());
     publish(kFailed, 0);
@@ -159,13 +178,15 @@ void DgService::run(uint32_t seen) {
       return;
     }
     publish(kServed, seq);
+    t_served_ = clock_type::now();  // the next token's seen_us[0] origin (site.cu: the previous token's end)
   }
 }
 
 void DgService::serve_token(uint32_t seq) {
   const uint32_t G = core_->gated();
   core_->begin_token(seq);
-  auto t_prev = clock_type::now();
+  auto t_prev = t_served_;
+  wait_began(seq);  // every flag deadline starts once the step began
   for (uint32_t g = 0; g < G; ++g) {
     DgLayerTimeline t;
     wait_word(&m_.flag[g], seq, "export flag", g, true);
@@ -185,9 +206,10 @@ void DgService::serve_token(uint32_t seq) {
     const uint64_t mask = uint64_t(r.mask_lo) | uint64_t(r.mask_hi) << 32;
     ids_.assign(r.ids, r.ids + n);
     const DgStats before = core_->stats();
-    core_->serve(g, ids_.data(), n, mask);  // throws on an id outside the layer
+    core_->serve_demand(g, ids_.data(), n, mask);  // throws on an id outside the layer
     const auto t_demand = clock_type::now();
-    t.demand_us = us_since(t_seen, t_demand);
+    t.demand_us = us_since(t_seen, t_demand);  // ends at ready, before recency (site.cu)
+    core_->serve_use(g, ids_.data(), n, mask);
     if (n_pred > 0) {
       wait_word(&m_.pflag[g], seq, "prediction flag", g, false);
       const auto t_pw = clock_type::now();
@@ -204,11 +226,13 @@ void DgService::serve_token(uint32_t seq) {
     t.serve_us = us_since(t_seen, t_end);
     if (cfg_.diag) {
       const DgStats& after = core_->stats();
-      t.ids = n;
+      t.ids = uint32_t(after.lookups - before.lookups);  // the unique ids (one lookup each)
       t.misses = uint32_t(after.misses - before.misses);
       t.covered = uint32_t(after.covered - before.covered);
+      t.covered_waits = uint32_t(after.covered_waits - before.covered_waits);
       t.fetched = uint32_t(after.fetched - before.fetched);
       t.prefetched = uint32_t(after.prefetched - before.prefetched);
+      t.predicted_true = uint32_t(after.predicted_true - before.predicted_true);
       tl_[g] = t;
     }
     t_prev = t_end;

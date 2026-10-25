@@ -13,6 +13,7 @@
 #include "dg_ctx.hpp"
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
+#include "strix_stream/ss_test.h"
 
 struct ss_desc {
   ts::Desc d;
@@ -109,6 +110,7 @@ void options_defaults(ss_options* o) {
   o->dg_prefetch_per_layer = 4;
   o->dg_prefetch_per_token = 48;
   o->dg_wait_timeout_ms = 10000;
+  o->dg_spare_target = 0xFFFFFFFFu;
 #if defined(_WIN32)
   o->dg_service_boost = 1;
 #endif
@@ -119,7 +121,6 @@ void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
-  o.reserved2 = 0;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
@@ -714,7 +715,7 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
   return SS_OK;
 }
 
-// Device-gated test hooks (tests/test_dg_cuda.cu): not in ss.h.
+// Device-gated test hooks (include/strix_stream/ss_test.h): not in ss.h, refused without dg_test_hooks = 1.
 ss_status ss_test_dg_mutate(ss_ctx* c, int m) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_mutate").test_mutate(m); });
 }
@@ -767,6 +768,12 @@ ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream) {
 }
 ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_keep").keep(g, ids, n); });
+}
+ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
+                            uint32_t prefetch_per_token) {
+  return ctx_guard(c, [&] {
+    dg_ctx(c, "ss_dg_set_budgets").set_budgets(spare_target, prefetch_per_layer, prefetch_per_token);
+  });
 }
 ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) {
   return guard([&] {

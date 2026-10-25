@@ -61,6 +61,7 @@ ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n,
 ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream) { return ss_dg_enqueue_wait(c, g, stream); }
 ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream) { return ss_dg_enqueue_end(c, stream); }
 ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) { return ss_dg_keep(c, g, ids, n); }
+ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token) { return ss_dg_set_budgets(c, spare_target, prefetch_per_layer, prefetch_per_token); }
 ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) { return ss_dg_timeline_sized(c, g, out, size); }
 ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) { return ss_stats_dg_sized(c, out, size); }
 ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) { return ss_recipe_from_text(text, len, origin, out); }

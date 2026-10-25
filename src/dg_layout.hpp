@@ -32,7 +32,8 @@ struct DgLayout {
   uint64_t bounce_bytes = 0;        // pinned: the covering aligned reads of unaligned parts
   uint64_t staging_bytes = 0;       // pinned: one resident's bytes on their way to the arena at open
   // Exactly what the context allocates, so admission bills what it allocates.
-  static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1); }
+  // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1], absent_err
+  static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1) + 1; }
 };
 
 // Bytes of the mapped control area for G gated layers (64-byte aligned arrays).
