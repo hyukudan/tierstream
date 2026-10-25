@@ -169,8 +169,9 @@ open. See [docs/design.md §3.5](docs/design.md); a recipe sets it per placement
 
 ## Status
 
-v1, local only. The CPU tests pass on MSVC and on GCC with ASan, UBSan and TSan. The CUDA backend is built; its GPU
-test runs in one short window. The HIP backend has not been built yet (no ROCm on this machine).
+v1. The CPU tests pass on MSVC and on GCC with ASan, UBSan and TSan. The CUDA backend is built and its GPU test runs
+in one short window. The HIP backend for Strix Halo (unified memory) is still a stub: it has not been built or run
+yet; building and testing it with the nodes' ROCm toolchain is the next step.
 
 ## Credits
 
