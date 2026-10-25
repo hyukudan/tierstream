@@ -5,7 +5,8 @@ The expected names come from tools/rename_abi_baseline.txt, captured once from m
 before the rename) and never regenerated from the current tree: every strix-stream C ABI function and supported test
 hook (ss_test_*) is still DEFINED, by name, in the library archive, and so is each ABI function's ts_ name. SS_API
 functions added to ss.h after the baseline are checked the same way. include/strix_stream/ss.h still has the baseline's
-SHA-256 (byte identity). Internal C++ symbols are not ABI and are not compared.
+SHA-256 (byte identity), or the SHA-256 of a
+reviewed additive version listed after it (ss.h-sha256 lines). Internal C++ symbols are not ABI and are not compared.
 Usage: check_old_symbols.py ARCHIVE
 """
 import hashlib
@@ -22,12 +23,12 @@ HEADER = ROOT / "include" / "strix_stream" / "ss.h"
 def expected():
     rows = [l.split() for l in (ROOT / "tools" / "rename_abi_baseline.txt").read_text(encoding="utf-8").splitlines()
             if l and not l.startswith("#")]
-    sha = next(r[1] for r in rows if r[0] == "ss.h-sha256")
+    shas = {r[1] for r in rows if r[0] == "ss.h-sha256"}
     abi = {r[1] for r in rows if r[0] == "abi"}
     hooks = {r[1] for r in rows if r[0] == "hook"}
     hdr = re.sub(r"/\*.*?\*/", "", HEADER.read_text(encoding="utf-8"), flags=re.S)
     abi |= set(re.findall(r"\bSS_API\s+[^;{}]*?\b(ss_\w+)\s*\(", hdr, flags=re.S))
-    return abi, hooks, sha
+    return abi, hooks, shas
 
 
 def defined(archive):
@@ -55,10 +56,10 @@ def main():
     if len(sys.argv) != 2:
         print(__doc__)
         return 2
-    abi, hooks, sha = expected()
+    abi, hooks, shas = expected()
     have_sha = hashlib.sha256(HEADER.read_bytes()).hexdigest()
-    if have_sha != sha:
-        print("check_old_symbols: include/strix_stream/ss.h changed (sha256 %s, baseline %s)" % (have_sha, sha))
+    if have_sha not in shas:
+        print("check_old_symbols: include/strix_stream/ss.h is not a reviewed version (sha256 %s)" % have_sha)
         return 1
     have = defined(sys.argv[1])
     missing = sorted(n for n in abi | hooks if n not in have)

@@ -17,7 +17,13 @@ typedef ss_backend_kind ts_backend_kind;
 typedef ss_budget ts_budget;
 typedef ss_ctx ts_ctx;
 typedef ss_desc ts_desc;
+typedef ss_dg_device_view ts_dg_device_view;
+typedef ss_dg_layer_timeline ts_dg_layer_timeline;
+typedef ss_dg_part ts_dg_part;
+typedef ss_dg_stats ts_dg_stats;
+typedef ss_dg_unit ts_dg_unit;
 typedef ss_exclusive_stats ts_exclusive_stats;
+typedef ss_forward_mode ts_forward_mode;
 typedef ss_group ts_group;
 typedef ss_layer_stats ts_layer_stats;
 typedef ss_layer_view ts_layer_view;
@@ -46,6 +52,8 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_E_NOMEM SS_E_NOMEM
 #define TS_E_RECIPE SS_E_RECIPE
 #define TS_E_UNSUPPORTED SS_E_UNSUPPORTED
+#define TS_FORWARD_DEVICE_GATED SS_FORWARD_DEVICE_GATED
+#define TS_FORWARD_HOST SS_FORWARD_HOST
 #define TS_OK SS_OK
 #define TS_POLICY_LRU SS_POLICY_LRU
 #define TS_POLICY_SCORED SS_POLICY_SCORED
@@ -59,6 +67,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_TIER_RESIDENT SS_TIER_RESIDENT
 #define TS_TIER_RESIDENT_BACKED SS_TIER_RESIDENT_BACKED
 #define TS_ABI_VERSION SS_ABI_VERSION
+#define TS_DG_MAX_IDS SS_DG_MAX_IDS
+#define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
+#define TS_DG_PROTOCOL SS_DG_PROTOCOL
 #define TS_HAVE_STATS_SNAPSHOT SS_HAVE_STATS_SNAPSHOT
 #define TS_SNAPSHOT_EXCLUSIVE SS_SNAPSHOT_EXCLUSIVE
 #define TS_SNAPSHOT_READAHEAD SS_SNAPSHOT_READAHEAD
@@ -117,6 +128,17 @@ TS_API ss_status ts_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_
 TS_API ss_status ts_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size);
 TS_API ss_status ts_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out, uint32_t info_size);
 TS_API ss_status ts_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_len);
+TS_API ss_status ts_dg_get_device_view_sized(const ss_ctx* c, ss_dg_device_view* out, uint32_t size);
+TS_API int ts_dg_gated_index(const ss_ctx* c, int layer);
+TS_API ss_status ts_dg_enqueue_begin(ss_ctx* c, void* stream);
+TS_API ss_status ts_dg_enqueue_export(ss_ctx* c, int g, const int32_t* ids_dev, int n, int n_pred, void* stream);
+TS_API ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n, void* stream);
+TS_API ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
+TS_API ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream);
+TS_API ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
+TS_API ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token);
+TS_API ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
+TS_API ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 TS_API ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out);
 TS_API ss_status ts_recipe_from_file(const char* path, ss_recipe** out);
 TS_API void ts_recipe_free(ss_recipe* r);
@@ -133,6 +155,11 @@ static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }
 static inline ss_status ts_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* out) { return ss_stats_exclusive(c, out); }
 static inline ss_status ts_stats_snapshot(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out) { return ss_stats_snapshot(c, total_out, info_out); }
+static inline ss_status ts_dg_get_device_view(const ss_ctx* c, ss_dg_device_view* out) { return ss_dg_get_device_view(c, out); }
+static inline ss_status ts_stats_dg(const ss_ctx* c, ss_dg_stats* out) { return ss_stats_dg(c, out); }
+#if defined(__CUDACC__)
+static __device__ __forceinline__ int32_t ts_dg_slot(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot(v, g, id); }
+#endif
 
 #ifdef __cplusplus
 }

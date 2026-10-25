@@ -53,6 +53,17 @@ ss_status ts_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) { 
 ss_status ts_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size) { return ss_stats_exclusive_sized(c, out, size); }
 ss_status ts_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out, uint32_t info_size) { return ss_stats_snapshot_sized(c, total_out, info_out, info_size); }
 ss_status ts_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_len) { return ss_stats_snapshot_json(c, out_json, out_len); }
+ss_status ts_dg_get_device_view_sized(const ss_ctx* c, ss_dg_device_view* out, uint32_t size) { return ss_dg_get_device_view_sized(c, out, size); }
+int ts_dg_gated_index(const ss_ctx* c, int layer) { return ss_dg_gated_index(c, layer); }
+ss_status ts_dg_enqueue_begin(ss_ctx* c, void* stream) { return ss_dg_enqueue_begin(c, stream); }
+ss_status ts_dg_enqueue_export(ss_ctx* c, int g, const int32_t* ids_dev, int n, int n_pred, void* stream) { return ss_dg_enqueue_export(c, g, ids_dev, n, n_pred, stream); }
+ss_status ts_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n, void* stream) { return ss_dg_enqueue_predict(c, g, ids_dev, n, stream); }
+ss_status ts_dg_enqueue_wait(ss_ctx* c, int g, void* stream) { return ss_dg_enqueue_wait(c, g, stream); }
+ss_status ts_dg_enqueue_end(ss_ctx* c, void* stream) { return ss_dg_enqueue_end(c, stream); }
+ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) { return ss_dg_keep(c, g, ids, n); }
+ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token) { return ss_dg_set_budgets(c, spare_target, prefetch_per_layer, prefetch_per_token); }
+ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) { return ss_dg_timeline_sized(c, g, out, size); }
+ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) { return ss_stats_dg_sized(c, out, size); }
 ss_status ts_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) { return ss_recipe_from_text(text, len, origin, out); }
 ss_status ts_recipe_from_file(const char* path, ss_recipe** out) { return ss_recipe_from_file(path, out); }
 void ts_recipe_free(ss_recipe* r) { ss_recipe_free(r); }

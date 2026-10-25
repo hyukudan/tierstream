@@ -2,6 +2,8 @@
 # symbol of its CPU archive (dumpbin /symbols strix_stream.lib), and the SHA-256 of include/strix_stream/ss.h.
 # Checked by tools/check_old_symbols.py. Never regenerated from the current tree.
 ss.h-sha256 bdc137af7b7969da4abb395561d4d8fad60eab402030a5faff27d12bbd62cec9
+# devgate (additive: the device-gated declarations; no baseline declaration changed, diff 4dc53b0..devgate-ts)
+ss.h-sha256 df91fe89e9be4e9f36ea5e6e82a8d5ba8d74f8d484ad8011fda9a6bb1c3a7860
 abi ss_abi_version
 abi ss_acquire
 abi ss_acquire_groups

@@ -44,11 +44,18 @@ add_library(tierstream STATIC
   src/resident_set.cpp
   src/file_reader.cpp
   src/backend_cpu.cpp
+  src/dg_core.cpp
+  src/dg_service.cpp
+  src/dg_layout.cpp
+  src/dg_ctx.cpp
   src/stream_ctx.cpp
   src/capi.cpp
   src/ts_api.cpp)
 target_include_directories(tierstream PUBLIC include PRIVATE src)
 target_link_libraries(tierstream PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(tierstream PUBLIC avrt winmm)  # the device-gated service thread boost
+endif()
 # One release of the rename: the old CMake target name, and the old archive file next to the new one (engine build
 # scripts link strix_stream.lib / libstrix_stream.a by path).
 add_library(strix_stream ALIAS tierstream)
@@ -125,12 +132,14 @@ if(TS_CUDA)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   find_package(CUDAToolkit REQUIRED)
-  target_sources(tierstream PRIVATE src/backend_cuda.cpp)
+  target_sources(tierstream PRIVATE src/backend_cuda.cpp src/dg_kernels.cu)
+  # the target exists before CUDA is enabled: its CUDA_ARCHITECTURES was not initialized from the variable
+  set_target_properties(tierstream PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   target_compile_definitions(tierstream PRIVATE SS_WITH_CUDA=1)
   if(TS_MUTATION_NO_SRC_WAIT)
     target_compile_definitions(tierstream PRIVATE SS_MUTATION_NO_SRC_WAIT=1)
   endif()
-  target_link_libraries(tierstream PUBLIC CUDA::cudart)
+  target_link_libraries(tierstream PUBLIC CUDA::cudart CUDA::cuda_driver)  # cuStreamWriteValue32 (device-gated)
 endif()
 
 if(TS_HIP)
@@ -166,6 +175,13 @@ if(TS_TESTS)
   add_test(NAME exclusive COMMAND ts-test-exclusive)
   add_test(NAME readahead COMMAND ts-test-readahead)
   add_test(NAME snapshot COMMAND ts-test-snapshot)
+  foreach(t dg dg-service dg-open)
+    string(REPLACE "-" "_" f ${t})
+    add_executable(ts-test-${t} tests/test_${f}.cpp)
+    target_include_directories(ts-test-${t} PRIVATE src)
+    target_link_libraries(ts-test-${t} PRIVATE tierstream)
+    add_test(NAME ${t} COMMAND ts-test-${t})
+  endforeach()
 
   add_executable(ts-test-capi tests/test_capi.c)
   target_link_libraries(ts-test-capi PRIVATE tierstream)
@@ -187,8 +203,11 @@ if(TS_TESTS)
   add_dependencies(ts-test-old-abi tierstream)
   target_include_directories(ts-test-old-abi PRIVATE include)
   set(ts_old_abi_deps Threads::Threads)  # what an engine linking the file links itself
+  if(WIN32)
+    list(APPEND ts_old_abi_deps avrt winmm)
+  endif()
   if(TS_CUDA)
-    list(APPEND ts_old_abi_deps CUDA::cudart)
+    list(APPEND ts_old_abi_deps CUDA::cudart CUDA::cuda_driver)
   endif()
   if(TS_HIP)
     list(APPEND ts_old_abi_deps hip::host)
@@ -287,6 +306,11 @@ if(TS_TESTS)
     foreach(name ts-probe-order ss-probe-order)
       add_executable(${name} tests/probe_order.cu)
     endforeach()
+    add_executable(ts-test-dg-cuda tests/test_dg_cuda.cu)
+    target_include_directories(ts-test-dg-cuda PRIVATE src tests)
+    target_link_libraries(ts-test-dg-cuda PRIVATE tierstream CUDA::cudart)
+    add_executable(ts-test-device tests/test_ts_device.cu)  # ts_dg_slot == ss_dg_slot in a kernel (GPU run)
+    target_link_libraries(ts-test-device PRIVATE tierstream CUDA::cudart)
     add_executable(ts-test-cuda tests/test_cuda.cu)
     target_include_directories(ts-test-cuda PRIVATE src)
     target_link_libraries(ts-test-cuda PRIVATE tierstream CUDA::cudart)

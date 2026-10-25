@@ -10,8 +10,10 @@
 #include "errors.hpp"
 #include "plan.hpp"
 #include "recipe.hpp"
+#include "dg_ctx.hpp"
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
+#include "strix_stream/ss_test.h"
 
 struct ss_desc {
   ts::Desc d;
@@ -21,7 +23,8 @@ struct ss_plan {
   const ss_desc* desc;
 };
 struct ss_ctx {
-  std::unique_ptr<ts::Ctx> c;
+  std::unique_ptr<ts::Ctx> c;     // host contract (SS_FORWARD_HOST)
+  std::unique_ptr<ts::DgCtx> dg;  // device-gated decode (SS_FORWARD_DEVICE_GATED): exactly one of the two is set
 };
 struct ss_recipe {
   ts::RecipeStack s;
@@ -102,6 +105,15 @@ void options_defaults(ss_options* o) {
   o->score_window = 16;
   o->pin_planned = 1;
   o->direct_io = 1;
+  o->forward_mode = SS_FORWARD_HOST;
+  o->dg_prefetch_reserve = 0xFFFFFFFFu;
+  o->dg_prefetch_per_layer = 4;
+  o->dg_prefetch_per_token = 48;
+  o->dg_wait_timeout_ms = 10000;
+  o->dg_spare_target = 0xFFFFFFFFu;
+#if defined(_WIN32)
+  o->dg_service_boost = 1;
+#endif
 }
 
 // Bytes that were padding in older headers carry whatever the caller's compiler left there: never read.
@@ -109,6 +121,7 @@ void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
+  o.reserved2_opt = 0;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
@@ -267,16 +280,43 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
     ss_budget bb = versioned(budget, budget_defaults, "ss_open budget");
     need(!plan || ts::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
     ts::Plan p = plan ? plan->p : ts::plan_make(d->d, bb, {});
-    *out = new ss_ctx{std::make_unique<ts::Ctx>(d->d, bb, p, o)};
+    need(o.forward_mode == SS_FORWARD_HOST || o.forward_mode == SS_FORWARD_DEVICE_GATED,
+         "ss_open: unknown forward_mode");
+    if (o.forward_mode == SS_FORWARD_DEVICE_GATED) {
+      auto dg = ts::open_dg_ctx(d->d, p, o);
+      *out = new ss_ctx{nullptr, std::move(dg)};
+    } else {
+      *out = new ss_ctx{std::make_unique<ts::Ctx>(d->d, bb, p, o), nullptr};
+    }
   });
 }
 
 void ss_close(ss_ctx* c) { delete c; }
 
 int ss_source_direct(const ss_ctx* c, int source) {
-  if (!c || source < 0 || source >= c->c->n_sources()) return -1;
+  if (!c) return -1;
+  if (c->dg)
+    return c->dg->poisoned() || source < 0 || source >= c->dg->n_sources() ? -1 : c->dg->source_direct(source) ? 1 : 0;
+  if (source < 0 || source >= c->c->n_sources()) return -1;
   return c->c->source_direct(source) ? 1 : 0;
 }
+
+namespace {
+// The host-contract runtime of a context; a device-gated context refuses the call.
+ts::Ctx& host_ctx(const ss_ctx* c, const char* fn) {
+  if (c->dg) ts::fail(SS_E_INVALID, std::string(fn) + ": refused in device-gated mode (ss.h: Device-gated decode)");
+  return *c->c;
+}
+ts::DgCtx& dg_ctx(const ss_ctx* c, const char* fn) {
+  if (!c->dg) ts::fail(SS_E_INVALID, std::string(fn) + ": the context is not device-gated");
+  return *c->dg;
+}
+bool ctx_poisoned(const ss_ctx* c) { return c->dg ? c->dg->poisoned() : c->c->poisoned(); }
+void ctx_poison(ss_ctx* c) {
+  if (c->dg) c->dg->poison();
+  else c->c->poison();
+}
+}  // namespace
 
 // Context calls: a poisoned context refuses everything; an allocation failure or a non-library exception poisons it
 // (library errors - bad arguments, IO, hash, capacity - leave the context consistent and usable).
@@ -287,7 +327,7 @@ ss_status ctx_guard(ss_ctx* c, F&& f) {
     g_err = "null context";
     return SS_E_INVALID;
   }
-  if (c->c->poisoned()) {
+  if (ctx_poisoned(c)) {
     g_err = "context poisoned by an earlier out-of-memory or internal failure: close it";
     return SS_E_BACKEND;
   }
@@ -296,15 +336,15 @@ ss_status ctx_guard(ss_ctx* c, F&& f) {
     return SS_OK;
   } catch (const ts::Error& e) {
     // A device or allocation error mid-call may leave half-updated bookkeeping (and CUDA errors are sticky).
-    if (e.status() == SS_E_BACKEND || e.status() == SS_E_NOMEM) c->c->poison();
+    if (e.status() == SS_E_BACKEND || e.status() == SS_E_NOMEM) ctx_poison(c);
     g_err = e.what();
     return e.status();
   } catch (const std::bad_alloc&) {
-    c->c->poison();
+    ctx_poison(c);
     g_err = "out of host memory (context poisoned)";
     return SS_E_NOMEM;
   } catch (const std::exception& e) {
-    c->c->poison();
+    ctx_poison(c);
     g_err = e.what();
     return SS_E_BACKEND;
   }
@@ -312,10 +352,24 @@ ss_status ctx_guard(ss_ctx* c, F&& f) {
 
 }  // extern "C++"
 
-#define CTX_CALL(expr) return ctx_guard(c, [&] { c->c->expr; })
+#define CTX_CALL(expr)                                          \
+  do {                                                          \
+    const char* fn_ = __func__;                                 \
+    return ctx_guard(c, [&] { host_ctx(c, fn_).expr; });        \
+  } while (0)
+// Calls a device-gated context has too.
+#define CTX_CALL_BOTH(host_expr, dg_expr)                       \
+  return ctx_guard(c, [&] {                                     \
+    if (c->dg) c->dg->dg_expr;                                  \
+    else c->c->host_expr;                                       \
+  })
 
-ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n) { CTX_CALL(seed(layer, units, n)); }
-ss_status ss_begin(ss_ctx* c, const uint32_t* rows, int n_layers) { CTX_CALL(begin(rows, n_layers)); }
+ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n) {
+  CTX_CALL_BOTH(seed(layer, units, n), seed(layer, units, n));
+}
+ss_status ss_begin(ss_ctx* c, const uint32_t* rows, int n_layers) {
+  CTX_CALL_BOTH(begin(rows, n_layers), begin(rows, n_layers));
+}
 ss_status ss_layer_routes(ss_ctx* c, int layer, const int32_t* ids, int n) { CTX_CALL(routes(layer, ids, n)); }
 ss_status ss_layer_routes_dev(ss_ctx* c, int layer, const int32_t* ids_dev, int n, void* s) {
   CTX_CALL(routes_dev(layer, ids_dev, n, s));
@@ -328,19 +382,19 @@ ss_status ss_prefetch_layer(ss_ctx* c, int layer) { CTX_CALL(prefetch_layer(laye
 ss_status ss_acquire(ss_ctx* c, int layer, void* s, ss_layer_view* out) {
   return ctx_guard(c, [&] {
     need(out != nullptr, "ss_acquire: null view");
-    c->c->acquire(layer, s, true, out);
+    host_ctx(c, "ss_acquire").acquire(layer, s, true, out);
   });
 }
 ss_status ss_acquire_groups(ss_ctx* c, int layer, void* s, ss_layer_view* out) {
   return ctx_guard(c, [&] {
     need(out != nullptr, "ss_acquire_groups: null view");
-    c->c->acquire(layer, s, false, out);
+    host_ctx(c, "ss_acquire_groups").acquire(layer, s, false, out);
   });
 }
 ss_status ss_group_wait(ss_ctx* c, int layer, int group, void* s) { CTX_CALL(group_wait(layer, group, s)); }
 ss_status ss_release(ss_ctx* c, int layer, void* s) { CTX_CALL(release(layer, s)); }
-ss_status ss_end(ss_ctx* c) { CTX_CALL(end()); }
-ss_status ss_check_unit(ss_ctx* c, int layer, int unit) { CTX_CALL(check_unit(layer, unit)); }
+ss_status ss_end(ss_ctx* c) { CTX_CALL_BOTH(end(), end()); }
+ss_status ss_check_unit(ss_ctx* c, int layer, int unit) { CTX_CALL_BOTH(check_unit(layer, unit), check_unit(layer, unit)); }
 
 ss_status ss_lookahead_select(const float* scores, int rows, int n_experts, int top_k, int32_t* out, int max_out,
                               int* n_out) {
@@ -382,7 +436,12 @@ ss_status ss_lookahead_select(const float* scores, int rows, int n_experts, int 
 
 ss_status ss_stats_layer(const ss_ctx* c, int layer, ss_layer_stats* out) {
   return guard([&] {
-    need(c && out && layer >= 0 && layer < c->c->n_layers(), "ss_stats_layer: bad argument");
+    need(c && out, "ss_stats_layer: bad argument");
+    if (c->dg) {
+      c->dg->layer_stats(layer, out);
+      return;
+    }
+    need(layer >= 0 && layer < c->c->n_layers(), "ss_stats_layer: bad argument");
     *out = c->c->stats(layer);
   });
 }
@@ -390,23 +449,29 @@ ss_status ss_stats_layer(const ss_ctx* c, int layer, ss_layer_stats* out) {
 ss_status ss_stats_total(const ss_ctx* c, ss_layer_stats* out) {
   return guard([&] {
     need(c && out, "ss_stats_total: null argument");
-    *out = c->c->total();
+    *out = c->dg ? c->dg->total() : c->c->total();
   });
 }
 
 void ss_stats_reset(ss_ctx* c) {
-  if (c) c->c->stats_reset();
+  if (!c) return;
+  (void)guard([&] {
+    if (c->dg) c->dg->stats_reset();  // refused inside a gated token: nothing changes, ss_last_error says why
+    else c->c->stats_reset();
+  });
 }
 
 void ss_set_stats_hook(ss_ctx* c, ss_stats_hook hook, void* user) {
-  if (c) c->c->set_hook(hook, user);
+  if (!c) return;
+  if (c->dg) c->dg->set_hook(hook, user);
+  else c->c->set_hook(hook, user);
 }
 
 ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) {
   std::string s;
   ss_status st = guard([&] {
     need(c != nullptr, "ss_stats_to_json: null context");
-    s = ts::json_write(c->c->stats_json());
+    s = ts::json_write(c->dg ? c->dg->stats_json() : c->c->stats_json());
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
@@ -420,7 +485,7 @@ ss_status ss_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss
     need(!info_out || info_size >= sizeof(uint32_t), "ss_stats_snapshot: info_size below struct_size");
     ss_layer_stats t;
     ss_snapshot_info i;
-    if (!c->c->snapshot(&t, &i))
+    if (!(c->dg ? c->dg->snapshot(&t, &i) : c->c->snapshot(&t, &i)))
       ts::fail(SS_E_INVALID,
                "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
     if (total_out) *total_out = t;
@@ -436,7 +501,7 @@ ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_l
   ss_status st = guard([&] {
     need(c != nullptr, "ss_stats_snapshot_json: null context");
     ts::Json j;
-    if (!c->c->snapshot_json(&j))
+    if (!(c->dg ? c->dg->snapshot_json(&j) : c->c->snapshot_json(&j)))
       ts::fail(SS_E_INVALID,
                "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
     s = ts::json_write(j);
@@ -448,57 +513,57 @@ ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_l
 ss_status ss_test_check_exclusive(ss_ctx* c) {
   return guard([&] {
     need(c != nullptr, "ss_test_check_exclusive: null context");
-    c->c->check_exclusive();
+    host_ctx(c, "ss_test_check_exclusive").check_exclusive();
   });
 }
 
 ss_status ss_host_prefetch(ss_ctx* c, int layer, const int32_t* ids, int n) {
-  return ctx_guard(c, [&] { c->c->host_prefetch(layer, ids, n); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_host_prefetch").host_prefetch(layer, ids, n); });
 }
 
 ss_status ss_host_prefetch_layer(ss_ctx* c, int layer) {
   return ctx_guard(c, [&] {
-    need(layer >= 0 && layer < c->c->n_layers(), "ss_host_prefetch_layer: layer out of range");
-    if (!c->c->ra_enabled()) return;  // read-ahead off: a no-op that allocates nothing
-    std::vector<int32_t> ids(size_t(c->c->layer_units(layer)));
+    need(layer >= 0 && layer < host_ctx(c, "ss_host_prefetch_layer").n_layers(), "ss_host_prefetch_layer: layer out of range");
+    if (!host_ctx(c, "ss_host_prefetch_layer").ra_enabled()) return;  // read-ahead off: a no-op that allocates nothing
+    std::vector<int32_t> ids(size_t(host_ctx(c, "ss_host_prefetch_layer").layer_units(layer)));
     for (size_t u = 0; u < ids.size(); ++u) ids[u] = int32_t(u);
-    c->c->host_prefetch(layer, ids.data(), int(ids.size()));
+    host_ctx(c, "ss_host_prefetch_layer").host_prefetch(layer, ids.data(), int(ids.size()));
   });
 }
 
 // Test hooks (CUDA test): known bytes in every free block; host-wait the library's copy stream.
 ss_status ss_test_fill_free_blocks(ss_ctx* c, int byte) {
-  return ctx_guard(c, [&] { c->c->test_fill_free_blocks(byte); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_fill_free_blocks").test_fill_free_blocks(byte); });
 }
 ss_status ss_test_sync_copy(ss_ctx* c) {
-  return ctx_guard(c, [&] { c->c->test_sync_copy(); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_sync_copy").test_sync_copy(); });
 }
 
 // Test hooks: wait until this forward's read-ahead reads ended; reads handed to the readers since open.
 ss_status ss_test_ra_quiesce(ss_ctx* c) {
-  return ctx_guard(c, [&] { c->c->test_ra_quiesce(); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_ra_quiesce").test_ra_quiesce(); });
 }
-uint64_t ss_test_ra_started(ss_ctx* c) { return c ? c->c->ra_started() : 0; }
+uint64_t ss_test_ra_started(ss_ctx* c) { return c && c->c ? c->c->ra_started() : 0; }
 
 // Test hook: one-shot read-ahead fault injection (Ctx::test_inject).
 ss_status ss_test_inject(ss_ctx* c, int what) {
-  return ctx_guard(c, [&] { c->c->test_inject(what); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_inject").test_inject(what); });
 }
 
 // Test hook (CUDA test): reader threads take no job while held.
 ss_status ss_test_hold_readers(ss_ctx* c, int hold) {
-  return ctx_guard(c, [&] { c->c->test_hold_readers(hold != 0); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_hold_readers").test_hold_readers(hold != 0); });
 }
 
 // Test hook (CUDA test): the write-back stream waits for `event` (a cudaEvent_t) before its next copies.
 ss_status ss_test_gate_writeback(ss_ctx* c, void* event) {
-  return ctx_guard(c, [&] { c->c->test_gate_writeback(event); });
+  return ctx_guard(c, [&] { host_ctx(c, "ss_test_gate_writeback").test_gate_writeback(event); });
 }
 
 ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size) {
   return guard([&] {
     need(c && out && size >= sizeof(uint32_t), "ss_stats_exclusive: bad argument");
-    ss_exclusive_stats x = c->c->exclusive_stats();
+    ss_exclusive_stats x = (c->dg ? c->dg->exclusive_stats() : c->c->exclusive_stats());
     x.struct_size = std::min<uint32_t>(size, uint32_t(sizeof x));
     std::memcpy(static_cast<void*>(out), &x, x.struct_size);
   });
@@ -649,6 +714,85 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
   options->struct_size = std::min<uint32_t>(osz, uint32_t(sizeof oout));
   if (plan) *plan = made;
   return SS_OK;
+}
+
+// Device-gated test hooks (include/strix_stream/ss_test.h): not in ss.h, refused without dg_test_hooks = 1.
+ss_status ss_test_dg_mutate(ss_ctx* c, int m) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_mutate").test_mutate(m); });
+}
+ss_status ss_test_dg_pressure(ss_ctx* c, uint32_t free_per_token, uint32_t evict_recent) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_pressure").test_pressure(free_per_token, evict_recent); });
+}
+ss_status ss_test_dg_check(ss_ctx* c) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_check").test_check(); });
+}
+ss_status ss_test_dg_gate(ss_ctx* c, int stream, void* event) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_gate").test_gate(stream, event); });
+}
+ss_status ss_test_dg_flags(ss_ctx* c, uint32_t flags) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_flags").test_flags(flags); });
+}
+ss_status ss_test_dg_stop_service(ss_ctx* c) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_stop_service").test_stop_service(); });
+}
+
+
+// ---- Device-gated decode (ss.h) ----
+ss_status ss_dg_get_device_view_sized(const ss_ctx* c, ss_dg_device_view* out, uint32_t size) {
+  return ctx_guard(const_cast<ss_ctx*>(c), [&] {  // a poisoned context hands out no device pointers
+    need(out && size >= sizeof(uint32_t), "ss_dg_get_device_view: bad argument");
+    ss_dg_device_view v;
+    dg_ctx(c, "ss_dg_get_device_view").device_view(&v);
+    need(size >= offsetof(ss_dg_device_view, parts) + sizeof(ss_dg_part) * v.n_parts,
+         "ss_dg_get_device_view: the caller's struct is too small for this context's parts");
+    v.struct_size = std::min<uint32_t>(size, uint32_t(sizeof v));
+    std::memcpy(static_cast<void*>(out), &v, v.struct_size);
+  });
+}
+int ss_dg_gated_index(const ss_ctx* c, int layer) {
+  return c && c->dg && !c->dg->poisoned() ? c->dg->gated_index(layer) : -1;
+}
+ss_status ss_dg_enqueue_begin(ss_ctx* c, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_begin").enqueue_begin(stream); });
+}
+ss_status ss_dg_enqueue_export(ss_ctx* c, int g, const int32_t* ids_dev, int n, int n_pred, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_export").enqueue_export(g, ids_dev, n, n_pred, stream); });
+}
+ss_status ss_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_predict").enqueue_predict(g, ids_dev, n, stream); });
+}
+ss_status ss_dg_enqueue_wait(ss_ctx* c, int g, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_wait").enqueue_wait(g, stream); });
+}
+ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_end").enqueue_end(stream); });
+}
+ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_keep").keep(g, ids, n); });
+}
+ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
+                            uint32_t prefetch_per_token) {
+  return ctx_guard(c, [&] {
+    dg_ctx(c, "ss_dg_set_budgets").set_budgets(spare_target, prefetch_per_layer, prefetch_per_token);
+  });
+}
+ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) {
+  return guard([&] {
+    need(c && out && size >= sizeof(uint32_t), "ss_dg_timeline: bad argument");
+    ss_dg_layer_timeline t;
+    dg_ctx(c, "ss_dg_timeline").timeline(g, &t);
+    t.struct_size = std::min<uint32_t>(size, uint32_t(sizeof t));
+    std::memcpy(static_cast<void*>(out), &t, t.struct_size);
+  });
+}
+ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) {
+  return guard([&] {
+    need(c && out && size >= sizeof(uint32_t), "ss_stats_dg: bad argument");
+    ss_dg_stats x;
+    dg_ctx(c, "ss_stats_dg").stats(&x);
+    x.struct_size = std::min<uint32_t>(size, uint32_t(sizeof x));
+    std::memcpy(static_cast<void*>(out), &x, x.struct_size);
+  });
 }
 
 }  // extern "C"
