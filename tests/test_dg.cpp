@@ -472,12 +472,13 @@ struct Mini {
   ts::DgConfig c;
   std::unique_ptr<Scripted> t;
   std::unique_ptr<DgCore> core;
+  // Q: spare blocks (default D, the planner's usual grant; may be below D)
   Mini(uint32_t R, uint32_t D, uint32_t T, const std::vector<uint32_t>& order, uint32_t pf_layer = 4,
-       bool reserve_auto = false) {
+       bool reserve_auto = false, int Q = -1) {
     c.n_units.assign(G, U);
     c.persistent_slots = R + D;
     c.bank_slots = 4;
-    c.blocks = K - R + D;
+    c.blocks = K - R + (Q < 0 ? D : uint32_t(Q));
     c.spare_target = T;
     c.prefetch_reserve_auto = reserve_auto;
     c.prefetch_reserve = reserve_auto ? 0 : 1;
@@ -556,6 +557,20 @@ TEST(dg_counters_prediction_and_miss_layers) {
 
 // The seed order picks the residents (the first persistent_slots - T distinct keys) and is the recency order: the
 // first evictions are its last entries (cache.cpp:236-256).
+// Fewer spare blocks than spare slots (Q < D, as the engine caches run): a boundary that needs more victims than free
+// blocks writes back what fits and keeps the rest resident (evict_short), never a victim without a block.
+TEST(dg_spare_blocks_below_slots) {
+  Mini m(8, 4, 4, keys_in_order(8), 4, false, 1);
+  m.core->set_pressure(0, 6);  // the boundary also evicts the 6 most recently used
+  m.core->begin_token(1);
+  m.serve(0, {0, 1, 2, 3});  // residents only: no promotion frees a block
+  m.core->end_token({});
+  CHECK_EQ(m.core->stats().evicted, 1ull);
+  CHECK_EQ(m.core->stats().evict_short, 1ull);
+  CHECK_EQ(m.core->free_blocks(), 0u);
+  m.core->check();
+}
+
 TEST(dg_seed_order_residents_and_lru) {
   std::vector<uint32_t> order = {40, 3, 17, 40, 29, 8, 33, 12, 5};  // 40 twice: skipped the second time
   for (uint32_t k = 0; k < Mini::K; ++k) order.push_back(k);

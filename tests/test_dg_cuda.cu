@@ -381,8 +381,9 @@ TEST(dg_cuda_pressure) {
 }
 
 // Spares as the engine caches have them (Sol rtx-vram-plan 2.7): a global count of 20 spare slots (not a multiple of the
-// 6 layers) on the plan's 12 spare blocks (dyn 2 x 6): Q < D, so boundaries write back at most the free blocks and keep
-// the other victims resident (evict_short). Exact under pressure, invariants at every boundary.
+// 6 layers) on the plan's 12 spare blocks (dyn 2 x 6): Q < D. Exact under pressure, invariants at every boundary. (Every
+// promotion frees its block, so with misses the blocks rarely run out here; evict_short is covered by the core test
+// dg_spare_blocks_below_slots.)
 TEST(dg_cuda_global_spares) {
   Rig r("gspares", 8, 2, 8, 10000, true, [](ss_options& o) { o.dg_spare_slots = 20; });
   if (!r.c) return;
@@ -398,7 +399,6 @@ TEST(dg_cuda_global_spares) {
   CHECK_EQ(k.failed, 0);
   CHECK_EQ(k.wrong, 0);
   CHECK_EQ(x.blocks, uint64_t(6 * (64 - 8) + 12));  // P + Q
-  CHECK(x.evict_short > 0);
   CHECK(x.evicted > 0);
 }
 
