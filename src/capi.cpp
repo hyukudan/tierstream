@@ -17,6 +17,7 @@
 #include "recipe.hpp"
 #include "dg_ctx.hpp"
 #include "dg_layout.hpp"
+#include "capi_internal.hpp"
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
 #include "strix_stream/ss_test.h"
@@ -1364,3 +1365,9 @@ ss_status ss_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* 
 
 
 }  // extern "C"
+
+// Adaptive memory plan glue (adapt_capi.cpp, include/tierstream/ts_adapt.h): the same error handling and handles.
+ss_status ts_capi_guard(const std::function<void()>& f) { return guard(f); }
+ss_status ts_capi_text(const std::string& s, char** out, size_t* len) { return give_text(s, out, len); }
+ts::Ctx* ts_capi_ctx(ss_ctx* c) { return c ? c->c.get() : nullptr; }
+const ts::Desc* ts_capi_desc(const ss_desc* d) { return d ? &d->d : nullptr; }
