@@ -59,6 +59,22 @@ add_library(strix_stream ALIAS tierstream)
 # generator unless it holds a generator expression), else the binary directory (+ /<CONFIG> likewise). Both
 # properties are initialized from the CMAKE_* variables when the target is created. CTest ts-old-archive-location
 # checks the result against $<TARGET_FILE_DIR:tierstream>.
+# A relative directory is read against the binary directory, as CMake does. When the directory holds a generator
+# expression its absoluteness is only known once evaluated, so it is decided by $<PATH:IS_ABSOLUTE> (CMake 3.24+).
+function(ts_absolute_dir out d)
+  string(GENEX_STRIP "${d}" plain)
+  if(plain STREQUAL d)
+    if(NOT IS_ABSOLUTE "${d}")
+      set(d ${CMAKE_CURRENT_BINARY_DIR}/${d})
+    endif()
+  elseif(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set(d "$<IF:$<PATH:IS_ABSOLUTE,${d}>,${d},${CMAKE_CURRENT_BINARY_DIR}/${d}>")
+  else()
+    message(FATAL_ERROR "tierstream: an archive output directory with a generator expression needs CMake 3.24+ "
+                        "(the strix_stream archive copy must know where the archive is)")
+  endif()
+  set(${out} "${d}" PARENT_SCOPE)
+endfunction()
 get_property(ts_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(ts_multi_config)
   set(ts_configs ${CMAKE_CONFIGURATION_TYPES})
@@ -81,9 +97,7 @@ foreach(cfg ${ts_configs})
       string(APPEND d "/${cfg}")
     endif()
   endif()
-  if(NOT IS_ABSOLUTE "${d}")  # CMake reads a relative output directory against the binary directory
-    set(d ${CMAKE_CURRENT_BINARY_DIR}/${d})
-  endif()
+  ts_absolute_dir(d "${d}")
   if(ts_multi_config)
     string(APPEND ts_archive_dir "$<$<CONFIG:${cfg}>:${d}>")
   else()
@@ -96,9 +110,7 @@ if(ts_archive_dir STREQUAL "")  # single-config with no CMAKE_BUILD_TYPE
   else()
     set(ts_archive_dir ${CMAKE_CURRENT_BINARY_DIR})
   endif()
-  if(NOT IS_ABSOLUTE "${ts_archive_dir}")
-    set(ts_archive_dir ${CMAKE_CURRENT_BINARY_DIR}/${ts_archive_dir})
-  endif()
+  ts_absolute_dir(ts_archive_dir "${ts_archive_dir}")
 endif()
 set(TS_OLD_ARCHIVE ${ts_archive_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}strix_stream${CMAKE_STATIC_LIBRARY_SUFFIX})
 add_custom_command(TARGET tierstream POST_BUILD
