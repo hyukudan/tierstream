@@ -1,9 +1,9 @@
 # strix-stream
 
 A weight cache for inference engines whose model does not fit in GPU memory. It keeps the weights that matter now
-on the GPU, keeps more in page-locked host RAM, and reads the rest from NVMe. It moves weight *units* (an expert, a
-layer's blob, a lookup table) between these tiers while the engine runs. Engines read every unit through an address
-table, so where a unit lives never changes a single output bit.
+on the GPU, keeps more in page-locked host RAM, and reads the rest from NVMe. It moves weight *units* (an expert, or
+a whole layer's blob) between these tiers while the engine runs. Engines read every unit through an address table,
+so where a unit lives never changes a single output bit.
 
 - C ABI: `include/strix_stream/ss.h` (prefix `ss_`).
 - Design and engine contract: [docs/design.md](docs/design.md). Recipes: [docs/recipes.md](docs/recipes.md).
@@ -17,60 +17,78 @@ table, so where a unit lives never changes a single output bit.
      engine kernels ── read unit u of layer L at table[L][u] ──┐
                                                                v
   ┌─ 1. GPU memory (VRAM) ──────────────────────────────────────────────────────────┐
-  │  resident slots (the plan's best units) │ dynamic slots (adaptive) │ ring        │
+  │  resident slots (the plan's units) │ dynamic slots (adaptive) │ ring (temporary)  │
   └─────────────────────────────────────────────────────────────────────────────────┘
         ^ promote: copy RAM -> VRAM          │ evict
-        │ (a miss, a prefetch)               v   inclusive: drop it (a RAM copy or the file still has it)
+        │                                    v   inclusive: drop it (RAM or the file still has it)
         │                                        exclusive: write it back VRAM -> RAM into a free block
   ┌─ 2. pinned host RAM ────────────────────────────────────────────────────────────┐
-  │  page-locked blocks: units the GPU does not hold │ read-ahead buffers            │
+  │  blocks of the plan's pinned units │ staging buffers │ read-ahead buffers (opt.) │
   └─────────────────────────────────────────────────────────────────────────────────┘
-        ^ read at open; read-ahead fills the buffers before the GPU needs the unit
+        ^ on a miss: read the file into a staging buffer, then copy it to VRAM
+        │ ahead of time (opt.): read-ahead fills its buffers before the GPU slot is free
   ┌─ 3. model files on NVMe ────────────────────────────────────────────────────────┐
-  │  GGUF / safetensors / packed records, read unbuffered (direct I/O)               │
+  │  GGUF / safetensors / packed records; unbuffered (direct I/O) by default,        │
+  │  buffered when the file system refuses it                                        │
   └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-On unified-memory machines (Strix Halo), tiers 1 and 2 are the same memory: a resident unit is mapped host memory,
-and a miss is read from NVMe straight into its slot.
+- **Ring.** A small set of temporary GPU slots, used by misses that do not get a persistent slot and by prefetches.
+- **Inclusive vs exclusive RAM.** In inclusive mode (the default), a unit can be in RAM and in VRAM at once. In
+  exclusive mode, RAM holds only units that are not on the GPU (below).
+- **Unified memory (Strix Halo).** Tiers 1 and 2 are the same memory, and there is no separate pinned tier. A
+  resident unit is mapped host memory. A miss is read from NVMe straight into its slot when the file offsets and the
+  slot are aligned, otherwise through a staging buffer and a memcpy.
 
-- **Descriptor.** Lists the model's units: their files, offsets, sizes and parts (for example an expert's gate, up
-  and down matrices).
-- **Plan.** Assigns each unit a starting tier from a memory budget.
-  - The planner fills VRAM with the highest benefit per byte, then pinned RAM, and leaves the rest on disk.
-  - By default every unit is worth the same; a measured routing frequency makes the plan smarter.
-  - `ss-plan` prints a plan; `ss_plan_from_tiers` takes your own.
+A **descriptor** lists the model's units: their files, offsets, sizes and parts (for example an expert's gate, up and
+down matrices). A **plan** assigns each unit a starting tier from a memory budget:
+- First it reserves the descriptor's fixed bytes, the engine's workspace, the margin, the dynamic slots and the ring.
+- Then it fills the rest of VRAM:
+  - with `order = ranked`, the units with the highest benefit per byte (by default every unit is worth the same; a
+    measured routing frequency makes it smarter);
+  - with `order = prefix`, the longest model-order prefix of layers that fits.
+- Then pinned RAM; the rest stays on disk.
+
+`ss-plan` prints a plan; `ss_plan_from_tiers` takes your own.
 
 ### One forward, from the engine's side
 
-For each layer:
+`ss_begin` opens a forward and `ss_end` closes it. For each layer in between:
 1. The engine says which units it needs: `ss_layer_routes` (the router's expert ids), or `ss_layer_all` for a dense
    layer.
 2. `ss_acquire` gives it the layer's table once those units are on the GPU.
 3. `ss_release` says the kernels are done with them.
 
-Units already resident are free. The others are *misses*, copied from pinned RAM or read from disk into a free slot.
-`ss_acquire_groups` lets the engine start on the resident units while the misses are still coming ("hits first").
+Units already resident need no weight transfer. The others are *misses*, copied from pinned RAM or read from disk
+into a free slot. `ss_acquire_groups` lets the engine start on the resident units while the misses are still coming
+("hits first").
 
 ### Promotion and eviction, in both directions
 
-- **Promotion (RAM -> VRAM, disk -> VRAM).** A miss is copied into a slot. With `pin_planned = false` (decode), the
-  plan's residents are only a warm start: the resident set adapts to what the router actually picks.
+- **Promotion (RAM -> VRAM, disk -> VRAM).** A miss is copied into a slot.
+  - With `pin_planned = true` (prefill), the planned residents never move; only the dynamic slots adapt.
+  - With `pin_planned = false` (decode), the planned residents are only a warm start, and the resident set follows
+    what the router actually picks.
 - **Eviction (VRAM -> RAM, or nowhere).** When a slot is needed, the cache picks a victim:
   - **LRU** (default) evicts the least recently used unit that this forward is not using. On our DeepSeek decode
-    traces it hits 95-98 % of lookups, against 84-93 % for a fixed placement of the same size.
+    traces it hit 95-98 % of lookups, against 84-93 % for a fixed placement of the same size (design.md §3.1).
   - **SCORED** ranks units by a mix of routing transitions (which experts follow which), recent frequency and age. It
     is opt-in until it beats LRU on real traces.
-- **Inclusive vs exclusive** (`tier_mode`) decides what an eviction costs:
+- **Inclusive vs exclusive** (`tier_mode`) decides what an eviction costs.
   - **Inclusive** (default): a unit promoted from pinned RAM keeps its RAM copy, so eviction just drops the VRAM copy.
     It is simple, but the same unit can occupy VRAM and RAM at once.
-  - **Exclusive**: each unit lives in exactly one place: a VRAM slot, a RAM block, or only its file.
-    - Promotion frees the unit's RAM block.
-    - Eviction writes the unit back from VRAM into a free RAM block (a device-to-host copy on its own stream, the
-      opposite PCIe direction).
-    - VRAM + RAM then hold the whole model whenever together they are just big enough. The DeepSeek RTX replica
-      keeps 80 GiB of experts on the GPU and ~63 GiB in RAM (all 142 GiB), and never reads the disk after start-up.
-    - On a GPU with a single copy engine (WDDM), write-backs and promotions share it.
+  - **Exclusive**: at every forward boundary, each unit lives in exactly one of three places: a VRAM slot, a RAM
+    block, or only its file. (During a transfer it is briefly in two; the files always stay as backing storage.)
+    - **Promotion.** When a miss is promoted into a persistent slot, its RAM block is freed at `ss_end`. A miss
+      served from the ring keeps its block.
+    - **Eviction.** The victim is written back from VRAM into a free RAM block of its size: a device-to-host copy on
+      its own stream, the opposite PCIe direction. With no free block, the miss is served from the ring and the
+      victim stays. With full slots and no spare blocks, the resident set stops adapting, but nothing falls back to
+      disk.
+    - **Capacity.** VRAM + RAM can then hold the whole model when, after the fixed bytes, workspace, ring and
+      alignment, their unit capacity covers it. Design example (design.md §3.5): for the DeepSeek V4.1 RTX decode
+      replica, 80 GiB of VRAM slots plus ~63 GiB of RAM blocks would hold all 142.4 GiB of experts, with no file read
+      after open. The shipped pending recipe's actual budget still leaves 5.8 GiB on NVMe.
 
 ### Fetching ahead
 
@@ -81,33 +99,35 @@ Units already resident are free. The others are *misses*, copied from pinned RAM
     into the few experts most likely next (`lookahead_units`, default 2).
   - They are read at low priority, only while no demand is waiting.
   - By default they land in the ring and never evict a resident on a guess (`spec_persistent = true` lets them in).
-- **Host read-ahead** (`readahead_units`, engine knob `host_prefetch_layers`):
+- **Host read-ahead** (`readahead_units`; the engine calls `ss_host_prefetch_layer`, recipe engine knob
+  `host_prefetch_layers`):
   - Disk is the slowest tier, and a disk read normally cannot start until a GPU slot is free.
   - Read-ahead reads the next layers' disk units into pinned RAM buffers early, so when the slot frees up only the
-    fast RAM -> VRAM copy is left.
-  - Before it existed, MiniMax RTX prefill at 8K waited ~0.45 s per disk layer.
+    RAM -> VRAM copy is left.
+  - Before it existed, MiniMax RTX prefill at 8K waited ~0.45 s per disk layer (design.md §3.6).
 - **Seed** (`ss_seed`): between requests, load a usage profile's favourite units into free slots.
+
+Engine knobs (`prefetch_layers`, `host_prefetch_layers`, …) only take effect in an engine that implements them.
 
 ### What never changes
 
 Bytes are copied, never transformed, and engine kernels must not depend on which slot a unit sits in. So every
-placement, policy and prefetch setting gives bit-identical outputs. With `verify_hash`, every read is checked against
-the descriptor's hash, and a mismatch is an error, never silently used.
+placement, policy and prefetch setting gives bit-identical outputs. With `verify_hash` enabled and descriptor hashes
+supplied, unit bytes loaded from files are checked before they are accepted, and a mismatch is an error.
 
 ## When it pays (and when it does not)
 
 The question is how many weight bytes each token must move across PCIe, compared with what the GPU reads from its
-own memory:
-- from pinned RAM, ~50 GB/s;
-- from NVMe, a few GB/s;
-- from VRAM on an RTX PRO 6000, ~1.8 TB/s.
+own memory, which is much faster.
+- Pinned RAM to VRAM measured 31-32.5 GB/s on the RTX PRO 6000 with one copy engine (design.md §8).
+- NVMe is slower still.
 
 | workload | streaming | why |
 |---|---|---|
-| **MoE decode** (DeepSeek, MiniMax, Qwen MoE, GLM) | pays | A token uses only the top-k experts of each layer (6 of 384 for DeepSeek V4.1), so a hot set fits on the GPU. LRU keeps 95-98 % of lookups hits, and a miss costs one expert copy (~0.4 ms for 10 MB). |
-| **Prefill and large batches** (dense or MoE) | pays | Thousands of tokens reuse every weight byte, so the copy of layer L+1 hides behind layer L's compute. |
-| **Models that do not fit at all** | pays | The alternative is not running, or splitting across machines. Exclusive mode stretches VRAM + RAM to the model's size. |
-| **Dense decode** (one or a few tokens per step) | does **not** pay | Every token reads every weight. Whatever is not resident crosses PCIe on every token at ~1/35 of VRAM bandwidth, so the streamed fraction dominates the step time. Use a smaller quantization, more GPUs, or a unified-memory machine instead. |
+| **MoE decode** (DeepSeek, MiniMax, Qwen MoE, GLM) | usually pays | A token uses only the top-k experts of each layer (6 of 384 for DeepSeek V4.1). When routing has a hot set, as on our DeepSeek traces (95-98 % LRU hits), most lookups need no transfer and a miss costs one expert copy. |
+| **Prefill and large batches** (dense or MoE) | can pay | Many tokens reuse every weight byte, so the copy of layer L+1 can hide behind layer L's compute, as long as that compute takes longer than the copy. |
+| **Models that do not fit at all** | makes them run | The alternative is not running, or splitting across machines. That is a capacity gain, not a speed gain. Exclusive mode removes disk reads only when VRAM + RAM cover the units. |
+| **Dense decode** (one or a few tokens per step) | does **not** pay | Every token reads every weight. Whatever is not resident crosses PCIe on every token, far slower than VRAM, so the streamed fraction dominates the step time. Use a smaller quantization, more GPUs, or a unified-memory machine instead. |
 | **MoE decode with near-uniform routing** | pays less | With no hot set, the miss rate approaches the fraction of experts that are not resident. |
 
 ## Recipe knobs at a glance
@@ -116,13 +136,15 @@ A recipe (below) compiles to the library's budget and options. The knobs that sh
 
 | knob | default | what it does |
 |---|---|---|
-| `device_gib`, `host_pinned_gib`, `workspace_gib` | from the hardware | the VRAM and pinned-RAM budgets, and the engine's own VRAM |
-| `units` (`resident`, `pinned`, `rest`) | `fill` | how many units of each group start in VRAM, in RAM, and on disk |
-| `pin_planned` | true | true: residents never move (prefill). false: they are a warm start for LRU / SCORED (decode). |
+| `device_gib` | the device set's `memory_min_gib` | the VRAM budget |
+| `host_pinned_gib` | 0 | the pinned-RAM budget |
+| `workspace_gib` | derived from the descriptor and the route's bounds (refused if it cannot be derived) | the engine's own VRAM |
+| `units`: `resident` / `pinned` / `rest` | `"fill"` / 0 / `"disk"` | how many units of each group start in VRAM, in RAM, and on disk |
+| `pin_planned` | true | true: planned residents never move (prefill). false: they are a warm start for LRU / SCORED (decode). |
 | `dynamic_slots_per_layer` | 0 | extra VRAM slots per layer for the adaptive set |
-| `ring_slots` | auto | VRAM slots shared by misses that are not admitted, and by prefetches |
+| `ring_slots` | 0 (auto) | temporary VRAM slots for misses that are not admitted, and for prefetches |
 | `policy` | `lru` | `lru` or `scored` eviction |
-| `tier_mode`, `host_spare_units` | `inclusive`, auto | inclusive or exclusive; free RAM blocks kept for write-backs |
+| `tier_mode`, `host_spare_units` | `inclusive`, 0 (auto) | inclusive or exclusive; free RAM blocks requested for write-backs |
 | `lookahead_units`, `spec_persistent` | 2, false | speculative experts per layer; whether a guess may take a persistent slot |
 | `readahead_units`, `host_prefetch_layers` | 0, 0 | host read-ahead buffers and distance |
 | `prefetch_layers` | 1 | certain whole-layer prefetch distance |
@@ -249,8 +271,8 @@ devices, with exactly one owner per unit.
 
 **Autotuner and overrides.** Three layers make the effective recipe: the recipe, an autotuner profile, and human
 overrides (files or `--set path=value`), highest last. A profile is bound to the recipe's bytes, the engine, the
-model, the devices, their drivers, the descriptors and the probed bandwidths; if any of them changed it is refused
-and the recipe runs untuned. A recipe can pin fields the autotuner may not change. `ss-recipe explain` shows, for
+model, the devices, their drivers and the descriptors, which must all still match, and to the probed bandwidths,
+which may drift by up to `max_drift` (default 10 %). Otherwise the profile is refused and the recipe runs untuned. A recipe can pin fields the autotuner may not change. `ss-recipe explain` shows, for
 every field, its value, which layer set it and what it replaced.
 
 **Exactness is not an option.** Every placement a recipe can express produces bit-identical outputs; a recipe that
