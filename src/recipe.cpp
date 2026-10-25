@@ -1,6 +1,7 @@
 #include "recipe.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <map>
@@ -234,6 +235,39 @@ int64_t count_of(const Reader& rd, const Json& v, const std::string& path) {
   return rd.integer(v, path, 0, kMaxUnit + 1);
 }
 
+bool hex_run(const std::string& s, size_t at, size_t n) {
+  if (at + n > s.size()) return false;
+  for (size_t i = at; i < at + n; ++i)
+    if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+  return true;
+}
+
+// "GPU-" + 8-4-4-4-12 lowercase hex: cudaDeviceProp.uuid as nvidia-smi prints it.
+bool cuda_uuid_ok(const std::string& s) {
+  if (s.size() != 40 || s.compare(0, 4, "GPU-") != 0) return false;
+  size_t at = 4;
+  for (size_t n : {8, 4, 4, 4, 12}) {
+    if (!hex_run(s, at, n)) return false;
+    at += n;
+    if (at < s.size() && s[at++] != '-') return false;
+  }
+  return true;
+}
+
+// HIP has no normative UUID text yet (a hip uuid selector is refused by the planner): a token of [A-Za-z0-9-].
+bool hip_uuid_ok(const std::string& s) {
+  if (s.empty() || s.size() > 64) return false;
+  for (char c : s)
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) return false;
+  return true;
+}
+
+// dddd:bb:dd.f, lowercase hex, function 0-7.
+bool pci_ok(const std::string& s) {
+  return s.size() == 12 && hex_run(s, 0, 4) && s[4] == ':' && hex_run(s, 5, 2) && s[7] == ':' && hex_run(s, 8, 2) &&
+         s[10] == '.' && s[11] >= '0' && s[11] <= '7';
+}
+
 RGroup group_from(const Reader& rd, const Json& e, const std::string& w, const std::string& id) {
   rd.keys(e, w, {"id", "class", "layers", "rank", "list", "resident", "pinned", "rest", "peer"});
   RGroup g;
@@ -276,13 +310,90 @@ RGroup group_from(const Reader& rd, const Json& e, const std::string& w, const s
   return g;
 }
 
+// Placement-mode keys of a route (docs/recipes.md §5.4): max_rows, max_sequences, assist.<set>, components.<id>.
+// Schema-time checks only; whatever needs the binding or the engine's components-v1 belongs to the planner.
+void route_placement_keys(const Reader& rd, const Recipe& r, const Json& e, const std::string& w, RRoute& rt) {
+  if (const Json* v = e.find("max_rows")) rt.max_rows = rd.integer(*v, w + ".max_rows", 1, 65536);
+  if (const Json* v = e.find("max_sequences")) rt.max_sequences = rd.integer(*v, w + ".max_sequences", 1, 65536);
+  if (const Json* as = e.find("assist")) {
+    const std::string aw = w + ".assist";
+    if (!as->is_object()) rd.bad(aw, "expected a table keyed by device set");
+    for (const auto& kv : as->obj) {  // std::map: set id order
+      if (kv.first.rfind("x-", 0) == 0) continue;
+      const std::string sw = aw + "." + kv.first;
+      const RDevice* dev = r.device(kv.first);
+      if (!dev) rd.bad(sw, "PL_E_UNKNOWN_DEVICE \"" + kv.first + "\" is not a device set of match.devices");
+      if (std::find(rt.devices.begin(), rt.devices.end(), kv.first) != rt.devices.end())
+        rd.bad(sw, "PL_E_SCHEMA \"" + kv.first + "\" executes the route (an assist is not listed in its devices)");
+      if (dev->count != 1 || dev->kind == SS_BACKEND_CPU)
+        rd.bad(sw, "PL_E_SCHEMA an assist is one GPU: a cuda or hip set with count 1");
+      rd.keys(kv.second, sw, {"device_gib", "margin_gib", "margin_fraction"});
+      RAssist a;
+      a.set = kv.first;
+      if (const Json* x = kv.second.find("device_gib")) a.device_gib = rd.num(*x, sw + ".device_gib", 0, kMaxGib);
+      if (const Json* x = kv.second.find("margin_gib")) a.margin_gib = rd.num(*x, sw + ".margin_gib", 0, 64);
+      if (const Json* x = kv.second.find("margin_fraction"))
+        a.margin_fraction = rd.num(*x, sw + ".margin_fraction", 0, 0.5);
+      rt.assists.push_back(a);
+    }
+  }
+  if (const Json* cs = e.find("components")) {
+    const std::string cw = w + ".components";
+    if (!cs->is_object()) rd.bad(cw, "expected a table keyed by component id");
+    for (const auto& kv : cs->obj) {
+      if (kv.first.rfind("x-", 0) == 0) continue;
+      const std::string iw = cw + "." + kv.first;
+      const int prio = component_priority(kv.first);
+      if (!prio) rd.bad(iw, "PL_E_UNKNOWN_COMPONENT \"" + kv.first + "\" is not a component id");
+      rd.keys(kv.second, iw, {"device", "gib", "units", "layers"});
+      RComponent c;
+      c.id = kv.first;
+      if (const Json* x = kv.second.find("device")) {
+        c.device = rd.str(*x, iw + ".device");
+        if (!reserved_destination(c.device) && c.device != rt.devices[0] && !rt.assist(c.device))
+          rd.bad(iw + ".device", "PL_E_UNKNOWN_DEVICE \"" + c.device +
+                                     "\" is not the route's anchor, one of its assists, host_pinned, host_pageable, "
+                                     "file or auto");
+      }
+      if (const Json* x = kv.second.find("gib")) {
+        if (!component_table()[size_t(prio - 1)].elastic)
+          rd.bad(iw + ".gib", "PL_E_SCHEMA only elastic components (arena, expert_*, layer_*) take a size");
+        c.has_gib = true;
+        c.gib = rd.num(*x, iw + ".gib", 0, kMaxGib);
+      }
+      if (const Json* x = kv.second.find("units")) {
+        if (!component_table()[size_t(prio - 1)].elastic)
+          rd.bad(iw + ".units", "PL_E_SCHEMA only elastic components (arena, expert_*, layer_*) take a size");
+        if (c.has_gib) rd.bad(iw, "PL_E_SCHEMA gib and units are exclusive (units: an exact count)");
+        c.units = rd.integer(*x, iw + ".units", 0, int64_t(1) << 32);
+      }
+      if (const Json* x = kv.second.find("layers")) {  // reserved: the planner refuses it (PL_E_CAPABILITY)
+        c.has_layers = true;
+        c.layers = layer_ranges(rd, *x, iw + ".layers");
+      }
+      rt.components.push_back(c);
+    }
+    std::sort(rt.components.begin(), rt.components.end(), [](const RComponent& a, const RComponent& b) {
+      return component_priority(a.id) < component_priority(b.id);
+    });
+  }
+  // max_rows / max_sequences exist only in placement mode, so a legacy recipe's canonical form never changes
+  if (!rt.placement_mode() && (rt.max_rows > 0 || rt.max_sequences > 0))
+    rd.bad(w + (rt.max_rows > 0 ? ".max_rows" : ".max_sequences"),
+           "PL_E_SCHEMA only on a placement-mode route (with an assist or components table)");
+  if (rt.placement_mode() && (rt.execute != Execute::Single))
+    rd.bad(w + ".execute", "PL_E_SCHEMA a placement-mode route (assist / components) has one anchor: \"single\"");
+}
+
 }  // namespace
 
 const std::vector<PlacementField>& placement_fields() {
   static const std::vector<PlacementField> f = {
       {"device_gib", FieldType::Gib, 0, kMaxGib, 0},  // default: the set's memory_min_gib
       {"host_pinned_gib", FieldType::Gib, 0, kMaxGib, 0},
-      {"workspace_gib", FieldType::Gib, 0, kMaxGib, 0},                  // optional: derived when absent
+      {"host_pageable_gib", FieldType::Gib, 0, kMaxGib, 0},         // placement: 0 = not checked
+      {"host_available_floor_gib", FieldType::Gib, 0, kMaxGib, 0},  // placement: 0 = not checked
+      {"workspace_gib",FieldType::Gib, 0, kMaxGib, 0},                  // optional: derived when absent
       {"max_context_tokens", FieldType::Int, 1, double(kMaxTokens), 0},  // required
       {"max_batch", FieldType::Int, 1, 65536, 0},                        // required
       {"margin_gib", FieldType::Float, 0, 64, 2.0},
@@ -317,6 +428,58 @@ const std::vector<PlacementField>& placement_fields() {
       {"max_copies_per_token", FieldType::Int, 0, 65536, 0},
   };
   return f;
+}
+
+const std::vector<ComponentInfo>& component_table() {
+  static const std::vector<ComponentInfo> t = {
+      {"context", "anchor", false},     {"dense", "anchor", false},          {"head", "anchor", false},
+      {"mtp", "anchor", false},         {"buffers", "anchor", false},        {"state", "anchor", false},
+      {"window", "anchor", false},      {"graphs", "anchor", false},         {"drafter", "anchor", false},
+      {"relay", "host_pinned", false},  {"ple", "host_pinned", false},       {"spares", "anchor", false},
+      {"arena", "anchor", true},        {"layer_slots", "anchor", true},     {"expert_host", "host_pinned", true},
+      {"layer_host", "host_pinned", true}, {"expert_assist", "", true},      {"expert_compute", "", true},
+      {"expert_file", "file", true},    {"engram", "file", false},           {"staging", "host_pinned", false},
+      {"pageable", "host_pageable", false},
+  };
+  return t;
+}
+
+int component_priority(const std::string& id) {
+  const auto& t = component_table();
+  for (size_t i = 0; i < t.size(); ++i)
+    if (id == t[i].id) return int(i) + 1;
+  return 0;
+}
+
+bool reserved_destination(const std::string& w) {
+  return w == "auto" || w == "host_pinned" || w == "host_pageable" || w == "file";
+}
+
+std::string normalize_uuid(const std::string& s) {
+  std::string t = s;
+  for (char& c : t) c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (t.compare(0, 4, "gpu-") == 0) t = "GPU-" + t.substr(4);
+  return t;
+}
+
+std::string normalize_pci(const std::string& s) {
+  std::string t = s;
+  for (char& c : t) c = char(std::tolower(static_cast<unsigned char>(c)));
+  // nvidia-smi prints an 8-digit domain (00000000:01:00.0)
+  if (t.size() == 16 && t.compare(0, 4, "0000") == 0 && t[8] == ':') t = t.substr(4);
+  return pci_ok(t) ? t : std::string();
+}
+
+const RAssist* RRoute::assist(const std::string& set) const {
+  for (const auto& a : assists)
+    if (a.set == set) return &a;
+  return nullptr;
+}
+
+const RComponent* RRoute::component(const std::string& cid) const {
+  for (const auto& c : components)
+    if (c.id == cid) return &c;
+  return nullptr;
 }
 
 double RPlacement::get(const char* key) const {
@@ -395,7 +558,7 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
     if (r.device(d.id)) rd.bad(w, "duplicate id");
     rd.keys(e, w,
             {"id", "kind", "count", "name", "memory_min_gib", "host_ram_min_gib", "disk_read_gbytes_ps_min",
-             "h2d_gbytes_ps_min", "internal_link"});
+             "h2d_gbytes_ps_min", "internal_link", "optional", "uuid", "pci", "index"});
     std::string k = rd.choice(rd.need(e, "kind", w), w + ".kind", {"cuda", "hip", "cpu"});
     d.kind = k == "cuda" ? SS_BACKEND_CUDA : k == "hip" ? SS_BACKEND_HIP : SS_BACKEND_CPU;
     if (const Json* v = e.find("count")) d.count = int(rd.integer(*v, w + ".count", 1, 64));
@@ -418,6 +581,23 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
       if (const Json* x = v->find("gbps_min")) d.internal_gbps_min = rd.num(*x, lw + ".gbps_min", 0, 1e6);
       if (d.count < 2) rd.bad(lw, "only for a set with count >= 2");
     }
+    // Placement selectors: one physical device each, so only on count = 1 sets of a GPU kind.
+    if (const Json* v = e.find("optional")) d.optional = rd.boolean(*v, w + ".optional");
+    if (const Json* v = e.find("uuid")) {
+      d.uuid = rd.str(*v, w + ".uuid");
+      if (d.kind == SS_BACKEND_CUDA && !cuda_uuid_ok(d.uuid))
+        rd.bad(w + ".uuid", "PL_E_SCHEMA \"" + d.uuid +
+                                "\" is not a CUDA UUID (GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, lowercase hex)");
+      if (d.kind == SS_BACKEND_HIP && !hip_uuid_ok(d.uuid))
+        rd.bad(w + ".uuid", "PL_E_SCHEMA \"" + d.uuid + "\" is not a device UUID text");
+    }
+    if (const Json* v = e.find("pci")) {
+      d.pci = rd.str(*v, w + ".pci");
+      if (!pci_ok(d.pci)) rd.bad(w + ".pci", "PL_E_SCHEMA \"" + d.pci + "\" is not a PCI address dddd:bb:dd.f (lowercase)");
+    }
+    if (const Json* v = e.find("index")) d.index = rd.integer(*v, w + ".index", 0, 1023);
+    if ((d.optional || !d.uuid.empty() || !d.pci.empty() || d.index >= 0) && (d.count != 1 || d.kind == SS_BACKEND_CPU))
+      rd.bad(w, "PL_E_SCHEMA optional / uuid / pci / index select one GPU: only on a cuda or hip set with count 1");
     r.devices.push_back(d);
   }
   if (const Json* links = m.find("links")) {
@@ -460,7 +640,8 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
     if (r.route(rt.id)) rd.bad(w, "duplicate id");
     rd.keys(
         e, w,
-        {"id", "phase", "devices", "execute", "handoff_route", "links", "when", "fallback", "enabled", "placement"});
+        {"id", "phase", "devices", "execute", "handoff_route", "links", "when", "fallback", "enabled", "placement",
+         "max_rows", "max_sequences", "assist", "components"});
     rt.phase = rd.choice(rd.need(e, "phase", w), w + ".phase", {"prefill", "decode"}) == "prefill" ? Phase::Prefill
                                                                                                    : Phase::Decode;
     const Json& ds = rd.array(rd.need(e, "devices", w), w + ".devices");
@@ -622,6 +803,7 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
       if (rt.execute == Execute::Hetero && p->groups.empty())
         rd.bad(w + ".placement." + s, "a hetero route needs unit groups for every set");
     }
+    route_placement_keys(rd, r, e, w, rt);
     r.routes.push_back(rt);
   }
 
@@ -674,6 +856,25 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
     }
   }
 
+  // Placement: reserved destination words are no set ids in a placement-mode recipe; executing sets are never
+  // optional; optional sets follow the others in set-id order (their binding order), so the canonical form does not
+  // depend on how they were declared.
+  bool any_placement = false;
+  for (const auto& rt : r.routes) any_placement = any_placement || rt.placement_mode();
+  for (const auto& d : r.devices) {
+    if (any_placement && reserved_destination(d.id))
+      rd.bad("match.devices." + d.id, "PL_E_SCHEMA \"" + d.id + "\" is a reserved destination word (placement mode)");
+    if (d.optional)
+      for (const auto& rt : r.routes)
+        if (std::find(rt.devices.begin(), rt.devices.end(), d.id) != rt.devices.end())
+          rd.bad("match.devices." + d.id + ".optional",
+                 "PL_E_SCHEMA route \"" + rt.id + "\" executes on it (only an assist set may be optional)");
+  }
+  std::stable_sort(r.devices.begin(), r.devices.end(), [](const RDevice& a, const RDevice& b) {
+    if (a.optional != b.optional) return !a.optional;
+    return a.optional && a.id < b.id;
+  });
+
   if (const Json* v = doc.find("pin")) {
     rd.array(*v, "pin");
     for (size_t i = 0; i < v->arr.size(); ++i) {
@@ -720,6 +921,11 @@ Json recipe_to_json(const Recipe& r) {
       il["gbps_min"] = fnum(d.internal_gbps_min);
       e["internal_link"] = il;
     }
+    // Placement selectors (after recipe-v1 shipped): written only when set.
+    if (d.optional) e["optional"] = Json::boolean(true);
+    if (!d.uuid.empty()) e["uuid"] = Json::string(d.uuid);
+    if (!d.pci.empty()) e["pci"] = Json::string(d.pci);
+    if (d.index >= 0) e["index"] = Json::number(d.index);
     devs.push(e);
   }
   m["devices"] = devs;
@@ -772,7 +978,8 @@ Json recipe_to_json(const Recipe& r) {
         // Added after recipe-v1 shipped: written only when set, so existing recipes keep their canonical bytes (and
         // the effective hash their profiles and compiled plans are bound to).
         if ((std::string(f.key) == "host_spare_units" || std::string(f.key) == "readahead_units" ||
-             std::string(f.key) == "host_prefetch_layers") &&
+             std::string(f.key) == "host_prefetch_layers" || std::string(f.key) == "host_pageable_gib" ||
+             std::string(f.key) == "host_available_floor_gib") &&
             p.v[k] == 0)
           continue;
         if ((std::string(f.key) == "weight_dirs" && p.weight_dirs.empty()) ||
@@ -826,6 +1033,32 @@ Json recipe_to_json(const Recipe& r) {
       pl[p.set] = pe;
     }
     e["placement"] = pl;
+    // Placement mode (after recipe-v1 shipped): written only when set.
+    if (rt.max_rows > 0) e["max_rows"] = Json::number(rt.max_rows);
+    if (rt.max_sequences > 0) e["max_sequences"] = Json::number(rt.max_sequences);
+    if (!rt.assists.empty()) {
+      Json as = Json::object();
+      for (const auto& a : rt.assists) {
+        Json ae = Json::object();
+        ae["device_gib"] = fnum(a.device_gib);
+        ae["margin_gib"] = fnum(a.margin_gib);
+        ae["margin_fraction"] = fnum(a.margin_fraction);
+        as[a.set] = ae;
+      }
+      e["assist"] = as;
+    }
+    if (!rt.components.empty()) {
+      Json cs = Json::object();
+      for (const auto& c : rt.components) {
+        Json ce = Json::object();
+        ce["device"] = Json::string(c.device);
+        if (c.has_gib) ce["gib"] = fnum(c.gib);
+        if (c.units >= 0) ce["units"] = Json::number(c.units);
+        if (c.has_layers) ce["layers"] = ranges_json(c.layers);
+        cs[c.id] = ce;
+      }
+      e["components"] = cs;
+    }
     routes.push(e);
   }
   j["routes"] = routes;

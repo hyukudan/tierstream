@@ -48,6 +48,9 @@ add_library(tierstream STATIC
   src/recipe.cpp
   src/recipe_resolve.cpp
   src/recipe_run.cpp
+  src/components.cpp
+  src/place.cpp
+  src/solve.cpp
   src/resident_set.cpp
   src/file_reader.cpp
   src/raw_file.cpp
@@ -216,7 +219,7 @@ if(TS_TESTS)
   target_link_libraries(ts-test-read-bench PRIVATE tierstream)
   add_test(NAME read-bench COMMAND ts-test-read-bench $<TARGET_FILE:ts-read-bench>)
   set_tests_properties(read-bench PROPERTIES TIMEOUT 60)
-  foreach(t core runtime recipe exclusive readahead snapshot mfile source-file)
+  foreach(t core runtime recipe exclusive readahead snapshot mfile source-file place)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
     target_include_directories(ts-test-${t} PRIVATE src)
@@ -251,6 +254,7 @@ if(TS_TESTS)
   set_tests_properties(devprof-tool PROPERTIES WILL_FAIL ON)  # no device under that root: refused, rc 1
   add_test(NAME devprof-tool-usage COMMAND ts-devprof --bogus)
   set_tests_properties(devprof-tool-usage PROPERTIES PASS_REGULAR_EXPRESSION "unknown argument --bogus")
+  add_test(NAME place COMMAND ts-test-place WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
   add_executable(ts-test-capi tests/test_capi.c)
   target_link_libraries(ts-test-capi PRIVATE tierstream)
@@ -335,6 +339,16 @@ if(TS_TESTS)
   foreach(r ${ts_example_recipes})
     add_test(NAME "example:${r}" COMMAND ts-recipe validate ${r} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endforeach()
+  # ts-recipe place on the contract's §2.5 recipe (placement-v1 out), and its PRO-only refusal (exit 1, units short).
+  add_test(NAME place-cli COMMAND ts-recipe place tests/data/placement/cli-recipe.toml --route decode_rtx
+           --probe tests/data/placement/cli-probe.json --components tests/data/placement/cli-components.json
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(place-cli PROPERTIES PASS_REGULAR_EXPRESSION "\"placement_sha256\":\"[0-9a-f]+\"")
+  add_test(NAME place-cli-refusal COMMAND ts-recipe place tests/data/placement/cli-recipe.toml --route decode_rtx
+           --probe tests/data/placement/cli-probe.json --components tests/data/placement/cli-components.json
+           --set routes.decode_rtx.assist.aux.device_gib=0 --set "routes.decode_rtx.components.drafter.device=\"auto\""
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(place-cli-refusal PROPERTIES WILL_FAIL TRUE)
   set(ts_citation_only bad-bad-quote bad-dangling-cite bad-empty-evidence-list bad-layers-uncited
       bad-uncited-idle-preload bad-uncited-threshold)
   file(GLOB ts_bad_recipes RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} recipes/examples/tests/bad-*.toml)

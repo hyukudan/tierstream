@@ -6,6 +6,9 @@
 //   ts-recipe select   RECIPE STATE.json [LAYERS]
 //   ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]
 //                      [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
+//   ts-recipe place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]
+//                      [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]
+//   ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]
 //   LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 // JSON on stdout; exit 0 = success, 1 = refusal (message on stderr), 2 = usage error.
 #include <cstdio>
@@ -18,6 +21,7 @@
 
 #include "json.hpp"
 #include "strix_stream/ss.h"
+#include "tierstream/ts_place.h"
 
 // The tool's own name (ts-recipe; ss-recipe for one release of the rename): every message starts with it.
 #ifndef TS_TOOL_NAME
@@ -27,13 +31,16 @@
 namespace {
 
 const char* kUsage =
-    "usage: " TS_TOOL_NAME " validate|explain|match|select|plan RECIPE [...]\n"
+    "usage: " TS_TOOL_NAME " validate|explain|match|select|plan|place|solve RECIPE [...]\n"
     "  validate RECIPE [LAYERS]\n"
     "  explain  RECIPE [LAYERS] [--json]\n"
     "  match    RECIPE PROBE.json [LAYERS]\n"
     "  select   RECIPE STATE.json [LAYERS]\n"
     "  plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]\n"
     "           [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]\n"
+    "  place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]\n"
+    "           [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]\n"
+    "  solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]\n"
     "  LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...\n";
 
 [[noreturn]] void usage(const std::string& why) {
@@ -85,7 +92,7 @@ struct DescHolder {
 int main(int argc, char** argv) {
   if (argc < 3) usage("missing command or recipe");
   const std::string cmd = argv[1];
-  if (cmd != "validate" && cmd != "explain" && cmd != "match" && cmd != "select" && cmd != "plan")
+  if (cmd != "validate" && cmd != "explain" && cmd != "match" && cmd != "select" && cmd != "plan" && cmd != "place" && cmd != "solve")
     usage("unknown command " + cmd);
   const std::string recipe_path = argv[2];
   int i = 3;
@@ -95,9 +102,10 @@ int main(int argc, char** argv) {
     input = argv[3];
     i = 4;
   }
-  std::string profile, identity, route, set, desc_path, benefit_path, id;
+  std::string profile, identity, route, set, desc_path, benefit_path, id, probe_path, components_path, usage_path,
+      context_path, inputs_path;
   int member = 0;
-  bool json_out = false;
+  bool json_out = false, explain_out = false;
   std::vector<std::string> overrides, sets, refs;
   for (; i < argc; ++i) {
     const std::string a = argv[i];
@@ -115,13 +123,27 @@ int main(int argc, char** argv) {
       sets.push_back(next());
     else if (a == "--json" && cmd == "explain")
       json_out = true;
-    else if (a == "--route" && cmd == "plan")
+    else if (a == "--route" && (cmd == "plan" || cmd == "place" || cmd == "solve"))
       route = next();
+    else if (a == "--probe" && (cmd == "place" || cmd == "solve"))
+      probe_path = next();
+    else if (a == "--components" && cmd == "place")
+      components_path = next();
+    else if (a == "--usage" && cmd == "place")
+      usage_path = next();
+    else if (a == "--context" && cmd == "place")
+      context_path = next();
+    else if (a == "--explain" && cmd == "place")
+      explain_out = true;
+    else if (a == "--inputs" && cmd == "solve")
+      inputs_path = next();
+    else if (a == "--table" && cmd == "solve")
+      explain_out = true;
     else if (a == "--id" && cmd == "plan")
       id = next();
     else if (a == "--member" && cmd == "plan")
       member = std::atoi(next().c_str());
-    else if (a == "--desc" && cmd == "plan")
+    else if (a == "--desc" && (cmd == "plan" || cmd == "place"))
       desc_path = next();
     else if (a == "--benefit" && cmd == "plan")
       benefit_path = next();
@@ -187,6 +209,46 @@ int main(int argc, char** argv) {
     ss_status st = cmd == "match" ? ss_recipe_match(r, t.data(), t.size(), &out, nullptr)
                                   : ss_recipe_select(r, t.data(), t.size(), &out, nullptr);
     if (st != SS_OK) refuse(cmd.c_str());
+    print_owned(out);
+    return 0;
+  }
+
+  if (cmd == "solve") {
+    if (route.empty() || probe_path.empty() || inputs_path.empty()) usage("solve needs --route, --probe and --inputs");
+    const std::string probe = slurp(probe_path), inputs = slurp(inputs_path);
+    char* tab = nullptr;
+    if (ts_solve(r, route.c_str(), probe.data(), probe.size(), inputs.data(), inputs.size(), &out, nullptr,
+                 explain_out ? &tab : nullptr, nullptr) != SS_OK)
+      refuse("solve");
+    if (explain_out) {
+      std::printf("%s", tab);
+      ss_free(tab);
+      ss_free(out);
+      return 0;
+    }
+    print_owned(out);
+    return 0;
+  }
+  if (cmd == "place") {
+    if (route.empty() || probe_path.empty() || components_path.empty())
+      usage("place needs --route, --probe and --components");
+    const std::string probe = slurp(probe_path), comps = slurp(components_path);
+    const std::string usage_text = usage_path.empty() ? std::string() : slurp(usage_path);
+    const std::string context_text = context_path.empty() ? std::string() : slurp(context_path);
+    DescHolder desc;
+    if (!desc_path.empty() && ss_desc_from_file(desc_path.c_str(), &desc.d) != SS_OK) refuse("descriptor");
+    char* ex = nullptr;
+    if (ts_place(r, route.c_str(), probe.data(), probe.size(), comps.data(), comps.size(), desc.d,
+                 usage_path.empty() ? nullptr : usage_text.data(), usage_text.size(),
+                 context_path.empty() ? nullptr : context_text.data(), context_text.size(), &out, nullptr,
+                 explain_out ? &ex : nullptr, nullptr) != SS_OK)
+      refuse("place");
+    if (explain_out) {
+      std::printf("%s", ex);
+      ss_free(ex);
+      ss_free(out);
+      return 0;
+    }
     print_owned(out);
     return 0;
   }

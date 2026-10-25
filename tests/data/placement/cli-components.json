@@ -1,0 +1,323 @@
+{
+ "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "capabilities": [
+  "multi_device"
+ ],
+ "components": [
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 8033731008,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "dense"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 2027110400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "head"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 177167400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "buffers"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 199286620,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "state"
+  },
+  {
+   "charges": [
+    {
+     "allocs": 0,
+     "at": "device",
+     "bytes": 726589440,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 61440,
+     "name": "dg.slot_table",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 348,
+     "name": "dg.controls",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "window"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 1073741824,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "graphs"
+  },
+  {
+   "id": "drafter",
+   "qualified": [
+    {
+     "arch": "sm_120",
+     "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+     "receipt_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    {
+     "arch": "sm_89",
+     "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+     "receipt_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+   ],
+   "variants": {
+    "anchor": [
+     {
+      "at": "device",
+      "bytes": 8053063680,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ],
+    "assist": [
+     {
+      "at": "device",
+      "bytes": 10593557320,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 64424509,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 23040,
+     "name": "dg.mapped",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 16777216,
+     "name": "dg.bounce",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 9953280,
+     "name": "dg.staging",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 61440,
+     "name": "dg.table_pin",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "staging"
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 1048576,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "relay"
+  }
+ ],
+ "config": {
+  "cache": "tierstream",
+  "cache_config": {
+   "dg_max_ids": 36,
+   "host_spares": 96,
+   "policy": "lru",
+   "prefetch": "off",
+   "spare_billing": "global",
+   "spares": 96,
+   "wait_timeout_ms": 2000,
+   "window_slots": 73
+  },
+  "max_context_tokens": 131072,
+  "max_rows": 6,
+  "max_sequences": 1
+ },
+ "context": {
+  "sm_120": 644245094,
+  "sm_89": 644245094
+ },
+ "context_growth": {
+  "sm_120": 0,
+  "sm_89": 0
+ },
+ "context_receipts": [
+  {
+   "alloc_granularity_bytes": 2097152,
+   "allowance_bytes": 644245094,
+   "arch": "sm_120",
+   "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "device_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "driver": "617.14",
+   "max_growth_bytes": 0,
+   "max_observed_bytes": 590000000,
+   "method": "pdh-process-dedicated",
+   "platform": "windows-wddm",
+   "receipt_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "runs": 5
+  },
+  {
+   "alloc_granularity_bytes": 2097152,
+   "allowance_bytes": 644245094,
+   "arch": "sm_89",
+   "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "device_name": "NVIDIA GeForce RTX 4090",
+   "driver": "617.14",
+   "max_growth_bytes": 0,
+   "max_observed_bytes": 590000000,
+   "method": "pdh-process-dedicated",
+   "platform": "windows-wddm",
+   "receipt_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+   "runs": 5
+  }
+ ],
+ "desc_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+ "elastic": {
+  "host_spares": 96,
+  "per_layer_units": 384,
+  "slot_allocs": 3,
+  "spare_billing": "global",
+  "spares": 96,
+  "unit_bytes": 9953280,
+  "units_total": 15360
+ },
+ "engine": "strix-cuda-ds41-replica",
+ "model_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+ "schema": "tierstream/components-v1"
+}

@@ -33,6 +33,12 @@ struct RDevice {
   bool has_internal_link = false;
   std::string internal_kind = "other";
   double internal_gbps_min = 0;
+  // Placement selectors (docs/recipes.md §3.2), each written to the canonical form only when set. An optional set
+  // is bound after the others and may stay unbound; uuid / pci equal the probe's normalized identity; index is the
+  // position among the host's probed devices of the same kind in PCI order (-1 = not set).
+  bool optional = false;
+  std::string uuid, pci;
+  int64_t index = -1;
   bool unified() const { return kind != SS_BACKEND_CUDA; }
 };
 
@@ -78,6 +84,34 @@ struct RWhen {
   }
 };
 
+// Placement mode (docs/recipes.md §5.4, contract placement-v1): per-route assists and component destinations.
+struct RAssist {  // routes.<id>.assist.<set>
+  std::string set;
+  double device_gib = 0, margin_gib = 0.5, margin_fraction = 0.03;  // device_gib 0 = disabled
+};
+struct RComponent {  // routes.<id>.components.<component>
+  std::string id;
+  std::string device = "auto";  // a set id (anchor or assist) | host_pinned | host_pageable | file | auto
+  bool has_gib = false;
+  double gib = 0;    // elastic ids only
+  int64_t units = -1;  // elastic ids only: an exact unit count (exclusive with gib; -1 = not set)
+  bool has_layers = false;  // reserved: refused by the planner (PL_E_CAPABILITY)
+  std::vector<std::pair<int, int>> layers;
+};
+
+// The closed list of component ids, in priority order (contract §1.1): ties and output orders follow it.
+struct ComponentInfo {
+  const char* id;
+  const char* dflt;  // "anchor" | "host_pinned" | "host_pageable" | "file" | "" (no default: capability only)
+  bool elastic;      // takes `gib` / `units`
+};
+const std::vector<ComponentInfo>& component_table();
+int component_priority(const std::string& id);  // 1-based; 0 = not a component id
+bool reserved_destination(const std::string& word);  // auto, host_pinned, host_pageable, file
+// Probe identities, normalized: "GPU-" + lowercase hex; dddd:bb:dd.f lowercase ("" when not a PCI address).
+std::string normalize_uuid(const std::string& s);
+std::string normalize_pci(const std::string& s);
+
 struct RRoute {
   std::string id;
   Phase phase = Phase::Prefill;
@@ -89,7 +123,15 @@ struct RRoute {
   std::string fallback;  // empty = none
   bool enabled = true;   // false: admits no request (docs/recipes.md §5)
   std::vector<RPlacement> placements;
+  // Placement mode: 0 = not set (max_rows defaults to 1, max_sequences to the anchor placement's max_batch).
+  int64_t max_rows = 0, max_sequences = 0;
+  std::vector<RAssist> assists;        // sorted by set id
+  std::vector<RComponent> components;  // sorted by priority
   const RPlacement* placement(const std::string& set) const;
+  const RAssist* assist(const std::string& set) const;
+  const RComponent* component(const std::string& cid) const;
+  // A route with an assist or components table plans through ts_place (the engine's --placement opts any route in).
+  bool placement_mode() const { return !assists.empty() || !components.empty(); }
 };
 
 struct Recipe {
@@ -168,9 +210,15 @@ struct BoundMember {
   std::string id, host, driver;
   int64_t ordinal = -1;
   double disk_read_gbytes_ps = -1, h2d_gbytes_ps = -1;  // -1 = not probed
+  // Physical identity (placement): phys = PCI address if probed, else UUID, else the probe id.
+  std::string kind, name, uuid, pci, phys, arch;
+  std::string platform;  // probe row "platform", else the report's (context-v1 key), "" = not probed
+  double memory_gib = 0;
+  int64_t memory_bytes = -1;  // probed exact bytes, -1 = not probed (gib_bytes(memory_gib) then)
 };
 struct Binding {
-  std::vector<std::pair<std::string, std::vector<BoundMember>>> sets;  // recipe set order
+  // Recipe set order; an unbound optional set has no members.
+  std::vector<std::pair<std::string, std::vector<BoundMember>>> sets;
   const std::vector<BoundMember>* of(const std::string& set) const;
 };
 

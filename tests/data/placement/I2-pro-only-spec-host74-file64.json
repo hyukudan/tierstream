@@ -1,0 +1,333 @@
+{
+ "alloc_granularity": {
+  "sm_120": 2097152,
+  "sm_89": 2097152
+ },
+ "anchor": "rtx",
+ "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "capabilities": [
+  "multi_device",
+  "file_expert_tier"
+ ],
+ "components": [
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 8033731008,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "dense"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 2027110400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "head"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 177167400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "buffers"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 199286620,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "state"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "allocs": 0,
+     "at": "device",
+     "bytes": 726589440,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 61440,
+     "name": "dg.slot_table",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 348,
+     "name": "dg.controls",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "window"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 1073741824,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "graphs"
+  },
+  {
+   "default": "anchor",
+   "id": "drafter",
+   "qualified": [
+    "sm_120",
+    "sm_89"
+   ],
+   "variants": {
+    "anchor": [
+     {
+      "at": "device",
+      "bytes": 8053063680,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ],
+    "assist": [
+     {
+      "at": "device",
+      "bytes": 10593557320,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 64424509,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 23040,
+     "name": "dg.mapped",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 16777216,
+     "name": "dg.bounce",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 9953280,
+     "name": "dg.staging",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 61440,
+     "name": "dg.table_pin",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "host_pinned",
+   "id": "staging"
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 67108864,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "file",
+   "id": "expert_file"
+  }
+ ],
+ "context": {
+  "sm_120": 644245094,
+  "sm_89": 644245094
+ },
+ "context_receipts": [
+  [
+   "sm_120",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "617.14",
+   "windows-wddm",
+   "0000000000000000000000000000000000000000000000000000000000000000"
+  ],
+  [
+   "sm_89",
+   "NVIDIA GeForce RTX 4090",
+   "617.14",
+   "windows-wddm",
+   "0000000000000000000000000000000000000000000000000000000000000000"
+  ]
+ ],
+ "devices": [
+  {
+   "arch": "sm_120",
+   "bound": true,
+   "budget_gib": 90.0,
+   "driver": "617.14",
+   "margin_frac_ppm": 0,
+   "margin_gib": 0.6,
+   "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "platform": "windows-wddm",
+   "set": "rtx"
+  },
+  {
+   "arch": "sm_89",
+   "bound": true,
+   "budget_gib": 0.0,
+   "driver": "617.14",
+   "margin_frac_ppm": 30000,
+   "margin_gib": 0.5,
+   "name": "NVIDIA GeForce RTX 4090",
+   "platform": "windows-wddm",
+   "set": "aux"
+  }
+ ],
+ "explicit": {},
+ "file_units": 64,
+ "host_pinned_gib": 74.0,
+ "host_spare_units": 96,
+ "priority": [
+  "dense",
+  "head",
+  "buffers",
+  "state",
+  "window",
+  "graphs",
+  "drafter",
+  "relay",
+  "staging",
+  "expert_file"
+ ],
+ "slot_allocs": 3,
+ "spares_units": 96,
+ "total_units": 15360,
+ "unit_bytes": 9953280
+}

@@ -27,23 +27,38 @@ SCHEMA = "strix-stream/recipe-v1"
 TOP = {"schema", "name", "description", "generated_by", "pin", "match", "limits", "routes"}
 MATCH = {"model", "model_sha256", "engine", "devices", "links"}
 DEVICE = {"id", "kind", "count", "name", "memory_min_gib", "host_ram_min_gib", "disk_read_gbytes_ps_min",
-          "h2d_gbytes_ps_min", "internal_link"}
+          "h2d_gbytes_ps_min", "internal_link", "optional", "uuid", "pci", "index"}
 LINK = {"id", "between", "kind", "gbps_min"}
 LIMITS = {"host_free_ram_floor_gib", "host_free_commit_floor_gib"}
-ROUTE = {"id", "phase", "enabled", "devices", "execute", "handoff_route", "links", "when", "fallback", "placement"}
+ROUTE = {"id", "phase", "enabled", "devices", "execute", "handoff_route", "links", "when", "fallback", "placement",
+         "max_rows", "max_sequences", "assist", "components"}
 WHEN = {"prompt_tokens_min", "prompt_tokens_max", "batch_min", "batch_max"}
 BUDGET = {"device_gib", "host_pinned_gib", "workspace_gib", "max_context_tokens", "max_batch", "margin_gib",
-          "margin_fraction", "dynamic_slots_per_layer", "ring_slots", "pinned_backing", "tier_mode"}
+          "margin_fraction", "dynamic_slots_per_layer", "ring_slots", "pinned_backing", "tier_mode",
+          "host_pageable_gib", "host_available_floor_gib"}
 OPTIONS = {"policy", "lookahead_units", "reader_threads", "staging_buffers", "staging_mib", "copy_piece_mib",
            "score_window", "pin_planned", "fill_residents", "direct_io", "verify_hash", "group_units",
            "spec_persistent"}
 ENGINE = {"prefetch_layers", "chunk_tokens", "routed_only_max_tokens", "idle_preload_layers", "max_copies_per_token"}
 PLACEMENT = BUDGET | OPTIONS | ENGINE | {"units"}
 UNITS = {"id", "class", "layers", "rank", "list", "resident", "pinned", "rest", "peer"}
+# Placement mode (docs/recipes.md §5.4; contract placement-v1 §1.1, §2.2-2.3)
+ASSIST = {"device_gib", "margin_gib", "margin_fraction"}
+COMPONENT = {"device", "gib", "units", "layers"}
+COMPONENT_IDS = ["context", "dense", "head", "mtp", "buffers", "state", "window", "graphs", "drafter", "relay", "ple",
+                 "spares", "arena", "layer_slots", "expert_host", "layer_host", "expert_assist", "expert_compute",
+                 "expert_file", "engram", "staging", "pageable"]
+ELASTIC = {"arena", "layer_slots", "expert_host", "layer_host", "expert_assist", "expert_compute", "expert_file"}
+RESERVED = {"auto", "host_pinned", "host_pageable", "file"}
+CUDA_UUID = re.compile(r"GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")
+PCI = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\Z")
 SETTABLE = ([("limits", k) for k in LIMITS] +
             [("match", "devices", "*", k) for k in ("name", "memory_min_gib", "host_ram_min_gib",
                                                    "disk_read_gbytes_ps_min", "h2d_gbytes_ps_min")] +
             [("match", "links", "*", "gbps_min"), ("routes", "*", "fallback"), ("routes", "*", "enabled")] +
+            [("routes", "*", "max_rows"), ("routes", "*", "max_sequences")] +
+            [("routes", "*", "assist", "*", k) for k in ASSIST] +
+            [("routes", "*", "components", "*", k) for k in ("device", "gib", "units")] +
             [("routes", "*", "when", k) for k in WHEN] +
             [("routes", "*", "placement", "*", k) for k in BUDGET | OPTIONS | ENGINE] +
             [("routes", "*", "placement", "*", "units", "*", k) for k in ("layers", "rank", "list", "resident", "pinned")])
@@ -57,10 +72,12 @@ CITED_LEAVES = {"prompt_tokens_min", "prompt_tokens_max", "batch_min", "batch_ma
                 "staging_buffers", "prefetch_layers", "chunk_tokens", "routed_only_max_tokens", "lookahead_units",
                 "resident", "pinned", "list", "host_free_ram_floor_gib", "margin_gib", "margin_fraction",
                 "reader_threads", "copy_piece_mib", "score_window", "group_units", "layers", "h2d_gbytes_ps_min",
-                "host_free_commit_floor_gib", "idle_preload_layers", "max_copies_per_token"}
+                "host_free_commit_floor_gib", "idle_preload_layers", "max_copies_per_token",
+                "host_pageable_gib", "host_available_floor_gib", "max_rows", "max_sequences", "gib"}
 ZERO_EXEMPT = {"prompt_tokens_min", "host_pinned_gib", "dynamic_slots_per_layer", "ring_slots", "chunk_tokens",
                "routed_only_max_tokens", "pinned", "resident", "prefetch_layers", "lookahead_units", "group_units",
-               "idle_preload_layers", "max_copies_per_token", "host_free_commit_floor_gib", "h2d_gbytes_ps_min"}
+               "idle_preload_layers", "max_copies_per_token", "host_free_commit_floor_gib", "h2d_gbytes_ps_min",
+               "host_pageable_gib", "host_available_floor_gib"}
 BASIS = {"measured", "derived", "projected", "upper_bound", "lower_bound", "target"}
 PRED = {"route", "metric", "value", "basis", "evidence", "at_prompt_tokens", "context_tokens", "concurrency",
         "batch", "scope", "date"}
@@ -176,6 +193,14 @@ def validate(path, root):
                 if d["internal_link"].get("kind") not in ("usb4", "ethernet", "pcie", "other"):
                     c.err(f"{w}.internal_link.kind", "usb4 | ethernet | pcie | other")
                 c.num(d["internal_link"], "gbps_min", f"{w}.internal_link", 0)
+            c.boolean(d, "optional", w)
+            if "uuid" in d and not (isinstance(d["uuid"], str) and (d.get("kind") != "cuda" or CUDA_UUID.match(d["uuid"]))):
+                c.err(f"{w}.uuid", "GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, lowercase hex (cuda)")
+            if "pci" in d and not (isinstance(d["pci"], str) and PCI.match(d["pci"])):
+                c.err(f"{w}.pci", "dddd:bb:dd.f, lowercase")
+            c.num(d, "index", w, 0, 1023, integer=True)
+            if any(k in d for k in ("optional", "uuid", "pci", "index")) and (cnt != 1 or d.get("kind") == "cpu"):
+                c.err(w, "optional / uuid / pci / index: a cuda or hip set with count 1")
             if i in sets:
                 c.err(w, "duplicate set id")
             sets[i] = dict(d, count=cnt)
@@ -300,6 +325,7 @@ def route_checks(c, i, rt, byid, sets, links):
         fb = None
     if fb is not None and (fb == i or byid.get(fb, {}).get("phase") != ph):
         c.err(f"{w}.fallback", "a route of the same phase, not itself")
+    placement_mode_checks(c, w, rt, sets, devs, ex)
     pl = rt.get("placement", {})
     if not c.table(pl, f"{w}.placement"):
         return
@@ -308,6 +334,59 @@ def route_checks(c, i, rt, byid, sets, links):
             c.err(f"{w}.placement", f"set {s!r} has no placement")
     for s, p in pl.items():
         placement_checks(c, f"{w}.placement.{s}", s, p, sets, devs, ex)
+
+
+def placement_mode_checks(c, w, rt, sets, devs, ex):
+    c.num(rt, "max_rows", w, 1, 65536, integer=True)
+    c.num(rt, "max_sequences", w, 1, 65536, integer=True)
+    assists = rt.get("assist", {})
+    if c.table(assists, f"{w}.assist"):
+        for s, a in assists.items():
+            if s.startswith("x-"):
+                continue
+            aw = f"{w}.assist.{s}"
+            if s not in sets:
+                c.err(aw, "PL_E_UNKNOWN_DEVICE: not a declared set")
+            elif s in devs:
+                c.err(aw, "an assist is not one of the route's devices")
+            elif sets[s]["count"] != 1 or sets[s].get("kind") == "cpu":
+                c.err(aw, "an assist is a cuda or hip set with count 1")
+            if c.keys(a, ASSIST, aw):
+                c.num(a, "device_gib", aw, 0, 1048576)
+                c.num(a, "margin_gib", aw, 0, 64)
+                c.num(a, "margin_fraction", aw, 0, 0.5)
+    comps = rt.get("components", {})
+    if c.table(comps, f"{w}.components"):
+        dests = RESERVED | set(devs[:1]) | {s for s in (assists if isinstance(assists, dict) else {})}
+        for cid, e in comps.items():
+            if cid.startswith("x-"):
+                continue
+            cw = f"{w}.components.{cid}"
+            if cid not in COMPONENT_IDS:
+                c.err(cw, "PL_E_UNKNOWN_COMPONENT")
+            if not c.keys(e, COMPONENT, cw):
+                continue
+            if "device" in e and e["device"] not in dests:
+                c.err(f"{cw}.device", "PL_E_UNKNOWN_DEVICE: the anchor, an assist, host_pinned, host_pageable, file "
+                                      "or auto")
+            if "gib" in e:
+                if cid not in ELASTIC:
+                    c.err(f"{cw}.gib", "PL_E_SCHEMA: elastic components only")
+                c.num(e, "gib", cw, 0, 1048576)
+            if "units" in e:
+                if cid not in ELASTIC:
+                    c.err(f"{cw}.units", "PL_E_SCHEMA: elastic components only")
+                if "gib" in e:
+                    c.err(cw, "PL_E_SCHEMA: gib and units are exclusive")
+                c.num(e, "units", cw, 0, 2 ** 32, integer=True)
+    if ("max_rows" in rt or "max_sequences" in rt) and not ("assist" in rt or "components" in rt):
+        c.err(w, "PL_E_SCHEMA: max_rows / max_sequences only on a placement-mode route")
+    if "assist" in rt or "components" in rt:
+        if ex != "single":
+            c.err(f"{w}.execute", "a placement-mode route is 'single' (one anchor)")
+        for s in sets:
+            if s in RESERVED:
+                c.err(f"match.devices.{s}", "PL_E_SCHEMA: reserved destination word as a set id")
 
 
 def placement_checks(c, pw, s, p, sets, devs, ex):
@@ -324,6 +403,8 @@ def placement_checks(c, pw, s, p, sets, devs, ex):
     c.num(p, "max_batch", pw, 1, 65536, integer=True, required=True)
     c.num(p, "margin_gib", pw, 0, 64)
     c.num(p, "margin_fraction", pw, 0, 0.5)
+    c.num(p, "host_pageable_gib", pw, 0, 1048576)
+    c.num(p, "host_available_floor_gib", pw, 0, 1048576)
     for k, lo, hi in (("dynamic_slots_per_layer", 0, 65536), ("ring_slots", 0, 65536), ("lookahead_units", 0, 64),
                       ("reader_threads", 1, 64), ("staging_buffers", 2, 64), ("staging_mib", 1, 16384),
                       ("copy_piece_mib", 1, 4096), ("score_window", 1, 4096), ("group_units", 0, 65536),
@@ -440,6 +521,11 @@ def pin_ok(pth, r):
                 pl = (rt.get("placement") or {}).get(sg) if ok and isinstance(rt.get("placement"), dict) else None
             elif pat[i - 1] == "units":
                 ok = isinstance(pl, dict) and sg in ids(pl.get("units"))
+            elif pat[i - 1] == "assist":
+                devs = rt.get("devices") if isinstance(rt, dict) else None
+                ok = sg in ids(m.get("devices")) and not (isinstance(devs, list) and sg in devs)
+            elif pat[i - 1] == "components":
+                ok = sg in COMPONENT_IDS
             if not ok:
                 break
         if ok:
@@ -451,7 +537,7 @@ def needs_cite(leaf_path, value):
     leaf = leaf_path.rsplit(".", 1)[-1]
     if leaf not in CITED_LEAVES:
         return False
-    if leaf in ("max_batch", "batch_max", "batch_min") and value == 1:
+    if leaf in ("max_batch", "batch_max", "batch_min", "max_rows", "max_sequences") and value == 1:
         return False  # one sequence = the engines' one-prompt contract, not a calibrated threshold
     if leaf in ZERO_EXEMPT and value == 0:
         return False

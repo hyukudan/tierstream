@@ -142,6 +142,29 @@ Success returns `strix-stream/recipe-match-v1` (§8.2): the binding (set → mem
 failure is refused with every unmet requirement, e.g. `match.devices.rtx: needs 1 cuda device named "RTX PRO 6000"
 with >= 94 GiB; eligible: 0 of 2 probed (NVIDIA GeForce RTX 4090 23.6 GiB: memory)`.
 
+### 3.2 Placement selectors and optional sets
+
+Added after recipe-v1 shipped (written to the canonical form only when set, so recipes without them keep their
+canonical bytes and `effective_sha256`). Only on a `cuda` or `hip` set with `count = 1`.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `optional` | bool | false | the set may stay unbound (an assist GPU, §5.4); a set a route executes on is never optional |
+| `uuid` | string | absent | equals the probe's normalized UUID (`GPU-` + 8-4-4-4-12 lowercase hex on `cuda`; a `hip` uuid selector is refused by the planner, `PL_E_CAPABILITY`) |
+| `pci` | string `dddd:bb:dd.f`, lowercase | absent | equals the probe's PCI address |
+| `index` | integer >= 0 | absent | position among the probed devices of the set's kind on the same host, sorted by PCI address (never CUDA's enumeration order); every candidate needs a PCI address (`PL_E_SCHEMA` otherwise) |
+
+All selectors must hold. Binding with optional sets: the other sets are bound by the search of §3.1, unchanged; then
+the optional sets, in set-id order, each take the first free eligible device in ascending physical order (PCI address,
+else UUID, else probe id) on their anchor's host (the host of the first route listing the set as an assist). An
+unbound optional set appears as `"<set>": []` in `recipe-match-v1`, and as `{unbound = true}` in a profile's
+`key.devices` / `key.drivers` / `probe` (and `key.descriptors`, or absent there); a profile tuned with the set bound
+never matches a run with it unbound, and vice versa. Optional sets are written to the canonical form after the others,
+in set-id order. **Binding mode is per recipe:** a recipe with a placement-mode route (§5.4) merges probe alias rows
+(rows sharing a PCI address or UUID are one device; rows that disagree are refused `PL_E_DUPLICATE_DEVICE`) and refuses
+malformed probe `pci` values; any other recipe binds exactly as before. Probe rows may carry `uuid`, `pci`, `arch`
+(`sm_XY` / `gfxNNNN`) and `memory_bytes` for the planner.
+
 ## 4. `[limits]`
 
 | field | type | default | meaning |
@@ -374,6 +397,84 @@ with the fixed bytes that side computes. Splitting the experts of one layer acro
 engine's internal layout and not a recipe placement in v1. `PAIR` units take no stream ring (the library never
 fetches them).
 
+### 5.4 Placement mode: per-GPU assists and components (`ts-recipe place`)
+
+A route is in **placement mode** when it has an `assist` or a `components` table (or the engine is started with
+`--placement` / its sugar flags). Such a route plans through the placement planner (`ts_place`,
+wave4/placement/contract.md) instead of `ss_recipe_plan`; legacy routes are untouched. Placement mode needs
+`execute = "single"` (one anchor: the route's set) and refuses set ids equal to the reserved destination words
+`auto`, `host_pinned`, `host_pageable`, `file`.
+
+```toml
+[[match.devices]]
+id = "aux"
+kind = "cuda"
+memory_min_gib = 12
+optional = true
+
+[[routes]]
+id = "decode_rtx"
+phase = "decode"
+devices = ["rtx"]
+execute = "single"
+max_rows = 6
+[routes.placement.rtx]
+device_gib = 90.0
+host_pinned_gib = 68.0
+host_pageable_gib = 6.0
+host_available_floor_gib = 6.0
+max_context_tokens = 131072
+max_batch = 1
+margin_gib = 0.6
+margin_fraction = 0.0
+[routes.assist.aux]
+device_gib = 12.0
+[routes.components.drafter]
+device = "aux"
+```
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `routes.<id>.max_rows` | integer 1..65536 | 1 | verify rows (placement mode only, `PL_E_SCHEMA` on a legacy route) |
+| `routes.<id>.max_sequences` | integer 1..65536 | `max_batch` | sequences (placement mode only) |
+| `routes.<id>.assist.<set>` | table keyed by a `match.devices` set | absent | an assist GPU: not in `devices`, `count = 1`, `cuda` (a `hip` assist is refused by the planner), on the anchor's host |
+| `...assist.<set>.device_gib` | float >= 0 | 0 | the assist's budget; 0 = disabled; <= the bound device's memory (`PL_E_BUDGET_ABOVE_DEVICE`) |
+| `...assist.<set>.margin_gib` / `margin_fraction` | float | 0.5 / 0.03 | the assist's margin = max(margin_gib, fraction x budget) |
+| `routes.<id>.components.<id>` | table keyed by a component id | absent | one of `context dense head mtp buffers state window graphs drafter relay ple spares arena layer_slots expert_host layer_host expert_assist expert_compute expert_file engram staging pageable` (`PL_E_UNKNOWN_COMPONENT` otherwise) |
+| `...components.<id>.device` | string | `"auto"` | the anchor's set, an assist set, `host_pinned`, `host_pageable`, `file` or `auto` (the component's default; auto never chooses an assist) |
+| `...components.<id>.gib` | float >= 0 | absent | elastic ids only (`arena`, `expert_*`, `layer_*`): a size, units = floor(bytes / unit_bytes) |
+| `...components.<id>.units` | integer >= 0 | absent | elastic ids only, exclusive with `gib`: an exact unit count |
+| `...components.<id>.layers` | layer list | absent | reserved: refused by the planner (`PL_E_CAPABILITY`) |
+| `routes.<id>.placement.<set>.host_pageable_gib` | float >= 0 | 0 (not checked) | the engine's pageable host budget (§5.1 field, written only when set) |
+| `routes.<id>.placement.<set>.host_available_floor_gib` | float >= 0 | 0 (not checked) | host memory kept available (§5.1 field, written only when set) |
+
+Every key is written to the canonical form only when present. Schema-time refusals carry the planner's codes in the
+message (`PL_E_SCHEMA`, `PL_E_UNKNOWN_COMPONENT`, `PL_E_UNKNOWN_DEVICE`); whatever needs the binding or the engine's
+`tierstream/components-v1` document (capabilities, receipts, budgets, coverage) is checked by the planner, which
+reports one `PL_E_<CODE>` line per error of the failing validation phase (V1 schema, V2 binding, V3 descriptor, V4
+feasibility). Its inputs: the effective recipe and route, a probe report (§8.2), the engine's components-v1 for that
+configuration and, optionally, the desc-v1 (its benefit ranks the units when there is no usage-v1; the TierSite library
+plan on its tier-only projection needs the device-gated context and is not in this build),
+`tierstream/usage-v1` (the unit rank: the producer's per-layer `count` / `use` / `recency` arrays, ranked by use desc,
+recency desc, layer, unit) and `tierstream/context-v1` (attributable per-process context samples). The
+context allowance of a touched device applies only with a components-v1 `context_receipts` entry for exactly its
+arch, device name, driver, platform and the build (`PL_E_MISSING_CONTEXT` naming the field otherwise). Its output is
+`tierstream/placement-v1`: per touched device the lines, budget, margin, context and phase peaks; the host lines
+(`expert_host` blocks / homes / host spares, `expert_file` units / spilled), the per-layer `units` assignment and the
+`seed`, decisions, alternatives (never chosen automatically) and `placement_sha256`.
+
+`ts-recipe solve` plans one row per choice (mode, R, context, sequences, each with its own components-v1) and
+predicts its tok/s from `tierstream/miss-curve-v1` curves and `tierstream/solver-costs-v1` (integer arithmetic,
+tags `knot` / `interpolated` / `clamped_high` / `unpredicted`). Each row's calibration identity (`calib`: devices,
+link, build / content / arithmetic hashes, prefetch, tier mode, driver, platform, policy, usage) is derived by the
+solver (`xfer` = sha256 of the probe's transfer profile `tierstream/xfer-v1`, `cache_sha256` over `elastic` +
+`config.cache_config` without the R-derived fields, `file_store` / `engram_store`; curves must be out of sample and the
+probe's transfer figures within 10 % of the calibration run's); costs or curves whose `applicability` lacks a required key or differs from it
+predict nothing. A row's FILE rate comes from its language's own usage-v1 (`usage_lang`) over the cold set the pooled
+usage-v1 chose; FILE units without that table are `unpredicted`. A row refused only for pinned host while the engine
+lacks `file_expert_tier` is planned hypothetically with the FILE tier and marked `requires: [file_expert_tier]`. Output
+`tierstream/solver-v1`; nothing is ranked or picked.
+
 ## 6. Profiles, overrides and resolution
 
 ### 6.1 Layers and precedence
@@ -435,7 +536,11 @@ field (`device_gib`, `host_pinned_gib`, `workspace_gib`, `max_context_tokens`, `
 `margin_fraction`, `dynamic_slots_per_layer`, `ring_slots`, `pinned_backing`, `host_spare_units`, `staging_buffers`,
 `staging_mib`, `tier_mode`) of a placement the
 profile sets anything in, or any `match.*` field, is refused ("drop the profile or retune"); the same holds when the
-profile is added after such an override.
+profile is added after such an override. Placement mode extends the tuned scopes: `host_pageable_gib` and
+`host_available_floor_gib` are budget fields; a profile that writes a route's `assist.*`, `components.*`, `max_rows` or
+`max_sequences` tunes that route's whole layout (no override may change any of those, nor a budget of the route's
+placements), and a profile that tunes a route's placement guards the route's `assist.*`, `components.*`, `max_rows`
+and `max_sequences` too.
 
 Overrides (`strix-stream/recipe-overrides-v1`): `recipe` (required, must equal the name), `recipe_sha256` (optional,
 checked when set), `source`, `set`. `ss_recipe_set(path, value)` is a one-entry overrides layer whose value is TOML
@@ -458,6 +563,10 @@ bypassed by replacing a parent):
 - `routes.<route>.placement.<set>.` every field of §5.1 (a placement the recipe does not have is created for that set
   when the set is in the route's `devices`)
 - `routes.<route>.placement.<set>.units.<group>.` `layers`, `rank`, `list`, `resident`, `pinned`
+- `routes.<route>.max_rows`, `routes.<route>.max_sequences`
+- `routes.<route>.assist.<set>.` `device_gib`, `margin_gib`, `margin_fraction` (`<set>` a `match.devices` set that is
+  not one of the route's devices; a layer may create the table)
+- `routes.<route>.components.<id>.` `device`, `gib`, `units`
 
 Structure belongs to the recipe and is not settable: `schema`, `name`, `pin`, every `id`, `match.model`,
 `model_sha256`, `engine`, a set's `kind`, `count`, `internal_link`, a link's `between` and `kind`, a route's `phase`,
@@ -632,7 +741,36 @@ ts-recipe match    RECIPE PROBE.json [LAYERS]
 ts-recipe select   RECIPE STATE.json [LAYERS]
 ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json
                    [--benefit FILE] [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
+ts-recipe place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]
+                   [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]
+ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]
 LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 ```
 
-JSON on stdout. Exit 0 on success, 1 on a refusal (message on stderr), 2 on a usage error.
+JSON on stdout. Exit 0 on success, 1 on a refusal (message on stderr), 2 on a usage error. `place` prints
+`tierstream/placement-v1` (or, with `--explain`, the explanation printed from the same numbers); a refusal lists one
+`PL_E_<CODE>` line per error. `solve` prints `tierstream/solver-v1` (or, with `--table`, the rows as a table).
+
+### 8.5 Placement C ABI (`include/tierstream/ts_place.h`)
+
+Functions added after the rename exist only under their tierstream names (`ss.h` is frozen by the rename's byte
+gate); `tierstream/ts.h` includes the header.
+
+```c
+ts_status ts_place(const ts_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                   const char* components_json, size_t components_len, const ts_desc* desc,
+                   const char* usage_json, size_t usage_len, const char* context_json, size_t context_len,
+                   char** out_json, size_t* out_len, char** explain, size_t* explain_len);
+ts_status ts_place_from_flags(const char* probe_json, size_t probe_len, const char* components_json,
+                              size_t components_len, int argc, const char* const* argv, char** out_json,
+                              size_t* out_len, char** explain, size_t* explain_len);
+ts_status ts_solve(const ts_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                   const char* inputs_json, size_t inputs_len, char** out_json, size_t* out_len, char** table,
+                   size_t* table_len);
+```
+
+`ts_place_from_flags` takes the engine's sugar flags (`--anchor DEV`, `--gpu-budget-gib DEV=X[,...]`,
+`--device-map COMP=DEV[,...]`, `--host-pinned-gib X`, `--host-pageable-gib X`, `--host-available-floor-gib X`,
+`--margin-gib X`, `--margin-fraction X`; `DEV` = `gpuN` (PCI order among the probe's devices of the backend on the host
+of runtime ordinal 0) | `uuid:` (CUDA only) | `pci:` | `name:` (exactly one match)) and plans the recipe they make
+(sets named `gpuN`, route `flags`). A refusal returns `SS_E_RECIPE` with the `PL_E_*` lines as the message.

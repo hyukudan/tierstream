@@ -1,0 +1,36 @@
+# contract placement-v1 rev 4 section 2.5, literally (G4 J)
+schema = "tierstream/recipe-v1"
+name = "ds41-rtx-replica-pro-plus-aux"
+[match]
+model = "DeepSeek-V4.1-Flash"
+engine = "strix-cuda-ds41-replica"
+[[match.devices]]
+id = "rtx"
+kind = "cuda"
+name = "RTX PRO 6000"
+memory_min_gib = 94
+host_ram_min_gib = 120
+[[match.devices]]
+id = "aux"
+kind = "cuda"
+memory_min_gib = 12
+optional = true
+[[routes]]
+id = "decode_rtx"
+phase = "decode"
+devices = ["rtx"]
+execute = "single"
+max_rows = 6
+[routes.placement.rtx]
+device_gib = 90.0
+host_pinned_gib = 68.0
+host_pageable_gib = 6.0
+host_available_floor_gib = 6.0
+max_context_tokens = 131072
+max_batch = 1
+margin_gib = 0.6                  # explicit (see §2.2 Margins): context/graphs/buffers are explicit lines
+margin_fraction = 0.0
+[routes.assist.aux]
+device_gib = 12.0                 # assist margin defaults 0.5 / 0.03
+[routes.components.drafter]
+device = "aux"
