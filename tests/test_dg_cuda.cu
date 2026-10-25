@@ -1,0 +1,438 @@
+// Device-gated decode mode on a GPU (design rev 3.2 §8.3; one short PC-BIG). A synthetic MoE step per token: for
+// every gated layer, export its routed ids, wait, and checksum every part of every routed unit through ss_dg_slot and
+// the part strides, in a CUDA graph captured once (and eagerly). Every checksum is compared with the file's bytes.
+// Phases: eager, graph, prediction on, 8 -> 0 -> 8 graph switching, pressure (banks, resurrections, mid-token
+// collects, MRU evictions), the failure paths (a stopped service, an out-of-range id) and three mutations that must
+// produce wrong checksums or a failed token: no ready wait (copies delayed by a gate), no completion edge (a delayed
+// last reader under MRU evictions), and the ids check.
+//   ss-test-dg-cuda [--only NAME]
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <random>
+#include <string>
+#include <vector>
+
+#include "check.hpp"
+#include "dg_fixture.hpp"
+#include "strix_stream/ss.h"
+
+extern "C" ss_status ss_test_dg_mutate(ss_ctx* c, int m);
+extern "C" ss_status ss_test_dg_pressure(ss_ctx* c, uint32_t free_per_token, uint32_t evict_recent);
+extern "C" ss_status ss_test_dg_check(ss_ctx* c);
+extern "C" ss_status ss_test_dg_gate(ss_ctx* c, int stream, void* event);
+extern "C" ss_status ss_test_dg_flags(ss_ctx* c, uint32_t flags);
+extern "C" ss_status ss_test_dg_stop_service(ss_ctx* c);
+
+using sstest::DgModel;
+
+namespace {
+
+#define CU(x)                                                                                      \
+  do {                                                                                             \
+    cudaError_t e_ = (x);                                                                          \
+    if (e_ != cudaSuccess) {                                                                       \
+      std::printf("  %s:%d: %s -> %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_));          \
+      ++sstest::failures();                                                                        \
+    }                                                                                              \
+  } while (0)
+
+__device__ __forceinline__ unsigned long long gtimer() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+__global__ void spin_ns(unsigned long long ns) {
+  const unsigned long long t0 = gtimer();
+  while (gtimer() - t0 < ns) {
+  }
+}
+
+// One block per routed id: the unit's bytes (its parts back to back) summed as byte x (position % 251 + 1).
+__global__ void checksum(ss_dg_device_view v, uint32_t g, const int32_t* ids, unsigned long long* out) {
+  const int32_t slot = ss_dg_slot(&v, g, ids[blockIdx.x]);
+  unsigned long long s = 0;
+  uint64_t pos0 = 0;
+  for (uint32_t p = 0; p < v.n_parts; ++p) {
+    const unsigned char* base = static_cast<const unsigned char*>(v.parts[p].base) + uint64_t(slot) * v.parts[p].stride;
+    for (uint64_t i = threadIdx.x; i < v.parts[p].bytes; i += blockDim.x)
+      s += (unsigned long long)base[i] * ((pos0 + i) % 251 + 1);
+    pos0 += v.parts[p].bytes;
+  }
+  atomicAdd(out + blockIdx.x, s);
+}
+
+uint64_t host_sum(const std::vector<uint8_t>& v) {
+  uint64_t s = 0;
+  for (size_t i = 0; i < v.size(); ++i) s += uint64_t(v[i]) * (i % 251 + 1);
+  return s;
+}
+
+struct Rig {
+  DgModel m;
+  ss_desc* d = nullptr;
+  ss_plan* p = nullptr;
+  ss_ctx* c = nullptr;
+  ss_budget b;
+  ss_options o;
+  uint32_t n;  // ids per layer per token (== dg_max_ids)
+  cudaStream_t s = nullptr, side = nullptr;
+  cudaEvent_t fork = nullptr, join = nullptr;
+  int32_t *ids_dev = nullptr, *pred_dev = nullptr, *ids_host = nullptr, *pred_host = nullptr;
+  unsigned long long *sums_dev = nullptr, *sums_host = nullptr;
+  ss_dg_device_view v{};
+  std::vector<std::vector<uint64_t>> want;  // [layer][unit]
+  cudaGraphExec_t graph[2] = {nullptr, nullptr};  // [predict]
+  std::mt19937 rng{11};
+  unsigned long long last_spin_ns = 0;  // a delay before the last layer's checksum (in the captured graph)
+  uint64_t distinct = 0;  // distinct routed ids summed over layers and tokens (the service dedups each layer's ids)
+
+  Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000)
+      : m(tag), n(max_ids) {
+    CHECK_OK(ss_desc_from_json(m.json.data(), m.json.size(), &d));
+    sstest::dg_budget(b, m, dyn, max_ids);
+    std::vector<uint8_t> t = m.tiers(resident);
+    CHECK_OK(ss_plan_from_tiers(d, &b, t.data(), t.size(), &p));
+    sstest::dg_options(o, max_ids, SS_BACKEND_CUDA);
+    o.dg_wait_timeout_ms = timeout_ms;
+    o.dg_diag = 1;
+    CHECK_OK(ss_open(d, &b, p, &o, &c));
+    if (!c) return;
+    CHECK_OK(ss_dg_get_device_view(c, &v));
+    CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    CU(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+    CU(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+    CU(cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+    const size_t cells = size_t(m.G) * n;
+    CU(cudaMalloc(&ids_dev, cells * 4));
+    CU(cudaMalloc(&pred_dev, cells * 4));
+    CU(cudaMalloc(&sums_dev, cells * 8));
+    CU(cudaHostAlloc(&ids_host, cells * 4, cudaHostAllocDefault));
+    CU(cudaHostAlloc(&pred_host, cells * 4, cudaHostAllocDefault));
+    CU(cudaHostAlloc(&sums_host, cells * 8, cudaHostAllocDefault));
+    want.resize(size_t(m.G));
+    for (int L = 0; L < m.G; ++L)
+      for (int u = 0; u < m.U; ++u) want[size_t(L)].push_back(host_sum(m.bytes(L, u)));
+  }
+  ~Rig() {
+    if (s) cudaStreamSynchronize(s);
+    for (auto& g : graph)
+      if (g) (void)cudaGraphExecDestroy(g);
+    ss_close(c);
+    ss_plan_free(p);
+    ss_desc_free(d);
+    (void)cudaFree(ids_dev);
+    (void)cudaFree(pred_dev);
+    (void)cudaFree(sums_dev);
+    (void)cudaFreeHost(ids_host);
+    (void)cudaFreeHost(pred_host);
+    (void)cudaFreeHost(sums_host);
+    if (fork) (void)cudaEventDestroy(fork);
+    if (join) (void)cudaEventDestroy(join);
+    if (side) (void)cudaStreamDestroy(side);
+    if (s) (void)cudaStreamDestroy(s);
+  }
+
+  // The step: begin; per layer export, (predict on the side stream, joined), wait, checksum; end.
+  void enqueue_step(bool predict) {
+    CHECK_OK(ss_dg_enqueue_begin(c, s));
+    for (int g = 0; g < m.G; ++g) {
+      const bool pr = predict && g + 1 < m.G;
+      CHECK_OK(ss_dg_enqueue_export(c, g, ids_dev + size_t(g) * n, int(n), pr ? int(n) : 0, s));
+      if (pr) {
+        CU(cudaEventRecord(fork, s));
+        CU(cudaStreamWaitEvent(side, fork, 0));
+        CHECK_OK(ss_dg_enqueue_predict(c, g, pred_dev + size_t(g) * n, int(n), side));
+        CU(cudaEventRecord(join, side));
+        CU(cudaStreamWaitEvent(s, join, 0));
+      }
+      CHECK_OK(ss_dg_enqueue_wait(c, g, s));
+      if (g + 1 == m.G && last_spin_ns) spin_ns<<<1, 1, 0, s>>>(last_spin_ns);
+      checksum<<<n, 128, 0, s>>>(v, uint32_t(g), ids_dev + size_t(g) * n, sums_dev + size_t(g) * n);
+    }
+    CHECK_OK(ss_dg_enqueue_end(c, s));
+  }
+  void capture(bool predict) {
+    cudaGraph_t gr = nullptr;
+    CU(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
+    enqueue_step(predict);
+    CU(cudaStreamEndCapture(s, &gr));
+    CU(cudaGraphInstantiate(&graph[predict ? 1 : 0], gr, 0));
+    (void)cudaGraphDestroy(gr);
+  }
+
+  uint32_t pick(int L) {
+    const double x = std::uniform_real_distribution<double>(0, 1)(rng);
+    return uint32_t(double(m.U) * x * x * x) % uint32_t(m.U);
+  }
+  // One token; returns the number of wrong checksums, or -1 when ss_end failed (status in *st).
+  int token(bool use_graph, bool predict, ss_status* st = nullptr, int bad_id_layer = -1) {
+    for (int g = 0; g < m.G; ++g)
+      for (uint32_t i = 0; i < n; ++i) {
+        ids_host[size_t(g) * n + i] = int32_t(pick(g));
+        pred_host[size_t(g) * n + i] = int32_t(pick(g < m.G - 1 ? g + 1 : g));
+      }
+    if (bad_id_layer >= 0) ids_host[size_t(bad_id_layer) * n] = m.U + 3;
+    for (int g = 0; g < m.G; ++g) {
+      std::vector<int32_t> u(ids_host + size_t(g) * n, ids_host + size_t(g) * n + n);
+      std::sort(u.begin(), u.end());
+      distinct += uint64_t(std::unique(u.begin(), u.end()) - u.begin());
+    }
+    const size_t cells = size_t(m.G) * n;
+    CU(cudaMemcpyAsync(ids_dev, ids_host, cells * 4, cudaMemcpyHostToDevice, s));
+    CU(cudaMemcpyAsync(pred_dev, pred_host, cells * 4, cudaMemcpyHostToDevice, s));
+    CU(cudaMemsetAsync(sums_dev, 0, cells * 8, s));
+    CHECK_OK(ss_begin(c, nullptr, 0));
+    if (use_graph) CU(cudaGraphLaunch(graph[predict ? 1 : 0], s));
+    else enqueue_step(predict);
+    CU(cudaMemcpyAsync(sums_host, sums_dev, cells * 8, cudaMemcpyDeviceToHost, s));
+    const ss_status e = ss_end(c);
+    if (st) *st = e;
+    CU(cudaStreamSynchronize(s));
+    if (e != SS_OK) return -1;
+    int wrong = 0;
+    for (int g = 0; g < m.G; ++g)
+      for (uint32_t i = 0; i < n; ++i) {
+        const int32_t id = ids_host[size_t(g) * n + i];
+        if (sums_host[size_t(g) * n + i] != want[size_t(g)][size_t(id)]) ++wrong;
+      }
+    return wrong;
+  }
+  ss_dg_stats stats() {
+    ss_dg_stats x{};
+    CHECK_OK(ss_stats_dg(c, &x));
+    return x;
+  }
+};
+
+// Wrong checksums and failed tokens, counted apart (a failed token never looks clean).
+struct Tally {
+  int wrong = 0, failed = 0;
+  void add(int w) {
+    if (w < 0) ++failed;
+    else wrong += w;
+  }
+};
+
+// After a failed ss_end: the context refuses everything but close and the stats calls.
+void expect_poisoned(Rig& r) {
+  CHECK_EQ(int(ss_begin(r.c, nullptr, 0)), int(SS_E_BACKEND));
+  ss_dg_device_view v{};
+  CHECK_EQ(int(ss_dg_get_device_view(r.c, &v)), int(SS_E_BACKEND));
+  CHECK_EQ(ss_dg_gated_index(r.c, 0), -1);
+  CHECK_EQ(ss_source_direct(r.c, 0), -1);
+  CHECK_EQ(int(ss_dg_enqueue_begin(r.c, r.s)), int(SS_E_BACKEND));
+  ss_dg_stats x{};
+  CHECK_OK(ss_stats_dg(r.c, &x));
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(r.c, &js, nullptr));
+  ss_free(js);
+}
+
+void print(const char* name, const ss_dg_stats& x) {
+  std::printf("  %s: tokens %llu, misses %llu (covered %llu), prefetched %llu (used %llu), banks %llu, resurrected "
+              "%llu, mid collects %llu, evicted %llu, free slots %llu\n",
+              name, (unsigned long long)x.tokens, (unsigned long long)x.misses, (unsigned long long)x.covered,
+              (unsigned long long)x.prefetched, (unsigned long long)x.prefetch_used,
+              (unsigned long long)x.bank_serves, (unsigned long long)x.resurrected,
+              (unsigned long long)x.collected_mid, (unsigned long long)x.evicted, (unsigned long long)x.free_slots);
+}
+
+}  // namespace
+
+TEST(dg_cuda_eager_graph_prediction) {
+  Rig r("main", 16, 8, 8);
+  if (!r.c) return;
+  Tally k;
+  for (int t = 0; t < 20; ++t) k.add(r.token(false, false));
+  r.capture(false);
+  r.capture(true);
+  for (int t = 0; t < 200; ++t) k.add(r.token(true, false));
+  for (int t = 0; t < 200; ++t) k.add(r.token(true, true));
+  for (int t = 0; t < 120; ++t) k.add(r.token(true, (t / 10) % 2 == 0));  // 8 -> 0 -> 8 switching
+  CHECK_EQ(k.failed, 0);
+  CHECK_EQ(k.wrong, 0);
+  CHECK_OK(ss_test_dg_check(r.c));
+  for (int L = 0; L < r.m.G; ++L)
+    for (int u = 0; u < r.m.U; u += 9) CHECK_OK(ss_check_unit(r.c, L, u));
+  const ss_dg_stats x = r.stats();
+  print("main", x);
+  CHECK_EQ(x.tokens, 540ull);
+  CHECK(x.misses > 0 && x.prefetched > 0 && x.prefetch_used > 0 && x.evicted > 0);
+  ss_dg_layer_timeline tl{};
+  CHECK_OK(ss_dg_timeline_sized(r.c, 2, &tl, sizeof tl));
+  CHECK_EQ(tl.ids, r.n);
+}
+
+// The stats contract (sol-6 R2a-R2c): the hook once per successful token, the snapshot published at each one, a reset
+// that clears the resettable counters but not the exclusive (lifetime) ones.
+int g_hook_calls = 0;
+uint64_t g_hook_routed = 0;
+void count_hook(void*, const ss_layer_stats* fwd_total, const ss_layer_stats*, int) {
+  ++g_hook_calls;
+  g_hook_routed += fwd_total->routed;
+}
+
+TEST(dg_cuda_stats) {
+  Rig r("stats", 8, 4, 8);
+  if (!r.c) return;
+  ss_set_stats_hook(r.c, count_hook, nullptr);
+  ss_layer_stats tot{};
+  ss_snapshot_info info{};
+  CHECK_EQ(int(ss_stats_snapshot(r.c, &tot, &info)), int(SS_E_INVALID));  // arms it
+  r.capture(false);
+  Tally k;
+  for (int t = 0; t < 10; ++t) k.add(r.token(true, false));
+  CHECK_EQ(k.failed, 0);
+  CHECK_EQ(k.wrong, 0);
+  CHECK_EQ(g_hook_calls, 10);
+  CHECK_EQ(g_hook_routed, r.distinct);
+  CHECK_OK(ss_stats_snapshot(r.c, &tot, &info));
+  CHECK_EQ(info.sequence, 10ull);
+  CHECK_EQ(info.forwards, 10ull);
+  CHECK_EQ(tot.routed, r.distinct);
+  ss_exclusive_stats x0{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x0));
+  CHECK(x0.writebacks > 0);
+  ss_stats_reset(r.c);
+  ss_dg_stats d{};
+  CHECK_OK(ss_stats_dg(r.c, &d));
+  CHECK_EQ(d.tokens, 0ull);
+  ss_layer_stats t2{};
+  CHECK_OK(ss_stats_total(r.c, &t2));
+  CHECK_EQ(t2.routed, 0ull);
+  ss_exclusive_stats x1{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x1));
+  CHECK_EQ(x1.writebacks, x0.writebacks);  // never reset
+  CHECK_EQ(x1.min_free_blocks, x0.min_free_blocks);
+  CHECK_OK(ss_stats_snapshot(r.c, &tot, &info));
+  CHECK_EQ(info.sequence, 11ull);  // the reset published
+  CHECK_EQ(tot.routed, 0ull);
+  CHECK_EQ(info.exclusive_writebacks, x0.writebacks);
+  char* js = nullptr;
+  CHECK_OK(ss_stats_snapshot_json(r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"device_gated\"") && std::strstr(js, "\"exclusive\""));
+  ss_free(js);
+}
+
+TEST(dg_cuda_pressure) {
+  Rig r("pressure", 8, 2, 8);
+  if (!r.c) return;
+  CHECK_OK(ss_test_dg_pressure(r.c, 2, 6));
+  r.capture(true);
+  Tally k;
+  for (int t = 0; t < 300; ++t) {
+    k.add(r.token(true, true));
+    CHECK_OK(ss_test_dg_check(r.c));  // the ownership invariants at every boundary
+  }
+  CHECK_EQ(k.failed, 0);
+  CHECK_EQ(k.wrong, 0);
+  const ss_dg_stats x = r.stats();
+  print("pressure", x);
+  CHECK(x.bank_serves > 0);
+  CHECK(x.resurrected > 0);
+  CHECK(x.collected_mid > 0);
+  CHECK(x.covered > 0);
+}
+
+// A stopped service: the device's waits end on host_abort within a round trip, ss_end fails, close frees.
+TEST(dg_cuda_stopped_service) {
+  Rig r("stop", 4, 4, 8, 10000);
+  if (!r.c) return;
+  ss_snapshot_info info{};
+  CHECK_EQ(int(ss_stats_snapshot(r.c, nullptr, &info)), int(SS_E_INVALID));  // arms it
+  r.capture(false);
+  CHECK_EQ(r.token(true, false), 0);
+  CHECK_OK(ss_stats_snapshot(r.c, nullptr, &info));
+  const uint64_t published = info.sequence;
+  CHECK_OK(ss_test_dg_stop_service(r.c));
+  const auto t0 = std::chrono::steady_clock::now();
+  ss_status st = SS_OK;
+  CHECK_EQ(r.token(true, false, &st), -1);
+  const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  stopped service: ss_end %d in %.3f s: %s\n", int(st), s, ss_last_error());
+  CHECK_EQ(int(st), int(SS_E_BACKEND));
+  CHECK(s < 3.0);  // not the 10 s device deadline
+  expect_poisoned(r);
+  ss_stats_reset(r.c);  // a poisoned context publishes no more
+  CHECK_OK(ss_stats_snapshot(r.c, nullptr, &info));
+  CHECK_EQ(info.sequence, published);
+}
+
+TEST(dg_cuda_bad_id) {
+  Rig r("badid", 16, 4, 8);
+  if (!r.c) return;
+  r.capture(false);
+  ss_status st = SS_OK;
+  CHECK_EQ(r.token(true, false, &st, 2), -1);
+  std::printf("  bad id: ss_end %d: %s\n", int(st), ss_last_error());
+  CHECK_EQ(int(st), int(SS_E_BACKEND));
+  expect_poisoned(r);
+}
+
+// Mutation: no ready wait. The demand copies of one token are held back by a gate (a ~150 ms spin on another stream);
+// with the wait the readers see the units, without it they read the guard slot (zeros).
+TEST(dg_cuda_mutation_no_ready_wait) {
+  for (int mut = 0; mut < 2; ++mut) {
+    Rig r(mut ? "nowait-m" : "nowait", 4, 8, 8);
+    if (!r.c) return;
+    if (mut) CHECK_OK(ss_test_dg_flags(r.c, 1));  // before the capture: the flag is a kernel argument
+    r.capture(false);
+    cudaStream_t gs = nullptr;
+    cudaEvent_t gate = nullptr;
+    CU(cudaStreamCreateWithFlags(&gs, cudaStreamNonBlocking));
+    CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+    Tally k;
+    for (int t = 0; t < 5; ++t) {
+      spin_ns<<<1, 1, 0, gs>>>(150000000ull);
+      CU(cudaEventRecord(gate, gs));
+      CHECK_OK(ss_test_dg_gate(r.c, 0, gate));
+      k.add(r.token(true, false));
+    }
+    std::printf("  %s: wrong %d, failed tokens %d\n", mut ? "mutation (no ready wait)" : "normal (gated copies)",
+                k.wrong, k.failed);
+    CHECK_EQ(k.failed, 0);
+    if (mut) CHECK(k.wrong > 0);
+    else CHECK_EQ(k.wrong, 0);
+    CU(cudaStreamSynchronize(gs));
+    (void)cudaEventDestroy(gate);
+    (void)cudaStreamDestroy(gs);
+  }
+}
+
+// Mutation: no completion edge. The last layer's reader is delayed ~100 ms and every boundary evicts the most
+// recently used units: without the edge the boundary unpublishes them while the reader still resolves its slots.
+TEST(dg_cuda_mutation_no_completion_edge) {
+  for (int mut = 0; mut < 2; ++mut) {
+    Rig r(mut ? "edge-m" : "edge", 8, 4, 8);
+    if (!r.c) return;
+    CHECK_OK(ss_test_dg_pressure(r.c, 0, 24));
+    r.last_spin_ns = 100000000ull;
+    r.capture(false);
+    if (mut) CHECK_OK(ss_test_dg_flags(r.c, 2));
+    Tally k;
+    for (int t = 0; t < 6; ++t) k.add(r.token(true, false));
+    std::printf("  %s: wrong %d, failed tokens %d\n",
+                mut ? "mutation (no completion edge)" : "normal (completion edge)", k.wrong, k.failed);
+    CHECK_EQ(k.failed, 0);
+    if (mut) CHECK(k.wrong > 0);
+    else CHECK_EQ(k.wrong, 0);
+  }
+}
+
+int main(int argc, char** argv) {
+  const char* only = nullptr;
+  for (int i = 1; i < argc; ++i)
+    if (!std::strcmp(argv[i], "--only") && i + 1 < argc) only = argv[++i];
+  int dev = 0;
+  cudaDeviceProp p{};
+  if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
+    std::printf("no CUDA device\n");
+    return 2;
+  }
+  std::printf("device %d: %s, %.1f GiB, async engines %d\n", dev, p.name, double(p.totalGlobalMem) / double(1ull << 30),
+              p.asyncEngineCount);
+  return sstest::run_all(only);
+}

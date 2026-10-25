@@ -1,0 +1,43 @@
+// Device-gated decode mode: what an open needs from the descriptor, the plan and the options (design rev 3.2 §1-§2),
+// with every refusal. Backend-free, so the CPU tests check it; the CUDA context allocates exactly this.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "desc.hpp"
+#include "plan.hpp"
+#include "strix_stream/ss.h"
+
+namespace ts {
+
+struct DgLayout {
+  std::vector<int> gated;           // descriptor layer of each gated ordinal
+  std::vector<int> ordinal;         // per descriptor layer: its gated ordinal, -1 when not gated
+  std::vector<uint32_t> unit_base;  // G + 1 (keys = unit_base[g] + unit)
+  std::vector<uint64_t> part_bytes, part_offset;  // per part (offset inside the unit's bytes)
+  uint64_t unit_bytes = 0, host_stride = 0;
+  uint32_t keys = 0;
+  uint32_t R = 0;  // device residents (the plan's tier R)
+  uint32_t D = 0;  // spare slots = the plan's billed dynamic slots, and the boundary's free target
+  uint32_t B = 0;  // bank size = dg_max_ids
+  uint32_t P = 0;  // pinned units (tier P)
+  uint32_t Q = 0;  // spare blocks the planner granted and billed
+  uint32_t persistent_slots = 0, slots = 0, guard_slot = 0, blocks = 0;
+  std::vector<uint32_t> residents;  // keys of the tier-R units, in key order
+  uint64_t need = 0, billed = 0;    // device bytes: the arena + tables + controls, and what the plan billed for them
+  uint64_t mapped_bytes = 0;        // the mapped control area
+  uint64_t device_ctl_bytes = 0;    // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1]
+  uint64_t bounce_bytes = 0;        // pinned: the covering aligned reads of unaligned parts
+  uint64_t staging_bytes = 0;       // pinned: one resident's bytes on their way to the arena at open
+  // Exactly what the context allocates, so admission bills what it allocates.
+  static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1); }
+};
+
+// Bytes of the mapped control area for G gated layers (64-byte aligned arrays).
+uint64_t dg_mapped_bytes(uint32_t gated);
+// Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
+DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);
+
+}  // namespace ts
