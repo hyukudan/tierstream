@@ -174,9 +174,12 @@ test runs in one short window. The HIP backend has not been built yet (no ROCm o
 
 ## Credits
 
-The streaming mechanisms here (scored residency, next-layer router lookahead, unbuffered expert reads into device
-slots, hits-first gating) follow published descriptions of weight-streaming runtimes for large MoE models. No
-third-party source code is included: every file in this repository is new code written for this project (see
+The design of this library was inspired by [mlx-stream](https://github.com/davidtai/mlx-stream) by David Tai, a
+DeepSeek-V4.1-Flash plugin for mlx-serve that streams experts from SSD. Its approach to MoE weight streaming
+(scored residency, next-layer router lookahead, unbuffered expert reads into device slots, hits-first gating) is
+the starting point for the mechanisms here; thanks to its author for publishing it.
+
+No third-party source code is included: every file in this repository is new code written for this project (see
 NOTICE). If a ported file is ever added, it keeps its original license notice in the file and in NOTICE.
 
 ## License
