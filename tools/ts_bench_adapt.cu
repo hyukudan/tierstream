@@ -5,7 +5,13 @@
 //   ts-bench-adapt --desc D.json --trace T.txt --usage U.json --active A --host H [--filter val-&:code:]
 //                  [--tokens N] [--warmup W] [--layer-us 154.5] [--ahead K] [--recall 0.79] [--hostpf 1]
 //                  [--specpf 0] [--readahead 8] [--readers 4] [--dyn 2] [--ring 48] [--spares 96]
-//                  [--mode exclusive|inclusive] [--check-every 50] [--device-gib X] [--host-gib Y] [--out R.json]
+//                  [--mode exclusive|inclusive] [--check-every 50] --device-gib X --host-gib Y [--out R.json]
+//                  [--max-seconds 600] [--force 1] [--dry 1]
+//
+// Shared-GPU safety: --device-gib / --host-gib are required (no defaults); the device must be an RTX PRO 6000 unless
+// --force 1; the plan's device peak + 1 GiB must fit the device's free memory and the plan's pinned bytes must fit
+// --host-gib, else nothing is allocated; the replay stops after --max-seconds (default 600). Run it only inside a
+// PC-BIG slot.
 //
 // --active: units placed RESIDENT (top of the usage ranking), --host: next units PINNED, the rest DISK (file homes).
 // Lookahead: after layer L's routes, layer L+1..L+K's ids are hinted (the true ids, each replaced by a wrong one with
@@ -74,11 +80,23 @@ struct Args {
   }
   double f(const std::string& k, double d) const {
     auto it = m.find(k);
-    return it == m.end() ? d : std::atof(it->second.c_str());
+    if (it == m.end()) return d;
+    char* e = nullptr;
+    const double v = std::strtod(it->second.c_str(), &e);
+    if (!e || *e || !std::isfinite(v) || v < 0) bad(k);
+    return v;
   }
   long long i(const std::string& k, long long d) const {
     auto it = m.find(k);
-    return it == m.end() ? d : std::atoll(it->second.c_str());
+    if (it == m.end()) return d;
+    char* e = nullptr;
+    const long long v = std::strtoll(it->second.c_str(), &e, 10);
+    if (!e || *e || v < 0) bad(k);
+    return v;
+  }
+  [[noreturn]] static void bad(const std::string& k) {
+    std::fprintf(stderr, "ts-bench-adapt: --%s: expected a non-negative number\n", k.c_str());
+    std::exit(2);
   }
 };
 
@@ -93,7 +111,23 @@ double pct(std::vector<double> v, double q) {
 
 int main(int argc, char** argv) {
   Args a;
-  for (int i = 1; i + 1 < argc; i += 2) a.m[std::string(argv[i]).substr(2)] = argv[i + 1];
+  if (argc % 2 == 0) {
+    std::fprintf(stderr, "ts-bench-adapt: options come in --name value pairs\n");
+    return 2;
+  }
+  for (int i = 1; i + 1 < argc; i += 2) {
+    const std::string k = argv[i];
+    if (k.rfind("--", 0) != 0 || k.size() < 3) {
+      std::fprintf(stderr, "ts-bench-adapt: unexpected argument %s\n", k.c_str());
+      return 2;
+    }
+    a.m[k.substr(2)] = argv[i + 1];
+  }
+  for (const char* req : {"desc", "trace", "usage", "device-gib", "host-gib"})
+    if (!a.m.count(req)) {
+      std::fprintf(stderr, "ts-bench-adapt: --%s is required\n", req);
+      return 2;
+    }
   const std::string desc_text = slurp(a.s("desc"));
   ss_desc* d = nullptr;
   ok(ss_desc_from_json(desc_text.data(), desc_text.size(), &d), "descriptor");
@@ -114,8 +148,8 @@ int main(int argc, char** argv) {
   ss_budget_defaults(&b);
   b.margin_gib = 0.5;
   b.margin_fraction = 0;
-  b.device_bytes = uint64_t(a.f("device-gib", 94.0) * double(uint64_t(1) << 30));
-  b.host_pinned_bytes = uint64_t(a.f("host-gib", 70.0) * double(uint64_t(1) << 30));
+  b.device_bytes = uint64_t(a.f("device-gib", 0) * double(uint64_t(1) << 30));
+  b.host_pinned_bytes = uint64_t(a.f("host-gib", 0) * double(uint64_t(1) << 30));
   b.dynamic_slots_per_layer = uint32_t(a.i("dyn", 2));
   b.ring_slots = uint32_t(a.i("ring", 48));
   b.tier_mode = excl ? SS_TIER_MODE_EXCLUSIVE : SS_TIER_MODE_INCLUSIVE;
@@ -144,6 +178,27 @@ int main(int argc, char** argv) {
   o.staging_bytes = uint64_t(a.i("staging-mib", 32)) << 20;
   o.verify_hash = 0;  // no descriptor hashes for the GGUF: the sample check below compares with the file bytes
   cu(cudaSetDevice(o.device), "set device");
+  {
+    cudaDeviceProp prop{};
+    cu(cudaGetDeviceProperties(&prop, o.device), "device properties");
+    if (std::string(prop.name).find("RTX PRO 6000") == std::string::npos && a.s("force", "0") != "1") {
+      std::fprintf(stderr, "ts-bench-adapt: device %d is '%s', not an RTX PRO 6000 (--force 1 to override)\n", o.device,
+                   prop.name);
+      return 3;
+    }
+    size_t free_b = 0, total_b = 0;
+    cu(cudaMemGetInfo(&free_b, &total_b), "memory info");
+    const uint64_t need = tot.peak_device_bytes + (uint64_t(1) << 30);
+    if (free_b < need) {
+      std::fprintf(stderr, "ts-bench-adapt: device %d has %.2f GiB free, the plan needs %.2f GiB (+1 GiB margin)\n",
+                   o.device, free_b / 1073741824.0, need / 1073741824.0);
+      return 3;
+    }
+    if (tot.pinned_bytes > b.host_pinned_bytes) {
+      std::fprintf(stderr, "ts-bench-adapt: the plan pins %.2f GiB > --host-gib\n", tot.pinned_bytes / 1073741824.0);
+      return 3;
+    }
+  }
   cudaStream_t s;
   cu(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
   spin_ns<<<1, 1, 0, s>>>(1000);  // load the module before any timed step
@@ -176,9 +231,18 @@ int main(int argc, char** argv) {
   uint64_t checked = 0, check_fail = 0, tokens = 0, hinted = 0;
   std::vector<int32_t> hint;
   auto t_run0 = std::chrono::steady_clock::now();
+  const auto t_start = t_run0;
+  const double max_seconds = a.f("max-seconds", 600);
+  bool timed_out = false;
   for (const auto& sq : trace.seqs) {
+    if (timed_out) break;
     if (!ts::adapt::seq_match(sq.name, filter)) continue;
     for (uint32_t k = 0; k < sq.tokens && int64_t(tokens) < max_tokens + warmup; ++k) {
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() > max_seconds) {
+        std::fprintf(stderr, "ts-bench-adapt: --max-seconds reached after %llu tokens\n", (unsigned long long)tokens);
+        timed_out = true;
+        break;
+      }
       if (int64_t(tokens) == warmup) {
         ok(ss_stats_total(c, &st0), "stats");
         t_run0 = std::chrono::steady_clock::now();
@@ -227,6 +291,11 @@ int main(int argc, char** argv) {
   const double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_run0).count();
   ok(ss_stats_total(c, &st1), "stats");
   const double nt = double(ms.size());
+  if (ms.empty()) {
+    std::fprintf(stderr, "ts-bench-adapt: no timed token (filter matched too few tokens or warm-up too long)\n");
+    ss_close(c);
+    return 4;
+  }
   double mean = 0;
   for (double x : ms) mean += x;
   mean /= std::max(1.0, nt);

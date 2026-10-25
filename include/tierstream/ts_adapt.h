@@ -43,9 +43,12 @@ TS_API ts_status ts_usage_sha256(const ts_usage* u, char out_hex[65]);
 /* Online update: the router's ids of one layer for the current token(s), then one tick per decoded token. */
 TS_API ts_status ts_usage_observe(ts_usage* u, int layer, const int32_t* ids, int n);
 TS_API ts_status ts_usage_tick(ts_usage* u, uint32_t rows);
-/* Attach to a context (NULL detaches): every ss_layer_routes / ss_layer_routes_dev of a forward is observed and
- * ss_end ticks once per row of the forward (the largest rows_per_layer given to ss_begin, else 1). The table must
- * have the descriptor's shape and outlive the attachment; the context never frees it. Engine thread only. */
+/* Attach to a host-mode context (NULL detaches): every ss_layer_routes / ss_layer_routes_dev of a forward is observed
+ * (ss_layer_all is not: dense layers carry no routing) and ss_end ticks once per row of the forward (the largest
+ * rows_per_layer given to ss_begin, else 1). The table must have the descriptor's shape and outlive the attachment;
+ * the context never frees it. The table has no lock: while attached it is used only on the engine thread (read it,
+ * serialize it or merge into it after detaching, or between forwards on that thread). Attach / detach between
+ * forwards only (SS_E_INVALID inside one). Device-gated contexts: the engine feeds ts_usage_observe / ts_usage_tick. */
 TS_API ts_status ts_usage_attach(ts_ctx* c, ts_usage* u);
 
 TS_API int64_t ts_usage_total_units(const ts_usage* u);

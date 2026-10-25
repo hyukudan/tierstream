@@ -120,6 +120,13 @@ TEST(adapt_usage_file_roundtrip_and_validation) {
     threw = true;
   }
   CHECK(threw);
+  // dense layers (0 units) round-trip
+  Usage z("m", {0, 3, 0}, 8);
+  const int32_t zz[] = {2};
+  z.observe(1, zz, 1);
+  z.tick();
+  CHECK_EQ(Usage::from_text(z.to_text()).to_text(), z.to_text());
+  CHECK_EQ(z.total_units(), int64_t(3));
   // merge(a, b) has the counts and tokens of one table that saw both
   Usage a("m", {5}, 0), b("m", {5}, 0), ab("m", {5}, 0);
   const int32_t x[] = {1, 2}, y[] = {2, 4};
@@ -260,9 +267,9 @@ TEST(adapt_simulator_hand_case) {
 }
 
 TEST(adapt_solver_goldens) {
-  // SV1 = the placement contract's frozen golden (wave4/placement/golden/sv1, solver_ref.py sha256 2f338710...);
-  // S1 = more rows (file units, spec interpolation, clamped_high, a missing ctx cost) from the same reference.
-  for (const char* name : {"sv1", "s1"}) {
+  // SV1 / SV1b = the placement contract's frozen goldens (wave4/placement/golden/sv1, solver_ref.py sha256
+  // 5722f6e2...: applicability / calib / sequences rules, incomplete calibration -> unpredicted), byte for byte.
+  for (const char* name : {"sv1", "sv1b"}) {
     const std::string dir = "tests/data/adapt/";
     const std::string fx = slurp(dir + name + "-fixture.json"), want = slurp(dir + name + "-expected.json");
     CHECK(!fx.empty() && !want.empty());

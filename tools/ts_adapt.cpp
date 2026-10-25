@@ -215,7 +215,7 @@ int run(int argc, char** argv) {
   }
   if (cmd == "xval") {
     require(a.pos.size() == 1, SS_E_INVALID, "xval: TRACE");
-    Trace t = trace_load(a.pos[0], int(a.num("units", 384)));
+    Trace t = trace_load(a.pos[0], int(a.num("units", 0)));
     const int folds = int(a.num("folds", 5));
     SimConfig c;
     c.active = a.num("active", 0);
@@ -225,30 +225,12 @@ int run(int argc, char** argv) {
     c.wb_windows = uint32_t(a.num("wb", 1));
     c.evict = evict_of(a.get("evict"));
     c.file_last_window = uint32_t(a.num("window", 64));
-    SimResult tot;
-    for (int f = 0; f < folds; ++f) {
-      // Tag every sequence with its fold so the name filters select it.
-      Trace tf = t;
-      for (size_t i = 0; i < tf.seqs.size(); ++i) tf.seqs[i].name = "#f" + std::to_string(int(i) % folds) + "#" + tf.seqs[i].name;
-      const std::string self = "#f" + std::to_string(f) + "#";
-      Usage u = usage_from_trace(tf, "!" + self, "xval", uint32_t(a.num("half-life", 256)));
-      std::string filt = self;
-      if (a.has("filter")) filt += "&" + a.get("filter");
-      SimResult r = simulate(tf, filt, u.rank(), c);
-      tot.windows += r.windows;
-      tot.tokens += r.tokens;
-      tot.lookups += r.lookups;
-      tot.miss_pinned += r.miss_pinned;
-      tot.miss_file += r.miss_file;
-      tot.bank += r.bank;
-      tot.evicted += r.evicted;
-      tot.discarded += r.discarded;
-      tot.file_uses += r.file_uses;
-    }
+    const SimResult tot = simulate_xval(t, a.get("filter"), c, folds, uint32_t(a.num("half-life", 256)));
     std::printf("xval folds %d active %lld file %lld: windows %llu misses/window %.3f (pinned %.3f file %.3f) "
                 "file-uses %.3f bank %.3f writebacks %.3f discards %.3f\n",
                 folds, static_cast<long long>(c.active), static_cast<long long>(c.file_units),
-                static_cast<unsigned long long>(tot.windows), tot.milli_per_window(tot.miss_pinned + tot.miss_file) / 1000.0,
+                static_cast<unsigned long long>(tot.windows),
+                tot.milli_per_window(tot.miss_pinned + tot.miss_file) / 1000.0,
                 tot.milli_per_window(tot.miss_pinned) / 1000.0, tot.milli_per_window(tot.miss_file) / 1000.0,
                 tot.milli_per_window(tot.file_uses) / 1000.0, tot.milli_per_window(tot.bank) / 1000.0,
                 tot.milli_per_window(tot.evicted) / 1000.0, tot.milli_per_window(tot.discarded) / 1000.0);

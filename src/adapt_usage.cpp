@@ -65,6 +65,7 @@ uint64_t rdiv(uint64_t n, uint64_t d) {
 Usage::Usage(std::string model, std::vector<uint32_t> units_per_layer, uint32_t half_life_tokens)
     : model_(std::move(model)), units_(std::move(units_per_layer)), half_life_(half_life_tokens) {
   require(!units_.empty(), SS_E_INVALID, "usage: no layers");
+  require(half_life_tokens < (1u << 30), SS_E_INVALID, "usage: half life out of range");
   q32_ = decay_q32(half_life_);
   int64_t b = 0;
   for (uint32_t n : units_) {
@@ -220,7 +221,7 @@ Usage Usage::from_json(const Json& j) {
     const Json* nu = l.find("n_units");
     require(nu != nullptr, SS_E_INVALID, w + ".n_units missing");
     const uint64_t n = json_u64(*nu, w + ".n_units");
-    require(n > 0 && n < (uint64_t(1) << 20), SS_E_INVALID, w + ".n_units out of range");
+    require(n < (uint64_t(1) << 20), SS_E_INVALID, w + ".n_units out of range");  // 0 = a dense layer
     units.push_back(uint32_t(n));
   }
   const Json* hl = dec->find("half_life_tokens");

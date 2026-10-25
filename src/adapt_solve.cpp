@@ -175,25 +175,65 @@ uint64_t line_sum(const Json* lines, const std::string& where, Json* out) {
 
 }  // namespace
 
+namespace {
+
+// Calibration identity keys (contract 3.9, golden/solver_ref.py 5722f6e2): an applicability lacking any of them is
+// incomplete, and every key it has must equal the choice's `calib` value.
+const char* const kCostKeys[] = {"sequences", "adapter", "drafter", "anchor_device", "assist_device", "link",
+                                 "build_sha256", "content_sha256", "arithmetic_sha256", "prefetch", "tier_mode",
+                                 "driver", "platform"};
+const char* const kCurveKeys[] = {"sequences", "adapter", "drafter", "policy", "usage_sha256", "build_sha256",
+                                  "content_sha256", "prefetch", "tier_mode"};
+
+template <size_t N>
+bool applies(const Json* app, const char* const (&req)[N], const Json* calib) {
+  if (!app || !app->is_object() || app->obj.empty()) return false;
+  for (const char* k : req)
+    if (!app->find(k)) return false;
+  for (const auto& kv : app->obj) {
+    const Json* c = calib && calib->is_object() ? calib->find(kv.first) : nullptr;
+    if (!c || json_write(*c) != json_write(kv.second)) return false;
+  }
+  return true;
+}
+
+Json unpredicted_row(const Json& id) {
+  Json o = Json::object();
+  o["id"] = id;
+  o["tag"] = Json::string("unpredicted");
+  for (const char* k : {"milli_misses_total", "milli_misses_pinned", "milli_misses_file", "window_us", "milli_tok_s"})
+    o[k] = Json();
+  return o;
+}
+
+}  // namespace
+
 Json solve_ref(const Json& fx) {
   const Json& curves = need(fx, "curves", "fixture");
   const Json& usage = need(fx, "usage", "fixture");
   require(usage.is_array(), SS_E_INVALID, "fixture.usage: coldest-first micro-selections");
-  const Costs c{&need(fx, "costs", "fixture")};
+  const Json& costs = need(fx, "costs", "fixture");
+  const Costs c{&costs};
   Json rows = Json::array();
   for (const Json& ch : need(fx, "choices", "fixture").arr) {
+    const Json& id = need(ch, "id", "choice");
     const uint32_t r = uint32_t(u64(ch, "R", "choice"));
     const std::string mode = str_or(ch, "mode", "plain");
     require(mode == "spec" || r == 1, SS_E_INVALID, "fixture: plain needs R = 1");
     const std::string key = str_or(ch, "lang", "") + "/R" + std::to_string(r);
-    const Interp t = interp(need(curves, key, "fixture.curves"), u64(ch, "active_units", "choice"), "curves." + key);
-    Json o = Json::object();
-    o["id"] = need(ch, "id", "choice");
+    // v1 predicts single-sequence choices only; costs and curves apply only to their calibration identity
+    const Json* seq = ch.find("sequences");
+    const Json* calib = ch.find("calib");
+    if (!seq || json_write(*seq) != "1" || !applies(costs.find("applicability"), kCostKeys, calib) ||
+        !applies(fx.find("curves_applicability"), kCurveKeys, calib) || !curves.find(key)) {
+      rows.push(unpredicted_row(id));
+      continue;
+    }
+    const Interp t = interp(*curves.find(key), u64(ch, "active_units", "choice"), "curves." + key);
     Window w;
     uint64_t file_m = 0, pinned_m = 0;
     if (t.ok) {
-      const uint64_t fu = u64(ch, "file_units", "choice");
-      require(fu <= usage.arr.size(), SS_E_INVALID, "fixture.usage shorter than file_units");
+      const uint64_t fu = std::min<uint64_t>(u64(ch, "file_units", "choice"), usage.arr.size());  // = a Python slice
       uint64_t sum = 0;
       for (uint64_t i = 0; i < fu; ++i) sum += json_u64(usage.arr[size_t(i)], "usage");
       file_m = std::min<uint64_t>(r * rdiv(sum, 1000), t.value);
@@ -201,17 +241,17 @@ Json solve_ref(const Json& fx) {
       w = window_time(c, mode, r, u64(ch, "ctx", "choice"), key, t.value, pinned_m, file_m);
     }
     if (!w.ok) {
-      o["tag"] = Json::string("unpredicted");
-      for (const char* k : {"milli_misses_total", "milli_misses_pinned", "milli_misses_file", "window_us", "milli_tok_s"})
-        o[k] = Json();
-    } else {
-      o["tag"] = Json::string(t.tag);
-      o["milli_misses_total"] = Json::number(t.value);
-      o["milli_misses_pinned"] = Json::number(pinned_m);
-      o["milli_misses_file"] = Json::number(file_m);
-      o["window_us"] = Json::number(w.window_us);
-      o["milli_tok_s"] = Json::number(w.milli_tok_s);
+      rows.push(unpredicted_row(id));
+      continue;
     }
+    Json o = Json::object();
+    o["id"] = id;
+    o["tag"] = Json::string(t.tag);
+    o["milli_misses_total"] = Json::number(t.value);
+    o["milli_misses_pinned"] = Json::number(pinned_m);
+    o["milli_misses_file"] = Json::number(file_m);
+    o["window_us"] = Json::number(w.window_us);
+    o["milli_tok_s"] = Json::number(w.milli_tok_s);
     rows.push(o);
   }
   Json out = Json::object();
@@ -257,7 +297,9 @@ Json solve(const Json& in, const std::string& base) {
   const uint64_t w3_milli = ref ? u64_or(*ref, "w3_milli_tok_s", 0, "reference") : 0;
 
   Json out = Json::object();
-  out["schema"] = Json::string("tierstream/solver-v1");
+  // A what-if document, deliberately NOT tierstream/solver-v1: the operator solver (ts-recipe solve, placement
+  // contract 3.9) is claudeadmin-placement's; solve_ref above is its arithmetic for the goldens.
+  out["schema"] = Json::string("tierstream/adapt-whatif-v1");
   out["usage_sha256"] = Json::string(usage.sha256());
   if (curves) out["curves_source"] = Json::string(str_or(*curves, "schema", "?"));
   if (trace) out["trace_sha256"] = Json::string(trace->sha256);
@@ -316,10 +358,17 @@ Json solve(const Json& in, const std::string& base) {
     }
     uint64_t active = std::min<uint64_t>((budget - charged) / unit, units);
     if (const Json* cap = ch.find("arena_units")) active = std::min<uint64_t>(active, json_u64(*cap, where + ".arena_units"));
-    const uint64_t host_fixed = aux + spare_blocks * hstride;
+    uint64_t host_fixed = aux + spare_blocks * hstride;
     uint64_t host_units = 0;
     if (pinned > host_fixed) host_units = std::min<uint64_t>((pinned - host_fixed) / hstride, units - active);
-    const uint64_t file_units = units - active - host_units;
+    uint64_t file_units = units - active - host_units;
+    // A FILE tier needs its pinned staging (solver-costs-v1 file_staging_bytes): charged when there is one.
+    const uint64_t staging = costs_doc ? u64_or(*costs_doc, "file_staging_bytes", 0, "costs") : 0;
+    if (file_units > 0 && staging > 0) {
+      host_fixed += staging;
+      host_units = pinned > host_fixed ? std::min<uint64_t>((pinned - host_fixed) / hstride, units - active) : 0;
+      file_units = units - active - host_units;
+    }
     row["status"] = Json::string("ok");
     row["active_units"] = Json::number(active);
     row["arena_bytes"] = Json::number(active * unit);
@@ -351,11 +400,12 @@ Json solve(const Json& in, const std::string& base) {
         Window w;
         if (t.ok) w = window_time(Costs{costs_doc.get()}, kind, r, ctx, key, t.value, pinned_m, file_m);
         else w.missing = "active units below the curve's first knot";
+        if (batch != 1) w = Window{false, "sequences != 1 (v1 predicts single-sequence rows only)"};
         Json a = Json::object();
         a["tag"] = Json::string(w.ok ? t.tag : "unpredicted");
-        a["milli_misses_total"] = Json::number(t.value);
-        a["milli_misses_pinned"] = Json::number(pinned_m);
-        a["milli_misses_file_bound"] = Json::number(file_m);
+        a["milli_misses_total"] = t.ok ? Json::number(t.value) : Json();
+        a["milli_misses_pinned"] = t.ok ? Json::number(pinned_m) : Json();
+        a["milli_misses_file_bound"] = t.ok ? Json::number(file_m) : Json();
         if (w.ok) {
           a["window_us"] = Json::number(w.window_us);
           a["milli_tok_s"] = Json::number(w.milli_tok_s);
@@ -390,7 +440,8 @@ Json solve(const Json& in, const std::string& base) {
         b["milli_file_uses"] = Json::number(sr.milli_per_window(sr.file_uses));
         if (costs_doc) {
           const uint64_t pm = sr.milli_per_window(sr.miss_pinned), fm = sr.milli_per_window(sr.miss_file);
-          const Window w = window_time(Costs{costs_doc.get()}, kind, r, ctx, key, pm + fm, pm, fm);
+          Window w = window_time(Costs{costs_doc.get()}, kind, r, ctx, key, pm + fm, pm, fm);
+          if (batch != 1) w = Window{false, "sequences != 1 (v1 predicts single-sequence rows only)"};
           if (w.ok) {
             b["window_us"] = Json::number(w.window_us);
             b["milli_tok_s"] = Json::number(w.milli_tok_s);

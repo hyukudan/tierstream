@@ -1606,6 +1606,9 @@ void Ctx::wait_job_quiet(Job& j) {
 }
 
 void Ctx::set_usage(adapt::Usage* u) {
+  // The table is not locked: it is only touched on the engine thread, between ss_begin and ss_end; attaching or
+  // detaching inside a forward would tick a forward it did not observe from the start.
+  require(!in_forward_, SS_E_INVALID, "usage attach: not inside a forward (between ss_begin and ss_end)");
   if (u) {
     require(u->n_layers() == n_layers(), SS_E_INVALID, "usage attach: the table's layer count differs from the descriptor");
     for (int L = 0; L < n_layers(); ++L)
