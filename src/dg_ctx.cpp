@@ -68,13 +68,17 @@ class CudaTransport final : public DgTransport {
       ck(cudaStreamCreateWithPriority(&s_[kDem], cudaStreamNonBlocking, hi), "cudaStreamCreate (demand)");
       ck(cudaStreamCreateWithPriority(&s_[kPf], cudaStreamNonBlocking, lo), "cudaStreamCreate (prefetch)");
       ck(cudaStreamCreateWithFlags(&s_[kD2h], cudaStreamNonBlocking), "cudaStreamCreate (write-back)");
+      ck(cudaHostAlloc(reinterpret_cast<void**>(&table_pin_), size_t(x_.keys ? x_.keys : 1) * 4, cudaHostAllocPortable),
+         "cudaHostAlloc (table staging)");
     } catch (...) {  // the destructor does not run for a throwing constructor
       for (cudaStream_t s : s_)
         if (s) cudaStreamDestroy(s);
+      if (table_pin_) cudaFreeHost(table_pin_);
       throw;
     }
   }
   ~CudaTransport() override {
+    if (table_pin_) cudaFreeHost(table_pin_);
     for (cudaEvent_t e : dma_a_)
       if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : dma_b_)
@@ -148,8 +152,11 @@ class CudaTransport final : public DgTransport {
   }
   void event_sync(void* ev) override { ck(cudaEventSynchronize(static_cast<cudaEvent_t>(ev)), "cudaEventSynchronize"); }
   void sync(Stream s) override { ck(cudaStreamSynchronize(s_[s]), "cudaStreamSynchronize"); }
+  // From pinned staging (as the reference, cache.cpp:552-556): a pageable source would stage through the driver's
+  // own buffer on every boundary.
   void upload_table(const int32_t* t, uint32_t n) override {
-    ck(cudaMemcpyAsync(slot_of_, t, size_t(n) * 4, cudaMemcpyHostToDevice, s_[kDem]), "cudaMemcpyAsync (table)");
+    std::memcpy(table_pin_, t, size_t(n) * 4);
+    ck(cudaMemcpyAsync(slot_of_, table_pin_, size_t(n) * 4, cudaMemcpyHostToDevice, s_[kDem]), "cudaMemcpyAsync (table)");
     sync(kDem);
   }
   void gate(Stream s, void* ev) { wait(s, ev); }
@@ -167,6 +174,7 @@ class CudaTransport final : public DgTransport {
   uint32_t* ready_;
   const std::vector<char*>& blocks_;
   cudaStream_t s_[3] = {nullptr, nullptr, nullptr};
+  int32_t* table_pin_ = nullptr;  // keys entries
 };
 
 class CudaDgCtx final : public DgCtx {
