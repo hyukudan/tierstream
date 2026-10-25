@@ -397,7 +397,7 @@ Profile (`strix-stream/recipe-profile-v1`):
 | field | type | default | meaning |
 |---|---|---|---|
 | `recipe` | string | required | must equal the recipe's `name` |
-| `recipe_sha256` | 64 lowercase hex | required | must equal the sha256 of the recipe's bytes as loaded |
+| `recipe_sha256` | 64 lowercase hex | required | must equal the sha256 of the recipe's bytes as loaded  Any byte change of the recipe file invalidates the profile, including respelling only its `schema` from `strix-stream/recipe-v1` to `tierstream/recipe-v1` (the effective recipe and its hash stay the same; re-bind the profile to the new file's hash) |
 | `workload` | string, non-empty | required | the workload class it was tuned for; must equal the identity's `workload` |
 | `source` | string | `""` | shown by explain |
 | `key.engine_sha256`, `key.model_sha256` | 64 lowercase hex | required | must equal the identity's |

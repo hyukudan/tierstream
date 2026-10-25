@@ -393,6 +393,48 @@ const Json* field_of(const Json& explain, const std::string& path) {
 
 }  // namespace
 
+// The rename (wave4/wstream/rename/design.md §3): the tierstream spellings of the recipe, profile and overrides
+// schemas are accepted and give exactly what the strix-stream spellings give (one canonical JSON, one effective hash,
+// the same explain); the canonical output keeps the old id; the profile binds to the recipe file's raw bytes, so a
+// respelled recipe is another file for its old profile.
+TEST(rename_both_schema_spellings) {
+  auto respell = [](std::string t, const char* from, const char* to) {
+    const size_t at = t.find(from);
+    if (at != std::string::npos) t.replace(at, std::strlen(from), to);
+    return t;
+  };
+  const std::string lab_new = respell(kLab, "\"strix-stream/recipe-v1\"", "\"tierstream/recipe-v1\"");
+  CHECK(lab_new != std::string(kLab));
+  const Json probe = json_parse(kProbe);
+  const std::string sets = "\"routes.prefill_long.placement.rtx.units.layers.resident\" = 33\n";
+  const std::string ov =
+      "schema = \"strix-stream/recipe-overrides-v1\"\nrecipe = \"mm-lab\"\n[set]\n"
+      "\"routes.decode_pair.placement.pair.lookahead_units\" = 6\n";
+  RecipeStack a(kLab, "lab.toml");
+  a.add_profile(profile_text(a.sha256(), sets), "tune.toml", probe);
+  a.add_overrides(ov, "ops.toml");
+  RecipeStack b(lab_new, "lab.toml");
+  b.add_profile(respell(profile_text(b.sha256(), sets), "\"strix-stream/recipe-profile-v1\"",
+                        "\"tierstream/recipe-profile-v1\""),
+                "tune.toml", probe);
+  b.add_overrides(respell(ov, "\"strix-stream/recipe-overrides-v1\"", "\"tierstream/recipe-overrides-v1\""),
+                  "ops.toml");
+  CHECK(a.sha256() != b.sha256());  // raw bytes: two files
+  CHECK_EQ(json_write(a.effective_json()), json_write(b.effective_json()));
+  CHECK_EQ(a.effective_sha256(), b.effective_sha256());
+  CHECK(json_write(a.effective_json()).find("\"strix-stream/recipe-v1\"") != std::string::npos);
+  CHECK(json_write(b.effective_json()).find("tierstream/") == std::string::npos);
+  // explain names the file's own hash; everything else is the same
+  std::string ex_b = json_write(b.explain());
+  const size_t at = ex_b.find(b.sha256());
+  CHECK(at != std::string::npos);
+  if (at != std::string::npos) ex_b.replace(at, b.sha256().size(), a.sha256());
+  CHECK_EQ(json_write(a.explain()), ex_b);
+  // the old profile (bound to the old file's bytes) does not bind to the respelled file
+  RecipeStack c(lab_new, "lab.toml");
+  CHECK_REFUSED(c.add_profile(profile_text(a.sha256(), sets), "tune.toml", probe), "recipe_sha256");
+}
+
 TEST(layers_precedence_pins_and_explain) {
   RecipeStack s(kLab, "lab.toml");
   const Json probe = json_parse(kProbe);

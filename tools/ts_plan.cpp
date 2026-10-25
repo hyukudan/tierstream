@@ -12,10 +12,14 @@
 #define TS_TOOL_NAME "ts-plan"
 #endif
 
+// Every ts-plan diagnostic starts with "ts-plan: ". The old ss-plan prints exactly what strix-stream's ss-plan printed
+// (no prefix), so scripts that parse it see the same bytes.
+static const char* const kPrefix = std::strcmp(TS_TOOL_NAME, "ss-plan") == 0 ? "" : TS_TOOL_NAME ": ";
+
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: " TS_TOOL_NAME " DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] "
-                         "[--dynamic N] [--desc]\n");
+    std::fprintf(stderr, "%susage: " TS_TOOL_NAME " DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] "
+                         "[--dynamic N] [--desc]\n", kPrefix);
     return 2;
   }
   ss_budget b;
@@ -26,7 +30,7 @@ int main(int argc, char** argv) {
     std::string a = argv[i];
     auto next = [&]() -> const char* {
       if (i + 1 >= argc) {
-        std::fprintf(stderr, "%s needs a value\n", a.c_str());
+        std::fprintf(stderr, "%s%s needs a value\n", kPrefix, a.c_str());
         std::exit(2);
       }
       return argv[++i];
@@ -38,13 +42,13 @@ int main(int argc, char** argv) {
     else if (a == "--dynamic") b.dynamic_slots_per_layer = uint32_t(std::atoi(next()));
     else if (a == "--desc") print_desc = true;
     else {
-      std::fprintf(stderr, "unknown argument %s\n", a.c_str());
+      std::fprintf(stderr, "%sunknown argument %s\n", kPrefix, a.c_str());
       return 2;
     }
   }
   ss_desc* d = nullptr;
   if (ss_desc_from_file(argv[1], &d) != SS_OK) {
-    std::fprintf(stderr, "descriptor: %s\n", ss_last_error());
+    std::fprintf(stderr, "%sdescriptor: %s\n", kPrefix, ss_last_error());
     return 1;
   }
   char* out = nullptr;
@@ -57,7 +61,7 @@ int main(int argc, char** argv) {
   }
   ss_plan* p = nullptr;
   if (ss_plan_make(d, &b, nullptr, 0, &p) != SS_OK) {
-    std::fprintf(stderr, "plan: %s\n", ss_last_error());
+    std::fprintf(stderr, "%splan: %s\n", kPrefix, ss_last_error());
     ss_desc_free(d);
     return 1;
   }

@@ -11,6 +11,7 @@ endforeach()
 option(TS_CUDA "Build the CUDA backend" OFF)
 option(TS_HIP "Build the HIP backend (Strix Halo, unified memory)" OFF)
 option(TS_TESTS "Build the tests" ON)
+option(TS_RENAME_GATES "Also build and run the pre-rename (4dc53b0) C++ tests unchanged (needs git)" OFF)
 option(TS_MUTATION_NO_SRC_WAIT "Test-only mutation: drop the exclusive same-forward source wait (must fail the CUDA test)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -51,12 +52,23 @@ target_link_libraries(tierstream PUBLIC Threads::Threads)
 # One release of the rename: the old CMake target name, and the old archive file next to the new one (engine build
 # scripts link strix_stream.lib / libstrix_stream.a by path).
 add_library(strix_stream ALIAS tierstream)
-set(TS_OLD_ARCHIVE ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}strix_stream${CMAKE_STATIC_LIBRARY_SUFFIX})
-add_custom_command(OUTPUT ${TS_OLD_ARCHIVE}
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:tierstream> ${TS_OLD_ARCHIVE}
-  DEPENDS tierstream
+# The copy is a step of the library's own build, so every build of tierstream (targeted or not, any configuration)
+# refreshes it, in the directory of that configuration's archive.
+# (Computed as CMake places the archive: BYPRODUCTS cannot name the target's own $<TARGET_FILE_DIR>.)
+if(CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+  set(ts_archive_dir ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
+else()
+  set(ts_archive_dir ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+get_property(ts_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(ts_multi_config)
+  string(APPEND ts_archive_dir "/$<CONFIG>")
+endif()
+set(TS_OLD_ARCHIVE ${ts_archive_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}strix_stream${CMAKE_STATIC_LIBRARY_SUFFIX})
+add_custom_command(TARGET tierstream POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:tierstream> ${TS_OLD_ARCHIVE}
+  BYPRODUCTS ${TS_OLD_ARCHIVE}
   COMMENT "tierstream: the strix_stream archive name (kept for one release)")
-add_custom_target(strix_stream_archive ALL DEPENDS ${TS_OLD_ARCHIVE})
 
 if(TS_CUDA)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -124,7 +136,7 @@ if(TS_TESTS)
   add_test(NAME ts-names-cpp COMMAND ts-test-names-cpp)
   # (2) an unchanged pre-rename C test (the old header only) linked by FILE PATH against the old archive name
   add_executable(ts-test-old-abi tests/test_capi.c)
-  add_dependencies(ts-test-old-abi strix_stream_archive)
+  add_dependencies(ts-test-old-abi tierstream)
   target_include_directories(ts-test-old-abi PRIVATE include)
   set(ts_old_abi_deps Threads::Threads)  # what an engine linking the file links itself
   if(TS_CUDA)
@@ -151,8 +163,20 @@ if(TS_TESTS)
   set_tests_properties(ts-prefix-ss-recipe PROPERTIES PASS_REGULAR_EXPRESSION "^ss-recipe: recipe: cannot open recipe no-such-file.toml")
   add_test(NAME ts-prefix-ss-recipe-usage COMMAND ss-recipe)
   set_tests_properties(ts-prefix-ss-recipe-usage PROPERTIES PASS_REGULAR_EXPRESSION "^ss-recipe: ")
+  # ss-plan prints what strix-stream's ss-plan printed (no prefix; the reference comparison is
+  # wave4/wstream/rename/byte_gate.py); ts-plan prefixes every diagnostic.
   add_test(NAME ts-prefix-ss-plan COMMAND ss-plan)
   set_tests_properties(ts-prefix-ss-plan PROPERTIES PASS_REGULAR_EXPRESSION "^usage: ss-plan ")
+  add_test(NAME ts-prefix-ss-plan-open COMMAND ss-plan no-such-file.json --device-gib 1)
+  set_tests_properties(ts-prefix-ss-plan-open PROPERTIES PASS_REGULAR_EXPRESSION "^descriptor: ")
+  add_test(NAME ts-prefix-ts-plan COMMAND ts-plan)
+  set_tests_properties(ts-prefix-ts-plan PROPERTIES PASS_REGULAR_EXPRESSION "^ts-plan: usage: ts-plan ")
+  add_test(NAME ts-prefix-ts-plan-arg COMMAND ts-plan d.json --bogus)
+  set_tests_properties(ts-prefix-ts-plan-arg PROPERTIES PASS_REGULAR_EXPRESSION "^ts-plan: unknown argument --bogus")
+  add_test(NAME ts-prefix-ts-plan-value COMMAND ts-plan d.json --ring)
+  set_tests_properties(ts-prefix-ts-plan-value PROPERTIES PASS_REGULAR_EXPRESSION "^ts-plan: --ring needs a value")
+  add_test(NAME ts-prefix-ts-plan-open COMMAND ts-plan no-such-file.json --device-gib 1)
+  set_tests_properties(ts-prefix-ts-plan-open PROPERTIES PASS_REGULAR_EXPRESSION "^ts-plan: descriptor: ")
   add_test(NAME ts-prefix-ts-recipe COMMAND ts-recipe validate no-such-file.toml)
   set_tests_properties(ts-prefix-ts-recipe PROPERTIES PASS_REGULAR_EXPRESSION "^ts-recipe: recipe: cannot open recipe no-such-file.toml")
   # (5) the ss:: bridge for translation units built against src/ (minimax/rtx-prefill-ss calls ss::xxh64)
@@ -178,6 +202,31 @@ if(TS_TESTS)
       set_tests_properties("refuse:${n}" PROPERTIES WILL_FAIL TRUE)
     endif()
   endforeach()
+
+  # (6) opt-in: strix-stream's own C++ tests at the last pre-rename commit, built UNCHANGED (taken with git show)
+  # against the renamed library, their ss:: names resolved through the xxh64.hpp bridge (force-included).
+  if(TS_RENAME_GATES)
+    find_package(Git REQUIRED)
+    set(ts_base 4dc53b0)
+    set(ts_old_dir ${CMAKE_CURRENT_BINARY_DIR}/rename-base-tests)
+    file(MAKE_DIRECTORY ${ts_old_dir})
+    foreach(f check.hpp fixture.hpp test_core.cpp test_runtime.cpp test_recipe.cpp test_exclusive.cpp
+              test_readahead.cpp test_snapshot.cpp)
+      execute_process(COMMAND ${GIT_EXECUTABLE} show ${ts_base}:tests/${f}
+                      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} OUTPUT_FILE ${ts_old_dir}/${f}
+                      RESULT_VARIABLE ts_git_rc)
+      if(NOT ts_git_rc EQUAL 0)
+        message(FATAL_ERROR "TS_RENAME_GATES: git show ${ts_base}:tests/${f} failed")
+      endif()
+    endforeach()
+    foreach(t core runtime recipe exclusive readahead snapshot)
+      add_executable(ts-test-base-${t} ${ts_old_dir}/test_${t}.cpp)
+      target_include_directories(ts-test-base-${t} PRIVATE src)
+      target_compile_options(ts-test-base-${t} PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/FIxxh64.hpp,-includexxh64.hpp>)
+      target_link_libraries(ts-test-base-${t} PRIVATE tierstream)
+      add_test(NAME base-${t} COMMAND ts-test-base-${t} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    endforeach()
+  endif()
 
   if(TS_CUDA)
     foreach(name ts-probe-order ss-probe-order)
