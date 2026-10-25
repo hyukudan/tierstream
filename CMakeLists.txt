@@ -97,6 +97,11 @@ if(SS_TESTS)
   target_link_libraries(ss-test-readahead PRIVATE strix_stream)
   add_test(NAME readahead COMMAND ss-test-readahead)
 
+  add_executable(ss-test-snapshot tests/test_snapshot.cpp)
+  target_include_directories(ss-test-snapshot PRIVATE src)
+  target_link_libraries(ss-test-snapshot PRIVATE strix_stream)
+  add_test(NAME snapshot COMMAND ss-test-snapshot)
+
   add_executable(ss-test-capi tests/test_capi.c)
   target_link_libraries(ss-test-capi PRIVATE strix_stream)
   set_target_properties(ss-test-capi PROPERTIES LINKER_LANGUAGE CXX)

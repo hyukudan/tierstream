@@ -7,7 +7,7 @@
  * gives the engine one pointer table per layer to read weights through.
  *
  * Threading: one context is driven by one engine thread (every ss_* call on a context from the same thread, or
- * externally serialized). The library runs its own reader threads.
+ * externally serialized), except ss_stats_snapshot* (any thread, see Stats). The library runs its own reader threads.
  *
  * Streams and lifetimes (design.md §6.1):
  *   - every stream argument of one forward (ss_layer_routes_dev, ss_acquire*, ss_group_wait, ss_release) must be the
@@ -26,7 +26,7 @@
  * Failures: a library error (SS_E_INVALID, SS_E_IO, SS_E_HASH, SS_E_CAPACITY) leaves the context consistent: a failed
  * read is reported at ss_acquire / ss_end and the unit is read again at its next use. An out-of-memory, device
  * (SS_E_BACKEND / SS_E_NOMEM) or internal failure inside a context call poisons the context: every later call except
- * ss_close returns an error.
+ * ss_close and the stats calls returns an error.
  *
  * Exactness: the library never changes bytes. A unit's bytes on the device are identical whether it is resident,
  * landed from the pinned tier or read from a file. Which slot holds a unit, and when it landed, is visible to the
@@ -330,6 +330,48 @@ SS_API ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* o
 static inline ss_status ss_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* out) {
   return ss_stats_exclusive_sized(c, out, (uint32_t)sizeof *out);
 }
+
+/* Stats snapshot (design.md §7.1): the one exception to the threading rule. ss_stats_snapshot* may be called from any
+ * thread, concurrently with any call on the context and with each other, but never concurrently with or after
+ * ss_close (stop the readers first). They work on a poisoned context and return the last publication.
+ *
+ * The first call arms the context: from then on the engine thread publishes an immutable copy of the counters at the
+ * end of each ss_end that folds a forward's numbers (also one that reports a read failure) and of each ss_stats_reset
+ * between forwards. While nothing is published (so normally on that first call) every call returns SS_E_INVALID with
+ * its outputs untouched. Unarmed, the only added work is one relaxed load per ss_end / ss_stats_reset. A publication
+ * holds every counter since open (or since the last reset) exactly as ss_stats_total / ss_stats_exclusive /
+ * ss_stats_to_json gave them on the engine thread at that moment. Live changes between publications (inside a
+ * forward, ss_seed promotions, read-ahead requested between forwards, a reset during a forward) appear at the next
+ * publication; a poisoned context publishes no more. During the stats hook the previous publication is still shown.
+ *
+ * Versioned like ss_exclusive_stats: use the inline ss_stats_snapshot; min(info_size, sizeof) bytes are written and
+ * only the fields wholly inside them are meaningful. Fields are only ever appended. SS_HAVE_STATS_SNAPSHOT says that
+ * this header declares the calls (the library linked must export them). */
+#define SS_HAVE_STATS_SNAPSHOT 1
+#define SS_SNAPSHOT_READAHEAD 1u  /* read-ahead buffers exist: the readahead_* fields apply */
+#define SS_SNAPSHOT_EXCLUSIVE 2u  /* EXCLUSIVE tier mode: the exclusive_* fields apply */
+typedef struct ss_snapshot_info {
+  uint32_t struct_size;
+  uint32_t flags;                     /* SS_SNAPSHOT_* */
+  uint64_t sequence;                  /* publications since arming (1 = the first) */
+  uint64_t forwards;                  /* forwards ended at that publication (the JSON's "forwards") */
+  /* Host read-ahead (0 unless SS_SNAPSHOT_READAHEAD), as the JSON's "readahead" object. */
+  uint64_t readahead_buffers, readahead_buffer_bytes, readahead_requested, readahead_read, readahead_landed;
+  uint64_t readahead_unused, readahead_failed, readahead_fallback, readahead_bytes;
+  /* EXCLUSIVE tier (0 unless SS_SNAPSHOT_EXCLUSIVE), as ss_exclusive_stats plus the block count. */
+  uint64_t exclusive_writebacks, exclusive_writeback_bytes, exclusive_deferred, exclusive_promoted;
+  uint64_t exclusive_free_blocks, exclusive_min_free_blocks, exclusive_rereads, exclusive_blocks;
+} ss_snapshot_info;
+/* total_out (may be NULL): the per-layer counters of the publication summed, as ss_stats_total. info_out (may be
+ * NULL; not both): struct_size is set to the bytes written; info_size < 4 with info_out = SS_E_INVALID. */
+SS_API ss_status ss_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out,
+                                         uint32_t info_size);
+static inline ss_status ss_stats_snapshot(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out) {
+  return ss_stats_snapshot_sized(c, total_out, info_out, (uint32_t)sizeof *info_out);
+}
+/* strix-stream/stats-v1 of the last publication: byte for byte the document ss_stats_to_json gave at that moment.
+ * Freed with ss_free. */
+SS_API ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_len);
 
 /* ---------------------------------------------------------------------------------------------------------------
  * Recipes (docs/recipes.md): how one model runs on one hardware set per workload class, compiled into ss_budget /
