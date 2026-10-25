@@ -83,7 +83,7 @@ struct Line {
 };
 
 struct Dev {
-  std::string set;
+  std::string set, signature;
   bool anchor = false, bound = false, enabled = false;
   const RDevice* rd = nullptr;
   const BoundMember* bm = nullptr;
@@ -301,20 +301,43 @@ PlaceResult place(const PlaceInput& in) {
       errs.push_back("PL_E_MISSING_CONTEXT " + d.set + ": components-v1 has no context for " + d.bm->arch);
       continue;
     }
+    std::set<std::pair<std::string, std::string>> selected;
+    for (const ComponentDecl& c : C->components) {
+      const RComponent* x = rt->component(c.id);
+      std::string dest = x ? x->device : "auto";
+      if (dest == "auto") {
+        dest = dflt_of(c.id);
+        if (dest == "anchor") dest = anchor_set;
+      }
+      if (dest == d.set)
+        selected.emplace(c.id, c.has_variants ? (d.anchor ? "anchor" : "assist") : "default");
+    }
+    Json workload = Json::object(), components = Json::array(), warmup = Json::object();
+    for (const auto& p : selected) {
+      Json component = Json::object();
+      component["component"] = Json::string(p.first);
+      component["variant"] = Json::string(p.second);
+      components.push(component);
+    }
+    warmup["envelope_sha256"] = Json::string(C->envelope_sha256);
+    workload["components"] = components;
+    workload["warmup"] = warmup;
+    const std::string canonical = json_write(workload);
+    d.signature = sha256_hex(canonical.data(), canonical.size());
     const Components::ContextReceipt* matched = nullptr;
-    {  // the allowance applies only with a receipt for exactly this binding: arch, name, driver, platform, build
+    {  // the allowance applies only with a receipt for exactly this binding: arch, name, driver, platform, build, signature
       const std::string want =
-          d.bm->arch + "/" + d.bm->name + "/" + d.bm->driver + "/" + d.bm->platform + "/" + C->build_sha256;
+          d.bm->arch + "/" + d.bm->name + "/" + d.bm->driver + "/" + d.bm->platform + "/" + C->build_sha256 + "/" + d.signature;
       // the message names the first differing key field of the same-arch receipt with the longest matching prefix
-      // in the order arch, device_name, driver, platform, build_sha256 ("arch" when no receipt has this arch)
-      static const char* const kFields[] = {"arch", "device_name", "driver", "platform", "build_sha256"};
+      // in the order arch, device_name, driver, platform, build_sha256, signature ("arch" when no receipt has this arch)
+      static const char* const kFields[] = {"arch", "device_name", "driver", "platform", "build_sha256", "signature"};
       int best = 0;
       for (const auto& r : C->context_receipts) {
-        const std::string mine[5] = {d.bm->arch, d.bm->name, d.bm->driver, d.bm->platform, C->build_sha256};
-        const std::string theirs[5] = {r.arch, r.device_name, r.driver, r.platform, r.build_sha256};
+        const std::string mine[6] = {d.bm->arch, d.bm->name, d.bm->driver, d.bm->platform, C->build_sha256, d.signature};
+        const std::string theirs[6] = {r.arch, r.device_name, r.driver, r.platform, r.build_sha256, r.signature};
         int k = 0;
-        while (k < 5 && mine[k] == theirs[k]) ++k;
-        if (k == 5) matched = &r;
+        while (k < 6 && mine[k] == theirs[k]) ++k;
+        if (k == 6) matched = &r;
         best = std::max(best, k);
       }
       if (!matched) {
@@ -323,13 +346,27 @@ PlaceResult place(const PlaceInput& in) {
         continue;
       }
     }
-    d.context = i64(it->second);
+    d.context = i64(matched->allowance_bytes);
     d.granularity = i64(matched->alloc_granularity_bytes);  // G: billed per separate allocation (rev 17)
     d.receipt = matched;
     auto g = C->context_growth.find(d.bm->arch);
     d.growth = g == C->context_growth.end() ? 0 : i64(g->second);
     // rev 18, per touched device after the key: the receipt's configuration envelope, then the growth rule
-    if (matched->envelope_sha256.empty() || matched->envelope_sha256 != C->envelope_sha256) {
+    const Json* limits = C->config.find("limits");
+    const Json* envelope_limits = C->envelope.find("limits");
+    bool limits_match = limits && limits->is_object() && envelope_limits && envelope_limits->is_object() &&
+                        json_write(*limits) == json_write(*envelope_limits);
+    for (const char* key : {"stack_bytes", "printf_fifo", "malloc_heap", "dev_runtime_pending"}) {
+      const Json* value = limits ? limits->find(key) : nullptr;
+      const Json* qualified = envelope_limits ? envelope_limits->find(key) : nullptr;
+      limits_match = limits_match && value && qualified && value->is_number() &&
+                     json_write(*value) == json_write(*qualified);
+    }
+    if (const Json* stack = C->stack.find("stack_bytes")) {
+      const Json* configured = limits ? limits->find("stack_bytes") : nullptr;
+      limits_match = limits_match && configured && json_write(*stack) == json_write(*configured);
+    }
+    if (!limits_match || matched->envelope_sha256.empty() || matched->envelope_sha256 != C->envelope_sha256) {
       errs.push_back("PL_E_MISSING_CONTEXT " + d.set +
                      ": receipt qualified on another configuration envelope (mismatch: envelope)");
       continue;
@@ -357,17 +394,6 @@ PlaceResult place(const PlaceInput& in) {
         }
       }
   }
-  // rev 18: the `graphs` driver charge (on the anchor: graphs is anchored) is the receipt's qualified graph bytes
-  if (errs.empty())
-    if (const ComponentDecl* g = C->find("graphs"))
-      if (A.receipt && A.receipt->graph_bytes >= 0) {
-        int64_t declared = 0;
-        for (const Charge& ch : *g->for_role(false))
-          if (ch.driver) declared = add(declared, i64(ch.bytes));
-        if (declared != A.receipt->graph_bytes)
-          errs.push_back("PL_E_STALE graphs: driver charge " + num(declared) + " != receipt graph_bytes " +
-                         num(A.receipt->graph_bytes));
-      }
   if (stop("V3")) return res;
 
   // ---- V4 feasibility: S1 destinations ------------------------------------------------------------------------
@@ -474,6 +500,40 @@ PlaceResult place(const PlaceInput& in) {
       continue;
     }
     placed.push_back(pl);
+  }
+  // V3 (after key -> envelope -> growth): driver components and warm_bytes form the same per-device map.
+  // Report differing bytes in component priority order, then orphan receipt entries in key order.
+  if (errs.empty()) {
+    std::vector<std::string> warm_errors;
+    std::map<std::string, std::set<std::string>> materialised;
+    for (const Placed& p : placed) {
+      const Dev* d = dev_of(p.dest);
+      if (!p.decl || !d || !d->receipt) continue;
+      int64_t declared = 0;
+      bool driver = false;
+      for (const Charge& ch : *p.decl->for_role(!d->anchor))
+        if (ch.driver) {
+          driver = true;
+          declared = add(declared, i64(ch.bytes));
+        }
+      if (driver) materialised[d->set].insert(p.id);
+      auto it = d->receipt->warm_bytes.find(p.id);
+      const bool has_entry = it != d->receipt->warm_bytes.end();
+      if (driver && (!has_entry || declared != i64(it->second)))
+        warm_errors.push_back("PL_E_STALE " + p.id + " on " + d->set + ": driver charge " + num(declared) +
+                        " != receipt warm_bytes " + (has_entry ? num(i64(it->second)) : std::string("absent")));
+    }
+    for (const Dev& d : devs)
+      if (d.touched && d.receipt)
+        for (const auto& entry : d.receipt->warm_bytes)
+          if (!materialised[d.set].count(entry.first))
+            warm_errors.push_back("PL_E_STALE " + entry.first + " on " + d.set +
+                                  ": orphan receipt warm_bytes entry");
+    if (!warm_errors.empty()) {
+      errs = warm_errors;
+      stop("V3");
+      return res;
+    }
   }
   // A movable component (one with variants) needs a qualification receipt for the arch it lands on, explicit or auto
   // (contract §5.2): the product default (the drafter on the anchor) needs the anchor arch's receipt too.
@@ -583,16 +643,21 @@ PlaceResult place(const PlaceInput& in) {
   for (Dev& d : devs) {
     if (!d.touched) continue;
     const int64_t ctx = add(d.allowance, d.growth);  // max(context, context-v1) + context_growth, once per device
-    // physical allocation overhead (rev 17): G x (allocs of the lines live in the phase + slot_allocs on the anchor);
-    // the lines keep their payload bytes
+    // Reserve the maximum materialisation plus allocation overhead in every phase (rev 20).
+    int64_t mat_peak = 0;
     for (int p = 0; p < kPlacePhases; ++p) {
       int64_t allocs = d.anchor && elastic ? i64(C->slot_allocs) : 0;
       for (const Line& l : d.lines)
         if (l.phases & (1u << p)) allocs = add(allocs, l.allocs);
       const int64_t over = mul(d.granularity, allocs);
       d.overhead = std::max(d.overhead, over);
-      d.peak[p] = add(add(d.peak[p], ctx), over);
+      int64_t driver = 0;
+      for (const Line& l : d.lines)
+        if (l.driver && (l.phases & (1u << p))) driver = add(driver, l.live());
+      mat_peak = std::max(mat_peak, add(over, driver));
+      d.peak[p] -= driver;
     }
+    for (int p = 0; p < kPlacePhases; ++p) d.peak[p] = add(add(d.peak[p], ctx), mat_peak);
     if (d.max_peak() > d.budget - d.margin)
       errs.push_back("PL_E_BUDGET " + d.set + ": need " + num(d.max_peak()) + " > budget-margin " +
                      num(d.budget - d.margin) + "; knob: " +
@@ -662,11 +727,9 @@ PlaceResult place(const PlaceInput& in) {
   // host blocks are billed at the host stride (round_up(unit_bytes, 4096); equal to unit_bytes for DS)
   const int64_t hstride = elastic ? (unit + 4095) / 4096 * 4096 : 0;
   // expert host blocks are allocated in chunks of at most host_chunk_bytes: one granule per chunk (rev 18)
-  const int64_t hchunk = i64(C->host_chunk_bytes);
-  auto homes_bytes = [&](int64_t n) {
-    const int64_t b = mul(n, hstride);
-    return add(b, mul(hgran, ceil_div(b, hchunk)));
-  };
+  // dg_ctx.cpp:855-866: per_chunk = max(1, floor(host_chunk_bytes / host_stride)) blocks, one granule per chunk (rev 19)
+  const int64_t per_chunk = hstride ? std::max<int64_t>(1, i64(C->host_chunk_bytes) / hstride) : 1;
+  auto homes_bytes = [&](int64_t n) { return add(mul(n, hstride), mul(hgran, ceil_div(n, per_chunk))); };
   if (add(other_pinned, homes_bytes(host_spares)) > pinned_budget) {
     // nothing elastic is sized on a host that cannot hold its fixed charges (no negative homes)
     errs.push_back("PL_E_HOST_PINNED: mandatory pinned " + num(add(other_pinned, homes_bytes(host_spares))) +
@@ -911,6 +974,7 @@ PlaceResult place(const PlaceInput& in) {
     e["name"] = Json::string(d.bm->name);
     e["host"] = Json::string(d.bm->host);
     e["arch"] = Json::string(d.bm->arch);
+    e["signature"] = Json::string(d.signature);
     if (!d.bm->driver.empty()) e["driver"] = Json::string(d.bm->driver);
     if (!d.bm->platform.empty()) e["platform"] = Json::string(d.bm->platform);
     e["memory_bytes"] = Json::number(d.memory);

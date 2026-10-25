@@ -192,7 +192,7 @@ Json charges_json(const std::vector<Charge>& cs) {
     if (!c.name.empty()) e["name"] = Json::string(c.name);
     e["at"] = Json::string(charge_at_word(c.at));
     e["bytes"] = Json::number(c.bytes);
-    e["peak_extra"] = Json::number(c.peak_extra);
+    if (c.peak_extra) e["peak_extra"] = Json::number(c.peak_extra);  // canonical form omits defaults (rev 19)
     if (c.allocs != (c.driver ? 0u : 1u)) e["allocs"] = Json::number(c.allocs);  // when not the kind's default
     if (c.driver) e["kind"] = Json::string("driver");          // "payload" is the default, omitted
     Json ph = Json::array();
@@ -438,17 +438,17 @@ Components components_from_json(const Json& doc) {
       keys(e, w,
            {"arch", "device_name", "driver", "platform", "build_sha256", "allowance_bytes", "max_observed_bytes",
             "max_growth_bytes", "alloc_granularity_bytes", "envelope_sha256", "method", "runs", "receipt_sha256",
-            "host_alloc_granularity_bytes", "graph_bytes"});
-      {  // the key is complete (rev 16): five non-empty strings, else PL_E_SCHEMA naming the key as written
+            "host_alloc_granularity_bytes", "warm_bytes", "signature"});
+      {  // the key is complete (rev 16): six non-empty strings, else PL_E_SCHEMA naming the key as written
         std::string seen;
         bool complete = true;
-        for (const char* k : {"arch", "device_name", "driver", "platform", "build_sha256"}) {
+        for (const char* k : {"arch", "device_name", "driver", "platform", "build_sha256", "signature"}) {
           const Json* v = e.find(k);
           if (v) seen += (seen.empty() ? "" : ", ") + json_write(*v);
           complete = complete && v && v->is_string() && !v->text.empty();
         }
         if (!complete)
-          bad("context receipt key [" + seen + "]", "needs [arch, device_name, driver, platform, build_sha256]");
+          bad("context receipt key [" + seen + "]", "needs [arch, device_name, driver, platform, build_sha256, signature]");
       }
       Components::ContextReceipt r;
       r.arch = str(need(e, "arch", w), w + ".arch");
@@ -460,6 +460,7 @@ Components components_from_json(const Json& doc) {
       if (r.platform != "linux" && r.platform != "windows-wddm" && r.platform != "windows-tcc")
         bad(w + ".platform", "\"" + r.platform + "\" is not linux | windows-wddm | windows-tcc");
       r.build_sha256 = hex64(need(e, "build_sha256", w), w + ".build_sha256");
+      r.signature = hex64(need(e, "signature", w), w + ".signature");
       r.allowance_bytes = u64(need(e, "allowance_bytes", w), w + ".allowance_bytes");
       r.max_observed_bytes = u64(need(e, "max_observed_bytes", w), w + ".max_observed_bytes");
       if (r.max_observed_bytes > r.allowance_bytes) bad(w, "max_observed_bytes is above allowance_bytes");
@@ -468,12 +469,18 @@ Components components_from_json(const Json& doc) {
       if (r.alloc_granularity_bytes > (uint64_t(1) << 32))
         bad(w + ".alloc_granularity_bytes", "above 4 GiB per allocation");
       r.envelope_sha256 = hex64(need(e, "envelope_sha256", w), w + ".envelope_sha256");
-      if (const Json* x = e.find("host_alloc_granularity_bytes")) {
-        r.host_alloc_granularity_bytes = u64(*x, w + ".host_alloc_granularity_bytes");
-        if (r.host_alloc_granularity_bytes > (uint64_t(1) << 32))
-          bad(w + ".host_alloc_granularity_bytes", "above 4 GiB per allocation");
+      // required (rev 19): the pinned granule is qualified, never assumed
+      r.host_alloc_granularity_bytes =
+          u64(need(e, "host_alloc_granularity_bytes", w), w + ".host_alloc_granularity_bytes");
+      if (r.host_alloc_granularity_bytes > (uint64_t(1) << 32))
+        bad(w + ".host_alloc_granularity_bytes", "above 4 GiB per allocation");
+      if (const Json* x = e.find("warm_bytes")) {  // {component: bytes}; an absent entry is checked by V3
+        if (!x->is_object()) bad(w + ".warm_bytes", "expected {component: bytes}");
+        for (const auto& kv : x->obj) {
+          if (component_priority(kv.first) <= 0) bad(w + ".warm_bytes", "\"" + kv.first + "\" is not a component id");
+          r.warm_bytes[kv.first] = u64(kv.second, w + ".warm_bytes." + kv.first);
+        }
       }
-      if (const Json* x = e.find("graph_bytes")) r.graph_bytes = int64_t(u64(*x, w + ".graph_bytes"));
       r.method = str(need(e, "method", w), w + ".method");
       r.runs = u64(need(e, "runs", w), w + ".runs");
       if (r.runs < 3) bad(w + ".runs", "a context receipt needs >= 3 quiescent runs");
@@ -481,7 +488,7 @@ Components components_from_json(const Json& doc) {
       c.context_receipts.push_back(r);
     }
     auto key = [](const Components::ContextReceipt& r) {
-      return r.arch + "|" + r.device_name + "|" + r.driver + "|" + r.platform + "|" + r.build_sha256;
+      return r.arch + "|" + r.device_name + "|" + r.driver + "|" + r.platform + "|" + r.build_sha256 + "|" + r.signature;
     };
     std::sort(c.context_receipts.begin(), c.context_receipts.end(),
               [&](const Components::ContextReceipt& a, const Components::ContextReceipt& b) { return key(a) < key(b); });
@@ -819,14 +826,18 @@ Json components_to_json(const Components& c) {
     e["driver"] = Json::string(r.driver);
     e["platform"] = Json::string(r.platform);
     e["build_sha256"] = Json::string(r.build_sha256);
+    e["signature"] = Json::string(r.signature);
     e["allowance_bytes"] = Json::number(r.allowance_bytes);
     e["max_observed_bytes"] = Json::number(r.max_observed_bytes);
     e["max_growth_bytes"] = Json::number(r.max_growth_bytes);
     e["alloc_granularity_bytes"] = Json::number(r.alloc_granularity_bytes);
     e["envelope_sha256"] = Json::string(r.envelope_sha256);
-    if (r.host_alloc_granularity_bytes != 4096)
-      e["host_alloc_granularity_bytes"] = Json::number(r.host_alloc_granularity_bytes);
-    if (r.graph_bytes >= 0) e["graph_bytes"] = Json::number(r.graph_bytes);
+    e["host_alloc_granularity_bytes"] = Json::number(r.host_alloc_granularity_bytes);
+    if (!r.warm_bytes.empty()) {
+      Json wb = Json::object();
+      for (const auto& kv : r.warm_bytes) wb[kv.first] = Json::number(kv.second);
+      e["warm_bytes"] = wb;
+    }
     e["method"] = Json::string(r.method);
     e["runs"] = Json::number(r.runs);
     e["receipt_sha256"] = Json::string(r.receipt_sha256);

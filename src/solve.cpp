@@ -137,11 +137,12 @@ bool applies(const Json* app, const Json& calib, std::vector<const char*> keys, 
 
 // Every probe figure within +-10 % of the calibration's (10 x |p - c| <= c, integers, c > 0), grouped (rev 18): the
 // transfer figures of every device set the calibration names, and the store's read rate for FILE rows.
-bool within(const Json* probe, const Json* calib, bool file) {
+// rev 19: the groups are the choice's exec_sets (sorted); a set missing on either side fails.
+bool within(const Json* probe, const Json* calib, std::vector<std::string> exec_sets, bool file) {
   if (!calib || !calib->is_object()) return false;
+  std::sort(exec_sets.begin(), exec_sets.end());
   std::vector<std::pair<std::string, std::vector<const char*>>> groups;
-  for (const auto& kv : calib->obj)  // std::map: sorted
-    if (kv.first != "store") groups.push_back({kv.first, {"h2d_mbps", "d2h_mbps", "h2d_lat_ns"}});
+  for (const std::string& s : exec_sets) groups.push_back({s, {"h2d_mbps", "d2h_mbps", "h2d_lat_ns"}});
   if (groups.empty()) return false;
   if (file) groups.push_back({"store", {"file_read_mbps"}});
   for (const auto& g : groups) {
@@ -187,8 +188,8 @@ const Json* curves_applicability(const Json& in) {
 
 // The calibration gate of one row (everything but the curve lookup and the arithmetic).
 bool calibration_applies(const Json& in, const Json& calib, int64_t sequences, bool spec, bool file,
-                         const Json* probe_xfer, const std::vector<std::string>& lang_src,
-                         const std::vector<std::string>& pooled_src) {
+                         const Json* probe_xfer, const std::vector<std::string>& exec_sets,
+                         const std::vector<std::string>& lang_src, const std::vector<std::string>& pooled_src) {
   const Json* costs = in.find("costs");
   const Json* capp = curves_applicability(in);
   if (sequences != 1) return false;
@@ -199,7 +200,17 @@ bool calibration_applies(const Json& in, const Json& calib, int64_t sequences, b
     return false;
   const Json* ev = capp ? capp->find("evaluation") : nullptr;  // in-sample curves understate misses
   if (!ev || !ev->is_string() || (ev->text != "holdout" && ev->text != "kfold")) return false;
-  if (!within(probe_xfer, costs ? costs->find("xfer_measured") : nullptr, file)) return false;
+  if (ev->text == "holdout") {
+    const Json* sources = capp->find("evaluation_sources");
+    if (!sources || !sources->is_array() || sources->arr.empty()) return false;
+    for (const Json& s : sources->arr) {
+      if (!s.is_string() || s.text.size() != 64 ||
+          s.text.find_first_not_of("0123456789abcdef") != std::string::npos)
+        return false;
+      if (std::find(pooled_src.begin(), pooled_src.end(), s.text) != pooled_src.end()) return false;
+    }
+  }
+  if (!within(probe_xfer, costs ? costs->find("xfer_measured") : nullptr, exec_sets, file)) return false;
   if (file && !file_sources_ok(capp, lang_src, pooled_src)) return false;
   if (file) {  // the curves are measured at file_units = 0; only LRU keeps the total invariant to FILE homes
     const Json* pol = calib.is_object() ? calib.find("policy") : nullptr;
@@ -493,7 +504,8 @@ Json solve_predict(const Json& in) {
     Json row;
     const Json* uls = in.find("usage_lang_sources");
     const std::vector<std::string> lang_src = strings_of(uls ? uls->find(x.lang) : nullptr);
-    if (!calib || !calibration_applies(in, *calib, sequences, spec, has_file, c.find("probe_xfer"), lang_src,
+    if (!calib || !calibration_applies(in, *calib, sequences, spec, has_file, c.find("probe_xfer"),
+                                       strings_of(c.find("exec_sets")), lang_src,
                                        strings_of(in.find("usage_sources")))) {
       row = prediction_json(Prediction{});
     } else {
@@ -698,7 +710,19 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
     // the probe's transfer figures: the choice's own probe_xfer, else the probe report's
     const Json* pxf = c.find("probe_xfer") ? c.find("probe_xfer") : probe.find("probe_xfer");
     const auto ul = usage_lang.find(x.lang);
-    const bool ok = calibration_applies(in, calib, comps.max_sequences, x.mode == "spec", file > 0, pxf,
+    // exec_sets (rev 19): the anchor, plus the assist when the drafter executes there
+    std::vector<std::string> exec_sets = {anchor};
+    for (const Json& d : doc.find("devices")->arr)
+      if (d.find("role")->text != "anchor")
+        for (const Json& l : d.find("lines")->arr)
+          if (l.find("component")->text == "drafter") exec_sets.push_back(d.find("set")->text);
+    std::sort(exec_sets.begin(), exec_sets.end());
+    (*const_cast<Json*>(row.find("choice")))["exec_sets"] = [&] {
+      Json a = Json::array();
+      for (const auto& e : exec_sets) a.push(Json::string(e));
+      return a;
+    }();
+    const bool ok = calibration_applies(in, calib, comps.max_sequences, x.mode == "spec", file > 0, pxf, exec_sets,
                                         ul == usage_lang.end() ? std::vector<std::string>() : ul->second.sources,
                                         have_usage ? usage.sources : std::vector<std::string>());
     row["prediction"] = ok ? prediction_json(predict(curves, costs, x.mode, x.r, x.ctx, x.lang, active, cold, file > 0),

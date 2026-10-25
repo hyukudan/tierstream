@@ -13,7 +13,7 @@
     "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
     "drafter": "none",
     "driver": "581.57",
-    "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered",
+    "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered;readers=1;cache_mb=512",
     "file_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=direct;readers=4",
     "platform": "windows-wddm",
     "policy": "lru",
@@ -24,6 +24,9 @@
     "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 8192,
+   "exec_sets": [
+    "rtx"
+   ],
    "file_units": 10,
    "id": "lang-skew-es",
    "lang": "es",
@@ -53,7 +56,7 @@
     "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
     "drafter": "none",
     "driver": "581.57",
-    "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered",
+    "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered;readers=1;cache_mb=512",
     "file_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=direct;readers=4",
     "platform": "windows-wddm",
     "policy": "lru",
@@ -64,6 +67,9 @@
     "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 8192,
+   "exec_sets": [
+    "rtx"
+   ],
    "file_units": 10,
    "id": "lang-skew-code",
    "lang": "code",
@@ -95,7 +101,7 @@
    "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
    "drafter": "anchor",
    "driver": "581.57",
-   "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered",
+   "engram_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=buffered;readers=1;cache_mb=512",
    "file_store": "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=direct;readers=4",
    "platform": "windows-wddm",
    "prefetch": "off",

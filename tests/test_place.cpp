@@ -526,7 +526,7 @@ const char* kEnvelope =
     R"({"shapes":[{"phase":"decode","rows":1},{"phase":"spec","rows":2},{"phase":"spec","rows":3},)"
     R"({"phase":"spec","rows":4},{"phase":"spec","rows":5},{"phase":"spec","rows":6},{"phase":"prefill","bucket":256},)"
     R"({"phase":"prefill","bucket":512},{"phase":"prefill","bucket":1024}],)"
-    R"("limits":{"stack_bytes":1024,"printf_fifo":0,"malloc_heap":0},"pools":{"streams":4,"events":64},)"
+    R"("limits":{"stack_bytes":1024,"printf_fifo":0,"malloc_heap":0,"dev_runtime_pending":0},"pools":{"streams":4,"events":64},)"
     R"("allocator":{"api":"cudaMalloc","alloc_granularity":2097152},"dispatch":{"sm_120":[],"sm_89":[]},)"
     R"("cache_config":{"spares":96,"host_spares":96,"spare_billing":"global","policy":"lru","prefetch":"off",)"
     R"("wait_timeout_ms":2000}})";
@@ -561,8 +561,11 @@ Json components_of(const Json& fx, const std::string& engine = "e") {
                                    fx.find("host_spare_units")->text +
                                    R"(,"spare_billing":"global","policy":"lru","prefetch":"off","wait_timeout_ms":2000})");
   cfg["window"] = json_parse(R"({"dg_max_ids":36,"slots":73})");  // rev 18: the R-derived fields
+  cfg["limits"] = *json_parse(kEnvelope).find("limits");
+  if (const Json* config = fx.find("config"))
+    for (const auto& kv : config->obj) cfg[kv.first] = kv.second;
   c["config"] = cfg;
-  const Json envelope = json_parse(kEnvelope);
+  const Json envelope = fx.find("envelope") ? *fx.find("envelope") : json_parse(kEnvelope);
   const std::string env_text = json_write(envelope);
   const std::string env_sha = sha256_hex(env_text.data(), env_text.size());
   if (const Json* want = fx.find("envelope_sha256")) {
@@ -570,34 +573,44 @@ Json components_of(const Json& fx, const std::string& engine = "e") {
     c["envelope"] = envelope;
   }
   c["capabilities"] = fx.find("capabilities") ? *fx.find("capabilities") : Json::array();
-  c["context"] = *fx.find("context");
+  Json context = Json::object();
+  for (const Json& k : fx.find("context_receipts")->arr) {
+    const Json* allowance = k.arr.size() < 6 ? nullptr : fx.find("context")->find(k.arr[5].text);
+    if (allowance) context[k.arr[0].text] = *allowance;
+  }
+  for (const Json& d : fx.find("devices")->arr)
+    if (!context.find(d.find("arch")->text))
+      context[d.find("arch")->text] = Json::number(int64_t(644245094));
+  c["context"] = context;
   if (const Json* g = fx.find("context_growth")) c["context_growth"] = *g;
-  // the fixture lists the context receipts' keys [arch, device name, driver, platform, build_sha256] (rev 16: complete
+  // the fixture lists the context receipts' keys [arch, device name, driver, platform, build_sha256, signature] (rev 16: complete
   // keys; a truncated key of a malformed case keeps only the fields it has); each becomes a components-v1 receipt
   Json receipts = Json::array();
   for (const Json& k : fx.find("context_receipts")->arr) {
     Json r = Json::object();
-    const char* const fields[] = {"arch", "device_name", "driver", "platform", "build_sha256"};
-    for (size_t i = 0; i < 5 && i < k.arr.size(); ++i) r[fields[i]] = k.arr[i];
-    const Json* allowance = k.arr.empty() ? nullptr : fx.find("context")->find(k.arr[0].text);
+    const char* const fields[] = {"arch", "device_name", "driver", "platform", "build_sha256", "signature"};
+    for (size_t i = 0; i < 6 && i < k.arr.size(); ++i) r[fields[i]] = k.arr[i];
+    const Json* allowance = k.arr.size() < 6 ? nullptr : fx.find("context")->find(k.arr[5].text);
     r["allowance_bytes"] = allowance ? *allowance : Json::number(int64_t(644245094));
-    r["max_observed_bytes"] = Json::number(int64_t(590000000));
-    // rev 17: the receipt's measured growth and qualified per-allocation overhead G, per arch
-    const Json* mg = k.arr.empty() || !fx.find("receipt_max_growth") ? nullptr
-                                                                    : fx.find("receipt_max_growth")->find(k.arr[0].text);
+    r["max_observed_bytes"] = Json::number(std::min<int64_t>(ival(r["allowance_bytes"]), 590000000));
+    // rev 17: the receipt's measured growth and qualified per-allocation overhead G, per signature
+    const Json* mg = k.arr.size() < 6 || !fx.find("receipt_max_growth") ? nullptr
+                                                                    : fx.find("receipt_max_growth")->find(k.arr[5].text);
     r["max_growth_bytes"] = mg ? *mg : Json::number(int64_t(0));
-    const Json* g = k.arr.empty() || !fx.find("alloc_granularity") ? nullptr
-                                                                   : fx.find("alloc_granularity")->find(k.arr[0].text);
+    const Json* g = k.arr.size() < 6 || !fx.find("alloc_granularity") ? nullptr
+                                                                   : fx.find("alloc_granularity")->find(k.arr[5].text);
     r["alloc_granularity_bytes"] = g ? *g : Json::number(int64_t(0));
-    // the envelope the receipt was qualified on (rev 18; fixture receipt_envelope per arch)
-    const Json* re = k.arr.empty() || !fx.find("receipt_envelope") ? nullptr
-                                                                   : fx.find("receipt_envelope")->find(k.arr[0].text);
+    // the envelope the receipt was qualified on (rev 18; fixture receipt_envelope per signature)
+    const Json* re = k.arr.size() < 6 || !fx.find("receipt_envelope") ? nullptr
+                                                                   : fx.find("receipt_envelope")->find(k.arr[5].text);
     r["envelope_sha256"] = re ? *re : Json::string(env_sha);
-    // rev 18: the qualified graph bytes (receipt_graph_bytes per arch) and pinned granule (host_alloc_granularity)
-    const Json* gb = k.arr.empty() || !fx.find("receipt_graph_bytes") ? nullptr
-                                                                      : fx.find("receipt_graph_bytes")->find(k.arr[0].text);
-    if (gb) r["graph_bytes"] = *gb;
-    if (const Json* hg = fx.find("host_alloc_granularity")) r["host_alloc_granularity_bytes"] = *hg;
+    // rev 19: the qualified warm-up bytes per component (receipt_warm_bytes per signature) and the pinned granule
+    // (host_alloc_granularity, required)
+    const Json* wb = k.arr.size() < 6 || !fx.find("receipt_warm_bytes") ? nullptr
+                                                                     : fx.find("receipt_warm_bytes")->find(k.arr[5].text);
+    if (wb) r["warm_bytes"] = *wb;
+    const Json* hg = fx.find("host_alloc_granularity");
+    r["host_alloc_granularity_bytes"] = hg ? *hg : Json::number(int64_t(4096));
     r["method"] = Json::string("pdh-process-dedicated");
     r["runs"] = Json::number(int64_t(5));
     r["receipt_sha256"] = Json::string(std::string(64, 'c'));
@@ -685,7 +698,7 @@ void compare_numbers(const std::string& name, const Json& want, const Json& doc)
     CHECK(d != nullptr);
     if (!d) continue;
     const Json& w = kv.second;
-    for (const char* k : {"budget_bytes", "margin_bytes", "context_bytes", "alloc_overhead_bytes"})
+    for (const char* k : {"budget_bytes", "margin_bytes", "context_bytes", "alloc_overhead_bytes", "signature"})
       if (w.find(k) && json_write(*d->find(k)) != json_write(*w.find(k)))
         std::printf("  %s %s.%s: %s vs %s\n", name.c_str(), kv.first.c_str(), k, json_write(*d->find(k)).c_str(),
                     json_write(*w.find(k)).c_str()), ++sstest::failures();
@@ -712,13 +725,17 @@ void compare_numbers(const std::string& name, const Json& want, const Json& doc)
     if (l.find("component")->text == "expert_host") eh = &l;
     if (l.find("component")->text == "expert_file") ef = &l;
   }
-  CHECK(eh && ef);
-  if (!eh || !ef) return;
+  const Json zero = Json::number(int64_t(0));
+  const Json* host_blocks = eh ? eh->find("blocks") : &zero;
+  const Json* host_homes = eh ? eh->find("homes") : &zero;
+  const Json* host_bytes = eh ? eh->find("bytes") : &zero;
+  const Json* file_units = ef ? ef->find("units") : &zero;
+  const Json* file_spilled = ef ? ef->find("spilled") : &zero;
   const std::pair<const char*, const Json*> map[] = {
       {"pinned_budget_bytes", h.find("pinned_budget_bytes")}, {"other_pinned_bytes", h.find("other_pinned_bytes")},
-      {"pinned_total_bytes", h.find("pinned_total_bytes")},   {"expert_host_blocks", eh->find("blocks")},
-      {"expert_host_homes", eh->find("homes")},               {"expert_host_bytes", eh->find("bytes")},
-      {"file_units", ef->find("units")},                      {"file_units_spilled", ef->find("spilled")}};
+      {"pinned_total_bytes", h.find("pinned_total_bytes")},   {"expert_host_blocks", host_blocks},
+      {"expert_host_homes", host_homes},                    {"expert_host_bytes", host_bytes},
+      {"file_units", file_units},                          {"file_units_spilled", file_spilled}};
   if (const Json* wl = wh.find("lines")) {  // the other pinned consumers, one line per charge (names included)
     Json mine = Json::array();
     for (const Json& l : h.find("lines")->arr) {
@@ -772,7 +789,12 @@ const char* kCases[] = {"A-pro-only-spec-host68", "B-pro-only-spec-host76", "C-p
                         "P1b-unit-not-multiple-of-256", "O7-unsorted-receipt-keys",
                         "P2b-engine-cache-with-dg-charges", "O8-receipt-growth-at-minimum",
                         "O8b-receipt-growth-one-byte-below", "O9-receipt-other-envelope",
-                        "O10-graphs-charge-not-receipt"};
+                        "O10-graphs-charge-not-receipt", "O10b-drafter-aux-charge-not-receipt",
+                        "Q1-C-exact-pinned-budget", "Q1b-C-pinned-budget-one-byte-below",
+                        "O10c-orphan-warm-mtp", "O11-limit-stack_bytes-changed",
+                        "O11-limit-printf_fifo-changed", "O11-limit-malloc_heap-changed",
+                        "O11-limit-dev_runtime_pending-changed", "S1-identical-gpus-two-receipts",
+                         "S1-identical-gpus-one-receipt"};
 
 // The contract's §2.5 TOML, literally (G4 J): it must plan as case C.
 const char* kContract25 = R"(schema = "tierstream/recipe-v1"
@@ -833,6 +855,166 @@ TEST(g4_fixtures) {
       std::printf("  %s: exception %s\n", name, e.what());
       ++sstest::failures();
     }
+  }
+}
+
+TEST(g4_workload_signatures) {
+  const Json fx = fixture("S1-identical-gpus-two-receipts");
+  const Json comps = components_of(fx);
+  Run base = run_place(recipe_of(fx), probe_of(fx), comps);
+  CHECK(base.r.errors.empty());
+  if (!base.r.errors.empty()) return;
+  const Json& anchor = *doc_dev(base.r.doc, "rtx");
+  const Json& assist = *doc_dev(base.r.doc, "aux");
+  CHECK(anchor.find("signature")->text != assist.find("signature")->text);
+  const std::string assist_signature = assist.find("signature")->text;
+  {
+    Json changed = comps;
+    for (Json& r : changed["context_receipts"].arr)
+      if (r.find("signature")->text == assist_signature) {
+        r["allowance_bytes"] = Json::number(ival(*r.find("allowance_bytes")) + 1);
+        r["alloc_granularity_bytes"] = Json::number(ival(*r.find("alloc_granularity_bytes")) + 1);
+      }
+    Run run = run_place(recipe_of(fx), probe_of(fx), changed);
+    CHECK(run.r.errors.empty());
+    if (!run.r.errors.empty()) return;
+    CHECK_EQ(json_write(*doc_dev(run.r.doc, "rtx")), json_write(anchor));
+    const Json& aux = *doc_dev(run.r.doc, "aux");
+    CHECK_EQ(ival(*aux.find("context_bytes")), ival(*assist.find("context_bytes")) + 1);
+    CHECK_EQ(ival(*aux.find("alloc_overhead_bytes")), ival(*assist.find("alloc_overhead_bytes")) + 1);
+  }
+  {
+    Json changed = comps;
+    for (Json& r : changed["context_receipts"].arr)
+      if (r.find("signature")->text == assist_signature) r["max_growth_bytes"] = Json::number(int64_t(1));
+    Run run = run_place(recipe_of(fx), probe_of(fx), changed);
+    CHECK_EQ(run.r.errors.size(), size_t(1));
+    CHECK(!run.r.errors.empty() && has(run.r.errors[0], "PL_E_MISSING_CONTEXT aux: context_growth"));
+  }
+  {
+    Json changed = comps;
+    for (Json& r : changed["context_receipts"].arr)
+      if (r.find("signature")->text == assist_signature) r["warm_bytes"] = Json::object();
+    Run run = run_place(recipe_of(fx), probe_of(fx), changed);
+    CHECK_EQ(run.r.errors.size(), size_t(1));
+    CHECK(!run.r.errors.empty() && has(run.r.errors[0], "PL_E_STALE drafter on aux"));
+  }
+  {  // Portable receipts survive component order and local physical-identity changes.
+    Json changed = comps, probe = probe_of(fx);
+    std::reverse(changed["components"].arr.begin(), changed["components"].arr.end());
+    std::reverse(changed["context_receipts"].arr.begin(), changed["context_receipts"].arr.end());
+    for (Json& d : probe["devices"].arr) {
+      d["id"] = Json::string("local-" + d.find("id")->text);
+      d.obj.erase("uuid");
+      d["pci"] = Json::string(d.find("ordinal")->text == "0" ? "0000:02:00.0" : "0000:07:00.0");
+      d["ordinal"] = Json::number(int64_t(7));
+    }
+    Run run = run_place(recipe_of(fx), probe, changed);
+    CHECK(run.r.errors.empty());
+    if (run.r.errors.empty())
+      for (const char* set : {"rtx", "aux"})
+        CHECK_EQ(doc_dev(run.r.doc, set)->find("signature")->text,
+                 doc_dev(base.r.doc, set)->find("signature")->text);
+  }
+  for (const Json& bad : {Json(), Json::string(""), Json::string(std::string(64, 'A')),
+                          Json::string(std::string(63, 'a')), Json::string(std::string(64, 'x'))}) {
+    Json changed = comps;
+    changed["context_receipts"].arr[0]["signature"] = bad;
+    CHECK_REFUSED(components_from_json(changed), "PL_E_SCHEMA");
+  }
+}
+
+TEST(g4_receipt_boundaries) {
+  const Json fx = fixture("C-pro90-aux12-drafter-aux-host68");
+  const Json base = components_of(fx);
+  auto check = [&](const Json& comps, const char* message, size_t count = 1) {
+    Run run = run_place(recipe_of(fx), probe_of(fx), comps);
+    CHECK_EQ(run.r.phase, std::string("V3"));
+    CHECK_EQ(run.r.errors.size(), count);
+    CHECK(!run.r.errors.empty() && has(run.r.errors[0], message));
+  };
+  {  // Even zero-byte entries need driver materialisation on this device.
+    Json comps = base;
+    comps["context_receipts"].arr[0]["warm_bytes"]["mtp"] = Json::number(int64_t(0));
+    check(comps, "PL_E_STALE mtp on rtx: orphan receipt warm_bytes entry");
+  }
+  {  // The drafter executes on aux; its receipt entry on the anchor is an orphan.
+    Json comps = base;
+    comps["context_receipts"].arr[0]["warm_bytes"]["drafter"] = Json::number(int64_t(134217728));
+    check(comps, "PL_E_STALE drafter on rtx: orphan receipt warm_bytes entry");
+  }
+  {  // A zero-byte driver charge still requires an explicit matching receipt entry.
+    Json comps = base;
+    for (Json& c : comps["components"].arr)
+      if (c.find("id")->text == "graphs") c["charges"].arr[0]["bytes"] = Json::number(int64_t(0));
+    comps["context_receipts"].arr[0]["warm_bytes"].obj.erase("graphs");
+    check(comps, "PL_E_STALE graphs on rtx: driver charge 0 != receipt warm_bytes absent");
+    comps["context_receipts"].arr[0]["warm_bytes"]["graphs"] = Json::number(int64_t(0));
+    CHECK(run_place(recipe_of(fx), probe_of(fx), comps).r.errors.empty());
+  }
+  for (const char* key : {"stack_bytes", "printf_fifo", "malloc_heap", "dev_runtime_pending"}) {
+    Json comps = base;
+    comps["config"]["limits"][key] = Json::number(ival(comps["config"]["limits"][key]) + 1);
+    check(comps, "PL_E_MISSING_CONTEXT rtx: receipt qualified on another configuration envelope (mismatch: envelope)", 2);
+  }
+  {
+    Json comps = base;
+    comps["stack"]["stack_bytes"] = Json::number(int64_t(1025));
+    check(comps, "PL_E_MISSING_CONTEXT rtx: receipt qualified on another configuration envelope (mismatch: envelope)", 2);
+  }
+}
+
+// R1 uses abstract component labels and no expert units. Map its three payloads to vocabulary ids at the
+// descriptor boundary, then restore the labels when comparing the frozen reference output.
+TEST(g4_cross_phase_reservation) {
+  for (const char* name : {"R1-cross-phase-old-budget", "R1-cross-phase-exact-budget",
+                           "R1-cross-phase-one-byte-below"}) {
+    const Json fx = fixture(name);
+    Json mapped = fx;
+    const std::map<std::string, std::string> ids = {
+        {"persistent", "dense"}, {"scratch", "buffers"}, {"serving", "state"}};
+    for (Json& c : mapped["components"].arr) c["id"] = Json::string(ids.at(c.find("id")->text));
+    mapped.obj.erase("arena_gib");
+    auto& receipts = mapped["context_receipts"].arr;
+    receipts.erase(std::remove_if(receipts.begin(), receipts.end(), [&](const Json& key) {
+                     return key.arr.size() < 6 || !mapped.find("context")->find(key.arr[5].text);
+                   }), receipts.end());
+    Json comps = components_of(mapped);
+    comps.obj.erase("elastic");
+    // R1's abstract labels become three vocabulary ids, changing only the qualification signature.
+    const std::string mapped_signature = "e7a17b3d91e5581df276ccd3686d256de02df248e88a7b2eb7e7d16d49190d46";
+    comps["context_receipts"].arr[0]["signature"] = Json::string(mapped_signature);
+    Run run = run_place(recipe_of(mapped), probe_of(mapped), comps);
+    if (run.r.computed) {
+      Json& d = run.r.doc["devices"].arr[0];
+      CHECK_EQ(d.find("signature")->text, mapped_signature);
+      d["signature"] = fx.find("context_receipts")->arr[0].arr[5];
+    }
+    if (run.r.errors.empty()) {
+      for (Json& d : run.r.doc["devices"].arr)
+        for (Json& l : d["lines"].arr)
+          for (const auto& id : ids)
+            if (l.find("component")->text == id.second) l["component"] = Json::string(id.first);
+    }
+    check_case(name, run.r);
+    if (!run.r.errors.empty()) continue;
+    const Json& device = *doc_dev(run.r.doc, "rtx");
+    const int64_t c1 = ival(*device.find("context_allowance_bytes"));
+    const int64_t allowance = ival(*device.find("alloc_overhead_bytes")) +
+                              ival(*device.find("context_growth_bytes"));
+    Json history = Json::array();
+    for (const Json& sample : fx.find("runtime_samples")->arr) {
+      const int64_t process = ival(*sample.find("process_bytes"));
+      const int64_t residual = process - ival(*sample.find("live_payload_bytes")) - c1;
+      Json observation = Json::object();
+      observation["event"] = *sample.find("event");
+      observation["residual_bytes"] = Json::number(residual);
+      observation["residual_ok"] = Json::boolean(residual <= allowance);
+      observation["total_ok"] = Json::boolean(process <= ival(*device.find("budget_bytes")));
+      history.push(observation);
+    }
+    const Json want = json_parse(slurp(kData + std::string(name) + ".expected.json"));
+    CHECK_EQ(json_write(history), json_write(*want.find("runtime_history")));
   }
 }
 
@@ -980,15 +1162,24 @@ TEST(g4_extra_cases) {
   }
   {  // capability refusals: layers, layer_* quotas, an undeclared explicit id, a host component on a device
     const std::string t = recipe_of(c);
-    auto first = [&](const std::string& extra) {
-      Run run = run_place(t + extra, probe_of(c), components_of(c));
+    auto first = [&](const std::string& extra, const char* anchor_signature = nullptr,
+                     const char* assist_signature = nullptr) {
+      Json comps = components_of(c);
+      if (anchor_signature) comps["context_receipts"].arr[0]["signature"] = Json::string(anchor_signature);
+      if (assist_signature) comps["context_receipts"].arr[1]["signature"] = Json::string(assist_signature);
+      Run run = run_place(t + extra, probe_of(c), comps);
       return run.r.errors.empty() ? std::string() : run.r.errors[0];
     };
     CHECK(has(first("[routes.components.dense]\nlayers = [[0, 3]]\n"), "PL_E_CAPABILITY dense: layers"));
     CHECK(has(first("[routes.components.layer_slots]\ngib = 4\n"), "PL_E_CAPABILITY layer_slots: needs layer-granular"));
     CHECK(has(first("[routes.components.mtp]\ndevice = \"auto\"\n"), "PL_E_CAPABILITY mtp: not declared by the engine"));
-    CHECK(has(first("[routes.components.staging]\ndevice = \"aux\"\n"), "PL_E_CAPABILITY staging -> aux"));
-    CHECK(has(first("[routes.components.head]\ndevice = \"aux\"\n"), "PL_E_ANCHORED head"));
+    CHECK(has(first("[routes.components.staging]\ndevice = \"aux\"\n", nullptr,
+                    "d9414267336046af9205114714d4f8ca27a01d57ac823708981348c950bcd506"),
+              "PL_E_CAPABILITY staging -> aux"));
+    CHECK(has(first("[routes.components.head]\ndevice = \"aux\"\n",
+                    "8a948b239fcdb3029a6aeeea8c09004ef999e7eff5065778372c37e9e05ba0e3",
+                    "9c342aceb8ad1dc0050d6637e29946368321ed8c8d91ccc52131a6318039d0f2"),
+              "PL_E_ANCHORED head"));
     CHECK(has(first("[routes.components.arena]\ndevice = \"aux\"\n"), "PL_E_ANCHORED arena"));
     CHECK(has(first("[routes.components.engram]\ndevice = \"host_pinned\"\n"), "PL_E_CAPABILITY engram"));
   }
@@ -1021,7 +1212,7 @@ TEST(g4_extra_cases) {
     Run run = run_place(t, probe_of(b), components_of(b));
     CHECK(run.r.errors.empty());
     CHECK(has(run.r.explain, "drafter -> rtx (default)"));
-    CHECK(has(run.r.explain, "drafter -> aux: frees 8321499136 on rtx, needs 10861992776 + context on aux"));
+    CHECK(has(run.r.explain, "drafter -> aux: frees 8455716864 on rtx, needs 10996210504 + context on aux"));
     CHECK(has(run.r.explain, "device aux: not touched"));
     CHECK_EQ(run.r.doc.find("devices")->arr.size(), size_t(1));
   }
@@ -1275,12 +1466,21 @@ TEST(capi_place_and_flags) {
   CHECK_OK(ss_recipe_set(r, "routes.decode_rtx.assist.aux.device_gib", "0", "--set"));
   CHECK_OK(ss_recipe_set(r, "routes.decode_rtx.components.drafter.device", "\"auto\"", "--set"));
   out = nullptr;
-  CHECK_EQ(int(ts_place(r, "decode_rtx", probe.data(), probe.size(), comps.data(), comps.size(), nullptr, nullptr, 0,
-                        nullptr, 0, &out, nullptr, nullptr, nullptr)),
+  Json anchored = json_parse(comps);
+  for (Json& receipt : anchored["context_receipts"].arr) {
+    receipt["warm_bytes"].obj.erase("drafter");
+    if (receipt.find("arch")->text == "sm_120")
+      receipt["warm_bytes"]["drafter"] = Json::number(int64_t(134217728));
+  }
+  anchored["context_receipts"].arr[0]["signature"] =
+      fixture("A-pro-only-spec-host68").find("context_receipts")->arr[0].arr[5];
+  const std::string anchored_comps = json_write(anchored);
+  CHECK_EQ(int(ts_place(r, "decode_rtx", probe.data(), probe.size(), anchored_comps.data(), anchored_comps.size(),
+                        nullptr, nullptr, 0, nullptr, 0, &out, nullptr, nullptr, nullptr)),
            int(SS_E_RECIPE));
   CHECK(out == nullptr);
-  CHECK(has(ss_last_error(), "PL_E_HOST_PINNED: need 80203445309 > 73014444032"));  // A + the relay
-  CHECK(has(ss_last_error(), "723 units short"));
+  CHECK(has(ss_last_error(), "PL_E_HOST_PINNED: need 80342795325 > 73014444032"));  // A + the relay
+  CHECK(has(ss_last_error(), "737 units short"));
   // no components-v1: PL_E_MISSING_DESCRIPTOR
   CHECK_EQ(int(ts_place(r, "decode_rtx", probe.data(), probe.size(), nullptr, 0, nullptr, nullptr, 0, nullptr, 0, &out, nullptr,
                         nullptr, nullptr)),
@@ -1505,7 +1705,8 @@ TEST(platform_and_host_spares) {
     CHECK(run.r.errors.empty());
     // and a 4 GiB allowance with the recipe's 0.6 GiB anchor margin: no context-proportional band
     Json comps = components_of(c);
-    (*const_cast<Json*>(comps.find("context")))["sm_120"] = Json::number(int64_t(4) << 30);
+    for (Json& receipt : comps["context_receipts"].arr)
+      if (receipt.find("arch")->text == "sm_120") receipt["allowance_bytes"] = Json::number(int64_t(4) << 30);
     Run big = run_place(recipe_of(c), probe_of(c), comps);
     CHECK(big.r.errors.empty() || !has(big.r.errors[0], "margin"));
     // the platform still takes the normative values only (placement-mode binding)
@@ -1538,12 +1739,27 @@ TEST(sv1_solver_arithmetic) {
   // policy lru (rev 17)
   for (const char* name : {"SV1c-language-file-rate", "SV1c2-language-usage-identity", "SV1d-in-sample-curves",
                            "SV1e-file-rows-need-lru", "SV1f-fields-checked-alone", "SV1g-file-rows-need-holdout",
-                           "SV1h-lang-table-in-sample"}) {
+                           "SV1h-lang-table-in-sample", "SV1f2-draft-verify-checked-alone",
+                           "SV1i-holdout-disjoint-from-ranking", "SV1j-every-executing-set-needs-figures",
+                           "SV1j2-every-executing-set-with-figures", "SV1k-holdout-sources-missing",
+                            "SV1k-holdout-sources-empty", "SV1k-holdout-sources-malformed"}) {
     const Json inc = json_parse(slurp(kData + name + ".json"));
     std::string wantc = slurp(kData + name + ".expected.json");
     while (!wantc.empty() && (wantc.back() == '\n' || wantc.back() == '\r')) wantc.pop_back();
     const std::string got = json_write(solve_predict(inc));
     if (got != wantc) std::printf("  %s:\n    %s\n    %s\n", name, got.c_str(), wantc.c_str()), ++sstest::failures();
+  }
+}
+
+TEST(solver_holdout_provenance_types) {
+  const Json base = fixture("SV1k-holdout-sources-empty");
+  for (const char* bad : {"null", "{}", "0", "true", "[]", "[null]", "[[]]", "[3]", "[{}]",
+                          "[\"\"]", "[\"ABCDEF\"]", "\"not-an-array\""}) {
+    Json in = base;
+    in["curves_applicability"]["evaluation_sources"] = json_parse(bad);
+    const Json result = solve_predict(in);
+    CHECK_EQ(result.find("rows")->arr.size(), size_t(2));
+    for (const Json& row : result.find("rows")->arr) CHECK_EQ(row.find("tag")->text, std::string("unpredicted"));
   }
 }
 
@@ -1722,15 +1938,14 @@ TEST(solver_rows) {
   const Json out = solve(s, "decode_rtx", probe, in);
   CHECK_EQ(out.find("schema")->text, std::string("tierstream/solver-v1"));
   const Json& r0 = out.find("rows")->arr[0];
-  // I1 at host 74 is 64 units short; hypothetically with FILE (its staging from the costs) it is I3: 70 spilled
+  // I1 at host 74 is 89 units short; with FILE staging it is I3: 96 spilled
   CHECK_EQ(json_write(*r0.find("requires")), std::string("[\"file_expert_tier\"]"));
-  CHECK_EQ(json_write(*r0.find("placement")->find("file_units")), std::string("82"));
-  CHECK_EQ(json_write(*r0.find("placement")->find("devices")->arr[0].find("active_units")), std::string("7409"));
+  CHECK_EQ(json_write(*r0.find("placement")->find("file_units")), std::string("96"));
+  CHECK_EQ(json_write(*r0.find("placement")->find("devices")->arr[0].find("active_units")), std::string("7395"));
   const Json& p0 = *r0.find("prediction");
   CHECK_EQ(p0.find("tag")->text, std::string("interpolated"));
-  // the same row of SV1 (spec-I3: 7418 active, 73 file); the code table's FILE rate over the pooled cold set
-  // code/R6 at 7,409 active: rdiv(45,000 x 1,500 - 9,000 x 409, 1,500) = 42,546
-  CHECK_EQ(json_write(*p0.find("milli_misses_total")), std::string("42546"));
+  // code/R6 at 7,395 active: rdiv(45,000 x 1,500 - 9,000 x 395, 1,500) = 42,630
+  CHECK_EQ(json_write(*p0.find("milli_misses_total")), std::string("42630"));
   CHECK_EQ(json_write(*p0.find("estimates")), std::string("[\"verify_us\"]"));  // provenance says estimate
   CHECK_EQ(json_write(*p0.find("milli_misses_file")), std::string("12"));
   CHECK_EQ(out.find("usage_lang_sha256")->find("code")->text, usage_from_json(usage_code).sha256);
@@ -1886,7 +2101,7 @@ TEST(solver_rows) {
   const Json out2 = solve(s, "decode_rtx", probe, in);
   const Json& rf = *out2.find("rows")->arr[0].find("placement")->find("refusal");
   CHECK_EQ(rf.find("code")->text, std::string("PL_E_HOST_PINNED"));
-  CHECK_EQ(json_write(*rf.find("units_short")), std::string("75"));
+  CHECK_EQ(json_write(*rf.find("units_short")), std::string("89"));
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }

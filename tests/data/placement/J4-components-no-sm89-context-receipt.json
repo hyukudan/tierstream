@@ -114,11 +114,11 @@
   {
    "charges": [
     {
-     "allocs": 0,
      "at": "device",
      "bytes": 1073741824,
      "kind": "driver",
      "phases": [
+      "load",
       "prefill",
       "decode",
       "spec"
@@ -170,6 +170,17 @@
       ]
      },
      {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
       "at": "host_pinned",
       "bytes": 16777216,
       "phases": [
@@ -185,6 +196,17 @@
       "at": "device",
       "bytes": 10593557320,
       "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
       "phases": [
        "load",
        "prefill",
@@ -290,6 +312,12 @@
    "spares": 96,
    "wait_timeout_ms": 2000
   },
+  "limits": {
+   "dev_runtime_pending": 0,
+   "malloc_heap": 0,
+   "printf_fifo": 0,
+   "stack_bytes": 1024
+  },
   "max_context_tokens": 131072,
   "max_rows": 6,
   "max_sequences": 1,
@@ -357,15 +385,18 @@
    "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
    "device_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
    "driver": "617.14",
-   "envelope_sha256": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
-   "graph_bytes": 1073741824,
+   "envelope_sha256": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
    "host_alloc_granularity_bytes": 4096,
    "max_growth_bytes": 0,
    "max_observed_bytes": 590000000,
    "method": "pdh-process-dedicated",
    "platform": "windows-wddm",
    "receipt_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
-   "runs": 5
+   "runs": 5,
+   "signature": "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad",
+   "warm_bytes": {
+    "graphs": 1073741824
+   }
   }
  ],
  "desc_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -397,6 +428,7 @@
    "sm_89": []
   },
   "limits": {
+   "dev_runtime_pending": 0,
    "malloc_heap": 0,
    "printf_fifo": 0,
    "stack_bytes": 1024

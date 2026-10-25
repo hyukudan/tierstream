@@ -1,6 +1,6 @@
 """Writes the CLI inputs for ts-recipe place (tests/data/placement/cli-*): the components-v1 of G4 case C (the DS41
 replica, drafter variants anchor/assist with receipts for sm_89 and sm_120; context receipts per complete key (arch, device name,
-driver, platform, build), rev 16; config.cache_config) and a probe of the PC (PRO + 4090, with driver / platform)."""
+driver, platform, build, signature), rev 21; config.cache_config) and a probe of the PC (PRO + 4090, with driver / platform)."""
 import hashlib
 import json
 
@@ -22,19 +22,20 @@ doc = {'schema': 'tierstream/components-v1', 'engine': 'strix-cuda-ds41-replica'
                    'spares': fx['spares_units'], 'host_spares': fx['host_spare_units'], 'spare_billing': 'global',
                    'slot_allocs': fx['slot_allocs'], 'host_chunk_bytes': fx['host_chunk_bytes']},
        'config': {'max_context_tokens': 131072, 'max_sequences': 1, 'max_rows': 6, 'cache': 'tierstream',
+                  'limits': envelope['limits'],
                   'cache_config': {'spares': 96, 'host_spares': 96, 'spare_billing': 'global', 'policy': 'lru',
                                    'prefetch': 'off', 'wait_timeout_ms': 2000},
                   'window': {'dg_max_ids': 36, 'slots': 73}},  # rev 18: the R-derived fields
-       'capabilities': fx['capabilities'], 'context': fx['context'],
-       'context_receipts': [{'arch': a, 'device_name': n, 'driver': drv, 'platform': plat, 'build_sha256': b,
-                             'allowance_bytes': fx['context'][a], 'max_observed_bytes': 590000000,
+       'capabilities': fx['capabilities'], 'context': {a: fx['context'][sig] for a, n, drv, plat, b, sig in fx['context_receipts']},
+       'context_receipts': [{'arch': a, 'device_name': n, 'driver': drv, 'platform': plat, 'build_sha256': b, 'signature': sig,
+                             'allowance_bytes': fx['context'][sig], 'max_observed_bytes': 590000000,
                              'max_growth_bytes': 0,
-                             'alloc_granularity_bytes': fx['alloc_granularity'][a],
-                             'envelope_sha256': fx['receipt_envelope'][a],
+                             'alloc_granularity_bytes': fx['alloc_granularity'][sig],
+                             'envelope_sha256': fx['receipt_envelope'][sig],
                              'host_alloc_granularity_bytes': fx['host_alloc_granularity'],
-                             'graph_bytes': fx['receipt_graph_bytes'].get(a, 0), 'method': 'pdh-process-dedicated', 'runs': 5,
+                             'warm_bytes': fx['receipt_warm_bytes'].get(sig, {}), 'method': 'pdh-process-dedicated', 'runs': 5,
                              'receipt_sha256': 'c' * 64}
-                            for a, n, drv, plat, b in fx['context_receipts']],
+                            for a, n, drv, plat, b, sig in fx['context_receipts']],
        'context_growth': fx['context_growth'], 'envelope': envelope, 'components': comps}
 with open(D + 'cli-components.json', 'w', newline='') as f:
     json.dump(doc, f, indent=1, sort_keys=True)

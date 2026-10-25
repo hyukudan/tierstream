@@ -1,7 +1,7 @@
 {
  "alloc_granularity": {
-  "sm_120": 2097152,
-  "sm_89": 2097152
+  "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc": 2097152,
+  "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f": 2097152
  },
  "anchor": "rtx",
  "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -120,11 +120,11 @@
    "anchored": true,
    "charges": [
     {
-     "allocs": 0,
      "at": "device",
      "bytes": 1073741824,
      "kind": "driver",
      "phases": [
+      "load",
       "prefill",
       "decode",
       "spec"
@@ -155,6 +155,17 @@
       ]
      },
      {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
       "at": "host_pinned",
       "bytes": 16777216,
       "phases": [
@@ -170,6 +181,17 @@
       "at": "device",
       "bytes": 10593557320,
       "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
       "phases": [
        "load",
        "prefill",
@@ -252,8 +274,8 @@
   }
  ],
  "context": {
-  "sm_120": 644245094,
-  "sm_89": 644245094
+  "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc": 644245094,
+  "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f": 644245094
  },
  "context_growth": {
   "sm_120": 67108864,
@@ -265,14 +287,16 @@
    "NVIDIA GeForce RTX 4090",
    "617.14",
    "windows-wddm",
-   "0000000000000000000000000000000000000000000000000000000000000000"
+   "0000000000000000000000000000000000000000000000000000000000000000",
+   "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f"
   ],
   [
    "sm_120",
    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
    "617.14",
    "windows-wddm",
-   "0000000000000000000000000000000000000000000000000000000000000000"
+   "0000000000000000000000000000000000000000000000000000000000000000",
+   "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc"
   ]
  ],
  "devices": [
@@ -299,7 +323,7 @@
    "set": "aux"
   }
  ],
- "envelope_sha256": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
+ "envelope_sha256": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
  "explicit": {},
  "host_alloc_granularity": 4096,
  "host_chunk_bytes": 1073741824,
@@ -318,15 +342,19 @@
   "expert_file"
  ],
  "receipt_envelope": {
-  "sm_120": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
-  "sm_89": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9"
- },
- "receipt_graph_bytes": {
-  "sm_120": 1073741824
+  "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
+  "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0"
  },
  "receipt_max_growth": {
-  "sm_120": 0,
-  "sm_89": 0
+  "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc": 0,
+  "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f": 0
+ },
+ "receipt_warm_bytes": {
+  "7edebfef5dac9f9750b4ece78089f8876be002a1404c8e13e37432da3a85d3fc": {
+   "drafter": 134217728,
+   "graphs": 1073741824
+  },
+  "8962554569a23daa1f91d650b59987486c7634527943c8c38e782694fea6794f": {}
  },
  "slot_allocs": 3,
  "spares_units": 96,

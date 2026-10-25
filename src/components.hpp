@@ -73,18 +73,20 @@ struct Components {
   std::vector<std::string> capabilities;  // sorted, distinct
   // per arch: the engine's declared allowance (static per build; never a measured value: context-v1 carries those)
   std::map<std::string, uint64_t> context, context_growth;
-  // context_receipts (rev 15/16): one per complete key (arch, device name, driver, platform, build) the allowance was
+  // context_receipts (rev 15/16): one per complete key (arch, device name, driver, platform, build, signature) the allowance was
   // qualified on; a key field missing or empty and a duplicate key are PL_E_SCHEMA; max_growth_bytes = the residual
   // growth measured after the checkpoint (a receipt above context_growth[arch] does not admit, §2.4)
   struct ContextReceipt {
-    std::string arch, device_name, driver, platform, build_sha256, method, receipt_sha256;
+    std::string arch, device_name, driver, platform, build_sha256, signature, method, receipt_sha256;
     uint64_t allowance_bytes = 0, max_observed_bytes = 0, max_growth_bytes = 0, runs = 0;
     uint64_t alloc_granularity_bytes = 0;  // G (rev 17): the qualified per-allocation overhead bound
     std::string envelope_sha256;           // the configuration envelope the receipt was qualified on (rev 18)
-    uint64_t host_alloc_granularity_bytes = 4096;  // qualified pinned overhead per allocation (rev 18; default 4 KiB)
-    int64_t graph_bytes = -1;  // qualified graph-executable bytes the `graphs` driver charge must equal (-1 = none)
+    uint64_t host_alloc_granularity_bytes = 4096;  // qualified pinned overhead per allocation (required, rev 19)
+    // warm_bytes (rev 19): the qualified warm-up materialisation per component on a device of this key; every driver
+    // charge placed there must equal its entry
+    std::map<std::string, uint64_t> warm_bytes;
   };
-  std::vector<ContextReceipt> context_receipts;  // canonical order: (arch, device_name, driver, platform, build)
+  std::vector<ContextReceipt> context_receipts;  // canonical order: (arch, device_name, driver, platform, build, signature)
   bool has_spare_billing = false, spare_billing_per_layer = false;  // elastic.spare_billing: global | per_layer
   std::vector<ComponentDecl> components;  // sorted by priority
   std::string receipts_sha256;            // the tierstream/receipts-v1 file the receipts were copied from ("" = none)
