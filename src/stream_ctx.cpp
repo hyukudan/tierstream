@@ -974,7 +974,8 @@ void Ctx::run_ra_child(Job& j) {
   const char* src = static_cast<const char*>(ra_host_[b]);
   if (test_inject_.load() == 3 && test_inject_.exchange(0) == 3) fail(SS_E_IO, "read-ahead: injected copy failure");
   if (be_->unified()) {
-    be_->event_sync(j.dst_release_ev);
+    // Test-only mutation 6 (must make the GPU test fail): skip this landing's wait for the slot's previous reader.
+    if (!(test_inject_.load() == 6 && test_inject_.exchange(0) == 6)) be_->event_sync(j.dst_release_ev);
     j.issued_piece = true;
     std::memcpy(j.dst, src, size_t(l.unit_bytes));
     if (test_inject_.load() == 4 && test_inject_.exchange(0) == 4) fail(SS_E_IO, "read-ahead: injected copy failure");

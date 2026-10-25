@@ -1,5 +1,5 @@
-// HIP backend STUB for Strix Halo (gfx1151, unified LPDDR5X). Not built or tested on this PC (no ROCm here); it is
-// the interface the node replica adapters will exercise first.
+// HIP backend for Strix Halo (gfx1151, unified LPDDR5X). Built with the nodes' ROCm toolchain; its GPU test is
+// ss-test-hip (tests/test_cuda.cu through tests/gpu_runtime.hpp).
 //
 // Model: unified memory. "Device" slots are host-pinned, GPU-mapped memory (hipHostMalloc, coherent), so:
 //   - resident = mapped: the GPU reads the slot at full memory bandwidth; there is no H2D copy and no pinned tier
@@ -66,9 +66,13 @@ class HipBackend final : public Backend {
   }
   // Unified: every copy is a host memcpy into mapped memory (the library only copies after the slot is free).
   void copy_h2d(void* dst, const void* src, size_t n, void*) override { std::memcpy(dst, src, n); }
+  // The source can be engine memory from hipMalloc (route ids), which the host must not touch: a real copy, ordered
+  // on the engine stream behind the router (the caller records and later waits an event), or synchronous on none.
   void copy_d2h(void* dst, const void* src, size_t n, void* stream) override {
-    if (stream) ck(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "hipStreamSynchronize");
-    std::memcpy(dst, src, n);
+    if (stream)
+      ck(hipMemcpyAsync(dst, src, n, hipMemcpyDefault, static_cast<hipStream_t>(stream)), "hipMemcpyAsync");
+    else
+      ck(hipMemcpy(dst, src, n, hipMemcpyDefault), "hipMemcpy");
   }
   void copy_d2d(void* dst, const void* src, size_t n, void*) override { std::memmove(dst, src, n); }
   void stream_sync(void* stream) override {

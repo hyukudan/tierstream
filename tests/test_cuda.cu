@@ -1,12 +1,13 @@
-// CUDA backend test (one short PC-BIG on the RTX PRO).
+// GPU backend test: CUDA (ts-test-cuda, one short PC-BIG on the RTX PRO) or HIP (ts-test-hip, one node turn on
+// Strix Halo; gpu_runtime.hpp maps the runtime names, and exclusive cases check their refusal on unified memory).
 // Exactness and hazards: a kernel reads every byte of every routed unit through the device unit table on the engine
 // stream, AFTER a spin kernel that keeps the stream busy, and the host releases the layer and moves on without any
 // synchronization: slots are reused while earlier readers are still queued, and forwards run back to back. All
 // checksums are compared once at the end. A missing wait (copy before release, read before landing, table rewritten
 // while in use, a hit from the previous forward's copy in flight) shows as a wrong checksum.
 // Then a corrupt-hash fixture (the read failure path) and a pinned-tier / unbuffered-file bandwidth probe.
-//   ss-test-cuda [--bw-dir DIR] [--no-bw]
-#include <cuda_runtime.h>
+//   ts-test-cuda [--bw-dir DIR] [--no-bw]
+#include "gpu_runtime.hpp"
 
 #include <chrono>
 #include <cstring>
@@ -41,11 +42,23 @@ namespace {
     }                                                                                              \
   } while (0)
 
+// Spins for `cycles` at a nominal 2 GHz (the CUDA shader clock). gfx11 has no shader-cycle counter: on HIP the
+// constant-rate wall clock is used, scaled by its rate (set once in main).
+#if defined(__HIPCC__)
+__device__ long long g_wall_khz_dev = 0;
+__global__ void spin(long long cycles) {
+  const long long ticks = cycles * g_wall_khz_dev / 2000000;
+  long long t0 = wall_clock64();
+  while (wall_clock64() - t0 < ticks) {
+  }
+}
+#else
 __global__ void spin(long long cycles) {
   long long t0 = clock64();
   while (clock64() - t0 < cycles) {
   }
 }
+#endif
 
 // One block per listed unit: 64-bit sum of (byte x (index % 251 + 1)), order-free so the reduction is exact.
 __global__ void checksum(const uint64_t* table, const int32_t* units, int n, uint64_t bytes,
@@ -80,6 +93,18 @@ struct Run {
   }
 };
 
+// Opens the context. On a unified backend an exclusive context must be refused (design §3.5): the case checks the
+// refusal and ends there.
+bool open_ctx(Run& r) {
+  if (SS_TEST_UNIFIED && r.b.tier_mode == SS_TIER_MODE_EXCLUSIVE) {
+    CHECK_EQ(int(ss_open(r.d, &r.b, r.p, &r.o, &r.c)), int(SS_E_UNSUPPORTED));
+    std::printf("  exclusive refused on %s (unified memory), as designed\n", SS_TEST_RUNTIME);
+    return false;
+  }
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  return r.c != nullptr;
+}
+
 void plan(Run& r, std::initializer_list<const char*> tiers) {
   std::string js = "{\"tiers\":[";
   bool first = true;
@@ -113,11 +138,11 @@ struct Gpu {
     CU(cudaHostAlloc(&units_host, kMax * sizeof(int32_t), cudaHostAllocDefault));
   }
   ~Gpu() {
-    cudaStreamSynchronize(s);
-    cudaFree(units);
-    cudaFree(sums);
-    cudaFreeHost(units_host);
-    cudaStreamDestroy(s);
+    (void)cudaStreamSynchronize(s);
+    (void)cudaFree(units);
+    (void)cudaFree(sums);
+    (void)cudaFreeHost(units_host);
+    (void)cudaStreamDestroy(s);
   }
   void check(const ss_layer_view& v, const Fixture& fx, int L, const std::vector<int32_t>& list, bool delay = true) {
     int n = int(list.size());
@@ -197,15 +222,14 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
     plan(r, {"", "RRRRPPPPPPDDDDDD", "RRRRPPDD", "D", "RRRRDDDDDDDDDDDD"});
   }
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.policy = policy;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;
   r.o.group_units = 2;
   r.o.spec_persistent = spec_persistent;
-  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
-  if (!r.c) return;
+  if (!open_ctx(r)) return;
   ss_stats_reset(r.c);  // exclusive: no file read after open
   std::mt19937 g(77 + int(policy) * 3 + spec_persistent + int(spares) * 11);
   std::vector<int32_t*> ids_dev_list;
@@ -265,8 +289,8 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
     if (step % 10 == 0) CHECK_EQ(int(ss_acquire(r.c, 1, (void*)gpu.s, &v)), int(SS_E_INVALID));  // outside a forward
   }
   gpu.verify();
-  for (int32_t* p : ids_dev_list) cudaFree(p);
-  cudaFreeHost(ids_pinned);
+  for (int32_t* p : ids_dev_list) (void)cudaFree(p);
+  (void)cudaFreeHost(ids_pinned);
   ss_layer_stats t;
   CHECK_OK(ss_stats_total(r.c, &t));
   if (exclusive) {
@@ -325,13 +349,12 @@ void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = 
   if (readahead) plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRDDDD", "P", "PPPPPPPPPPPPPPPP"});
   else plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;  // a few MiB pinned in all
   if (readahead) r.o.readahead_units = 2;
-  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
-  if (!r.c) return;
+  if (!open_ctx(r)) return;
   cudaStream_t gate_s = nullptr;
   cudaEvent_t gate = nullptr;
   CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
@@ -378,9 +401,9 @@ void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = 
   gpu.verify();
   std::printf("  %s: write-backs %llu rereads %llu deferred %llu\n", name, (unsigned long long)x.writebacks,
               (unsigned long long)x.rereads, (unsigned long long)x.deferred);
-  cudaStreamSynchronize(gate_s);
-  cudaEventDestroy(gate);
-  cudaStreamDestroy(gate_s);
+  (void)cudaStreamSynchronize(gate_s);
+  (void)cudaEventDestroy(gate);
+  (void)cudaStreamDestroy(gate_s);
 }
 
 // The source wait alone (Sol sol-9 #3): layer 2 residents 0-3, pinned 4-5, disk 6-7, one spare. Reader threads held,
@@ -407,12 +430,11 @@ TEST(cuda_exclusive_source_wait_only) {
   r.b.host_spare_units = 1;
   plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPDD", "P", "PPPPPPPPPPPPPPPP"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.pin_planned = 0;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;  // a few MiB pinned in all
-  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
-  if (!r.c) return;
+  if (!open_ctx(r)) return;
   CHECK_OK(ss_test_fill_free_blocks(r.c, 0xEE));
   cudaStream_t gate_s = nullptr;
   cudaEvent_t gate = nullptr;
@@ -444,9 +466,9 @@ TEST(cuda_exclusive_source_wait_only) {
   CHECK_EQ(x.deferred, uint64_t(2));
   CHECK_EQ(x.rereads, uint64_t(1));
   gpu.verify();
-  cudaStreamSynchronize(gate_s);
-  cudaEventDestroy(gate);
-  cudaStreamDestroy(gate_s);
+  (void)cudaStreamSynchronize(gate_s);
+  (void)cudaEventDestroy(gate);
+  (void)cudaStreamDestroy(gate_s);
 }
 
 // Host read-ahead, layer-major, async (wave4/gapfix/wstream-readahead): every unit read from its file, host lookahead
@@ -465,7 +487,7 @@ TEST(cuda_readahead_layer_major_async) {
   r.b.host_pinned_bytes = 4 << 20;
   plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;
   r.o.readahead_units = 4;
@@ -517,7 +539,7 @@ std::vector<std::pair<int, int>> ra_dependency_run(int mutation, bool* landed_wh
   r.b.host_pinned_bytes = 4 << 20;
   plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;
   r.o.readahead_units = 1;
@@ -550,7 +572,7 @@ std::vector<std::pair<int, int>> ra_dependency_run(int mutation, bool* landed_wh
   CHECK_OK(ss_release(r.c, 4, gpu.s));
   CHECK_OK(ss_end(r.c));
   wrong = gpu.verify(mutation == 0);
-  cudaEventDestroy(l1_read);
+  (void)cudaEventDestroy(l1_read);
   return wrong;
 }
 
@@ -567,7 +589,10 @@ TEST(cuda_readahead_copy_dependencies) {
   CHECK(w6.size() == 1 && w6[0] == std::make_pair(1, 0));
   auto w7 = ra_dependency_run(7, &pending);
   std::printf("  mutation 7 (no buffer-event wait): wrong %zu\n", w7.size());
-  CHECK(w7.size() == 1 && w7[0] == std::make_pair(4, 8));
+  if (SS_TEST_UNIFIED)  // a unified landing is a synchronous memcpy: the buffer comes back only after it, no hazard
+    CHECK(w7.empty());
+  else
+    CHECK(w7.size() == 1 && w7[0] == std::make_pair(4, 8));
 }
 
 TEST(cuda_exclusive_same_forward_persistent) { exclusive_same_forward("x-same-persistent", 0); }
@@ -592,7 +617,7 @@ TEST(cuda_prefill_layer_major_async) {
   r.b.host_pinned_bytes = 2 << 20;
   plan(r, {"", "RRRRRRRRPPPPDDDD", "RRRRRRRR", "P", "RRRRRRRRDDDDPPPP"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.verify_hash = 1;
   r.o.staging_bytes = 64 * 1024;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
@@ -636,7 +661,7 @@ TEST(cuda_read_failure_reported_and_recovered) {
   r.b.dynamic_slots_per_layer = 4;
   plan(r, {"", "DDDDDDDDDDDDDDDD", "DDDDDDDD", "D", "DDDDDDDDDDDDDDDD"});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.verify_hash = 1;
   r.o.pin_planned = 0;
   r.o.staging_bytes = 64 * 1024;
@@ -702,7 +727,7 @@ TEST(cuda_bandwidth_pinned_and_nvme) {
   std::string t0(32, 'P'), t1(32, 'D');
   plan(r, {t0.c_str(), t1.c_str()});
   ss_options_defaults(&r.o);
-  r.o.backend = SS_BACKEND_CUDA;
+  r.o.backend = SS_TEST_BACKEND;
   r.o.reader_threads = 4;
   r.o.staging_buffers = 4;
   r.o.staging_bytes = uint64_t(16) << 20;  // pinned total: 256 MiB tier + 64 MiB staging
@@ -739,9 +764,22 @@ int main(int argc, char** argv) {
   int dev = 0;
   cudaDeviceProp p{};
   if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&p, dev) != cudaSuccess) {
-    std::printf("no CUDA device\n");
+    std::printf("no %s device\n", SS_TEST_RUNTIME);
     return 2;
   }
+#if defined(__HIPCC__)
+  int g_wall_khz = 0;
+  if (hipDeviceGetAttribute(&g_wall_khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || g_wall_khz <= 0) {
+    std::printf("no wall clock rate\n");
+    return 2;
+  }
+  const long long khz = g_wall_khz;
+  if (hipMemcpyToSymbol(HIP_SYMBOL(g_wall_khz_dev), &khz, sizeof khz) != hipSuccess) {
+    std::printf("cannot set the wall clock rate\n");
+    return 2;
+  }
+  std::printf("runtime hip, %s, wall clock %d kHz\n", p.gcnArchName, g_wall_khz);
+#endif
   std::printf("device %d: %s, %.1f GiB\n", dev, p.name, double(p.totalGlobalMem) / double(1ull << 30));
   return sstest::run_all(only);
 }
