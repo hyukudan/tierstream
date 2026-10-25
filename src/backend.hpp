@@ -6,7 +6,7 @@
 
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 class Backend {
  public:
@@ -42,4 +42,4 @@ std::unique_ptr<Backend> make_cpu_backend();
 std::unique_ptr<Backend> make_cuda_backend(int device);  // throws SS_E_UNSUPPORTED when not compiled in
 std::unique_ptr<Backend> make_hip_backend(int device);   // idem
 
-}  // namespace ss
+}  // namespace ts

@@ -9,7 +9,7 @@
 #include "errors.hpp"
 #include "xxh64.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr uint64_t kHostAlign = 4096;
@@ -1890,4 +1890,4 @@ void Ctx::check_exclusive() const {
               " allocated");
 }
 
-}  // namespace ss
+}  // namespace ts

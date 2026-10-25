@@ -6,10 +6,11 @@
 
 #include "errors.hpp"
 #include "recipe.hpp"
+#include "schema_id.hpp"
 #include "sha256.hpp"
 #include "toml.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr const char* kProfileSchema = "strix-stream/recipe-profile-v1";
@@ -244,7 +245,7 @@ RecipeLayer RecipeStack::read_layer(const std::string& text, const std::string& 
     return *v;
   };
   const char* want = profile ? kProfileSchema : kOverridesSchema;
-  if (str_in(doc, "schema", "schema", true) != want)
+  if (!schema_accepts(str_in(doc, "schema", "schema", true), want))
     bad(std::string("schema: expected \"") + want + "\" for " + (profile ? "a profile" : "overrides"));
   const std::string rname = str_in(doc, "recipe", "recipe", true);
   if (rname != eff_.name) bad("recipe: \"" + rname + "\" is not this recipe (\"" + eff_.name + "\")");
@@ -526,4 +527,4 @@ Json RecipeStack::explain() const {
   return out;
 }
 
-}  // namespace ss
+}  // namespace ts

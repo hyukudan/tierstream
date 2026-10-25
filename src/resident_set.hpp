@@ -8,7 +8,7 @@
 
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 struct Admission {
   std::vector<int32_t> hits;       // routed and resident (ascending)
@@ -69,4 +69,4 @@ class ResidentSet {
   std::vector<uint32_t> freq_;       // occurrences in the window
 };
 
-}  // namespace ss
+}  // namespace ts

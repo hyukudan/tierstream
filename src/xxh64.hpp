@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ss {
+namespace ts {
 
 class Xxh64 {
  public:
@@ -23,4 +23,7 @@ class Xxh64 {
 
 uint64_t xxh64(const void* data, size_t len, uint64_t seed = 0);
 
-}  // namespace ss
+}  // namespace ts
+
+// One release of the strix-stream -> tierstream rename: engine branches that build with -I<lib>/src call ss::xxh64.
+namespace ss = ts;

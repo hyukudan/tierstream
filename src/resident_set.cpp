@@ -6,7 +6,7 @@
 
 #include "errors.hpp"
 
-namespace ss {
+namespace ts {
 
 ResidentSet::ResidentSet(int n_units, int capacity, ss_policy policy, uint32_t window)
     : n_units_(n_units), policy_(policy), window_(window ? window : 16) {
@@ -216,4 +216,4 @@ void ResidentSet::observe(const std::vector<int32_t>& routed_in, const std::vect
   }
 }
 
-}  // namespace ss
+}  // namespace ts

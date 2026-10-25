@@ -10,7 +10,7 @@
 #include "json.hpp"
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 struct RingClass {
   uint64_t stride = 0;  // slot bytes (a unit stride)
@@ -71,4 +71,4 @@ void plan_backing(const Desc& d, const ss_budget& b, const std::vector<double>& 
 std::vector<uint8_t> tiers_from_json(const Desc& d, const Json& plan_json);
 Json plan_to_json(const Desc& d, const Plan& p);
 
-}  // namespace ss
+}  // namespace ts

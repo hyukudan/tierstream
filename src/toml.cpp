@@ -8,7 +8,7 @@
 
 #include "errors.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr size_t kMaxDepth = 64;
@@ -576,4 +576,4 @@ class Reader {
 
 Json toml_parse(const std::string& text) { return Reader(text).run(); }
 
-}  // namespace ss
+}  // namespace ts

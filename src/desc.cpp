@@ -5,8 +5,9 @@
 #include <set>
 
 #include "errors.hpp"
+#include "schema_id.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr const char* kSchema = "strix-stream/desc-v1";
@@ -133,7 +134,7 @@ Desc desc_from_json(const Json& j) {
              {"schema", "model", "engine", "fixed_device", "host_fixed", "state_bytes_per_position",
               "workspace_bytes_per_row", "unit_align", "sources", "order", "tiers", "ring_slots", "routes", "layers",
               "lookup_tables"});
-  require(json_str(need(j, "schema", w), "desc.schema") == kSchema, SS_E_DESC,
+  require(schema_accepts(json_str(need(j, "schema", w), "desc.schema"), kSchema), SS_E_DESC,
           std::string("desc.schema: expected \"") + kSchema + "\"");
   Desc d;
   d.model = opt_str(j, "model", w);
@@ -437,4 +438,4 @@ Json desc_to_json(const Desc& d) {
   return j;
 }
 
-}  // namespace ss
+}  // namespace ts

@@ -1,6 +1,6 @@
-# strix-stream design (v1)
+# tierstream design (v1)
 
-strix-stream is a model-generic weight-streaming library. An engine whose model is larger than its device keeps a
+tierstream is a model-generic weight-streaming library. An engine whose model is larger than its device keeps a
 resident set of weight units in device memory. It streams the rest from a pinned host tier or from files read
 unbuffered, and it reads every streamed or resident unit through one pointer table per layer. The library holds no
 model or engine code. A model plugs in with a **descriptor** (§2) and a small **adapter** in the engine (§6).
@@ -38,7 +38,7 @@ manifest, never GGUF or safetensors itself (hyperloom's `modelfiles.py` already 
 
 - Unknown keys are errors, except `x-*` keys, which are free-form adapter notes.
 - All sizes are bytes, as exact integers (64-bit safe).
-- `ss-plan DESC --desc` prints the canonical form: sorted keys, no whitespace.
+- `ts-plan DESC --desc` prints the canonical form: sorted keys, no whitespace.
 
 ### Top-level fields
 
@@ -462,8 +462,8 @@ counters, flags saying which apply) or `ss_stats_snapshot_json` (the same `strix
 | backend | status | notes |
 |---|---|---|
 | CPU | done, tested | host memory, unified; the reference for the in-place path |
-| CUDA | done, CPU-built; GPU test `ss-test-cuda` (one short PC-BIG) | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream for H2D: one DMA engine reaches 31-32.5 GB/s and a second H2D stream adds nothing (spec-rtx-prefill §2.1); exclusive mode adds a write-back (D2H) stream |
-| HIP | stub: compiles only with `-DSS_HIP=ON` on a ROCm host; not built or run yet | unified: slots are mapped host memory, misses are read in place from the local NVMe, host waits in v1 |
+| CUDA | done, CPU-built; GPU test `ts-test-cuda` (one short PC-BIG) | VRAM pool and rings, `cudaHostAlloc` tier and staging, one non-blocking copy stream for H2D: one DMA engine reaches 31-32.5 GB/s and a second H2D stream adds nothing (spec-rtx-prefill §2.1); exclusive mode adds a write-back (D2H) stream |
+| HIP | stub: compiles only with `-DTS_HIP=ON` on a ROCm host; not built or run yet | unified: slots are mapped host memory, misses are read in place from the local NVMe, host waits in v1 |
 
 ## 9. Versioning
 

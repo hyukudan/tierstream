@@ -7,9 +7,10 @@
 #include <set>
 
 #include "errors.hpp"
+#include "schema_id.hpp"
 #include "toml.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr const char* kSchema = "strix-stream/recipe-v1";
@@ -368,7 +369,7 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
   Reader rd(note);
   refuse_exactness(doc, "");
   rd.keys(doc, "recipe", {"schema", "name", "description", "generated_by", "pin", "match", "limits", "routes"});
-  if (rd.str(rd.need(doc, "schema", "recipe"), "schema") != kSchema)
+  if (!schema_accepts(rd.str(rd.need(doc, "schema", "recipe"), "schema"), kSchema))
     rd.bad("schema", std::string("expected \"") + kSchema + "\"");
   Recipe r;
   r.name = rd.ident(rd.need(doc, "name", "recipe"), "name", 64, true);
@@ -811,4 +812,4 @@ Json recipe_to_json(const Recipe& r) {
   return j;
 }
 
-}  // namespace ss
+}  // namespace ts

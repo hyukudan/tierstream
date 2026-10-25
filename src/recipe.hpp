@@ -14,7 +14,7 @@
 #include "plan.hpp"
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 enum class Phase { Prefill, Decode };
 enum class Execute { Single, Tp, Replicas, Hetero };
@@ -195,4 +195,4 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& effective_sha256, con
                        const std::string& set, int member, const std::string& device_id, const Desc& desc,
                        const std::vector<double>& benefit, const std::vector<RefInput>& refs);
 
-}  // namespace ss
+}  // namespace ts

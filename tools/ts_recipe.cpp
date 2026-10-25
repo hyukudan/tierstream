@@ -1,9 +1,10 @@
-// ss-recipe: validate, explain, match, select and compile strix-stream recipes (docs/recipes.md §8.4).
-//   ss-recipe validate RECIPE [LAYERS]
-//   ss-recipe explain  RECIPE [LAYERS] [--json]
-//   ss-recipe match    RECIPE PROBE.json [LAYERS]
-//   ss-recipe select   RECIPE STATE.json [LAYERS]
-//   ss-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]
+// ts-recipe (also built as ss-recipe for one release): validate, explain, match, select and compile tierstream
+// recipes (docs/recipes.md §8.4).
+//   ts-recipe validate RECIPE [LAYERS]
+//   ts-recipe explain  RECIPE [LAYERS] [--json]
+//   ts-recipe match    RECIPE PROBE.json [LAYERS]
+//   ts-recipe select   RECIPE STATE.json [LAYERS]
+//   ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]
 //                      [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
 //   LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 // JSON on stdout; exit 0 = success, 1 = refusal (message on stderr), 2 = usage error.
@@ -18,10 +19,15 @@
 #include "json.hpp"
 #include "strix_stream/ss.h"
 
+// The tool's own name (ts-recipe; ss-recipe for one release of the rename): every message starts with it.
+#ifndef TS_TOOL_NAME
+#define TS_TOOL_NAME "ts-recipe"
+#endif
+
 namespace {
 
 const char* kUsage =
-    "usage: ss-recipe validate|explain|match|select|plan RECIPE [...]\n"
+    "usage: " TS_TOOL_NAME " validate|explain|match|select|plan RECIPE [...]\n"
     "  validate RECIPE [LAYERS]\n"
     "  explain  RECIPE [LAYERS] [--json]\n"
     "  match    RECIPE PROBE.json [LAYERS]\n"
@@ -31,19 +37,19 @@ const char* kUsage =
     "  LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...\n";
 
 [[noreturn]] void usage(const std::string& why) {
-  std::fprintf(stderr, "ss-recipe: %s\n%s", why.c_str(), kUsage);
+  std::fprintf(stderr, TS_TOOL_NAME ": %s\n%s", why.c_str(), kUsage);
   std::exit(2);
 }
 
 [[noreturn]] void refuse(const char* what) {
-  std::fprintf(stderr, "ss-recipe: %s: %s\n", what, ss_last_error());
+  std::fprintf(stderr, TS_TOOL_NAME ": %s: %s\n", what, ss_last_error());
   std::exit(1);
 }
 
 std::string slurp(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) {
-    std::fprintf(stderr, "ss-recipe: cannot open %s\n", path.c_str());
+    std::fprintf(stderr, TS_TOOL_NAME ": cannot open %s\n", path.c_str());
     std::exit(1);
   }
   std::stringstream s;
@@ -59,11 +65,11 @@ void print_owned(char* s) {
 std::vector<double> read_benefit(const std::string& path) {
   std::vector<double> out;
   try {
-    ss::Json j = ss::json_parse(slurp(path));
+    ts::Json j = ts::json_parse(slurp(path));
     if (!j.is_array()) throw std::runtime_error("expected a JSON array of numbers");
-    for (const auto& v : j.arr) out.push_back(ss::json_f64(v, path));
+    for (const auto& v : j.arr) out.push_back(ts::json_f64(v, path));
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "ss-recipe: benefit %s: %s\n", path.c_str(), e.what());
+    std::fprintf(stderr, TS_TOOL_NAME ": benefit %s: %s\n", path.c_str(), e.what());
     std::exit(1);
   }
   return out;
@@ -159,19 +165,19 @@ int main(int argc, char** argv) {
       print_owned(out);
       return 0;
     }
-    ss::Json j = ss::json_parse(out);
+    ts::Json j = ts::json_parse(out);
     ss_free(out);
     std::printf("recipe %s (sha256 %s)\n", j.find("recipe")->text.c_str(), j.find("recipe_sha256")->text.c_str());
     for (const auto& L : j.find("layers")->arr)
       std::printf("  layer %-8s %s\n", L.find("kind")->text.c_str(), L.find("origin")->text.c_str());
     for (const auto& f : j.find("fields")->arr) {
       std::string from = f.find("from")->text;
-      if (const ss::Json* o = f.find("origin")) from += " " + o->text;
-      std::printf("%-64s %-24s [%s]\n", f.find("path")->text.c_str(), ss::json_write(*f.find("value")).c_str(),
+      if (const ts::Json* o = f.find("origin")) from += " " + o->text;
+      std::printf("%-64s %-24s [%s]\n", f.find("path")->text.c_str(), ts::json_write(*f.find("value")).c_str(),
                   from.c_str());
-      if (const ss::Json* sh = f.find("shadowed"))
+      if (const ts::Json* sh = f.find("shadowed"))
         for (const auto& s : sh->arr)
-          std::printf("%-64s   was %s from %s %s: %s\n", "", ss::json_write(*s.find("value")).c_str(),
+          std::printf("%-64s   was %s from %s %s: %s\n", "", ts::json_write(*s.find("value")).c_str(),
                       s.find("from")->text.c_str(), s.find("origin")->text.c_str(), s.find("reason")->text.c_str());
     }
     return 0;

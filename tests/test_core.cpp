@@ -13,7 +13,7 @@
 #include "strix_stream/ss.h"
 #include "xxh64.hpp"
 
-using namespace ss;
+using namespace ts;
 
 namespace {
 

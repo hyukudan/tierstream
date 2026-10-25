@@ -7,7 +7,7 @@
 
 #include "errors.hpp"
 
-namespace ss {
+namespace ts {
 
 Json Json::number(uint64_t v) {
   Json j;
@@ -368,4 +368,4 @@ bool json_bool(const Json& v, const std::string& where) {
   return v.b;
 }
 
-}  // namespace ss
+}  // namespace ts

@@ -18,7 +18,7 @@
 #include <unistd.h>
 #endif
 
-namespace ss {
+namespace ts {
 
 #if defined(_WIN32)
 
@@ -124,4 +124,4 @@ uint64_t File::pread(void* dst, uint64_t n, uint64_t offset) const {
 
 #endif
 
-}  // namespace ss
+}  // namespace ts

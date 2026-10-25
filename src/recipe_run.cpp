@@ -13,7 +13,7 @@
 #include "recipe.hpp"
 #include "sha256.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr long kMaxBindSteps = 1000000;
@@ -1220,4 +1220,4 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   return out;
 }
 
-}  // namespace ss
+}  // namespace ts

@@ -6,7 +6,7 @@
 
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 class Error : public std::runtime_error {
  public:
@@ -23,4 +23,4 @@ inline void require(bool ok, ss_status status, const std::string& msg) {
   if (!ok) fail(status, msg);
 }
 
-}  // namespace ss
+}  // namespace ts

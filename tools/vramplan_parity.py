@@ -1,6 +1,8 @@
-"""Planner parity: strix-stream's ss-plan against hyperloom vramplan.plan() on the same descriptor.
+"""Planner parity: tierstream's ts-plan against hyperloom vramplan.plan() on the same descriptor.
 
-    python tools/vramplan_parity.py --ss-plan build/ss-plan.exe --hyperloom D:/tmp/tm-hl-vramplan
+    python tools/vramplan_parity.py --ts-plan build/ts-plan.exe --hyperloom D:/tmp/tm-hl-vramplan
+
+(--ss-plan, the strix-stream name of the option and of the tool, is kept for one release.)
 
 The vramplan Model is built from the descriptor exactly as docs/design.md section 2 maps it (fixed bytes, one Unit per
 (layer, unit) with the pool stride, order, tiers, a stream() callable sized like strix-stream's per-size rings).
@@ -74,7 +76,9 @@ def ss_plan(exe, path, cap_gib, host_gib, ring):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ss-plan", required=True)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--ts-plan", dest="ss_plan")
+    g.add_argument("--ss-plan", dest="ss_plan")
     ap.add_argument("--hyperloom", required=True)
     a = ap.parse_args()
     sys.path.insert(0, a.hyperloom)

@@ -608,14 +608,14 @@ measured RTX/nodes crossover are in uncached tokens). `context_tokens` is the wh
 `binding` is the match result's. Result `strix-stream/recipe-select-v1`: `{recipe, effective_sha256, route,
 handoff_route, charge: {host: bytes}, trace: [{route, verdict, why}]}`.
 
-### 8.4 CLI `ss-recipe`
+### 8.4 CLI `ts-recipe`
 
 ```
-ss-recipe validate RECIPE [LAYERS]
-ss-recipe explain  RECIPE [LAYERS] [--json]
-ss-recipe match    RECIPE PROBE.json [LAYERS]
-ss-recipe select   RECIPE STATE.json [LAYERS]
-ss-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json
+ts-recipe validate RECIPE [LAYERS]
+ts-recipe explain  RECIPE [LAYERS] [--json]
+ts-recipe match    RECIPE PROBE.json [LAYERS]
+ts-recipe select   RECIPE STATE.json [LAYERS]
+ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json
                    [--benefit FILE] [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
 LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 ```

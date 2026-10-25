@@ -8,7 +8,7 @@
 
 #include "errors.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 struct U {
@@ -476,4 +476,4 @@ std::vector<uint8_t> tiers_from_json(const Desc& d, const Json& j) {
   return out;
 }
 
-}  // namespace ss
+}  // namespace ts

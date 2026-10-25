@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr uint64_t P1 = 0x9E3779B185EBCA87ULL;
@@ -111,4 +111,4 @@ uint64_t xxh64(const void* data, size_t len, uint64_t seed) {
   return x.digest();
 }
 
-}  // namespace ss
+}  // namespace ts

@@ -1,11 +1,15 @@
-# strix-stream
+# tierstream
+
+*Formerly strix-stream.* All-in-one weight streaming across memory tiers, for MoE and dense models, on CUDA and HIP.
 
 A weight cache for inference engines whose model does not fit in GPU memory. It keeps the weights that matter now
 on the GPU, keeps more in page-locked host RAM, and reads the rest from NVMe. It moves weight *units* (an expert, or
 a whole layer's blob) between these tiers while the engine runs. Engines read every unit through an address table,
 so where a unit lives never changes a single output bit.
 
-- C ABI: `include/strix_stream/ss.h` (prefix `ss_`).
+- C ABI: `include/tierstream/ts.h` (prefix `ts_`). The strix-stream names (`include/strix_stream/ss.h`, `ss_*`,
+  the `strix_stream` CMake target and library file, `ss-recipe` / `ss-plan`, `SS_*` options and `SS_TEST_DIR`)
+  keep working unchanged for one release (see Names below).
 - Design and engine contract: [docs/design.md](docs/design.md). Recipes: [docs/recipes.md](docs/recipes.md).
 - Backends: CPU (tests), CUDA (RTX PRO 6000, 4090), HIP for Strix Halo (unified memory; see Status).
 
@@ -52,7 +56,7 @@ down matrices). A **plan** assigns each unit a starting tier from a memory budge
     with one blob per layer this is a prefix of whole layers).
 - Then pinned RAM; the rest stays on disk.
 
-`ss-plan` prints a plan; `ss_plan_from_tiers` takes your own.
+`ts-plan` prints a plan; `ss_plan_from_tiers` takes your own.
 
 ### One forward, from the engine's side
 
@@ -118,6 +122,15 @@ Bytes are copied, never transformed, and engine kernels must not depend on which
 placement, policy and prefetch setting gives bit-identical outputs. With `verify_hash` enabled and descriptor hashes
 supplied, unit bytes loaded from files are checked before they are accepted, and a mismatch is an error.
 
+### One cache for every engine
+
+Every engine in this lab (DeepSeek, MiniMax, Qwen, GLM, on the RTX card and on the Strix Halo nodes) reads its
+streamed weights through tierstream instead of keeping its own expert cache. The residency, prefetch, prediction and
+write-back logic lives here once:
+- engines describe their units in a descriptor;
+- recipes choose the budgets;
+- the engine-side code shrinks to an adapter that names the units it needs and reads them through the tables.
+
 ## When it pays (and when it does not)
 
 The question is how many weight bytes each token must move across PCIe, compared with what the GPU reads from its
@@ -132,6 +145,7 @@ own memory, which is much faster.
 | **Models that do not fit at all** | makes them run | The alternative is not running, or splitting across machines. That is a capacity gain, not a speed gain. Exclusive mode removes disk reads only when VRAM + RAM cover the units. |
 | **Dense decode** (one or a few tokens per step) | does **not** pay | Every token reads every weight. Whatever is not resident crosses PCIe on every token, far slower than VRAM, so the streamed fraction dominates the step time. Use a smaller quantization, more GPUs, or a unified-memory machine instead. |
 | **MoE decode with near-uniform routing** | pays less | With no hot set, the miss rate approaches the fraction of experts that are not resident. |
+| **KV cache, adapters** (later) | not yet | The same tiers fit other large, unevenly used byte ranges. Units today are weights only. |
 
 ## Recipe knobs at a glance
 
@@ -159,16 +173,16 @@ The full list, with units and checks, is in [docs/recipes.md](docs/recipes.md).
 
 ```
 # Linux / WSL
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build   # -DTS_CUDA=ON, -DTS_HIP=ON
 # Windows (MSVC + Ninja), CPU or CUDA
 tools\build-win.bat          &  tools\build-win.bat cuda
 ```
 
-The tests write small synthetic model files under `SS_TEST_DIR`, or the system temp directory if it is not set. The
-CUDA test `ss-test-cuda` needs a GPU. It checksums every streamed unit on the device and probes pinned and NVMe
+The tests write small synthetic model files under `TS_TEST_DIR` (or `SS_TEST_DIR`), or the system temp directory if it is not set. The
+CUDA test `ts-test-cuda` needs a GPU. It checksums every streamed unit on the device and probes pinned and NVMe
 bandwidth with about 256 MiB each.
 
-`ss-plan DESC.json --device-gib X --host-gib Y` validates a descriptor and prints its tier plan, in the same format
+`ts-plan DESC.json --device-gib X --host-gib Y` validates a descriptor and prints its tier plan, in the same format
 hyperloom's planner reads.
 
 ## Recipes
@@ -275,18 +289,18 @@ devices, with exactly one owner per unit.
 **Autotuner and overrides.** Three layers make the effective recipe: the recipe, an autotuner profile, and human
 overrides (files or `--set path=value`), highest last. A profile is bound to the recipe's bytes, the engine, the
 model, the devices, their drivers and the descriptors, which must all still match, and to the probed bandwidths,
-which may drift by up to `max_drift` (default 10 %). Otherwise the profile is refused and the recipe runs untuned. A recipe can pin fields the autotuner may not change. `ss-recipe explain` shows, for
+which may drift by up to `max_drift` (default 10 %). Otherwise the profile is refused and the recipe runs untuned. A recipe can pin fields the autotuner may not change. `ts-recipe explain` shows, for
 every field, its value, which layer set it and what it replaced.
 
 **Exactness is not an option.** Every placement a recipe can express produces bit-identical outputs; a recipe that
 asks for "exact" anything is refused.
 
 ```
-ss-recipe validate RECIPE                 # strict check, prints the effective recipe
-ss-recipe explain  RECIPE --set routes.prefill_long.when.prompt_tokens_min=3072
-ss-recipe match    RECIPE PROBE.json      # does this hardware fit? which devices go where
-ss-recipe select   RECIPE STATE.json      # which route admits this request, and why not the others
-ss-recipe plan     RECIPE --route R --device-set S --desc DESC.json   # budget, options and plan-v1
+ts-recipe validate RECIPE                 # strict check, prints the effective recipe
+ts-recipe explain  RECIPE --set routes.prefill_long.when.prompt_tokens_min=3072
+ts-recipe match    RECIPE PROBE.json      # does this hardware fit? which devices go where
+ts-recipe select   RECIPE STATE.json      # which route admits this request, and why not the others
+ts-recipe plan     RECIPE --route R --device-set S --desc DESC.json   # budget, options and plan-v1
 ```
 
 The same calls are in the C ABI (`ss_recipe_*`).
@@ -300,9 +314,23 @@ The same calls are in the C ABI (`ss_recipe_*`).
   and MiniMax on a 32 GB card, MiniMax with >= 192 GB of host RAM, GLM 5.3 Flash.
 
 Every number in them carries its evidence in `x-` keys (`x-evidence`, `x-cites`, `x-predicted` with a basis:
-measured, derived, projected, bound or target). CTest validates each file with `ss-recipe` and checks that the
+measured, derived, projected, bound or target). CTest validates each file with `ts-recipe` and checks that the
 structural negative fixtures in `recipes/examples/tests/` are refused; `validate_v1.py` adds the citation checks
 (it needs the lab notes the `ref`s point into).
+
+## Names
+
+strix-stream was renamed tierstream. For this release the change is purely additive:
+- **C ABI.** `ts.h` adds the `ts_*` names on top of the unchanged `ss.h`. The types are the same types and each
+  `ts_*` function calls its `ss_*` function, so old and new code link against one library.
+- **Build and tools.** The CMake target is `tierstream` (alias `strix_stream`). The library file is built under both
+  names. The tools are `ts-recipe` / `ts-plan`, and `ss-recipe` / `ss-plan` are built too, each printing its own
+  name. The options are `TS_CUDA` / `TS_HIP` / `TS_TESTS`, and an `SS_*` value still works.
+- **Formats.** Every parser accepts `tierstream/<format>` and `strix-stream/<format>`. Every output still writes
+  `strix-stream/<format>` in this release, so no recipe hash, plan or stats document changes. Recipe files are
+  unchanged.
+
+The old names are removed in a later release, once every consumer has moved.
 
 ## Status
 

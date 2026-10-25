@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace ss {
+namespace ts {
 namespace {
 
 constexpr uint32_t kK[64] = {
@@ -75,4 +75,4 @@ std::string sha256_hex(const void* data, size_t n) {
   return out;
 }
 
-}  // namespace ss
+}  // namespace ts

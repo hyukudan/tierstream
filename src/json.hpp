@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace ss {
+namespace ts {
 
 struct Json {
   enum class Kind { Null, Bool, Number, String, Array, Object };
@@ -37,7 +37,7 @@ struct Json {
   void push(Json v) { kind = Kind::Array; arr.push_back(std::move(v)); }
 };
 
-// Throws ss::Error (errors.hpp) with a position on malformed input. Depth and size are bounded.
+// Throws ts::Error (errors.hpp) with a position on malformed input. Depth and size are bounded.
 Json json_parse(const std::string& text);
 std::string json_write(const Json& v);
 
@@ -48,4 +48,4 @@ double json_f64(const Json& v, const std::string& where);
 const std::string& json_str(const Json& v, const std::string& where);
 bool json_bool(const Json& v, const std::string& where);
 
-}  // namespace ss
+}  // namespace ts

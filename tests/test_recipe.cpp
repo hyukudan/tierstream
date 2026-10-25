@@ -17,7 +17,7 @@
 #include "strix_stream/ss.h"
 #include "toml.hpp"
 
-using namespace ss;
+using namespace ts;
 
 namespace {
 

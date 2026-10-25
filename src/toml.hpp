@@ -8,9 +8,9 @@
 
 #include "json.hpp"
 
-namespace ss {
+namespace ts {
 
-// Throws ss::Error(SS_E_RECIPE) with "toml: line N: ..." on malformed input. Depth and size are bounded.
+// Throws ts::Error(SS_E_RECIPE) with "toml: line N: ..." on malformed input. Depth and size are bounded.
 Json toml_parse(const std::string& text);
 
-}  // namespace ss
+}  // namespace ts

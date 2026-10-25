@@ -14,17 +14,17 @@
 #include "strix_stream/ss.h"
 
 struct ss_desc {
-  ss::Desc d;
+  ts::Desc d;
 };
 struct ss_plan {
-  ss::Plan p;
+  ts::Plan p;
   const ss_desc* desc;
 };
 struct ss_ctx {
-  std::unique_ptr<ss::Ctx> c;
+  std::unique_ptr<ts::Ctx> c;
 };
 struct ss_recipe {
-  ss::RecipeStack s;
+  ts::RecipeStack s;
 };
 
 namespace {
@@ -36,7 +36,7 @@ ss_status guard(F&& f) {
   try {
     f();
     return SS_OK;
-  } catch (const ss::Error& e) {
+  } catch (const ts::Error& e) {
     g_err = e.what();
     return e.status();
   } catch (const std::bad_alloc&) {
@@ -62,22 +62,22 @@ ss_status give_text(const std::string& s, char** out, size_t* len) {
   return SS_OK;
 }
 
-void need(bool ok, const char* what) { ss::require(ok, SS_E_INVALID, what); }
+void need(bool ok, const char* what) { ts::require(ok, SS_E_INVALID, what); }
 
 std::string read_text(const char* path, const char* what) {
   std::ifstream f(path, std::ios::binary);
-  ss::require(bool(f), SS_E_IO, std::string("cannot open ") + what + " " + path);
+  ts::require(bool(f), SS_E_IO, std::string("cannot open ") + what + " " + path);
   std::stringstream ss_;
   ss_ << f.rdbuf();
   return ss_.str();
 }
 
 // JSON inputs of the recipe calls (probe report, identity, request state).
-ss::Json parse_input(const char* text, size_t len, const char* what) {
+ts::Json parse_input(const char* text, size_t len, const char* what) {
   try {
-    return ss::json_parse(std::string(text, len));
-  } catch (const ss::Error& e) {
-    ss::fail(SS_E_RECIPE, std::string(what) + ": " + e.what());
+    return ts::json_parse(std::string(text, len));
+  } catch (const ts::Error& e) {
+    ts::fail(SS_E_RECIPE, std::string(what) + ": " + e.what());
   }
 }
 
@@ -118,7 +118,7 @@ T versioned(const T* in, void (*defaults)(T*), const char* what) {
   T v;
   defaults(&v);
   if (!in) return v;
-  ss::require(in->struct_size >= 2 * sizeof(uint32_t), SS_E_INVALID,
+  ts::require(in->struct_size >= 2 * sizeof(uint32_t), SS_E_INVALID,
               std::string(what) + ": struct_size not set (fill the struct with its *_defaults function)");
   std::memcpy(static_cast<void*>(&v), in, std::min<size_t>(in->struct_size, sizeof(T)));
   v.struct_size = uint32_t(sizeof(T));
@@ -147,7 +147,7 @@ void ss_free(void* p) { std::free(p); }
 ss_status ss_desc_from_json(const char* json_text, size_t len, ss_desc** out) {
   return guard([&] {
     need(json_text && out, "ss_desc_from_json: null argument");
-    auto* d = new ss_desc{ss::desc_from_json(ss::json_parse(std::string(json_text, len)))};
+    auto* d = new ss_desc{ts::desc_from_json(ts::json_parse(std::string(json_text, len)))};
     *out = d;
   });
 }
@@ -156,10 +156,10 @@ ss_status ss_desc_from_file(const char* path, ss_desc** out) {
   return guard([&] {
     need(path && out, "ss_desc_from_file: null argument");
     std::ifstream f(path, std::ios::binary);
-    ss::require(bool(f), SS_E_IO, std::string("cannot open descriptor ") + path);
+    ts::require(bool(f), SS_E_IO, std::string("cannot open descriptor ") + path);
     std::stringstream ss_;
     ss_ << f.rdbuf();
-    auto* d = new ss_desc{ss::desc_from_json(ss::json_parse(ss_.str()))};
+    auto* d = new ss_desc{ts::desc_from_json(ts::json_parse(ss_.str()))};
     *out = d;
   });
 }
@@ -192,7 +192,7 @@ ss_status ss_desc_to_json(const ss_desc* d, char** out_json, size_t* out_len) {
   std::string s;
   ss_status st = guard([&] {
     need(d != nullptr, "ss_desc_to_json: null descriptor");
-    s = ss::json_write(ss::desc_to_json(d->d));
+    s = ts::json_write(ts::desc_to_json(d->d));
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
@@ -205,7 +205,7 @@ ss_status ss_plan_make(const ss_desc* d, const ss_budget* b, const double* benef
     ss_budget bb = versioned(b, budget_defaults, "ss_plan_make");
     std::vector<double> ben;
     if (benefit) ben.assign(benefit, benefit + n_benefit);
-    *out = new ss_plan{ss::plan_make(d->d, bb, ben), d};
+    *out = new ss_plan{ts::plan_make(d->d, bb, ben), d};
   });
 }
 
@@ -213,16 +213,16 @@ ss_status ss_plan_from_tiers(const ss_desc* d, const ss_budget* b, const uint8_t
   return guard([&] {
     need(d && b && tiers && out, "ss_plan_from_tiers: null argument");
     ss_budget bb = versioned(b, budget_defaults, "ss_plan_from_tiers");
-    *out = new ss_plan{ss::plan_from_tiers(d->d, bb, std::vector<uint8_t>(tiers, tiers + n)), d};
+    *out = new ss_plan{ts::plan_from_tiers(d->d, bb, std::vector<uint8_t>(tiers, tiers + n)), d};
   });
 }
 
 ss_status ss_plan_from_json(const ss_desc* d, const ss_budget* b, const char* plan_json, size_t len, ss_plan** out) {
   return guard([&] {
     need(d && b && plan_json && out, "ss_plan_from_json: null argument");
-    auto t = ss::tiers_from_json(d->d, ss::json_parse(std::string(plan_json, len)));
+    auto t = ts::tiers_from_json(d->d, ts::json_parse(std::string(plan_json, len)));
     ss_budget bb = versioned(b, budget_defaults, "ss_plan_from_json");
-    *out = new ss_plan{ss::plan_from_tiers(d->d, bb, t), d};
+    *out = new ss_plan{ts::plan_from_tiers(d->d, bb, t), d};
   });
 }
 
@@ -252,7 +252,7 @@ ss_status ss_plan_to_json(const ss_plan* p, char** out_json, size_t* out_len) {
   std::string s;
   ss_status st = guard([&] {
     need(p != nullptr, "ss_plan_to_json: null plan");
-    s = ss::json_write(ss::plan_to_json(p->desc->d, p->p));
+    s = ts::json_write(ts::plan_to_json(p->desc->d, p->p));
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
@@ -265,9 +265,9 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
     need(!plan || plan->desc == d, "ss_open: plan was made from another descriptor");
     ss_options o = versioned(opt, options_defaults, "ss_open options");
     ss_budget bb = versioned(budget, budget_defaults, "ss_open budget");
-    need(!plan || ss::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
-    ss::Plan p = plan ? plan->p : ss::plan_make(d->d, bb, {});
-    *out = new ss_ctx{std::make_unique<ss::Ctx>(d->d, bb, p, o)};
+    need(!plan || ts::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
+    ts::Plan p = plan ? plan->p : ts::plan_make(d->d, bb, {});
+    *out = new ss_ctx{std::make_unique<ts::Ctx>(d->d, bb, p, o)};
   });
 }
 
@@ -294,7 +294,7 @@ ss_status ctx_guard(ss_ctx* c, F&& f) {
   try {
     f();
     return SS_OK;
-  } catch (const ss::Error& e) {
+  } catch (const ts::Error& e) {
     // A device or allocation error mid-call may leave half-updated bookkeeping (and CUDA errors are sticky).
     if (e.status() == SS_E_BACKEND || e.status() == SS_E_NOMEM) c->c->poison();
     g_err = e.what();
@@ -406,7 +406,7 @@ ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) {
   std::string s;
   ss_status st = guard([&] {
     need(c != nullptr, "ss_stats_to_json: null context");
-    s = ss::json_write(c->c->stats_json());
+    s = ts::json_write(c->c->stats_json());
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
@@ -421,7 +421,7 @@ ss_status ss_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss
     ss_layer_stats t;
     ss_snapshot_info i;
     if (!c->c->snapshot(&t, &i))
-      ss::fail(SS_E_INVALID,
+      ts::fail(SS_E_INVALID,
                "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
     if (total_out) *total_out = t;
     if (info_out) {
@@ -435,11 +435,11 @@ ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_l
   std::string s;
   ss_status st = guard([&] {
     need(c != nullptr, "ss_stats_snapshot_json: null context");
-    ss::Json j;
+    ts::Json j;
     if (!c->c->snapshot_json(&j))
-      ss::fail(SS_E_INVALID,
+      ts::fail(SS_E_INVALID,
                "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
-    s = ss::json_write(j);
+    s = ts::json_write(j);
   });
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
@@ -507,14 +507,14 @@ ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uin
 ss_status ss_recipe_from_text(const char* text, size_t len, const char* origin, ss_recipe** out) {
   return guard([&] {
     need(text && out, "ss_recipe_from_text: null argument");
-    *out = new ss_recipe{ss::RecipeStack(std::string(text, len), origin ? origin : "<text>")};
+    *out = new ss_recipe{ts::RecipeStack(std::string(text, len), origin ? origin : "<text>")};
   });
 }
 
 ss_status ss_recipe_from_file(const char* path, ss_recipe** out) {
   return guard([&] {
     need(path && out, "ss_recipe_from_file: null argument");
-    *out = new ss_recipe{ss::RecipeStack(read_text(path, "recipe"), path)};
+    *out = new ss_recipe{ts::RecipeStack(read_text(path, "recipe"), path)};
   });
 }
 
@@ -524,7 +524,7 @@ ss_status ss_recipe_add_profile(ss_recipe* r, const char* text, size_t len, cons
                                 const char* identity_json, size_t identity_len) {
   return guard([&] {
     need(r && text && identity_json, "ss_recipe_add_profile: null argument");
-    ss::Json id = parse_input(identity_json, identity_len, "identity");
+    ts::Json id = parse_input(identity_json, identity_len, "identity");
     r->s.add_profile(std::string(text, len), origin ? origin : "<profile>", id);
   });
 }
@@ -547,7 +547,7 @@ ss_status ss_recipe_to_json(const ss_recipe* r, char** out, size_t* len) {
   std::string s;
   ss_status st = guard([&] {
     need(r != nullptr, "ss_recipe_to_json: null recipe");
-    s = ss::json_write(r->s.effective_json());
+    s = ts::json_write(r->s.effective_json());
   });
   return st != SS_OK ? st : give_text(s, out, len);
 }
@@ -556,7 +556,7 @@ ss_status ss_recipe_explain(const ss_recipe* r, char** out, size_t* len) {
   std::string s;
   ss_status st = guard([&] {
     need(r != nullptr, "ss_recipe_explain: null recipe");
-    s = ss::json_write(r->s.explain());
+    s = ts::json_write(r->s.explain());
   });
   return st != SS_OK ? st : give_text(s, out, len);
 }
@@ -565,13 +565,13 @@ ss_status ss_recipe_match(const ss_recipe* r, const char* probe_json, size_t len
   std::string s;
   ss_status st = guard([&] {
     need(r && probe_json, "ss_recipe_match: null argument");
-    ss::Binding b = ss::recipe_bind(r->s.effective(), parse_input(probe_json, len, "probe"));
-    ss::Json j = ss::Json::object();
-    j["schema"] = ss::Json::string("strix-stream/recipe-match-v1");
-    j["recipe"] = ss::Json::string(r->s.effective().name);
-    j["effective_sha256"] = ss::Json::string(r->s.effective_sha256());
-    j["binding"] = ss::binding_json(b);
-    s = ss::json_write(j);
+    ts::Binding b = ts::recipe_bind(r->s.effective(), parse_input(probe_json, len, "probe"));
+    ts::Json j = ts::Json::object();
+    j["schema"] = ts::Json::string("strix-stream/recipe-match-v1");
+    j["recipe"] = ts::Json::string(r->s.effective().name);
+    j["effective_sha256"] = ts::Json::string(r->s.effective_sha256());
+    j["binding"] = ts::binding_json(b);
+    s = ts::json_write(j);
   });
   return st != SS_OK ? st : give_text(s, out, olen);
 }
@@ -580,8 +580,8 @@ ss_status ss_recipe_select(const ss_recipe* r, const char* state_json, size_t le
   std::string s;
   ss_status st = guard([&] {
     need(r && state_json, "ss_recipe_select: null argument");
-    s = ss::json_write(
-        ss::recipe_select(r->s.effective(), r->s.effective_sha256(), parse_input(state_json, len, "state")));
+    s = ts::json_write(
+        ts::recipe_select(r->s.effective(), r->s.effective_sha256(), parse_input(state_json, len, "state")));
   });
   return st != SS_OK ? st : give_text(s, out, olen);
 }
@@ -598,10 +598,10 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
     need(r && route && set && device_id && desc && budget && options, "ss_recipe_plan: null argument");
     std::vector<double> ben;
     if (benefit) ben.assign(benefit, benefit + n_benefit);
-    std::vector<ss::RefInput> refs;
+    std::vector<ts::RefInput> refs;
     need(n_refs == 0 || ref_descs, "ss_recipe_plan: n_refs > 0 needs ref_descs");
     for (size_t k = 0; k < n_refs; ++k) {
-      ss::RefInput ref;
+      ts::RefInput ref;
       ref.desc = ref_descs[k] ? &ref_descs[k]->d : nullptr;
       if (ref_benefits && ref_benefits[k]) {
         need(ref_n_benefits != nullptr, "ss_recipe_plan: ref_benefits needs ref_n_benefits");
@@ -609,7 +609,7 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
       }
       refs.push_back(std::move(ref));
     }
-    ss::RecipePlan rp = ss::recipe_plan(r->s.effective(), r->s.effective_sha256(), route, set, member, device_id,
+    ts::RecipePlan rp = ts::recipe_plan(r->s.effective(), r->s.effective_sha256(), route, set, member, device_id,
                                         desc->d, ben, refs);
     // Versioned in/out structs: start from the caller's (device ordinal kept), recipe fields from the plan.
     bout = rp.budget;
@@ -631,7 +631,7 @@ ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const char* set,
          "ss_recipe_plan: the route's placement sets readahead_units, which this caller's ss_options (an older header) "
          "cannot hold");
     if (plan) made = new ss_plan{std::move(rp.plan), desc};
-    s = ss::json_write(rp.doc);
+    s = ts::json_write(rp.doc);
   });
   if (st != SS_OK) return st;
   if (out) {

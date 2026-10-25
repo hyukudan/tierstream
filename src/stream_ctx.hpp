@@ -19,7 +19,7 @@
 #include "resident_set.hpp"
 #include "strix_stream/ss.h"
 
-namespace ss {
+namespace ts {
 
 struct RaEntry;
 
@@ -310,4 +310,4 @@ class Ctx {
   void* hook_user_ = nullptr;
 };
 
-}  // namespace ss
+}  // namespace ts

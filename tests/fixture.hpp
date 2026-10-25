@@ -33,7 +33,8 @@ struct Fixture {
   static constexpr uint64_t kBlob = (1u << 20) + 17;                  // layer 3 blob
 
   static std::filesystem::path temp_root() {
-    if (const char* e = std::getenv("SS_TEST_DIR")) return e;
+    if (const char* e = std::getenv("TS_TEST_DIR")) return e;
+    if (const char* e = std::getenv("SS_TEST_DIR")) return e;  // the strix-stream name, kept for one release
     return std::filesystem::temp_directory_path();
   }
 
@@ -83,7 +84,7 @@ struct Fixture {
     auto hashes = [&](int L) {
       std::string s = "[";
       for (size_t u = 0; u < expected[size_t(L)].size(); ++u) {
-        uint64_t h = ss::xxh64(expected[size_t(L)][u].data(), expected[size_t(L)][u].size());
+        uint64_t h = ts::xxh64(expected[size_t(L)][u].data(), expected[size_t(L)][u].size());
         if (corrupt_hash && (L == 1 || L == 4) && u == 3) h ^= 1;
         s += (u ? ",\"" : "\"") + hex(h) + "\"";
       }

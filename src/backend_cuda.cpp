@@ -8,7 +8,7 @@
 #include "backend.hpp"
 #include "errors.hpp"
 
-namespace ss {
+namespace ts {
 namespace {
 
 void ck(cudaError_t e, const char* what) {
@@ -106,4 +106,4 @@ class CudaBackend final : public Backend {
 
 std::unique_ptr<Backend> make_cuda_backend(int device) { return std::make_unique<CudaBackend>(device); }
 
-}  // namespace ss
+}  // namespace ts

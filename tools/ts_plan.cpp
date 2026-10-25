@@ -1,5 +1,6 @@
-// ss-plan: validate a desc-v1 manifest and print its tier plan as JSON (what hyperloom's planner adapter compares).
-//   ss-plan DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] [--dynamic N] [--desc]
+// ts-plan (also built as ss-plan for one release): validate a desc-v1 manifest and print its tier plan as JSON
+// (what hyperloom's planner adapter compares).
+//   ts-plan DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] [--dynamic N] [--desc]
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -7,9 +8,13 @@
 
 #include "strix_stream/ss.h"
 
+#ifndef TS_TOOL_NAME
+#define TS_TOOL_NAME "ts-plan"
+#endif
+
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: ss-plan DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] "
+    std::fprintf(stderr, "usage: " TS_TOOL_NAME " DESC.json --device-gib X [--host-gib Y] [--workspace-gib W] [--ring N] "
                          "[--dynamic N] [--desc]\n");
     return 2;
   }

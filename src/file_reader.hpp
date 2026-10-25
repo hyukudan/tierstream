@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 
-namespace ss {
+namespace ts {
 
 class File {
  public:
@@ -33,4 +33,4 @@ class File {
 #endif
 };
 
-}  // namespace ss
+}  // namespace ts

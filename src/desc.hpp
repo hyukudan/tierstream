@@ -7,7 +7,7 @@
 
 #include "json.hpp"
 
-namespace ss {
+namespace ts {
 
 enum class LayerKind { Dense, Moe, Blob };
 enum class Tiers { Pinned, Disk, PinnedDisk, Pair };  // where a unit may live when it is not resident
@@ -102,4 +102,4 @@ void desc_validate(Desc& d);  // throws SS_E_DESC; fills derived fields
 const char* tiers_name(Tiers t);
 const char* order_name(Order o);
 
-}  // namespace ss
+}  // namespace ts

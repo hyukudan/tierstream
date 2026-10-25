@@ -4,8 +4,8 @@
 #include <cstddef>
 #include <string>
 
-namespace ss {
+namespace ts {
 
 std::string sha256_hex(const void* data, size_t n);
 
-}  // namespace ss
+}  // namespace ts

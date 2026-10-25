@@ -19,7 +19,7 @@
 #include <cstring>
 #include <string>
 
-namespace ss {
+namespace ts {
 namespace {
 
 void ck(hipError_t e, const char* what) {
@@ -83,5 +83,5 @@ class HipBackend final : public Backend {
 
 std::unique_ptr<Backend> make_hip_backend(int device) { return std::make_unique<HipBackend>(device); }
 
-}  // namespace ss
+}  // namespace ts
 #endif

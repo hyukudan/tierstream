@@ -14,7 +14,7 @@
 #define SS_NO_HIP_BACKEND 1
 #endif
 
-namespace ss {
+namespace ts {
 namespace {
 
 void* aligned_alloc_4k(size_t bytes) {
@@ -73,4 +73,4 @@ std::unique_ptr<Backend> make_hip_backend(int) {
 }
 #endif
 
-}  // namespace ss
+}  // namespace ts
