@@ -144,6 +144,18 @@ layer, but a layer whose weights are already available needs no host reply.
     the next token. The default prefetch reserve follows the target; an explicit reserve stays fixed. Boundary
     write-backs are limited by available free pinned RAM blocks, so remaining victims stay resident and the target may
     not be reached.
+- **Write-back scheduling (opt-in):** by default every boundary copies its evicted experts back to RAM right away, so
+  the next token's first demand copies can queue behind them on a GPU whose one copy engine serves both directions.
+  With `dg_wb_defer = 1` the boundary only chooses the victims and unpublishes them. The service thread then copies
+  them back part by part during the next token, right after a layer's ready signal and prefetches, when the copy
+  engine is otherwise idle. It never copies after the last gated layer, and stops as soon as the device has
+  exported the next layer. `dg_wb_layer_bytes` sets the budget per layer (default: one part).
+  `dg_wb_max_outstanding` caps the bytes in flight (default: two experts). `dg_wb_stream` picks the demand stream
+  (default) or the write-back stream. A victim that is routed or predicted again before any of its bytes were copied
+  costs no copy. A demand that finds no free slot waits for a write-back already in flight, or else finishes the
+  oldest deferred one. Unfinished write-backs carry into the next token, up to about one boundary's worth of victims,
+  and the next boundary copies the older excess. Results are bit-for-bit identical. `ss_stats_dg` reports the deferred, cancelled, forced and
+  boundary-flushed counts and bytes.
 
 It is opt-in and CUDA only, for decode. It requires exclusive placement and LRU eviction, with `pin_planned = 0`.
 Before an engine makes it the default, it must pass the bit-for-bit correctness and performance checks against that
@@ -293,6 +305,8 @@ bandwidth with about 256 MiB each.
 
 `ts-plan DESC.json --device-gib X --host-gib Y` validates a descriptor and prints its tier plan, in the same format
 hyperloom's planner reads.
+
+To rebuild, rerun the gates and reproduce the measured DeepSeek results, see [docs/reproduce.md](docs/reproduce.md).
 
 ## Recipes
 
@@ -458,18 +472,18 @@ decode with prediction, statistics, memory pressure, global spares with fewer sp
 service, an out-of-range id, sequence desyncs, an absent entry, open-time refusals and seeding, test-hook gating,
 budgets, DMA timing, and two protocol mutations that the test must catch). The full-model DeepSeek bit-for-bit
 comparison against the replica's own cache and the speed-parity gate both passed. Device-gated decode is merged;
-the DeepSeek replica now uses tierstream as its only expert cache. This qualification does not cover unmerged features.
+the DeepSeek replica now uses tierstream as its only expert cache.
 
 As of 25 October 2026 late evening:
 
 | Work | State | Scope / qualification |
 |---|---|---|
 | Device-gated decode | Merged, opt-in | CUDA decode; full-model bit-for-bit and speed-parity gates passed. |
-| Deferred, bounded write-backs (`wbsched`) | Adopted in the DeepSeek RTX engine | Carries pending victims across token boundaries and bounds background submissions on the shared copy engine. Exact full-model gates pass; results below include the warm controller, now the engine default. |
-| Priced window prefetch (`winpf`) | Implemented in development, default off | Exact; gain not established and still under investigation. |
+| Deferred, bounded write-backs (`wbsched`) | Merged; on by default in the DeepSeek RTX engine (library field `dg_wb_defer`, runtime switch `ss_dg_set_sched`) | Carries pending victims across token boundaries and bounds background submissions on the shared copy engine. Exact full-model gates pass; results below include the warm controller, now the engine default. |
+| Priced window prefetch (`winpf`) | Merged, default off | Exact, but no repeatable gain was measured; kept off. |
 | Adaptive budgets, usage tables and NVMe placement (`adaptive`) | In development | Trace-replay measurements above; not an end-to-end engine result. |
-| Pipelined startup loader (`coldload`) | In development branches | Overlaps reads, staging and device copies with bounded buffers; measured load-time reduction below. |
-| Persistent loaded worker and cache reset-to-open | In development branches | Reuses one loaded process across requests; reset restores the fresh-load cache state. Each request is bitwise identical to a fresh process. |
+| Pipelined startup loader (`coldload`) | Merged, default on (`DG_LOAD_SERIAL=1` restores the serial loader) | Overlaps reads, staging and device copies with bounded buffers; measured load-time reduction below. |
+| Persistent loaded worker and cache reset-to-open | Merged (`ss_dg_reset_open`, `ss_dg_set_sched`, `ss_dg_residency`) | Reuses one loaded process across requests; reset restores the fresh-load cache state. Each request is bitwise identical to a fresh process. |
 
 Measured with DeepSeek V4.1 Flash on an RTX PRO 6000 (96 GB, Windows WDDM) alone: Q2 GGUF
 (IQ2_XXS gate/up, Q2_K down, Q8_0 dense), exclusive VRAM + pinned expert cache, and a speculative drafter
@@ -487,7 +501,7 @@ Across the evening's loads, code reached 82-95 tok/s; loads drifted by up to abo
 comparisons must stay within one load. These results qualify the combined engine configuration, not an isolated
 write-back scheduling speedup.
 
-| Startup / request operation (development branches) | Measured result |
+| Startup / request operation | Measured result |
 |---|---|
 | Full model load, serial → pipelined | 108.7 → 61.8 s; bitwise-identical placement and outputs |
 | Expert fill, serial → pipelined | 83.1 → 38.0 s; 2.25 → 6.73 GB/s, disk-bound |

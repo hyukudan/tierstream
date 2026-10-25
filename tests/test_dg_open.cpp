@@ -1,5 +1,6 @@
 // Device-gated open on the CPU backend: every v1 scope refusal (design rev 3.2 §1-§2) through ss_open, in the order
 // the layout checks them, then the backend refusal for a valid layout; old option structs read as the host contract.
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -136,6 +137,7 @@ TEST(dg_open_old_options_are_host) {
   ss_ctx* c = nullptr;
   CHECK_OK(ss_open(d, &b, p, &o, &c));
   CHECK_EQ(ss_dg_gated_index(c, 0), -1);  // a host-contract context
+  CHECK_EQ(int(ss_dg_reset_open(c)), int(SS_E_INVALID));
   int32_t ids[1] = {0};
   CHECK_EQ(int(ss_dg_enqueue_wait(c, 0, ids)), int(SS_E_INVALID));
   CHECK(std::string(ss_last_error()).find("not device-gated") != std::string::npos);
@@ -145,3 +147,167 @@ TEST(dg_open_old_options_are_host) {
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }
+
+// Write-back scheduling options: only 0 / 1 are valid for dg_wb_defer and dg_wb_stream; a valid setting reaches the
+// backend refusal on the CPU.
+TEST(dg_open_wb_defer_options) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_wb_defer = 2; }), SS_E_INVALID, "dg_wb_defer must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_wb_stream = 2; }), SS_E_INVALID, "dg_wb_stream must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) {
+           o.dg_wb_defer = 1;
+           o.dg_wb_stream = 1;
+           o.dg_wb_layer_bytes = 1;
+           o.dg_wb_max_outstanding = 4096;
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  // an older caller's struct ends before the write-back fields: whatever lies past its size is not read (0 = off)
+  expect(try_open(m, [](B&, O& o, T&) {
+           o.struct_size = uint32_t(offsetof(ss_options, dg_wb_defer));
+           o.dg_wb_defer = 7;
+           o.dg_wb_stream = 9;
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
+// ---- winpf: the tierstream/hint-prior-v1 file (ss.h: Window prefetch), parsed with every refusal ----
+#include "dg_ctx.hpp"
+#include "errors.hpp"
+#include "json.hpp"
+#include "sha256.hpp"
+
+namespace {
+
+struct PriorFile {
+  std::vector<uint8_t> b;
+  void u32(uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i)));
+  }
+  void u16(uint32_t v) {
+    b.push_back(uint8_t(v));
+    b.push_back(uint8_t(v >> 8));
+  }
+  void raw(const std::string& s) { b.insert(b.end(), s.begin(), s.end()); }
+  void seal() {  // the checksum: sha256 of every byte before it (raw 32 bytes)
+    const std::string hex = ts::sha256_hex(b.data(), b.size());
+    for (size_t i = 0; i < 64; i += 2) b.push_back(uint8_t(std::stoi(hex.substr(i, 2), nullptr, 16)));
+  }
+};
+
+// G gated layers of U units; P layers x k entries for the symbols; mutate(field) breaks one thing.
+std::vector<uint8_t> make_prior(const ts::Desc& d, const std::vector<int>& gated, uint32_t P, uint32_t k,
+                                const std::vector<int32_t>& syms, const std::string& mutate = "") {
+  PriorFile f;
+  f.raw(mutate == "magic" ? "TSHPRIO2" : "TSHPRIO1");
+  f.u32(mutate == "version" ? 2 : 1);
+  f.u32(uint32_t(gated.size()) + (mutate == "n_gated" ? 1 : 0));
+  for (size_t g = 0; g < gated.size(); ++g)
+    f.u32(uint32_t(d.layers[size_t(gated[g])].n_units) + (mutate == "units" && g == 1 ? 1 : 0));
+  std::string id = ts::hint_prior_identity(d, gated);
+  if (mutate == "identity") id[5] ^= 1;
+  f.raw(id);
+  const std::string prov = mutate == "prov" ? std::string(4097, 'x') : std::string("test prior");
+  f.u32(uint32_t(prov.size()));
+  f.raw(prov);
+  f.u32(mutate == "layers" ? 0 : P);
+  f.u32(mutate == "k" ? 65 : k);
+  f.u32(uint32_t(syms.size()));
+  for (size_t i = 0; i < syms.size(); ++i) {
+    f.u32(uint32_t(mutate == "dup" && i == 1 ? syms[0] : syms[i]));
+    for (uint32_t j = 0; j < P * k; ++j)
+      f.u16(mutate == "unit" && i == 0 && j == 0 ? 9999u : j == P * k - 1 ? 0xFFFFu : (uint32_t(syms[i]) * 7 + j) % 64);
+    for (uint32_t j = 0; j < P * k; ++j) f.u16(65535u - 1000u * j);
+  }
+  f.seal();
+  if (mutate == "checksum") f.b[40] ^= 1;
+  if (mutate == "size") f.b.push_back(0);
+  return f.b;
+}
+
+}  // namespace
+
+TEST(dg_prior_parse_and_refusals) {
+  DgModel m("prior");
+  const ts::Desc d = ts::desc_from_json(ts::json_parse(m.json));
+  std::vector<int> gated;
+  for (int L = 0; L < m.G; ++L) gated.push_back(L);
+  const std::vector<int32_t> syms = {5, 17, -3, 128000};
+  const std::vector<uint8_t> ok = make_prior(d, gated, 2, 4, syms);
+  const ts::DgPrior pr = ts::parse_hint_prior(ok.data(), ok.size(), d, gated);
+  CHECK_EQ(pr.layers, 2u);
+  CHECK_EQ(pr.k, 4u);
+  CHECK_EQ(pr.row.size(), size_t(4));
+  CHECK_EQ(pr.row.at(128000), 3u);
+  CHECK_EQ(pr.unit[0], uint32_t(5 * 7 % 64));
+  CHECK_EQ(pr.unit[7], 0xFFFFFFFFu);  // 0xFFFF = none
+  CHECK(pr.p[0] == 1.0f);
+  for (const char* bad : {"magic", "version", "n_gated", "units", "identity", "prov", "layers", "k", "checksum",
+                          "size", "dup", "unit"}) {
+    const std::vector<uint8_t> v = make_prior(d, gated, 2, 4, syms, bad);
+    bool refused = false;
+    try {
+      (void)ts::parse_hint_prior(v.data(), v.size(), d, gated);
+    } catch (const ts::Error& e) {
+      refused = e.status() == SS_E_INVALID;
+    }
+    if (!refused) std::printf("  not refused: %s\n", bad);
+    CHECK(refused);
+  }
+  // truncated anywhere: refused, never read past the end
+  for (size_t n = 0; n < ok.size(); n += 7) {
+    bool refused = false;
+    try {
+      (void)ts::parse_hint_prior(ok.data(), n, d, gated);
+    } catch (const ts::Error& e) {
+      refused = e.status() == SS_E_INVALID;
+    }
+    CHECK(refused);
+  }
+  // another layout (a part offset moved): another identity
+  ts::Desc d2 = d;
+  d2.layers[0].parts[0].offset += 256;
+  CHECK(ts::hint_prior_identity(d, gated) != ts::hint_prior_identity(d2, gated));
+}
+
+// The CPU backend refuses a gated open before reading the prior (the prior is validated in the CUDA open, after the
+// layout checks): a bad prior does not change that refusal.
+TEST(dg_prior_option_cpu_backend) {
+  DgModel m("prior-cpu");
+  const std::vector<uint8_t> junk(64, 7);
+  expect(try_open(m, [&](B&, O& o, T&) {
+           o.dg_prior = junk.data();
+           o.dg_prior_len = junk.size();
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
+// winpf ABI on the CPU: the defaults, sized defaults of an older options / params struct write only their bytes, and the
+// calls refuse a null context.
+TEST(dg_winpf_abi_cpu) {
+  ss_dg_winpf_params p;
+  ss_dg_winpf_defaults(&p);
+  CHECK_EQ(p.struct_size, uint32_t(sizeof p));
+  CHECK_EQ(p.enable, 0u);
+  CHECK_EQ(p.top_k, 0u);
+  CHECK_EQ(p.l1_cap, 1u);
+  CHECK_EQ(p.prior_cap, 1u);
+  CHECK_EQ(p.revert_unused, 1u);
+  CHECK(p.l1_pmin == 0.4f && p.prior_pmin == 0.7f && p.copy_gbps == 30.0f && p.prior_window_us == 1500u);
+  std::vector<uint8_t> ob(sizeof(ss_options) + 32, 0xC3);
+  const uint32_t old = uint32_t(offsetof(ss_options, dg_prior_len));
+  ss_options_defaults_sized(reinterpret_cast<ss_options*>(ob.data()), old);
+  bool canary = true;
+  for (size_t i = old; i < ob.size(); ++i) canary = canary && ob[i] == 0xC3;
+  CHECK(canary);
+  CHECK_EQ(reinterpret_cast<ss_options*>(ob.data())->struct_size, old);
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK(o.dg_prior == nullptr && o.dg_prior_len == 0);
+  CHECK_EQ(int(ss_dg_winpf_set(nullptr, &p)), int(SS_E_INVALID));
+  int32_t sym = 1;
+  CHECK_EQ(int(ss_dg_window_hint(nullptr, &sym, nullptr, 1)), int(SS_E_INVALID));
+}
+
+TEST(dg_reset_open_null_refused) {
+  CHECK_EQ(int(ss_dg_reset_open(nullptr)), int(SS_E_INVALID));
+}

@@ -75,6 +75,12 @@ __global__ __launch_bounds__(64) void export_kernel(Dev d, uint32_t g, const int
     r.mask_hi = uint32_t(mask >> 32);
     r.seq = seq;
     d.any_miss[g] = mask != 0ull ? 1u : 0u;
+    if (d.gts) {
+      volatile unsigned long long* s = d.gts + 4u * g;
+      s[1] = 0ull;
+      s[2] = 0ull;
+      s[0] = gtimer();
+    }
     __threadfence_system();
     *reinterpret_cast<volatile uint32_t*>(d.flag + g) = seq;
   }
@@ -97,8 +103,15 @@ __global__ void wait_kernel(Dev d, uint32_t g) {
   if (!d.any_miss[g]) return;
   const uint32_t seq = *d.seq;
   const unsigned long long t0 = gtimer();
+  if (d.gts) reinterpret_cast<volatile unsigned long long*>(d.gts)[4u * g + 1u] = t0;
   for (;;) {
-    if (int32_t(ld_acquire_sys(d.ready + g) - seq) >= 0) return;
+    if (int32_t(ld_acquire_sys(d.ready + g) - seq) >= 0) {
+      if (d.gts) {
+        reinterpret_cast<volatile unsigned long long*>(d.gts)[4u * g + 2u] = gtimer();
+        __threadfence_system();
+      }
+      return;
+    }
     if (ld_acquire_sys(d.host_abort)) {
       set_error(d, kDgHostAbort, g);
       return;

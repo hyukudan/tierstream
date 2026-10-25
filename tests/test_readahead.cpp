@@ -1,4 +1,4 @@
-// Host read-ahead (wave4/gapfix/wstream-readahead/design.md §7-11) on the CPU backend: byte identity against
+// Host read-ahead (design notes §7-11) on the CPU backend: byte identity against
 // readahead_units = 0, both completion / landing orders, failures with and without a waiting landing, cancellation,
 // shutdown without ss_end, deduplication, one reader, ABI and the R = 0 boundary.
 #include <cstddef>

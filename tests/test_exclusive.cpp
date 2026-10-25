@@ -189,7 +189,7 @@ TEST(exclusive_plan_billing_and_json) {
   ss_free(out);
   ss_plan_free(r.p);
   r.p = nullptr;
-  // Coverage first (Sol sol-7 #2): a host budget that holds exactly the pinned units gives no spare, never a unit
+  // Coverage first (review finding #2): a host budget that holds exactly the pinned units gives no spare, never a unit
   // moved to disk to make room for one.
   budget(r.b, units, 1);
   CHECK_OK(ss_plan_from_json(r.d, &r.b, js.data(), js.size(), &r.p));
@@ -242,7 +242,7 @@ TEST(exclusive_refusals) {
   CHECK(r.c == nullptr);
 }
 
-// Sol sol-7 #2, execution: residents 0-1 of layer 2, pinned 2-7, ONE spare. Routing 2 and 3 together has one block for
+// Review finding #2, execution: residents 0-1 of layer 2, pinned 2-7, ONE spare. Routing 2 and 3 together has one block for
 // one victim: one is admitted (its victim written back), the other is served from the ring with its victim kept.
 // Nothing is dropped to the file, so the next forwards (routing the victims) still read no file.
 TEST(exclusive_one_spare_keeps_coverage) {
@@ -376,7 +376,7 @@ TEST(exclusive_disk_units_seed_and_failed_read) {
   CHECK_OK(ss_test_check_exclusive(q.c));
 }
 
-// Every admission's deferrals are counted, also a prefetch admission that admitted nothing (Sol sol-8 #2).
+// Every admission's deferrals are counted, also a prefetch admission that admitted nothing (review finding #2).
 TEST(exclusive_prefetch_deferrals_counted) {
   for (int spec : {0, 1}) {
     Fixture fx(spec ? "x-pdefs" : "x-pdef");
@@ -421,7 +421,7 @@ TEST(exclusive_seed_frees_blocks) {
 }
 
 // ABI: an old caller's ss_budget (struct_size 64 on 64-bit, before reserved0) with garbage in its padding stays
-// inclusive (Sol sol-7 #1).
+// inclusive (review finding #1).
 TEST(exclusive_old_budget_padding_is_ignored) {
   static_assert(sizeof(void*) != 8 || offsetof(ss_budget, reserved0) == 60, "old struct end");
   static_assert(sizeof(void*) != 8 || offsetof(ss_budget, tier_mode) == 64, "first new field past the old size");

@@ -29,6 +29,8 @@ namespace {
 // the ready words with acquire loads.
 class Immediate final : public DgTransport {
  public:
+  void d2d(int32_t, int32_t) override {}
+  void h2h(int32_t, int32_t) override {}
   Immediate(uint32_t keys, uint32_t slots, uint32_t blocks, uint32_t* ready)
       : table_(keys), slot_(slots), block_(blocks, -1), ready_(ready) {
     for (auto& t : table_) t.store(-1);
@@ -36,6 +38,9 @@ class Immediate final : public DgTransport {
   }
   void h2d(Stream, int32_t slot, int32_t block) override { slot_[size_t(slot)].store(block_[size_t(block)], std::memory_order_relaxed); }
   void d2h(int32_t slot, int32_t block) override { block_[size_t(block)] = slot_[size_t(slot)].load(std::memory_order_relaxed); }
+  void d2h_part(Stream, int32_t slot, int32_t block, uint32_t) override { d2h(slot, block); }  // one part per unit
+  uint32_t parts() const override { return 1; }
+  uint64_t part_bytes(uint32_t) const override { return 8192; }
   void write_entry(Stream, uint32_t key, int32_t v) override { table_[key].store(v, std::memory_order_release); }
   void signal_ready(uint32_t g, uint32_t seq) override { ts::dg_store_release(&ready_[g], seq); }
   void* event_create() override { return new int(0); }
@@ -73,8 +78,9 @@ struct Rig {
   uint32_t seq = 0;
 
   // with_began: the service waits for the begin kernel's word before any flag (design rev 3.4 §11.2).
+  // wb_defer: the boundary's write-backs are issued by the service after each served layer.
   explicit Rig(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000), uint32_t max_ids = 8,
-               bool with_began = false) {
+               bool with_began = false, bool wb_defer = false) {
     ts::DgConfig c;
     c.n_units.assign(G, U);
     c.persistent_slots = 48 + 12;
@@ -82,6 +88,7 @@ struct Rig {
     c.blocks = G * U - 48 + 12;
     c.spare_target = 12;
     c.prefetch_reserve = 3;
+    c.wb_defer = wb_defer;
     t = std::make_unique<Immediate>(G * U, c.persistent_slots + 2 * c.bank_slots, c.blocks, ready.data());
     core = std::make_unique<DgCore>(c, t.get());
     std::vector<uint32_t> res;
@@ -193,6 +200,39 @@ TEST(dg_service_tokens) {
   CHECK_EQ(st.tokens, 200ull);
   CHECK(st.misses > 0 && st.prefetched > 0 && st.evicted > 0);
   CHECK_EQ(r.svc->timeline().size(), size_t(Rig::G));
+}
+
+// dg_wb_defer: the service issues the deferred write-backs after the layers it serves; every read stays exact, and
+// a boundary issues what the token left (the engine thread then owns the deferred queue).
+TEST(dg_service_tokens_wb_defer) {
+  Rig r(std::chrono::milliseconds(2000), 8, false, true);
+  std::mt19937 rng(6);
+  int bad_reads = 0;
+  for (int tok = 0; tok < 200; ++tok) {
+    r.seq = uint32_t(tok + 1);
+    r.svc->begin(r.seq);
+    for (uint32_t g = 0; g < Rig::G; ++g) {
+      std::vector<uint32_t> ids = routes(rng, 1 + uint32_t(rng() % 8));
+      const bool predict = g + 1 < Rig::G && tok % 3 != 0;
+      const uint64_t mask = r.do_export(g, ids, predict ? 6 : 0, r.seq);
+      if (predict) r.do_predict(g, routes(rng, 6));
+      if (mask) CHECK(r.do_wait(g));
+      if (!r.do_read(g, ids)) ++bad_reads;
+    }
+    ts::dg_store_release(&r.done, r.seq);
+    CHECK_EQ(int(r.svc->wait_terminal(r.seq, std::chrono::milliseconds(5000))), int(DgService::kServed));
+    r.core->check();  // the token's issued parts and cancels, before the boundary
+    r.core->end_token({});
+    r.core->check();
+  }
+  CHECK_EQ(bad_reads, 0);
+  const ts::DgStats& st = r.core->stats();
+  std::printf("  evicted %llu: deferred %llu, cancelled %llu, forced %llu, flushed at a boundary %llu\n",
+              (unsigned long long)st.evicted, (unsigned long long)st.wb_deferred, (unsigned long long)st.wb_cancelled,
+              (unsigned long long)st.wb_forced, (unsigned long long)st.wb_boundary_flushed);
+  CHECK(st.evicted > 0);
+  CHECK_EQ(st.wb_deferred, st.evicted);
+  CHECK(st.wb_deferred > st.wb_boundary_flushed);  // most write-backs went out inside a token
 }
 
 // The service fails a token, sets host_abort, returns, and reports why; the engine sees Failed.

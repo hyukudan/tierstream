@@ -3,6 +3,8 @@
 #include "dg_layout.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "dg_proto.hpp"
 #include "errors.hpp"
@@ -44,6 +46,8 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.spec_persistent) refuse(SS_E_INVALID, "spec_persistent is refused (prediction is the service's)");
   if (o.dg_max_ids < 1 || o.dg_max_ids > kDgMaxIds) refuse(SS_E_INVALID, "dg_max_ids must be 1..64 (rows x top_k)");
   if (o.dg_wait_timeout_ms < 1) refuse(SS_E_INVALID, "dg_wait_timeout_ms must be >= 1");
+  if (o.dg_wb_defer > 1) refuse(SS_E_INVALID, "dg_wb_defer must be 0 or 1");
+  if (o.dg_wb_stream > 1) refuse(SS_E_INVALID, "dg_wb_stream must be 0 or 1");
 
   DgLayout x;
   x.B = o.dg_max_ids;
@@ -160,13 +164,19 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               gib(limit) + " GiB)");
   // Host admission: on top of what the plan bills (blocks of P + Q, host_fixed): the mapped control area, the bounce
   // buffer (min(staging_bytes, 16 MiB), at least 4 x the largest source alignment) and the open-time staging buffer
-  // (one unit, 4 KiB rounded). The context allocates exactly these.
+  // (serial only: one unit, 4 KiB rounded). The context allocates exactly these.
   uint64_t max_align = 4096;
   for (const Source& src : d.sources) max_align = std::max(max_align, src.align);
   const uint64_t want = std::min<uint64_t>(o.staging_bytes ? o.staging_bytes : (uint64_t(16) << 20), uint64_t(16) << 20);
   x.bounce_bytes = std::max<uint64_t>((add_ck(want, max_align - 1, "the bounce buffer") / max_align) * max_align,
                                       mul_ck(4, max_align, "the bounce buffer"));
+  const char* serial = std::getenv("DG_LOAD_SERIAL");
+  const std::string serial_value = serial ? serial : "";
+  x.load_serial = serial_value == "1" || serial_value == "true" || serial_value == "on";
+  require(serial_value.empty() || serial_value == "0" || x.load_serial, SS_E_INVALID,
+          "device-gated: invalid DG_LOAD_SERIAL (use 0, 1, true, or on)");
   x.staging_bytes = (add_ck(x.unit_bytes, 4095, "the staging buffer") / 4096) * 4096;
+  // kept in pipeline mode too: ss_dg_reset_open's one-unit spare for placement cycles (persist)
   x.mapped_bytes = dg_mapped_bytes(G);
   const uint64_t host_extra =
       add_ck(add_ck(x.mapped_bytes, x.bounce_bytes, "the host extras"), x.staging_bytes, "the host extras");
@@ -176,6 +186,28 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               std::to_string(x.bounce_bytes) + ") and the staging buffer (" +
                               std::to_string(x.staging_bytes) + ") exceed the host budget (" +
                               std::to_string(b.host_pinned_bytes) + ")");
+  if (!x.load_serial) {
+    auto option = [](const char* name, uint32_t def, uint32_t max) {
+      const char* v = std::getenv(name);
+      if (!v) return def;
+      char* end = nullptr;
+      const unsigned long n = std::strtoul(v, &end, 10);
+      require(*v && end && !*end && n >= 1 && n <= max, SS_E_INVALID,
+              std::string("device-gated: invalid ") + name);
+      return uint32_t(n);
+    };
+    x.load_readers = option("DG_LOAD_READERS", 8, 32);
+    x.load_buffers = option("DG_LOAD_BUFFERS", 4, 16);
+    const uint64_t target = uint64_t(option("DG_LOAD_BUFFER_MIB", 64, 256)) << 20;
+    const uint64_t available = b.host_pinned_bytes - p.pinned - host_extra;
+    // Defaults shrink to the admitted host headroom (small fixtures need only KiB).
+    // Explicit sizes are exact and fail admission rather than silently shrinking.
+    x.load_buffer_bytes = std::getenv("DG_LOAD_BUFFER_MIB") ? target :
+        std::min(std::max(target, x.unit_bytes), available / x.load_buffers / 4096 * 4096);
+    require(x.load_buffer_bytes >= x.unit_bytes &&
+            x.load_buffer_bytes <= available / x.load_buffers, SS_E_CAPACITY,
+            "device-gated: startup ring exceeds the host budget (reduce DG_LOAD_BUFFERS or DG_LOAD_BUFFER_MIB)");
+  }
   return x;
 }
 

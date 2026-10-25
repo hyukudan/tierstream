@@ -3,13 +3,16 @@
 //
 // Every gated unit (key = unit_base[g] + unit) has one authoritative home: a slot of one arena shared by all gated
 // layers, or a pinned block. Inside a token the core only ADDS table entries (-1 -> slot), on the stream that copied
-// the bytes; evictions and D2H write-backs happen at the boundary. Port of wdsrtx's StreamCache (ds41/rtx-replica
-// a8cccdc7, src/cuda/ds41_stream_cache.cpp).
+// the bytes; evictions happen at the boundary, and so do the D2H write-backs unless they are deferred (wb_defer: the
+// service issues them part by part after served layers, the next boundary issues what is left). Port of
+// wdsrtx's StreamCache (ds41/rtx-replica a8cccdc7, src/cuda/ds41_stream_cache.cpp).
 #pragma once
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ts {
@@ -21,6 +24,13 @@ class DgTransport {
   virtual ~DgTransport() = default;
   virtual void h2d(Stream s, int32_t slot, int32_t block) = 0;  // every part, block -> slot
   virtual void d2h(int32_t slot, int32_t block) = 0;            // every part, slot -> block, on kD2h
+  // Reset movement. Block -1 is a dedicated one-unit host staging buffer, also accepted by h2d/d2h.
+  // d2d and h2h complete before returning; the core synchronizes h2d/d2h before reusing a source.
+  virtual void d2d(int32_t src, int32_t dst) = 0;
+  virtual void h2h(int32_t src, int32_t dst) = 0;
+  virtual void d2h_part(Stream s, int32_t slot, int32_t block, uint32_t part) = 0;  // one part, slot -> block
+  virtual uint32_t parts() const = 0;                     // parts per unit (>= 1)
+  virtual uint64_t part_bytes(uint32_t part) const = 0;  // a part's bytes (write-back accounting)
   // slot_of[key] = v after everything enqueued on s so far (a release: system fence, then the write).
   virtual void write_entry(Stream s, uint32_t key, int32_t v) = 0;
   virtual void signal_ready(uint32_t g, uint32_t seq) = 0;  // ready[g] = seq on kDem, a release too
@@ -32,12 +42,33 @@ class DgTransport {
   virtual void event_sync(void* ev) = 0;
   virtual void sync(Stream s) = 0;
   virtual void upload_table(const int32_t* table, uint32_t n) = 0;  // the whole table on kDem, then sync
-  // Diagnostics (dg_diag): a timing mark on kDem, which = 0 before the first demand copy of layer g, 1 after its
-  // ready. Only called for a layer with a non-zero mask. Default: nothing.
+  // Diagnostics (dg_diag): a timing mark on kDem, which = 0 before the first demand copy of layer g, 2 after the
+  // first fetched unit's copies (if any), 1 after its ready. Only called for a layer with a non-zero mask. Default:
+  // nothing.
   virtual void diag_mark(uint32_t g, int which) {
     (void)g;
     (void)which;
   }
+  // dg_diag at the boundary (no device work may be added there): after the token's streams are synced; then once
+  // the boundary's write-backs (n > 0) are enqueued on kD2h. Default: nothing.
+  virtual void diag_reset() {}
+  // dg_flush_ready at runtime (between tokens; default: not supported by this transport, ignored)
+  virtual void set_flush_ready(bool) {}
+  virtual void diag_boundary() {}
+  virtual void diag_writebacks_issued() {}
+  // winpf: push the stream's queued work to the GPU now (under WDDM a copy can otherwise sit in the driver's batch until
+  // a later submission, i.e. until after the demand it was meant to precede). Never waits. Default: nothing.
+  virtual void flush(Stream s) { (void)s; }
+};
+
+// dg_diag: the host time of the last boundary's phases (end_token), microseconds.
+struct DgBoundaryTimes {
+  double sync_us = 0;    // kDem + kPf synchronize
+  double select_us = 0;  // admissions, collect, victim selection
+  double upload_us = 0;  // the table upload (includes its synchronize)
+  double issue_us = 0;   // enqueueing the write-backs
+  uint32_t writebacks = 0;
+  uint64_t boundaries = 0;  // boundaries timed since open
 };
 
 struct DgConfig {
@@ -50,6 +81,13 @@ struct DgConfig {
   bool prefetch_reserve_auto = false;  // the reserve follows the spare target: min(24, spare_target / 4)
   uint32_t prefetch_per_layer = 4;
   uint32_t prefetch_per_token = 48;
+  // dg_wb_defer: write-backs deferred into the next token, issued on kDem right after a layer's ready (or on kD2h
+  // behind a post-ready event: wb_on_d2h), wb_layer_bytes of credit per served layer (0 = the first part's bytes),
+  // while fewer than wb_max_outstanding bytes are in flight (0 = two units' bytes).
+  bool wb_defer = false;
+  bool wb_on_d2h = false;
+  uint64_t wb_layer_bytes = 0;
+  uint64_t wb_max_outstanding = 0;
 };
 
 struct DgStats {
@@ -61,6 +99,42 @@ struct DgStats {
   // ids; predicted_true = unique ids of a layer found in the prediction made at the layer before; miss_layers =
   // gated layers with >= 1 miss, per token.
   uint64_t covered_waits = 0, predicted = 0, predicted_true = 0, miss_layers = 0;
+  // wb_defer: victims deferred at a boundary; cancelled before any part was submitted (also counted in resurrected);
+  // finished early for a demand without a free slot; still (partly) unsubmitted at the next boundary. Bytes: every
+  // write-back copy submitted (both modes), completed (collected), never copied (cancelled, or the unsent parts of a
+  // partly submitted victim resurrected), submitted by a boundary's flush; the host's waits of the forced path.
+  uint64_t wb_deferred = 0, wb_cancelled = 0, wb_forced = 0, wb_boundary_flushed = 0;
+  uint64_t wb_issued_bytes = 0, wb_completed_bytes = 0, wb_cancelled_bytes = 0, wb_boundary_flushed_bytes = 0;
+  uint64_t wb_forced_wait_ns = 0;
+  // winpf (design notes): window hints; prior (gated layers < P, between tokens) and l+1 (in-token) prefetch
+  // copies issued, used by their token, late (a demand of their token waited for their copies), reverted (unused, back
+  // to the host block at the boundary); l+1 candidates ranked, priced out by their bucket's precision.
+  uint64_t winpf_hints = 0, winpf_hint_rows = 0, prior_issued = 0, prior_used = 0, prior_late = 0, prior_reverted = 0;
+  uint64_t l1_candidates = 0, l1_issued = 0, l1_used = 0, l1_late = 0, l1_reverted = 0, l1_priced_out = 0;
+  uint64_t l1_skipped_ahead = 0;  // l+1 predictions not served: layer l+1 had already exported (its demand covers)
+  uint64_t prior_budget_stops = 0;  // window hints whose prior prefetches stopped at the copy-engine byte budget
+};
+
+// Window prefetch (winpf, opt-in; design notes). Off = today's behaviour byte for byte.
+struct DgWinpf {
+  bool enable = false;
+  uint32_t prior_layers = 4;   // gated layers 0..P-1 served from the token prior at a window hint
+  uint32_t prior_cap = 1;      // prior prefetches per gated layer per hint call (0 = no prior prefetch)
+  float prior_pmin = 0.7f;     // admit when P(used by the hinted rows) = 1 - prod(1 - min(1, w p)) >= this
+  uint32_t l1_cap = 1;         // l+1 prefetches per gated layer per token (the generic budgets still apply)
+  float l1_min_votes = 1.0f;   // weighted row votes an l+1 candidate needs
+  float l1_pmin = 0.0f;        // > 0: a (votes, rank) bucket whose online precision is below this is not admitted
+  bool revert_unused = true;   // an unused prefetch goes back to its host block at the boundary (no write-back)
+  uint32_t top_k = 0;          // ids per row in an export (the engine's top_k); rows = n / top_k, required when on
+  uint32_t prior_window_us = 1500;  // copy-engine time the draft step leaves before the next step's first export
+  double copy_gbps = 30.0;     // initial copy rate; dg_diag measurements replace it (observe_copy)
+};
+// tierstream/hint-prior-v1, parsed: per symbol, for gated layers 0..layers-1, k (unit, P(used)) ranked entries.
+struct DgPrior {
+  uint32_t layers = 0, k = 0;
+  std::unordered_map<int32_t, uint32_t> row;  // symbol -> row index
+  std::vector<uint32_t> unit;                  // [rows][layers][k], 0xffffffff = none
+  std::vector<float> p;                        // [rows][layers][k]
 };
 
 // Per gated layer (folded into the context's per-layer stats at each successful boundary).
@@ -94,6 +168,9 @@ class DgCore {
   const DgStats& stats() const { return st_; }
   const std::vector<DgLayerCounts>& layer_counts() const { return lc_; }
   uint32_t free_blocks() const { return uint32_t(free_blocks_.size()); }
+  uint32_t deferred() const { return uint32_t(deferred_.size()); }  // victims whose write-back is not recorded yet
+  uint32_t deferred_parts_issued() const { return deferred_.empty() ? 0u : deferred_.front().parts_done; }
+  uint64_t wb_outstanding_bytes() const { return outstanding_; }  // submitted write-back bytes not collected yet
   uint32_t gated_of(uint32_t k) const;  // the gated layer of a key
 
   // ---- inside a token (the service thread) ----
@@ -107,6 +184,12 @@ class DgCore {
   // A true use (recency + stats); was_miss = its export saw -1.
   void use(uint32_t g, uint32_t unit, bool was_miss);
   void signal(uint32_t g) { t_->signal_ready(g, seq_); }
+  // wb_defer: after gated layer g was served (its ready and its prefetches already enqueued), the next deferred
+  // write-back parts under the layer's byte credit (a part larger than the credit left still goes: the excess is a
+  // debt the next layers repay) and the outstanding cap (finished write-backs are collected first). Nothing after the
+  // last gated layer (the boundary's demand-stream sync would wait for it). ahead(), asked before every part: a
+  // later layer already exported (the device ran ahead): no more parts, its demand comes first.
+  void issue_writebacks(uint32_t g, const std::function<bool()>& ahead = nullptr);
   // The service's work for one exported layer (StreamSite::serve): serve_demand = the masked occurrences in export
   // order (cover a unit on the device or coming, else fetch it), then ready if any; serve_use = recency and stats over
   // the unique ids. serve = both. An id outside the layer throws SS_E_INVALID before any key is computed (the export
@@ -117,20 +200,42 @@ class DgCore {
     serve_demand(g, ids, n, mask);
     serve_use(g, ids, n, mask);
   }
-  // The prediction exported at layer g for layer g + 1: deduplicated, in order, under the prefetch budgets.
-  void serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n);
+  // The prediction exported at layer g for layer g + 1: deduplicated, in order, under the prefetch budgets. With
+  // winpf on and a window hint for this token: n_export = layer g's exported ids (rows = n_export / top_k, both n's
+  // must be multiples: SS_E_BACKEND otherwise), ranked by weighted row votes, then by the best rank; ahead = layer g + 1
+  // already exported (nothing is issued: its demand covers).
+  void serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export = 0, bool ahead = false);
   // Test-only fault injection (tests/test_dg.cpp, the model checker): each must be caught.
   enum Mutation { kNoMutation = 0, kEntryBeforeCopy, kNoCover, kEarlyEventRecycle, kNoBankUnpublish,
-                  kEarlySourceFree, kFreeResurrectedSlot, kEarlyWritebackBlock, kReevictPending };
+                  kEarlySourceFree, kFreeResurrectedSlot, kEarlyWritebackBlock, kReevictPending,
+                  kEarlyDeferredSlot, kRecordBeforeLastPart, kRevertKeepsEntry, kSeedNoPfSync };
   void set_mutation(int m) { mut_ = m; }
 
   // ---- boundary (the engine thread, the device done with the token) ----
   // Drains the token's copies, returns bank units to their blocks, collects write-backs, evicts LRU victims (never a
-  // key in keep) until free + pending reaches spare_target, uploads the table.
+  // key in keep) until free + pending (in flight or deferred) reaches spare_target, uploads the table, then issues the
+  // write-backs: the ones still deferred from the last boundary, then this boundary's (or defers these).
   void end_token(const std::vector<uint32_t>& keep);
   // Between tokens: HOST keys into free slots (no eviction, no bank), synchronously. Returns how many moved.
   uint32_t seed(const std::vector<uint32_t>& keys);
+  // Between tokens: every deferred write-back submitted, then every stream synchronized.
   void drain();
+  // Between tokens, with exclusive ownership. Restore the immutable place() blueprint; copies only misplaced units.
+  // Counters remain lifetime counters. A failed reset poisons the core; the owning context must also be poisoned.
+  void reset_open();
+  // Between tokens: write-back deferral on / off (dg_wb_defer at runtime; off submits the deferred ones first).
+  void set_wb_defer(bool on);
+  // The device-resident keys (home Device) in recency order, most recent first (persist: a usage / residency file
+  // written at shutdown seeds the next open's placement).
+  std::vector<uint32_t> residency() const;
+  bool wb_defer() const { return c_.wb_defer; }
+  bool reset_failed() const { return reset_failed_; }
+  // Test-only semantic comparison: excludes sequence domain, event handles, dead scratch and lifetime counters.
+  bool same_open_state(const DgCore& other) const;
+  // Teardown only (noexcept, no device call): drops the deferred write-backs nothing was submitted for yet. A partly
+  // submitted one's copies are drained by the caller's stream syncs before any memory is freed. The core is not
+  // used afterwards (its evicting keys have no record).
+  uint32_t abandon_writebacks() noexcept;
   // Every key in exactly one home, every slot / block / event accounted once, table == homes, LRU == device set.
   // Throws ts::Error(SS_E_BACKEND) naming the first broken rule.
   void check() const;
@@ -143,8 +248,29 @@ class DgCore {
   void set_spare_target(uint32_t n);
   void set_prefetch_budget(uint32_t per_layer, uint32_t per_token);
   uint32_t spare_target() const { return c_.spare_target; }
+  // ---- window prefetch (winpf), between tokens ----
+  void set_winpf(const DgWinpf& w);
+  const DgWinpf& winpf() const { return wp_; }
+  void set_prior(DgPrior&& p) { prior_ = std::move(p); }
+  const DgPrior& prior() const { return prior_; }
+  // The next window's rows (symbol = token id, weight in [0, 1]): appended to the rows hinted since the last boundary;
+  // issues the prior prefetches of gated layers 0..P-1 now.
+  void window_hint(const int32_t* symbols, const float* weights, uint32_t rows);
+  // dg_diag: the device time of one unit's copies (the least queued first copy of a token): the copy-rate estimate the
+  // prior budget uses (exponential average).
+  void observe_copy(double unit_ms);
+  uint32_t hinted_rows() const { return uint32_t(win_sym_.size()); }
+  uint32_t coming() const {  // units whose copy is enqueued and not admitted yet (test hook)
+    uint32_t n = 0;
+    for (uint32_t k : coming_) n += e_[k].home == Home::Coming ? 1u : 0u;
+    return n;
+  }
+  double copy_gbps() const { return rate_gbps_; }
+  // The l+1 buckets' learning state lives as long as the context (ss_stats_reset does not touch it), as scored
+  // eviction's tables (scored.md 8.4).
   uint32_t prefetch_reserve() const { return c_.prefetch_reserve; }
   void set_diag(bool on) { diag_ = on; }
+  const DgBoundaryTimes& boundary_times() const { return bt_; }
 
  private:
   static constexpr uint32_t kNone = 0xffffffffu;
@@ -157,6 +283,9 @@ class DgCore {
     bool wb_pending = false;    // a write-back of its slot is in flight (Evicting, or resurrected)
     bool via_prefetch = false;  // Coming on the prefetch stream: a demand covers it through pf_done
     bool used = false;          // prefetched and then used this token (stats)
+    uint8_t pf_kind = 0;        // winpf: 0 = generic / demand, 1 = prior, 2 = l+1
+    bool pf_late = false;       // winpf: a demand waited for this prefetch's copies
+    uint8_t pf_bucket = 0;      // winpf: the l+1 (votes, rank) bucket
     void* pf_done = nullptr;
   };
   struct Writeback {
@@ -164,15 +293,40 @@ class DgCore {
     int32_t slot, block;
     void* done;
     bool discard;  // resurrected: the key kept its slot, the block goes back to the free pool
+    uint64_t bytes;  // submitted (a discarded partial write-back: its submitted parts only)
+  };
+  // wb_defer: a victim whose write-back event is not recorded yet, in victim order. Unsubmitted (parts_done 0) or
+  // partly submitted (only the front: parts_done parts accepted, possibly all of them if the record failed). Its
+  // completion event exists only once it moved to wbs_: collect() never queries a deferred record.
+  struct Deferred {
+    uint32_t key;
+    int32_t slot, block;
+    uint32_t parts_done;
+    uint64_t bytes;  // submitted so far
   };
 
   void unlink(uint32_t k);
   void push_front(uint32_t k);
   void* event();
   uint32_t collect();
+  void submit_part(Deferred& d);
+  void* record_deferred_front(bool discard);  // its event after its submitted parts; into wbs_
+  void* finish_deferred_front();             // the front's remaining parts, then record_deferred_front(false)
+  void force_free_slot();
   int32_t take_bank_slot(uint32_t g);
   void write_entry(DgTransport::Stream s, uint32_t k, int32_t v);
+  bool fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted);
+  void apply_wb_defer();
+  void issue_prior();  // window_hint's prior prefetches
 
+  // Captured once by place(), after configuration resolution. No device allocations are replaced at reset.
+  DgConfig open_c_;
+  std::vector<Entry> open_e_;
+  std::vector<int32_t> open_table_, open_free_slots_, open_free_blocks_;
+  uint32_t open_head_ = kNone, open_tail_ = kNone, open_on_device_ = 0;
+  DgWinpf open_wp_;
+  double open_rate_gbps_ = 30;
+  bool open_rate_set_ = false, reset_failed_ = false;
   DgConfig c_;
   DgTransport* t_;
   std::vector<uint32_t> base_;  // unit_base, n_gated + 1
@@ -181,6 +335,12 @@ class DgCore {
   std::vector<int32_t> table_;
   std::vector<int32_t> free_slots_, free_blocks_;
   std::deque<Writeback> wbs_;
+  std::deque<Deferred> deferred_;
+  DgTransport::Stream wb_stream_ = DgTransport::kDem;  // where deferred parts go
+  uint64_t unit_bytes_ = 0, layer_bytes_ = 0, max_outstanding_ = 0, outstanding_ = 0;
+  int64_t credit_ = 0;               // issue_writebacks' byte credit (< 0: a debt)
+  size_t prev_evict_ = 0;            // victims chosen at the last boundary (the carry bound)
+  void* post_ready_ev_ = nullptr;    // wb_on_d2h: kD2h waits for the layer's ready through it
   std::vector<void*> event_pool_;
   std::vector<void*> all_events_;
   std::vector<uint32_t> bank_key_;
@@ -195,11 +355,28 @@ class DgCore {
   uint32_t pred_layer_ = kNone;
   std::vector<uint8_t> layer_missed_;  // per gated layer, this token
   bool diag_ = false;
+  DgBoundaryTimes bt_;
   uint32_t seq_ = 0;
   DgStats st_;
   std::vector<DgLayerCounts> lc_;
   int mut_ = kNoMutation;
   std::vector<uint32_t> uniq_;
+  // winpf
+  DgWinpf wp_;
+  DgPrior prior_;
+  std::vector<int32_t> win_sym_;
+  std::vector<float> win_w_;
+  uint64_t prior_bytes_ = 0;  // prior bytes issued for the window being hinted
+  double rate_gbps_ = 30.0;
+  bool rate_set_ = false;
+  // l+1 buckets: rounded votes (0..4) x best rank (0-1, 2-3, 4+); online precision = (hit + 1) / (n + 1)
+  double bkt_n_[15] = {}, bkt_hit_[15] = {};
+  uint32_t explore_ = 0;  // every 64th priced-out candidate is still admitted (keeps a bucket's estimate alive)
+  struct Cand {
+    float votes;
+    uint32_t rank, unit;
+  };
+  std::vector<Cand> cand_, pcand_;
 };
 
 }  // namespace ts

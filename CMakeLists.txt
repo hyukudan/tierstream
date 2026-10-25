@@ -45,7 +45,9 @@ add_library(tierstream STATIC
   src/file_reader.cpp
   src/backend_cpu.cpp
   src/dg_core.cpp
+  src/dg_prior.cpp
   src/dg_service.cpp
+  src/dg_load.cpp
   src/dg_layout.cpp
   src/dg_ctx.cpp
   src/stream_ctx.cpp
@@ -175,7 +177,7 @@ if(TS_TESTS)
   add_test(NAME exclusive COMMAND ts-test-exclusive)
   add_test(NAME readahead COMMAND ts-test-readahead)
   add_test(NAME snapshot COMMAND ts-test-snapshot)
-  foreach(t dg dg-service dg-open)
+  foreach(t dg dg-service dg-open dg-load)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
     target_include_directories(ts-test-${t} PRIVATE src)
@@ -188,7 +190,7 @@ if(TS_TESTS)
   set_target_properties(ts-test-capi PROPERTIES LINKER_LANGUAGE CXX)
   add_test(NAME capi COMMAND ts-test-capi)
 
-  # The rename's compatibility gates (wave4/wstream/rename/design.md §2.1, §4).
+  # The rename's compatibility gates (design notes §2.1, §4).
   # (1) the new header: both inclusion orders, member names, token pasting, C++ type identity, every ts_ wrapper
   add_executable(ts-test-names-c tests/test_ts_names.c)
   target_link_libraries(ts-test-names-c PRIVATE tierstream)
@@ -238,7 +240,7 @@ if(TS_TESTS)
   add_test(NAME ts-prefix-ss-recipe-usage COMMAND ss-recipe)
   set_tests_properties(ts-prefix-ss-recipe-usage PROPERTIES PASS_REGULAR_EXPRESSION "^ss-recipe: ")
   # ss-plan prints what strix-stream's ss-plan printed (no prefix; the reference comparison is
-  # wave4/wstream/rename/byte_gate.py); ts-plan prefixes every diagnostic.
+  # a byte-identity gate); ts-plan prefixes every diagnostic.
   add_test(NAME ts-prefix-ss-plan COMMAND ss-plan)
   set_tests_properties(ts-prefix-ss-plan PROPERTIES PASS_REGULAR_EXPRESSION "^usage: ss-plan ")
   add_test(NAME ts-prefix-ss-plan-open COMMAND ss-plan no-such-file.json --device-gib 1)
@@ -309,6 +311,7 @@ if(TS_TESTS)
     add_executable(ts-test-dg-cuda tests/test_dg_cuda.cu)
     target_include_directories(ts-test-dg-cuda PRIVATE src tests)
     target_link_libraries(ts-test-dg-cuda PRIVATE tierstream CUDA::cudart)
+    add_test(NAME dg-load-cuda COMMAND ts-test-dg-cuda --only dg_cuda_load_serial_pipeline)
     add_executable(ts-test-device tests/test_ts_device.cu)  # ts_dg_slot == ss_dg_slot in a kernel (GPU run)
     target_link_libraries(ts-test-device PRIVATE tierstream CUDA::cudart)
     add_executable(ts-test-cuda tests/test_cuda.cu)

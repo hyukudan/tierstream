@@ -1,4 +1,4 @@
-// The ss:: bridge of the rename (wave4/wstream/rename/design.md §2): a translation unit built against the library's
+// The ss:: bridge of the rename (design notes §2): a translation unit built against the library's
 // src/ (engine branch minimax/rtx-prefill-ss) still calls ss::xxh64.
 #include <cstdio>
 

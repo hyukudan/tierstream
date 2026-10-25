@@ -1,4 +1,4 @@
-// GPU backend test: CUDA (ts-test-cuda, one short PC-BIG on the RTX PRO) or HIP (ts-test-hip, one node turn on
+// GPU backend test: CUDA (ts-test-cuda, one short run on the RTX PRO) or HIP (ts-test-hip, one run on
 // Strix Halo; gpu_runtime.hpp maps the runtime names, and exclusive cases check their refusal on unified memory).
 // Exactness and hazards: a kernel reads every byte of every routed unit through the device unit table on the engine
 // stream, AFTER a spin kernel that keeps the stream busy, and the host releases the layer and moves on without any
@@ -321,7 +321,7 @@ void decode_variant(const char* name, ss_policy policy, int spec_persistent, boo
 TEST(cuda_decode_lru_async) { decode_variant("lru", SS_POLICY_LRU, 0, false); }
 TEST(cuda_decode_scored_async) { decode_variant("scored", SS_POLICY_SCORED, 0, false); }
 TEST(cuda_decode_lru_spec_persistent_backed) { decode_variant("lru-specp-backed", SS_POLICY_LRU, 1, true); }
-// Deterministic same-forward hazards (Sol sol-8 #3). Layer 2: residents 0-3 (LRU ties -> lowest id is the victim),
+// Deterministic same-forward hazards (review finding #3). Layer 2: residents 0-3 (LRU ties -> lowest id is the victim),
 // pinned 4-7. The write-back stream is gated behind a ~20 ms spin on another stream, so every write-back of the forward
 // is still pending when the copies that depend on it are issued:
 //   persistent: certain prefetch 5 evicts 0 (written back into a spare), then the routes name 0 again: 0 is admitted
@@ -406,7 +406,7 @@ void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = 
   (void)cudaStreamDestroy(gate_s);
 }
 
-// The source wait alone (Sol sol-9 #3): layer 2 residents 0-3, pinned 4-5, disk 6-7, one spare. Reader threads held,
+// The source wait alone (review finding #3): layer 2 residents 0-3, pinned 4-5, disk 6-7, one spare. Reader threads held,
 // write-back stream gated: certain prefetch 6 (a file read, held: its destination wait is not on the copy stream yet)
 // evicts 0 into the only spare; the routes {0, 7}: no block left, both deferred to the ring; 0's copy out of its block
 // is issued at once on the copy stream and nothing but its source wait orders it after 0's write-back. Without that
@@ -471,7 +471,7 @@ TEST(cuda_exclusive_source_wait_only) {
   (void)cudaStreamDestroy(gate_s);
 }
 
-// Host read-ahead, layer-major, async (wave4/gapfix/wstream-readahead): every unit read from its file, host lookahead
+// Host read-ahead, layer-major, async (design notes): every unit read from its file, host lookahead
 // H = 2, 4 buffers. Layers 1 and 4 share the 11,008-B ring, so layer 4's landings reuse slots layer 1 released while
 // its checksums are still queued behind a spin: a landing that skipped the slot's release wait shows as a wrong sum.
 TEST(cuda_readahead_layer_major_async) {
@@ -519,7 +519,7 @@ TEST(cuda_readahead_layer_major_async) {
   ss_free(js);
 }
 
-// Read-ahead copy dependencies, deterministic (Sol sol-7 readahead #1). Layer 1 fills the 16-slot ring and its
+// Read-ahead copy dependencies, deterministic (review finding 1). Layer 1 fills the 16-slot ring and its
 // checksums wait behind a ~200 ms spin. (a) Layer 4 unit 8 is read ahead (Ready), then routed: it lands in slot 0,
 // which still holds layer 1 unit 0 for that queued checksum (different bytes); the copy must wait the slot's release.
 // (b) With one buffer, unit 9's read reuses that buffer while unit 8's H2D out of it is still pending (it waits the

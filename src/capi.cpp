@@ -118,10 +118,25 @@ void options_defaults(ss_options* o) {
 
 // Bytes that were padding in older headers carry whatever the caller's compiler left there: never read.
 void clear_reserved(ss_budget& b) { b.reserved0 = 0; }
+void clear_reserved(ss_dg_winpf_params&) {}
+void winpf_defaults(ss_dg_winpf_params* p) {
+  *p = ss_dg_winpf_params{};
+  p->struct_size = uint32_t(sizeof *p);
+  p->enable = 0;
+  p->prior_layers = 4;
+  p->prior_cap = 1;
+  p->prior_pmin = 0.7f;
+  p->prior_window_us = 1500;
+  p->copy_gbps = 30.0f;
+  p->l1_cap = 1;
+  p->l1_min_votes = 1.0f;
+  p->l1_pmin = 0.4f;
+  p->revert_unused = 1;
+  p->top_k = 0;
+}
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
-  o.reserved2_opt = 0;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
@@ -726,6 +741,12 @@ ss_status ss_test_dg_pressure(ss_ctx* c, uint32_t free_per_token, uint32_t evict
 ss_status ss_test_dg_check(ss_ctx* c) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_check").test_check(); });
 }
+ss_status ss_test_dg_coming(ss_ctx* c, uint32_t* out) {
+  return ctx_guard(c, [&] {
+    need(out != nullptr, "ss_test_dg_coming: null output");
+    *out = dg_ctx(c, "ss_test_dg_coming").test_coming();
+  });
+}
 ss_status ss_test_dg_gate(ss_ctx* c, int stream, void* event) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_test_dg_gate").test_gate(stream, event); });
 }
@@ -767,8 +788,20 @@ ss_status ss_dg_enqueue_wait(ss_ctx* c, int g, void* stream) {
 ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_end").enqueue_end(stream); });
 }
+ss_status ss_dg_reset_open(ss_ctx* c) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_reset_open").reset_open(); });
+}
 ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_keep").keep(g, ids, n); });
+}
+ss_status ss_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total) {
+  return ctx_guard(c, [&] {
+    need(total != nullptr && (cap == 0 || out != nullptr), "ss_dg_residency: bad arguments");
+    *total = dg_ctx(c, "ss_dg_residency").residency(out, cap);
+  });
+}
+ss_status ss_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_sched").set_sched(wb_defer, flush_ready); });
 }
 ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
                             uint32_t prefetch_per_token) {
@@ -783,6 +816,47 @@ ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out
     dg_ctx(c, "ss_dg_timeline").timeline(g, &t);
     t.struct_size = std::min<uint32_t>(size, uint32_t(sizeof t));
     std::memcpy(static_cast<void*>(out), &t, t.struct_size);
+  });
+}
+ss_status ss_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size) {
+  return guard([&] {
+    need(c && out && size >= sizeof(uint32_t), "ss_dg_boundary_timeline: bad argument");
+    ss_dg_boundary_timeline t;
+    dg_ctx(c, "ss_dg_boundary_timeline").boundary_timeline(&t);
+    t.struct_size = std::min<uint32_t>(size, uint32_t(sizeof t));
+    std::memcpy(static_cast<void*>(out), &t, t.struct_size);
+  });
+}
+void ss_dg_winpf_defaults_sized(ss_dg_winpf_params* p, uint32_t size) { sized_defaults(p, size, winpf_defaults); }
+ss_status ss_dg_winpf_set(ss_ctx* c, const ss_dg_winpf_params* p) {
+  return ctx_guard(c, [&] {
+    const ss_dg_winpf_params v = versioned(p, winpf_defaults, "ss_dg_winpf_set");
+    need(v.enable <= 1 && v.revert_unused <= 1, "ss_dg_winpf_set: flags must be 0 or 1");
+    need(!v.enable || (v.top_k >= 1 && v.top_k <= uint32_t(SS_DG_MAX_IDS)),
+         "ss_dg_winpf_set: top_k (ids per row of an export) must be 1..64 when enabled");
+    need(v.prior_pmin >= 0 && v.prior_pmin <= 1 && v.l1_pmin >= 0 && v.l1_pmin <= 1 && v.l1_min_votes >= 0 &&
+             v.l1_min_votes <= 64 && v.prior_cap <= 64 && v.l1_cap <= 64 && v.prior_layers <= 4096 &&
+             v.copy_gbps > 0 && v.copy_gbps <= 1000 && v.prior_window_us <= 1000000,
+         "ss_dg_winpf_set: a parameter is out of range");
+    ts::DgWinpf w;
+    w.enable = v.enable != 0;
+    w.prior_layers = v.prior_layers;
+    w.prior_cap = v.prior_cap;
+    w.prior_pmin = v.prior_pmin;
+    w.l1_cap = v.l1_cap;
+    w.l1_min_votes = v.l1_min_votes;
+    w.l1_pmin = v.l1_pmin;
+    w.revert_unused = v.revert_unused != 0;
+    w.top_k = v.top_k;
+    w.prior_window_us = v.prior_window_us;
+    w.copy_gbps = double(v.copy_gbps);
+    dg_ctx(c, "ss_dg_winpf_set").winpf_set(w);
+  });
+}
+ss_status ss_dg_window_hint(ss_ctx* c, const int32_t* symbols, const float* weights, uint32_t rows) {
+  return ctx_guard(c, [&] {
+    need(rows <= uint32_t(SS_DG_MAX_IDS) && (rows == 0 || symbols), "ss_dg_window_hint: bad arguments");
+    dg_ctx(c, "ss_dg_window_hint").window_hint(symbols, weights, rows);
   });
 }
 ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) {

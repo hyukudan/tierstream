@@ -22,6 +22,8 @@ SS_API ss_status ss_test_dg_gate(ss_ctx* c, int stream, void* event);
 /* Kernel mutations: 1 = the wait kernel returns at once, 2 = ss_end skips the completion edge (both must fail the GPU
  * test). Set before a graph is captured: the flags are kernel arguments. */
 SS_API ss_status ss_test_dg_flags(ss_ctx* c, uint32_t flags);
+/* Between tokens: the units whose copy is enqueued and not admitted yet (window prefetch's prior copies). */
+SS_API ss_status ss_test_dg_coming(ss_ctx* c, uint32_t* out);
 /* Stops the service thread (its next token fails closed). */
 SS_API ss_status ss_test_dg_stop_service(ss_ctx* c);
 

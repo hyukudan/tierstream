@@ -1,4 +1,4 @@
-// Stream-ordering probe (one short PC-BIG; Sol sol-10 / sol-14): does this GPU/driver let an H2D on one non-blocking
+// Stream-ordering probe (one short hardware run): does this GPU/driver let an H2D on one non-blocking
 // stream finish while a D2H queued earlier on another stream is held behind an event wait?
 // Four conditions, each 3 times, with the integrated hazard's transfer size (8 KiB); everything is allocated and
 // warmed up before the first gate:

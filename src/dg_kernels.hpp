@@ -33,6 +33,9 @@ struct Dev {
   uint32_t* host_seq = nullptr;     // written by ss_begin: the one sequence the host authorized
   uint32_t* began = nullptr;        // the begin kernel's seq, after a system fence
   uint32_t* m_err_count = nullptr;  // the device's wait timeouts, copied by the end kernel
+  // dg_diag only (null = off): globaltimer stamps per gated layer, [4g] export, [4g + 1] wait entry, [4g + 2] ready
+  // seen (both 0 when the layer had no miss), [4g + 3] unused
+  unsigned long long* gts = nullptr;
   unsigned long long timeout_ns = 0;
   uint32_t test_flags = 0;  // test-only mutations (kSkipWait)
 };
