@@ -434,6 +434,29 @@ promotions), `free_blocks`, `min_free_blocks` (at forward starts). Too many defe
 `ss_stats_to_json` gives `strix-stream/stats-v1`. The hook fires at every `ss_end` with the forward's numbers, which is
 where a TTFT receipt takes its bytes and waits.
 
+### 7.1 Snapshot (any thread)
+
+The stats calls above belong to the engine thread. A status endpoint on another thread reads `ss_stats_snapshot`
+(the totals as `ss_layer_stats` plus `ss_snapshot_info`: publication sequence, forwards, read-ahead and exclusive
+counters, flags saying which apply) or `ss_stats_snapshot_json` (the same `strix-stream/stats-v1` document
+`ss_stats_to_json` gave at that moment, byte for byte, per-layer counters included).
+
+- Armed on demand: until the first snapshot call, the engine thread does one relaxed load of a false flag per
+  `ss_end` and per `ss_stats_reset`, nothing else. The first call arms and returns `SS_E_INVALID` (nothing published
+  yet); from then on the engine thread publishes at every `ss_end` that folds a forward (also one that reports a
+  read failure) and every `ss_stats_reset` between forwards.
+- A publication is a copy of the per-layer counters, the read-ahead counters, the exclusive counters and the forward
+  count under a small mutex, into storage sized at open: no allocation, no formatting, O(layers) per forward.
+  Readers copy it under the same mutex and sum or format outside it; backend, sources, read-ahead buffers and block
+  count are fixed at open.
+- Every publication is the live state at a forward boundary. Changes made between boundaries (inside a forward,
+  `ss_seed` promotions, read-ahead requested between forwards, a reset during a forward) appear at the next one; an
+  `ss_end` that fails before folding, and anything after the context is poisoned, publish nothing, so the last
+  publication stays readable. During the stats hook the previous publication is still shown.
+- Readers may run concurrently with every call except `ss_close`, which they must not overlap or follow.
+- `ss_snapshot_info` is versioned by size like `ss_exclusive_stats` (inline `ss_stats_snapshot` passes `sizeof`);
+  fields are only appended.
+
 ## 8. Backends
 
 | backend | status | notes |
@@ -446,6 +469,8 @@ where a TTFT receipt takes its bytes and waits.
 
 - `SS_ABI_VERSION` = 1. Structs are passed by pointer and filled with `*_defaults`.
 - A field added at the end is a minor change. Any other change bumps the ABI.
+- Calls are only ever added: `ss_stats_snapshot_sized` / `ss_stats_snapshot_json` (`SS_HAVE_STATS_SNAPSHOT`) came
+  after the first v1 release; a caller that uses them needs a library that exports them.
 - The descriptor schema is versioned separately (`desc-v1`). Plan and stats JSON carry their own schema ids.
 
 ## 10. Planned (not in v1)

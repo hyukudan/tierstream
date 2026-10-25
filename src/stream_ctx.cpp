@@ -194,6 +194,7 @@ void Ctx::init() {
 
   stats_.assign(d_.layers.size(), ss_layer_stats{});
   fwd_stats_.assign(d_.layers.size(), ss_layer_stats{});
+  snap_.layers.assign(d_.layers.size(), ss_layer_stats{});
 
   // Host read-ahead (design §2/§9): R pinned buffers of the largest unit that can be read from its file, each with its
   // own event. None when no unit can be (every streamable unit pinned or computed by a peer).
@@ -1652,6 +1653,8 @@ void Ctx::end() {
   fwd_open_ = false;
   ra_frozen_ = false;
   ++forward_;
+  // A forward whose read failed is still folded above: it is published like any other (design.md �7.1).
+  maybe_publish();
   if (failed != SS_OK) fail(failed, err);
 }
 
@@ -1692,9 +1695,85 @@ ss_layer_stats Ctx::total() const {
 void Ctx::stats_reset() {
   std::fill(stats_.begin(), stats_.end(), ss_layer_stats{});
   ra_st_ = RaStats{};
+  // Only at a boundary (the exclusive counters move inside a forward) and never from a poisoned context: otherwise
+  // the next ss_end publishes.
+  if (!in_forward_ && !fwd_open_ && !poisoned_) maybe_publish();
 }
 
-Json Ctx::stats_json() const {
+void Ctx::publish() {
+  std::lock_guard<std::mutex> lk(snap_mu_);
+  std::copy(stats_.begin(), stats_.end(), snap_.layers.begin());
+  snap_.ra = ra_st_;
+  snap_.x = xst_;
+  snap_.forwards = forward_;
+  ++snap_.seq;
+}
+
+bool Ctx::snapshot(ss_layer_stats* total, ss_snapshot_info* info) const {
+  snap_armed_.store(true, std::memory_order_relaxed);
+  ss_layer_stats t{};
+  ss_snapshot_info i{};
+  {
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    if (snap_.seq == 0) return false;
+    for (const auto& s : snap_.layers) add(t, s);
+    i.sequence = snap_.seq;
+    i.forwards = snap_.forwards;
+    if (ra_on()) {
+      i.readahead_requested = snap_.ra.requested;
+      i.readahead_read = snap_.ra.read;
+      i.readahead_landed = snap_.ra.landed;
+      i.readahead_unused = snap_.ra.unused;
+      i.readahead_failed = snap_.ra.failed;
+      i.readahead_fallback = snap_.ra.fallback;
+      i.readahead_bytes = snap_.ra.bytes;
+    }
+    if (excl_) {
+      i.exclusive_writebacks = snap_.x.writebacks;
+      i.exclusive_writeback_bytes = snap_.x.writeback_bytes;
+      i.exclusive_deferred = snap_.x.deferred;
+      i.exclusive_promoted = snap_.x.promoted;
+      i.exclusive_free_blocks = snap_.x.free_blocks;
+      i.exclusive_min_free_blocks = snap_.x.min_free_blocks;
+      i.exclusive_rereads = snap_.x.rereads;
+    }
+  }
+  // Fixed at open (never written after ss_open returned).
+  if (ra_on()) {
+    i.flags |= SS_SNAPSHOT_READAHEAD;
+    i.readahead_buffers = uint64_t(ra_host_.size());
+    i.readahead_buffer_bytes = ra_bytes_;
+  }
+  if (excl_) {
+    i.flags |= SS_SNAPSHOT_EXCLUSIVE;
+    i.exclusive_blocks = n_blocks_;
+  }
+  i.struct_size = uint32_t(sizeof i);
+  if (total) *total = t;
+  if (info) *info = i;
+  return true;
+}
+
+bool Ctx::snapshot_json(Json* out) const {
+  snap_armed_.store(true, std::memory_order_relaxed);
+  Published p;
+  p.layers.resize(d_.layers.size());  // allocated before the lock
+  {
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    if (snap_.seq == 0) return false;
+    std::copy(snap_.layers.begin(), snap_.layers.end(), p.layers.begin());
+    p.ra = snap_.ra;
+    p.x = snap_.x;
+    p.forwards = snap_.forwards;
+  }
+  *out = format_stats(StatsView{p.forwards, p.layers.data(), &p.ra, &p.x});
+  return true;
+}
+
+Json Ctx::stats_json() const { return format_stats(StatsView{forward_, stats_.data(), &ra_st_, &xst_}); }
+
+// The stats-v1 document of a set of counters (live or published); the fixed parts come from the context.
+Json Ctx::format_stats(const StatsView& v) const {
   auto one = [](const ss_layer_stats& s) {
     Json j = Json::object();
     j["routed"] = Json::number(s.routed);
@@ -1714,36 +1793,39 @@ Json Ctx::stats_json() const {
   Json j = Json::object();
   j["schema"] = Json::string("strix-stream/stats-v1");
   j["backend"] = Json::string(be_->name());
-  j["forwards"] = Json::number(forward_);
+  j["forwards"] = Json::number(v.forwards);
   Json direct = Json::array();
   for (const auto& f : files_) direct.push(Json::boolean(f->direct()));
   j["sources_direct"] = direct;
-  j["total"] = one(total());
+  const size_t n = d_.layers.size();
+  ss_layer_stats t{};
+  for (size_t L = 0; L < n; ++L) add(t, v.layers[L]);
+  j["total"] = one(t);
   Json layers = Json::array();
-  for (const auto& s : stats_) layers.push(one(s));
+  for (size_t L = 0; L < n; ++L) layers.push(one(v.layers[L]));
   j["layers"] = layers;
   if (ra_on()) {  // readahead_units = 0: the JSON is today's
     Json r = Json::object();
     r["buffers"] = Json::number(uint64_t(ra_host_.size()));
     r["buffer_bytes"] = Json::number(ra_bytes_);
-    r["requested"] = Json::number(ra_st_.requested);
-    r["read"] = Json::number(ra_st_.read);
-    r["landed"] = Json::number(ra_st_.landed);
-    r["unused"] = Json::number(ra_st_.unused);
-    r["failed"] = Json::number(ra_st_.failed);
-    r["fallback"] = Json::number(ra_st_.fallback);
-    r["bytes"] = Json::number(ra_st_.bytes);
+    r["requested"] = Json::number(v.ra->requested);
+    r["read"] = Json::number(v.ra->read);
+    r["landed"] = Json::number(v.ra->landed);
+    r["unused"] = Json::number(v.ra->unused);
+    r["failed"] = Json::number(v.ra->failed);
+    r["fallback"] = Json::number(v.ra->fallback);
+    r["bytes"] = Json::number(v.ra->bytes);
     j["readahead"] = r;
   }
   if (excl_) {
     Json x = Json::object();
-    x["writebacks"] = Json::number(xst_.writebacks);
-    x["writeback_bytes"] = Json::number(xst_.writeback_bytes);
-    x["deferred"] = Json::number(xst_.deferred);
-    x["rereads"] = Json::number(xst_.rereads);
-    x["promoted"] = Json::number(xst_.promoted);
-    x["free_blocks"] = Json::number(xst_.free_blocks);
-    x["min_free_blocks"] = Json::number(xst_.min_free_blocks);
+    x["writebacks"] = Json::number(v.x->writebacks);
+    x["writeback_bytes"] = Json::number(v.x->writeback_bytes);
+    x["deferred"] = Json::number(v.x->deferred);
+    x["rereads"] = Json::number(v.x->rereads);
+    x["promoted"] = Json::number(v.x->promoted);
+    x["free_blocks"] = Json::number(v.x->free_blocks);
+    x["min_free_blocks"] = Json::number(v.x->min_free_blocks);
     x["blocks"] = Json::number(n_blocks_);
     j["exclusive"] = x;
   }

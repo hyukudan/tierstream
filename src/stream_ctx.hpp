@@ -95,6 +95,10 @@ class Ctx {
   int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
   ss_exclusive_stats exclusive_stats() const;
+  // Stats snapshot (any thread, design.md §7.1). False (outputs untouched) while nothing is published; the first
+  // call arms publication. total / info / json may each be null.
+  bool snapshot(ss_layer_stats* total, ss_snapshot_info* info) const;
+  bool snapshot_json(Json* out) const;
   // Exclusive tier mode, between forwards (tests): every unit in a slot XOR a block XOR only its file, every block
   // owned exactly once (a unit or a free list). Throws SS_E_INVALID naming the first broken rule.
   void check_exclusive() const;
@@ -268,6 +272,30 @@ class Ctx {
   struct RaStats {
     uint64_t requested = 0, read = 0, landed = 0, unused = 0, failed = 0, fallback = 0, bytes = 0;
   } ra_st_;
+
+  // Stats snapshot (design.md §7.1). The engine thread publishes a copy of the counters at each ss_end and
+  // ss_stats_reset once a reader armed it; readers copy it under snap_mu_ and format outside. Everything else a
+  // document needs (backend, sources, read-ahead buffers, block count) is fixed at open.
+  struct StatsView {
+    uint64_t forwards;
+    const ss_layer_stats* layers;
+    const RaStats* ra;
+    const ss_exclusive_stats* x;
+  };
+  struct Published {
+    uint64_t seq = 0, forwards = 0;
+    std::vector<ss_layer_stats> layers;  // n_layers, sized at open: a publication allocates nothing
+    RaStats ra;
+    ss_exclusive_stats x{};
+  };
+  Json format_stats(const StatsView& v) const;
+  void publish();
+  void maybe_publish() {
+    if (snap_armed_.load(std::memory_order_relaxed)) publish();
+  }
+  mutable std::atomic<bool> snap_armed_{false};
+  mutable std::mutex snap_mu_;
+  Published snap_;  // guarded by snap_mu_
   std::vector<std::thread> workers_;
 
   void* fwd_stream_ = nullptr;

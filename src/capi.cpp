@@ -411,6 +411,39 @@ ss_status ss_stats_to_json(const ss_ctx* c, char** out_json, size_t* out_len) {
   return st != SS_OK ? st : give_text(s, out_json, out_len);
 }
 
+// Any thread (ss.h): the plain guard only, never ctx_guard (it reads the engine thread's poisoned flag).
+ss_status ss_stats_snapshot_sized(const ss_ctx* c, ss_layer_stats* total_out, ss_snapshot_info* info_out,
+                                  uint32_t info_size) {
+  return guard([&] {
+    need(c != nullptr, "ss_stats_snapshot: null context");
+    need(total_out || info_out, "ss_stats_snapshot: no output");
+    need(!info_out || info_size >= sizeof(uint32_t), "ss_stats_snapshot: info_size below struct_size");
+    ss_layer_stats t;
+    ss_snapshot_info i;
+    if (!c->c->snapshot(&t, &i))
+      ss::fail(SS_E_INVALID,
+               "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
+    if (total_out) *total_out = t;
+    if (info_out) {
+      i.struct_size = std::min<uint32_t>(info_size, uint32_t(sizeof i));
+      std::memcpy(static_cast<void*>(info_out), &i, i.struct_size);
+    }
+  });
+}
+
+ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_len) {
+  std::string s;
+  ss_status st = guard([&] {
+    need(c != nullptr, "ss_stats_snapshot_json: null context");
+    ss::Json j;
+    if (!c->c->snapshot_json(&j))
+      ss::fail(SS_E_INVALID,
+               "no stats snapshot published yet (armed now: published at the next completed ss_end or reset between forwards)");
+    s = ss::json_write(j);
+  });
+  return st != SS_OK ? st : give_text(s, out_json, out_len);
+}
+
 // Test hook (tests/test_exclusive.cpp, CUDA test): not in ss.h.
 ss_status ss_test_check_exclusive(ss_ctx* c) {
   return guard([&] {
