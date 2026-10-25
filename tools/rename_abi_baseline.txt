@@ -3,7 +3,7 @@
 # Checked by tools/check_old_symbols.py. Never regenerated from the current tree.
 ss.h-sha256 bdc137af7b7969da4abb395561d4d8fad60eab402030a5faff27d12bbd62cec9
 # devgate (additive: the device-gated declarations; no baseline declaration changed, diff 4dc53b0..devgate-ts)
-ss.h-sha256 645420c0b8b8125137936d29621e0d971aa323654d30b6064949d50c48ffe86d
+ss.h-sha256 974656420e87869ebe29517eab939bbc9d662691a9dd00979256f7b9944a91cc
 abi ss_abi_version
 abi ss_acquire
 abi ss_acquire_groups

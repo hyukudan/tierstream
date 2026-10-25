@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
+#include <functional>
 #include <cstring>
 #include <random>
 #include <string>
@@ -91,8 +93,9 @@ struct Rig {
   unsigned long long last_spin_ns = 0;  // a delay before the last layer's checksum (in the captured graph)
   uint64_t distinct = 0;  // distinct routed ids summed over layers and tokens (the service dedups each layer's ids)
 
+  // tweak: changes the options before ss_open; open_st: receives ss_open's status instead of requiring SS_OK.
   Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000,
-      bool hooks = true)
+      bool hooks = true, const std::function<void(ss_options&)>& tweak = {}, ss_status* open_st = nullptr)
       : m(tag), n(max_ids) {
     CHECK_OK(ss_desc_from_json(m.json.data(), m.json.size(), &d));
     sstest::dg_budget(b, m, dyn, max_ids);
@@ -102,7 +105,9 @@ struct Rig {
     o.dg_wait_timeout_ms = timeout_ms;
     o.dg_diag = 1;
     o.dg_test_hooks = hooks ? 1u : 0u;  // the mutation / pressure / gate hooks (ss_test.h)
-    CHECK_OK(ss_open(d, &b, p, &o, &c));
+    if (tweak) tweak(o);
+    if (open_st) *open_st = ss_open(d, &b, p, &o, &c);
+    else CHECK_OK(ss_open(d, &b, p, &o, &c));
     if (!c) return;
     CHECK_OK(ss_dg_get_device_view(c, &v));
     CU(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -172,10 +177,12 @@ struct Rig {
     return uint32_t(double(m.U) * x * x * x) % uint32_t(m.U);
   }
   // One token; returns the number of wrong checksums, or -1 when ss_end failed (status in *st).
-  int token(bool use_graph, bool predict, ss_status* st = nullptr, int bad_id_layer = -1) {
+  // fixed: when non-empty, every layer routes these n ids (instead of random ones).
+  int token(bool use_graph, bool predict, ss_status* st = nullptr, int bad_id_layer = -1,
+            const std::vector<int32_t>& fixed = {}) {
     for (int g = 0; g < m.G; ++g)
       for (uint32_t i = 0; i < n; ++i) {
-        ids_host[size_t(g) * n + i] = int32_t(pick(g));
+        ids_host[size_t(g) * n + i] = fixed.empty() ? int32_t(pick(g)) : fixed[i % fixed.size()];
         pred_host[size_t(g) * n + i] = int32_t(pick(g < m.G - 1 ? g + 1 : g));
       }
     if (bad_id_layer >= 0) ids_host[size_t(bad_id_layer) * n] = m.U + 3;
@@ -188,7 +195,15 @@ struct Rig {
     CU(cudaMemcpyAsync(ids_dev, ids_host, cells * 4, cudaMemcpyHostToDevice, s));
     CU(cudaMemcpyAsync(pred_dev, pred_host, cells * 4, cudaMemcpyHostToDevice, s));
     CU(cudaMemsetAsync(sums_dev, 0, cells * 8, s));
-    CHECK_OK(ss_begin(c, nullptr, 0));
+    const ss_status bs = ss_begin(c, nullptr, 0);
+    if (bs != SS_OK) {  // a mutation run: the begin precondition caught the previous token (rev 3.4 §11.1)
+      if (st) {
+        *st = bs;
+        CU(cudaStreamSynchronize(s));
+        return -1;
+      }
+      CHECK_OK(bs);
+    }
     if (use_graph) CU(cudaGraphLaunch(graph[predict ? 1 : 0], s));
     else enqueue_step(predict);
     CU(cudaMemcpyAsync(sums_host, sums_dev, cells * 8, cudaMemcpyDeviceToHost, s));
@@ -247,6 +262,7 @@ void expect_poisoned(Rig& r) {
   CHECK_EQ(ss_dg_gated_index(r.c, 0), -1);
   CHECK_EQ(ss_source_direct(r.c, 0), -1);
   CHECK_EQ(int(ss_dg_enqueue_begin(r.c, r.s)), int(SS_E_BACKEND));
+  CHECK_EQ(int(ss_dg_set_budgets(r.c, 0, 0, 0)), int(SS_E_BACKEND));
   ss_dg_stats x{};
   CHECK_OK(ss_stats_dg(r.c, &x));
   char* js = nullptr;
@@ -412,13 +428,17 @@ TEST(dg_cuda_mutation_no_ready_wait) {
       spin_ns<<<1, 1, 0, gs>>>(150000000ull);
       CU(cudaEventRecord(gate, gs));
       CHECK_OK(ss_test_dg_gate(r.c, 0, gate));
-      k.add(r.token(true, false));
+      ss_status st = SS_OK;
+      k.add(r.token(true, false, mut ? &st : nullptr));
+      if (k.failed) {
+        std::printf("  mutation failed the token: %s\n", ss_last_error());
+        break;  // poisoned from here
+      }
     }
     std::printf("  %s: wrong %d, failed tokens %d\n", mut ? "mutation (no ready wait)" : "normal (gated copies)",
                 k.wrong, k.failed);
-    CHECK_EQ(k.failed, 0);
-    if (mut) CHECK(k.wrong > 0);
-    else CHECK_EQ(k.wrong, 0);
+    if (mut) CHECK(k.wrong > 0 || k.failed > 0);  // caught: wrong bytes, or an absent entry reported (rev 3.4)
+    else CHECK_EQ(k.wrong + k.failed, 0);
     CU(cudaStreamSynchronize(gs));
     (void)cudaEventDestroy(gate);
     (void)cudaStreamDestroy(gs);
@@ -436,12 +456,18 @@ TEST(dg_cuda_mutation_no_completion_edge) {
     r.capture(false);
     if (mut) CHECK_OK(ss_test_dg_flags(r.c, 2));
     Tally k;
-    for (int t = 0; t < 6; ++t) k.add(r.token(true, false));
+    for (int t = 0; t < 6; ++t) {
+      ss_status st = SS_OK;
+      k.add(r.token(true, false, mut ? &st : nullptr));
+      if (k.failed) {
+        std::printf("  mutation failed the token: %s\n", ss_last_error());
+        break;  // poisoned from here
+      }
+    }
     std::printf("  %s: wrong %d, failed tokens %d\n",
                 mut ? "mutation (no completion edge)" : "normal (completion edge)", k.wrong, k.failed);
-    CHECK_EQ(k.failed, 0);
-    if (mut) CHECK(k.wrong > 0);
-    else CHECK_EQ(k.wrong, 0);
+    if (mut) CHECK(k.wrong > 0 || k.failed > 0);  // caught: wrong bytes, or a desync / absent report (rev 3.4)
+    else CHECK_EQ(k.wrong + k.failed, 0);
   }
 }
 
@@ -556,6 +582,14 @@ TEST(dg_cuda_dma_and_counters) {
   CHECK(x.predicted > 0 && x.miss_layers > 0);
   CHECK(x.predicted_true <= x.predicted);
   CHECK_EQ(x.device_timeouts, 0ull);
+  // without dg_diag there is no timeline at all (no DMA events are recorded): the getter refuses, the token runs
+  Rig q("dma-off", 16, 8, 8, 10000, true, [](ss_options& o) { o.dg_diag = 0; });
+  if (!q.c) return;
+  Tally kq;
+  for (int t = 0; t < 4; ++t) kq.add(q.token(false, false));
+  CHECK_EQ(kq.wrong + kq.failed, 0);
+  ss_dg_layer_timeline tl{};
+  CHECK_EQ(int(ss_dg_timeline_sized(q.c, 0, &tl, uint32_t(sizeof tl))), int(SS_E_INVALID));
 }
 
 // design rev 3.4 §11.5 / §11.8: hooks refused without dg_test_hooks; ss_dg_set_budgets bounded and between tokens.
@@ -578,4 +612,128 @@ TEST(dg_cuda_hooks_and_budgets) {
   r.enqueue_step(false);
   CHECK_OK(ss_end(r.c));
   CU(cudaStreamSynchronize(r.s));
+}
+
+// design rev 3.4 §11.7 / §11.8: option refusals at open.
+TEST(dg_cuda_open_refusals) {
+  struct Case {
+    const char* what;
+    std::function<void(ss_options&)> tweak;
+  };
+  static const ss_dg_unit bad[1] = {{0, 1 << 20}};
+  const Case cases[] = {
+      {"above the billed spares", [](ss_options& o) { o.dg_spare_target = 1u << 30; }},
+      {"is out of range", [](ss_options& o) { o.dg_seed = bad; o.dg_seed_n = 1; }},
+      {"null dg_seed", [](ss_options& o) { o.dg_seed = nullptr; o.dg_seed_n = 2; }},
+  };
+  for (const Case& c : cases) {
+    ss_status st = SS_OK;
+    Rig r("refuse", 16, 8, 8, 10000, true, c.tweak, &st);
+    CHECK_EQ(int(st), int(SS_E_INVALID));
+    CHECK(r.c == nullptr);
+    if (std::string(ss_last_error()).find(c.what) == std::string::npos)
+      std::printf("  refusal '%s' missing in: %s\n", c.what, ss_last_error());
+    CHECK(std::string(ss_last_error()).find(c.what) != std::string::npos);
+  }
+}
+
+// design rev 3.4 §11.7: a seed of units the plan did not make resident: every unit's bytes check out in its swapped
+// home, the first token routing only seeded units misses nothing, and the slot / block counts match an unseeded open.
+TEST(dg_cuda_seed_open) {
+  std::vector<ss_dg_unit> seed;
+  Rig plain("seed0", 4, 8, 8);
+  if (!plain.c) return;
+  for (int g = 0; g < plain.m.G; ++g)
+    for (int u = plain.m.U - 1; u >= plain.m.U - 4; --u) seed.push_back({g, u});  // the last 4 units of each layer
+  Rig r("seed1", 4, 8, 8, 10000, true, [&](ss_options& o) {
+    o.dg_seed = seed.data();
+    o.dg_seed_n = uint32_t(seed.size());
+  });
+  if (!r.c) return;
+  for (int L = 0; L < r.m.G; ++L)
+    for (int u = 0; u < r.m.U; ++u) CHECK_OK(ss_check_unit(r.c, L, u));
+  const ss_dg_stats a = r.stats(), b0 = plain.stats();
+  CHECK_EQ(a.free_slots, b0.free_slots);
+  CHECK_EQ(a.blocks, b0.blocks);
+  const std::vector<int32_t> ids = {int32_t(r.m.U - 1), int32_t(r.m.U - 2), int32_t(r.m.U - 3), int32_t(r.m.U - 4)};
+  Tally k;
+  k.add(r.token(false, false, nullptr, -1, ids));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  CHECK_EQ(r.stats().misses, 0ull);
+  k.add(plain.token(false, false, nullptr, -1, ids));
+  CHECK_EQ(k.wrong + k.failed, 0);
+  CHECK(plain.stats().misses > 0);  // the same routes miss without the seed
+}
+
+// design rev 3.4 §11.3: an old-size view (no absent_err) still reads the guard for an absent entry but cannot report
+// it; ABSENT never overrides an earlier code (a bad id here).
+TEST(dg_cuda_absent_old_view_and_order) {
+  {
+    Rig r("absent-old", 16, 8, 8);
+    if (!r.c) return;
+    ss_dg_device_view old{};
+    CHECK_OK(ss_dg_get_device_view_sized(r.c, &old, uint32_t(offsetof(ss_dg_device_view, absent_err))));
+    CHECK_EQ(old.struct_size, uint32_t(offsetof(ss_dg_device_view, absent_err)));
+    r.fill_ids();
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
+    for (int g = 0; g < r.m.G; ++g) {
+      CHECK_OK(ss_dg_enqueue_export(r.c, g, r.ids_dev + size_t(g) * r.n, int(r.n), 0, r.s));
+      CHECK_OK(ss_dg_enqueue_wait(r.c, g, r.s));
+      if (g == 1) unpublish_first<<<1, 1, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n);
+      checksum<<<r.n, 128, 0, r.s>>>(old, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
+    }
+    CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+    CHECK_OK(ss_end(r.c));  // nothing to report through an old view: the documented limit
+    CU(cudaStreamSynchronize(r.s));
+  }
+  {
+    Rig r("absent-order", 16, 8, 8);
+    if (!r.c) return;
+    r.fill_ids();
+    int32_t bad = r.m.U + 3;
+    CU(cudaMemcpy(r.ids_dev, &bad, 4, cudaMemcpyHostToDevice));  // layer 0's first id out of range: BAD_ID, abort
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
+    for (int g = 0; g < r.m.G; ++g) {
+      CHECK_OK(ss_dg_enqueue_export(r.c, g, r.ids_dev + size_t(g) * r.n, int(r.n), 0, r.s));
+      CHECK_OK(ss_dg_enqueue_wait(r.c, g, r.s));
+      if (g == 1) unpublish_first<<<1, 1, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n);
+      checksum<<<r.n, 128, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
+    }
+    CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+    CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
+    std::printf("  bad id then absent: %s\n", ss_last_error());
+    CHECK(std::string(ss_last_error()).find("absent") == std::string::npos);
+    CU(cudaStreamSynchronize(r.s));
+  }
+}
+
+// design rev 3.4 §11.2: a step that never launches is caught by ss_end's deadline (the service waits for began with
+// no deadline of its own), and close returns.
+TEST(dg_cuda_never_launched) {
+  Rig r("nolaunch", 16, 8, 8, 500);
+  if (!r.c) return;
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
+  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  never launched: ss_end failed after %.2f s: %s\n", secs, ss_last_error());
+  CHECK(std::string(ss_last_error()).find("did not finish") != std::string::npos);
+  CHECK(secs < 10.0);
+  ss_close(r.c);
+  r.c = nullptr;
+}
+
+// design rev 3.4 §11.5: every hook refused without dg_test_hooks.
+TEST(dg_cuda_hooks_refused) {
+  Rig r("hooks2", 16, 8, 8, 10000, false);
+  if (!r.c) return;
+  CHECK_EQ(int(ss_test_dg_mutate(r.c, 1)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_test_dg_gate(r.c, 0, nullptr)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_test_dg_flags(r.c, 1)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_test_dg_stop_service(r.c)), int(SS_E_INVALID));
+  Tally k;
+  for (int t = 0; t < 3; ++t) k.add(r.token(false, false));  // the context is unharmed
+  CHECK_EQ(k.wrong + k.failed, 0);
 }

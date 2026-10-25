@@ -265,8 +265,11 @@ class CudaDgCtx final : public DgCtx {
                          : code == kDgDesync  ? "a step ran outside ss_begin / ss_end (sequence desync)"
                          : code == kDgAbsent  ? "a slot lookup met an absent entry"
                                               : "the host aborted the token";
-      fail(SS_E_BACKEND, std::string("device-gated: token ") + std::to_string(seq_) + ": " + what + " at gated layer " +
-                             std::to_string(dg_load_acquire(m_.err_aux)) +
+      const uint32_t aux = dg_load_acquire(m_.err_aux);
+      const std::string where = code == kDgDesync   ? " (that step's seq " + std::to_string(aux) + ")"
+                                : code == kDgAbsent ? std::string()
+                                                    : " at gated layer " + std::to_string(aux);
+      fail(SS_E_BACKEND, std::string("device-gated: token ") + std::to_string(seq_) + ": " + what + where +
                              " (the context is poisoned, the token's outputs must be discarded)");
     }
     // 4. The boundary.

@@ -353,8 +353,10 @@ TEST(dg_service_stop_while_waiting_for_began) {
 // seen_us of layer 0 starts at the previous token's end (site.cu), so host time between tokens shows in it.
 TEST(dg_service_seen_us_origin) {
   Rig r(std::chrono::milliseconds(2000), 8, true);
+  double seen0_tok1 = 0;
   for (uint32_t tok = 1; tok <= 2; ++tok) {
-    if (tok == 2) std::this_thread::sleep_for(std::chrono::milliseconds(60));  // the engine between tokens
+    // token 1: the origin is the service's start (no previous token); token 2: the previous token's end
+    std::this_thread::sleep_for(std::chrono::milliseconds(tok == 1 ? 40 : 60));  // the engine before the token
     r.seq = tok;
     r.svc->begin(tok);
     ts::dg_store_release(&r.began, tok);
@@ -364,8 +366,11 @@ TEST(dg_service_seen_us_origin) {
     }
     ts::dg_store_release(&r.done, tok);
     CHECK_EQ(int(r.svc->wait_terminal(tok, std::chrono::milliseconds(5000))), int(DgService::kServed));
+    if (tok == 1) seen0_tok1 = r.svc->timeline()[0].seen_us;
     r.core->end_token({});
   }
+  if (seen0_tok1 < 40000) std::printf("  token 1 seen_us[0] = %.0f us (wanted >= 40000)\n", seen0_tok1);
+  CHECK(seen0_tok1 >= 40000);
   const double seen0 = r.svc->timeline()[0].seen_us;
   if (seen0 < 60000) std::printf("  seen_us[0] = %.0f us (wanted >= 60000)\n", seen0);
   CHECK(seen0 >= 60000);

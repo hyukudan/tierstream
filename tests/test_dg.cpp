@@ -355,6 +355,7 @@ TEST(dg_rare_paths_exercised) {
       sum.resurrected += o.st.resurrected;
       sum.collected_mid += o.st.collected_mid;
       sum.covered += o.st.covered;
+      sum.covered_waits += o.st.covered_waits;
       sum.prefetched += o.st.prefetched;
       sum.prefetch_used += o.st.prefetch_used;
       sum.evicted += o.st.evicted;
@@ -370,6 +371,7 @@ TEST(dg_rare_paths_exercised) {
   CHECK(sum.resurrected > 0);
   CHECK(sum.collected_mid > 0);
   CHECK(sum.covered > 0);
+  CHECK(sum.covered_waits > 0);  // the demand stream waited on a prefetch's copies (the path kNoCover breaks)
   CHECK(sum.prefetch_used > 0);
   CHECK(sum.evicted > 0);
 }
@@ -541,9 +543,10 @@ TEST(dg_counters_prediction_and_miss_layers) {
     CHECK_EQ(m.core->stats().predicted_true, 1ull);
     CHECK_EQ(m.core->stats().miss_layers, 2ull);  // layers 1 and 2
     if (budget == 0) CHECK_EQ(m.core->stats().prefetched, 0ull);
+    m.core->serve_prediction(1, std::vector<uint32_t>{6}.data(), 1);  // made last in token 1
     m.core->end_token({});
     m.core->begin_token(2);
-    m.serve(1, {3});  // a new token: the old prediction is gone
+    m.serve(1, {6});  // a new token: that prediction is gone (begin_token clears it)
     CHECK_EQ(m.core->stats().predicted_true, 1ull);
     m.core->end_token({});
     m.core->check();
@@ -556,15 +559,15 @@ TEST(dg_counters_prediction_and_miss_layers) {
 TEST(dg_seed_order_residents_and_lru) {
   std::vector<uint32_t> order = {40, 3, 17, 40, 29, 8, 33, 12, 5};  // 40 twice: skipped the second time
   for (uint32_t k = 0; k < Mini::K; ++k) order.push_back(k);
-  Mini m(8, 4, 4, order);
+  Mini m(8, 8, 8, order);
   const uint32_t want[8] = {40, 3, 17, 29, 8, 33, 12, 5};
   for (uint32_t k : want) CHECK(m.core->slot_of(k) >= 0);
   CHECK_EQ(m.core->on_device(), 8u);
-  // target 7: the miss below takes one of the 4 spares (3 free left), so the boundary evicts the four least recent =
-  // the last four seed entries, and the fifth from the end stays
-  m.core->set_spare_target(7);
+  // The 8 spares fill with 8 misses (most recent now), then a target of 4 free slots: the boundary evicts the four
+  // least recent units = the last four seed entries; the fifth from the end stays.
+  m.core->set_spare_target(4);
   m.core->begin_token(1);
-  m.serve(0, {0});  // a miss into one spare (most recent now)
+  m.serve(0, {0, 1, 2, 4, 6, 7, 9, 10});
   m.core->end_token({});
   for (uint32_t k : {5u, 12u, 33u, 8u}) CHECK(m.core->home(k) == DgCore::Home::Evicting);
   CHECK(m.core->home(29) == DgCore::Home::Device);

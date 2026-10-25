@@ -127,7 +127,10 @@ void DgService::wait_began(uint32_t seq) {
       fail(SS_E_BACKEND, "device-gated: sequence desync: a gated step began with seq " + std::to_string(v) +
                              " while serving token " + std::to_string(seq) +
                              " (a step ran outside ss_begin / ss_end)");
-    if ((spins & 1023u) == 0 && stop_.load(std::memory_order_acquire)) throw Stop{};
+    if ((spins & 1023u) == 0) {
+      if (stop_.load(std::memory_order_acquire)) throw Stop{};
+      if (m_.host_abort && dg_load_acquire(m_.host_abort)) throw Stop{};  // ss_end gave up on the step
+    }
     if (spins < 20000) SS_PAUSE();
     else std::this_thread::yield();
   }
@@ -177,8 +180,8 @@ void DgService::run(uint32_t seen) {
       publish(kFailed, seq);
       return;
     }
-    publish(kServed, seq);
     t_served_ = clock_type::now();  // the next token's seen_us[0] origin (site.cu: the previous token's end)
+    publish(kServed, seq);
   }
 }
 

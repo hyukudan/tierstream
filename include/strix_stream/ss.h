@@ -484,7 +484,7 @@ typedef struct ss_dg_stats {
   uint64_t resurrected, bank_serves, collected_mid, evicted, evict_short, writebacks_done, stalled;
   uint64_t free_slots, blocks, slots;
   /* appended: predicted (deduplicated valid predicted ids), predicted_true, miss_layers (gated layers with >= 1 miss,
-   * per token), device_timeouts (device waits that timed out), covered_waits */
+   * per token), device_timeouts (device waits that timed out: since open, not reset by ss_stats_reset), covered_waits */
   uint64_t predicted, predicted_true, miss_layers, device_timeouts, covered_waits;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
