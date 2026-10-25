@@ -120,8 +120,10 @@
    "anchored": true,
    "charges": [
     {
+     "allocs": 0,
      "at": "device",
      "bytes": 1073741824,
+     "kind": "driver",
      "phases": [
       "prefill",
       "decode",
@@ -253,6 +255,10 @@
   "sm_120": 644245094,
   "sm_89": 644245094
  },
+ "context_growth": {
+  "sm_120": 67108864,
+  "sm_89": 67108864
+ },
  "context_receipts": [
   [
    "sm_120",
@@ -293,7 +299,10 @@
    "set": "aux"
   }
  ],
+ "envelope_sha256": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
  "explicit": {},
+ "host_alloc_granularity": 4096,
+ "host_chunk_bytes": 1073741824,
  "host_pinned_gib": 68.0,
  "host_spare_units": 96,
  "priority": [
@@ -308,6 +317,17 @@
   "staging",
   "expert_file"
  ],
+ "receipt_envelope": {
+  "sm_120": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
+  "sm_89": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9"
+ },
+ "receipt_graph_bytes": {
+  "sm_120": 1073741824
+ },
+ "receipt_max_growth": {
+  "sm_120": 0,
+  "sm_89": 0
+ },
  "slot_allocs": 3,
  "spares_units": 96,
  "total_units": 15360,

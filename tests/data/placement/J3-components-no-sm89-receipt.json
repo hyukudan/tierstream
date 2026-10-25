@@ -114,8 +114,10 @@
   {
    "charges": [
     {
+     "allocs": 0,
      "at": "device",
      "bytes": 1073741824,
+     "kind": "driver",
      "phases": [
       "prefill",
       "decode",
@@ -270,18 +272,58 @@
  "config": {
   "cache": "tierstream",
   "cache_config": {
-   "dg_max_ids": 36,
    "host_spares": 96,
    "policy": "lru",
    "prefetch": "off",
    "spare_billing": "global",
    "spares": 96,
-   "wait_timeout_ms": 2000,
-   "window_slots": 73
+   "wait_timeout_ms": 2000
   },
   "max_context_tokens": 131072,
   "max_rows": 6,
-  "max_sequences": 1
+  "max_sequences": 1,
+  "shapes": [
+   {
+    "phase": "decode",
+    "rows": 1
+   },
+   {
+    "phase": "spec",
+    "rows": 2
+   },
+   {
+    "phase": "spec",
+    "rows": 3
+   },
+   {
+    "phase": "spec",
+    "rows": 4
+   },
+   {
+    "phase": "spec",
+    "rows": 5
+   },
+   {
+    "phase": "spec",
+    "rows": 6
+   },
+   {
+    "bucket": 256,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 512,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 1024,
+    "phase": "prefill"
+   }
+  ],
+  "window": {
+   "dg_max_ids": 36,
+   "slots": 73
+  }
  },
  "content": {
   "draft_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
@@ -293,8 +335,8 @@
   "sm_89": 644245094
  },
  "context_growth": {
-  "sm_120": 0,
-  "sm_89": 0
+  "sm_120": 67108864,
+  "sm_89": 67108864
  },
  "context_receipts": [
   {
@@ -304,6 +346,9 @@
    "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
    "device_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
    "driver": "617.14",
+   "envelope_sha256": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
+   "graph_bytes": 1073741824,
+   "host_alloc_granularity_bytes": 4096,
    "max_growth_bytes": 0,
    "max_observed_bytes": 590000000,
    "method": "pdh-process-dedicated",
@@ -318,6 +363,9 @@
    "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
    "device_name": "NVIDIA GeForce RTX 4090",
    "driver": "617.14",
+   "envelope_sha256": "080ec90f577c353f71fb6c14c38ae5d55c6bb5f41a353bd286241d60ce6b16f9",
+   "graph_bytes": 1073741824,
+   "host_alloc_granularity_bytes": 4096,
    "max_growth_bytes": 0,
    "max_observed_bytes": 590000000,
    "method": "pdh-process-dedicated",
@@ -337,6 +385,75 @@
   "units_total": 15360
  },
  "engine": "strix-cuda-ds41-replica",
+ "envelope": {
+  "allocator": {
+   "alloc_granularity": 2097152,
+   "api": "cudaMalloc"
+  },
+  "cache_config": {
+   "host_spares": 96,
+   "policy": "lru",
+   "prefetch": "off",
+   "spare_billing": "global",
+   "spares": 96,
+   "wait_timeout_ms": 2000
+  },
+  "dispatch": {
+   "sm_120": [],
+   "sm_89": []
+  },
+  "limits": {
+   "malloc_heap": 0,
+   "printf_fifo": 0,
+   "stack_bytes": 1024
+  },
+  "pools": {
+   "events": 64,
+   "streams": 4
+  },
+  "shapes": [
+   {
+    "phase": "decode",
+    "rows": 1
+   },
+   {
+    "phase": "spec",
+    "rows": 2
+   },
+   {
+    "phase": "spec",
+    "rows": 3
+   },
+   {
+    "phase": "spec",
+    "rows": 4
+   },
+   {
+    "phase": "spec",
+    "rows": 5
+   },
+   {
+    "phase": "spec",
+    "rows": 6
+   },
+   {
+    "bucket": 256,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 512,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 1024,
+    "phase": "prefill"
+   }
+  ]
+ },
  "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
- "schema": "tierstream/components-v1"
+ "schema": "tierstream/components-v1",
+ "stack": {
+  "dynamic_stack": false,
+  "stack_bytes": 1024
+ }
 }

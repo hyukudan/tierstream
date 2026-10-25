@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "components.hpp"
 #include "json.hpp"
 #include "recipe.hpp"
 
@@ -19,6 +20,9 @@ namespace ts {
 // numbers null. Rev 17: required keys compared only (drafter for spec rows, file_store for FILE rows), evaluation,
 // probe_xfer vs costs.xfer_measured, lru for FILE rows, estimates per row, usage_lang_sha256 at the top.
 Json solve_predict(const Json& inputs);
+
+// cache_sha256 of a components-v1 (§3.9): sha256 of the canonical {elastic as written, config.cache_config}.
+std::string cache_sha256_of(const Components& c);
 
 // The full solver. inputs = {curves: tierstream/miss-curve-v1 ({schema, applicability, curves: {...}}) or the bare
 // curve map + curves_applicability, costs: tierstream/solver-costs-v1, usage: the pooled tierstream/usage-v1 (optional;

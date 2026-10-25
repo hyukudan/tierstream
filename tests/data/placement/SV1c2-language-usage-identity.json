@@ -21,7 +21,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 8192,
    "file_units": 10,
@@ -29,10 +29,14 @@
    "lang": "es",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
@@ -57,7 +61,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 8192,
    "file_units": 10,
@@ -65,10 +69,14 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   }
@@ -93,7 +101,7 @@
    "prefetch": "off",
    "sequences": 1,
    "tier_mode": "exclusive",
-   "xfer": "rtx:gen5x16@cpu;drafter=none"
+   "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
   },
   "boundary_us": {
    "8192": 0
@@ -105,10 +113,14 @@
   "miss_pinned_us": 100,
   "provenance": {},
   "xfer_measured": {
-   "d2h_mbps": 23000,
-   "file_read_mbps": 6600,
-   "h2d_lat_ns": 9000,
-   "h2d_mbps": 24000
+   "rtx": {
+    "d2h_mbps": 23000,
+    "h2d_lat_ns": 9000,
+    "h2d_mbps": 24000
+   },
+   "store": {
+    "file_read_mbps": 6600
+   }
   }
  },
  "curves": {
@@ -139,7 +151,11 @@
   "cache_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
   "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
   "drafter": "anchor",
-  "evaluation": "kfold",
+  "evaluation": "holdout",
+  "evaluation_sources": [
+   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
   "policy": "lru",
   "prefetch": "off",
   "sequences": 1,
@@ -213,5 +229,19 @@
    400000,
    400001
   ]
- }
+ },
+ "usage_lang_sources": {
+  "code": [
+   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "en": [
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
+  "es": [
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ]
+ },
+ "usage_sources": [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ ]
 }

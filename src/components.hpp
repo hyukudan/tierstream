@@ -26,7 +26,8 @@ struct Charge {
   unsigned phases = 0;                 // bit p = place_phase_word(p)
   // separate allocations behind the charge (rev 17; default 1, 0 = carved from another allocation, e.g. the window
   // slots inside the arena): the planner bills G x allocs on a device and 4,096 B x allocs on pinned host
-  uint64_t allocs = 1;
+  uint64_t allocs = 1;  // default 1 for payload, 0 for driver charges (rev 18)
+  bool driver = false;  // kind (rev 18): "payload" (default) | "driver" (driver-materialised; the same arithmetic)
 };
 
 struct Receipt {  // qualified[]: bit-exact receipt of a movable component on one arch for one build
@@ -54,6 +55,7 @@ struct Components {
   bool has_elastic = false;
   uint64_t unit_bytes = 0, units_total = 0, per_layer_units = 0, spares = 0, host_spares = 0;
   uint64_t slot_allocs = 1;  // elastic.slot_allocs (rev 17): the arena's separate allocations (one per unit part)
+  uint64_t host_chunk_bytes = uint64_t(1) << 30;  // elastic.host_chunk_bytes (rev 18): expert homes' chunk size
   uint64_t per_layer_max_active = 0;  // 0 = no per-layer limit (DS: one global arena)
   bool exclusive = true;  // elastic.mode: "exclusive" (default; host homes partition the units) | "inclusive"
   // config: the allocation-affecting options the document was computed for
@@ -62,6 +64,12 @@ struct Components {
   bool device_gated() const { return cache == "tierstream"; }
   Json config;
   Json cache_config;  // config.cache_config (null = absent; required in placement mode, §3.9 cache_sha256)
+  // envelope (rev 18): everything the context observations depend on {shapes, limits, pools, allocator, dispatch,
+  // cache_config}; a context receipt admits only when its envelope_sha256 equals envelope_sha256 below
+  Json envelope;
+  Json elastic_doc;  // the elastic object as written (cache_sha256 hashes it, golden/calib_ref.py)
+  Json stack;  // stack (rev 18): the build's {stack_bytes, dynamic_stack} (kept as written)
+  std::string envelope_sha256;  // sha256 of the canonical envelope ("" = no envelope)
   std::vector<std::string> capabilities;  // sorted, distinct
   // per arch: the engine's declared allowance (static per build; never a measured value: context-v1 carries those)
   std::map<std::string, uint64_t> context, context_growth;
@@ -72,6 +80,9 @@ struct Components {
     std::string arch, device_name, driver, platform, build_sha256, method, receipt_sha256;
     uint64_t allowance_bytes = 0, max_observed_bytes = 0, max_growth_bytes = 0, runs = 0;
     uint64_t alloc_granularity_bytes = 0;  // G (rev 17): the qualified per-allocation overhead bound
+    std::string envelope_sha256;           // the configuration envelope the receipt was qualified on (rev 18)
+    uint64_t host_alloc_granularity_bytes = 4096;  // qualified pinned overhead per allocation (rev 18; default 4 KiB)
+    int64_t graph_bytes = -1;  // qualified graph-executable bytes the `graphs` driver charge must equal (-1 = none)
   };
   std::vector<ContextReceipt> context_receipts;  // canonical order: (arch, device_name, driver, platform, build)
   bool has_spare_billing = false, spare_billing_per_layer = false;  // elastic.spare_billing: global | per_layer
@@ -125,6 +136,7 @@ struct UsageUnit {
 };
 struct UsageDoc {
   std::string model, filter;          // filter: the sources' common filter ("" = pooled or mixed)
+  std::vector<std::string> sources;   // the sources' sha256 (trace identities; §3.9 FILE-rate source rules)
   int64_t tokens = 0;
   std::vector<int64_t> layer_units;   // n_units per file layer (0 = dense)
   std::vector<UsageUnit> units;       // every unit, layer-major, unit ascending

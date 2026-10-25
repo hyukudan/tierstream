@@ -436,8 +436,9 @@ std::string dec(double d) {  // shortest decimal text (TOML float)
 // entries, every other unit 0; use = rdiv(count x 10^6, tokens).
 Json usage_doc(const std::vector<std::array<int64_t, 4>>& hits, int64_t tokens = 1000, const std::string& filter = "",
                int dense = 0, int layers = 40, int units = 384) {
+  const std::string src(64, filter.empty() ? 'a' : 'b');  // pooled traces vs a language's evaluation traces
   std::string t = R"({"schema":"tierstream/usage-v1","model":"m","sources":[{"path":"t.txt","sha256":")" +
-                  std::string(64, 'a') + R"(","kind":"routes-trace","filter":")" + filter + R"(","tokens":)" +
+                  src + R"(","kind":"routes-trace","filter":")" + filter + R"(","tokens":)" +
                   std::to_string(tokens) + R"(}],"decay":{"factor_q32":4283353945,"half_life_tokens":256},"tick":)" +
                   std::to_string(tokens) + R"(,"tokens":)" + std::to_string(tokens) +
                   R"(,"order":"use desc, recency desc, layer asc, unit asc","layers":[)";
@@ -519,6 +520,17 @@ Json probe_of(const Json& fx, bool with_aux = true) {
   return json_parse(p + "]}");
 }
 
+// The configuration envelope of the G4 fixtures (golden/gen_g4.py ENVELOPE_OBJ, rev 18); its sha256 must equal the
+// fixtures' envelope_sha256 (a cross-check of the canonical JSON).
+const char* kEnvelope =
+    R"({"shapes":[{"phase":"decode","rows":1},{"phase":"spec","rows":2},{"phase":"spec","rows":3},)"
+    R"({"phase":"spec","rows":4},{"phase":"spec","rows":5},{"phase":"spec","rows":6},{"phase":"prefill","bucket":256},)"
+    R"({"phase":"prefill","bucket":512},{"phase":"prefill","bucket":1024}],)"
+    R"("limits":{"stack_bytes":1024,"printf_fifo":0,"malloc_heap":0},"pools":{"streams":4,"events":64},)"
+    R"("allocator":{"api":"cudaMalloc","alloc_granularity":2097152},"dispatch":{"sm_120":[],"sm_89":[]},)"
+    R"("cache_config":{"spares":96,"host_spares":96,"spare_billing":"global","policy":"lru","prefetch":"off",)"
+    R"("wait_timeout_ms":2000}})";
+
 // components-v1 of a fixture: its components (minus the fixture-only "default" / "anchored" keys, checked against
 // contract §1.1), elastic metadata, contexts, capabilities; the drafter carries receipts for both arches.
 Json components_of(const Json& fx, const std::string& engine = "e") {
@@ -536,6 +548,7 @@ Json components_of(const Json& fx, const std::string& engine = "e") {
   el["host_spares"] = *fx.find("host_spare_units");
   el["spare_billing"] = Json::string("global");
   if (const Json* sa = fx.find("slot_allocs")) el["slot_allocs"] = *sa;  // rev 17
+  if (const Json* hc = fx.find("host_chunk_bytes")) el["host_chunk_bytes"] = *hc;  // rev 18
   c["elastic"] = el;
   Json cfg = Json::object();
   cfg["max_context_tokens"] = Json::number(int64_t(131072));
@@ -543,12 +556,19 @@ Json components_of(const Json& fx, const std::string& engine = "e") {
   cfg["max_rows"] = Json::number(int64_t(6));
   // G4 models the TierSite adapter (dg.* named charges) unless the fixture says otherwise (`cache`, rev 14)
   cfg["cache"] = fx.find("cache") ? *fx.find("cache") : Json::string("tierstream");
-  // rev 16: every option that sizes or steers the expert cache (gen_g4.py CACHE_CONFIG)
+  // every option that sizes or steers the expert cache (gen_g4.py CACHE_CONFIG; no R-derived fields, rev 18)
   cfg["cache_config"] = json_parse(R"({"spares":)" + fx.find("spares_units")->text + R"(,"host_spares":)" +
                                    fx.find("host_spare_units")->text +
-                                   R"(,"spare_billing":"global","dg_max_ids":36,"window_slots":73,"policy":"lru",)"
-                                   R"("prefetch":"off","wait_timeout_ms":2000})");
+                                   R"(,"spare_billing":"global","policy":"lru","prefetch":"off","wait_timeout_ms":2000})");
+  cfg["window"] = json_parse(R"({"dg_max_ids":36,"slots":73})");  // rev 18: the R-derived fields
   c["config"] = cfg;
+  const Json envelope = json_parse(kEnvelope);
+  const std::string env_text = json_write(envelope);
+  const std::string env_sha = sha256_hex(env_text.data(), env_text.size());
+  if (const Json* want = fx.find("envelope_sha256")) {
+    CHECK_EQ(env_sha, want->text);
+    c["envelope"] = envelope;
+  }
   c["capabilities"] = fx.find("capabilities") ? *fx.find("capabilities") : Json::array();
   c["context"] = *fx.find("context");
   if (const Json* g = fx.find("context_growth")) c["context_growth"] = *g;
@@ -569,6 +589,15 @@ Json components_of(const Json& fx, const std::string& engine = "e") {
     const Json* g = k.arr.empty() || !fx.find("alloc_granularity") ? nullptr
                                                                    : fx.find("alloc_granularity")->find(k.arr[0].text);
     r["alloc_granularity_bytes"] = g ? *g : Json::number(int64_t(0));
+    // the envelope the receipt was qualified on (rev 18; fixture receipt_envelope per arch)
+    const Json* re = k.arr.empty() || !fx.find("receipt_envelope") ? nullptr
+                                                                   : fx.find("receipt_envelope")->find(k.arr[0].text);
+    r["envelope_sha256"] = re ? *re : Json::string(env_sha);
+    // rev 18: the qualified graph bytes (receipt_graph_bytes per arch) and pinned granule (host_alloc_granularity)
+    const Json* gb = k.arr.empty() || !fx.find("receipt_graph_bytes") ? nullptr
+                                                                      : fx.find("receipt_graph_bytes")->find(k.arr[0].text);
+    if (gb) r["graph_bytes"] = *gb;
+    if (const Json* hg = fx.find("host_alloc_granularity")) r["host_alloc_granularity_bytes"] = *hg;
     r["method"] = Json::string("pdh-process-dedicated");
     r["runs"] = Json::number(int64_t(5));
     r["receipt_sha256"] = Json::string(std::string(64, 'c'));
@@ -628,7 +657,7 @@ const Json* doc_dev(const Json& doc, const std::string& set) {
 // A placement line in place_ref's shape: {component, name?, bytes, peak_extra, phases}.
 Json ref_line(const Json& l) {
   Json x = Json::object();
-  for (const char* k : {"component", "name", "bytes", "peak_extra", "phases", "allocs"})
+  for (const char* k : {"component", "name", "bytes", "peak_extra", "phases", "allocs", "kind"})
     if (const Json* v = l.find(k)) x[k] = *v;
   return x;
 }
@@ -741,7 +770,9 @@ const char* kCases[] = {"A-pro-only-spec-host68", "B-pro-only-spec-host76", "C-p
                         "O4-receipt-for-other-platform", "O5-truncated-receipt-key", "O5b-empty-receipt-key",
                         "O6-duplicate-receipt-key", "P1-unaligned-host-stride", "P2-engine-cache-full-coverage",
                         "P1b-unit-not-multiple-of-256", "O7-unsorted-receipt-keys",
-                        "O8-receipt-growth-above-declared", "P2b-engine-cache-with-dg-charges"};
+                        "P2b-engine-cache-with-dg-charges", "O8-receipt-growth-at-minimum",
+                        "O8b-receipt-growth-one-byte-below", "O9-receipt-other-envelope",
+                        "O10-graphs-charge-not-receipt"};
 
 // The contract's §2.5 TOML, literally (G4 J): it must plan as case C.
 const char* kContract25 = R"(schema = "tierstream/recipe-v1"
@@ -1248,8 +1279,8 @@ TEST(capi_place_and_flags) {
                         nullptr, 0, &out, nullptr, nullptr, nullptr)),
            int(SS_E_RECIPE));
   CHECK(out == nullptr);
-  CHECK(has(ss_last_error(), "PL_E_HOST_PINNED: need 80143418429 > 73014444032"));  // A + the relay
-  CHECK(has(ss_last_error(), "717 units short"));
+  CHECK(has(ss_last_error(), "PL_E_HOST_PINNED: need 80203445309 > 73014444032"));  // A + the relay
+  CHECK(has(ss_last_error(), "723 units short"));
   // no components-v1: PL_E_MISSING_DESCRIPTOR
   CHECK_EQ(int(ts_place(r, "decode_rtx", probe.data(), probe.size(), nullptr, 0, nullptr, nullptr, 0, nullptr, 0, &out, nullptr,
                         nullptr, nullptr)),
@@ -1432,15 +1463,16 @@ TEST(context_v1_exact_match) {
     PlaceResult r = run(cd);
     return r.computed ? ival(*doc_dev(r.doc, "rtx")->find("context_bytes")) : int64_t(-1);
   };
-  const int64_t allowance = 644245094;
+  const int64_t growth = 67108864;  // the fixtures' context_growth (rev 18), charged on top
+  const int64_t allowance = 644245094 + growth;
   CHECK_EQ(charged(nullptr), allowance);
-  const uint64_t above = uint64_t(allowance) + 100000000;
+  const uint64_t above = uint64_t(644245094) + 100000000;
   const ContextDoc exact = ctx_doc(pro, "617.14", "windows-wddm", above);
-  CHECK_EQ(charged(&exact), int64_t(above + 3));  // median of the latest 5 (above + 1..5)
+  CHECK_EQ(charged(&exact), int64_t(above + 3) + growth);  // median of the latest 5 (above + 1..5)
   const ContextDoc four = ctx_doc(pro, "617.14", "windows-wddm", above, 5);  // latest 5 = 1, above + 1..4: lower median
-  CHECK_EQ(charged(&four), int64_t(above + 2));
+  CHECK_EQ(charged(&four), int64_t(above + 2) + growth);
   const ContextDoc two = ctx_doc(pro, "617.14", "windows-wddm", above, 3);  // 1, above + 1, above + 2: median above + 1
-  CHECK_EQ(charged(&two), int64_t(above + 1));
+  CHECK_EQ(charged(&two), int64_t(above + 1) + growth);
   const ContextDoc few = ctx_doc(pro, "617.14", "windows-wddm", above, 2);  // fewer than 3: ignored
   CHECK_EQ(charged(&few), allowance);
   for (const ContextDoc& other : {ctx_doc(pro, "610.00", "windows-wddm", above), ctx_doc(pro, "617.14", "linux", above),
@@ -1456,7 +1488,7 @@ TEST(context_v1_exact_match) {
                                              R"("samples":[{"bytes":1,"method":"m","device_used_before_stable":true}]}]})")),
                 "unknown key \"device_used_before_stable\"");
   // above 2 x the allowance: PL_E_STALE "context outlier"
-  const ContextDoc outlier = ctx_doc(pro, "617.14", "windows-wddm", uint64_t(allowance) * 3);
+  const ContextDoc outlier = ctx_doc(pro, "617.14", "windows-wddm", uint64_t(644245094) * 3);
   PlaceResult r = run(&outlier);
   CHECK(!r.errors.empty() && has(r.errors[0], "PL_E_STALE rtx: context outlier: re-qualify"));
 }
@@ -1505,13 +1537,31 @@ TEST(sv1_solver_arithmetic) {
   // change outside the cold set (same rows, another usage_lang_sha256); SV1d: in-sample curves; SV1e: FILE rows need
   // policy lru (rev 17)
   for (const char* name : {"SV1c-language-file-rate", "SV1c2-language-usage-identity", "SV1d-in-sample-curves",
-                           "SV1e-file-rows-need-lru"}) {
+                           "SV1e-file-rows-need-lru", "SV1f-fields-checked-alone", "SV1g-file-rows-need-holdout",
+                           "SV1h-lang-table-in-sample"}) {
     const Json inc = json_parse(slurp(kData + name + ".json"));
     std::string wantc = slurp(kData + name + ".expected.json");
     while (!wantc.empty() && (wantc.back() == '\n' || wantc.back() == '\r')) wantc.pop_back();
     const std::string got = json_write(solve_predict(inc));
     if (got != wantc) std::printf("  %s:\n    %s\n    %s\n", name, got.c_str(), wantc.c_str()), ++sstest::failures();
   }
+}
+
+// ---- calibration hashes (golden/calib_ref.py, CAL1): cache_sha256 per components-v1, xfer per profile ----------
+TEST(calibration_hashes_cal1) {
+  const Json cal = json_parse(slurp(kData + "CAL1.json"));
+  Json got = Json::object(), cache = Json::object(), xfer = Json::object();
+  for (const auto& kv : cal.find("components")->obj)
+    cache[kv.first] = Json::string(cache_sha256_of(components_from_json(kv.second)));
+  for (const auto& kv : cal.find("xfer_profiles")->obj) {
+    const std::string t = json_write(kv.second);
+    xfer[kv.first] = Json::string(sha256_hex(t.data(), t.size()));
+  }
+  got["cache_sha256"] = cache;
+  got["xfer"] = xfer;
+  std::string want = slurp(kData + "CAL1.expected.json");
+  while (!want.empty() && (want.back() == '\n' || want.back() == '\r')) want.pop_back();
+  CHECK_EQ(json_write(got), want);
 }
 
 // ---- usage-v1 in the producer's shape (strix-stream-adaptive adapt_usage.cpp; tests/data/placement/usage-all.json) --
@@ -1585,7 +1635,8 @@ TEST(solver_rows) {
   probe["xfer_host"] = json_parse(R"({"cpu_model":"AMD Ryzen 9 9950X","sockets":1,"numa_nodes":1,"pinned_policy":"node"})");
   const std::string store = "nvme:Samsung-990-PRO/gen4x4@cpu;fs=ntfs;io=direct;readers=4";
   probe["file_store"] = Json::string(store);
-  const Json figures = json_parse(R"({"h2d_mbps":24000,"d2h_mbps":23000,"h2d_lat_ns":9000,"file_read_mbps":6600})");
+  const Json figures = json_parse(
+      R"({"rtx":{"h2d_mbps":24000,"d2h_mbps":23000,"h2d_lat_ns":9000},"store":{"file_read_mbps":6600}})");
   probe["probe_xfer"] = figures;
   RecipeStack s(slurp(kData + "J2-recipe.toml"), "J2-recipe.toml");
   s.set("routes.decode_rtx.placement.rtx.host_pinned_gib", "74", "--set");  // the 74 GiB pinned cap: I1 / I3
@@ -1609,17 +1660,17 @@ TEST(solver_rows) {
   cost_app["drafter"] = Json::string("anchor");
   cost_app["anchor_device"] = Json::string(pro);
   cost_app["assist_device"] = Json::string("none");
-  // xfer = sha256 of the canonical xfer-v1 profile, written here by hand
+  // xfer = sha256 of the canonical xfer-v1 profile, written here by hand; it is golden/gen_sv1.py's XFER_PROFILE, so
+  // it equals the SV1 costs' xfer
   cost_app["xfer"] = Json::string(sha(json_parse(
-      R"({"schema":"tierstream/xfer-v1","devices":[{"set":"rtx","pci_path":["0000:00:01.1","0000:01:00.0"],)"
-      R"("link":{"gen":5,"width":16},"via":"direct","numa_node":0}],"host":{"cpu_model":"AMD Ryzen 9 9950X",)"
-      R"("sockets":1,"numa_nodes":1,"pinned_policy":"node"},"drafter":"none"})")));
-  {  // cache_sha256 over {elastic, cache_config} without the R-derived fields
+      R"({"devices":[{"set":"rtx","pci_path":["0000:00:01.1","0000:01:00.0"],"link":"gen5x16","via":"direct",)"
+      R"("numa_node":0}],"host":{"cpu_model":"AMD Ryzen 9 9950X","sockets":1,"numa_nodes":1,"pinned_policy":"node"},)"
+      R"("drafter_link":"none"})")));
+  CHECK_EQ(cost_app.find("xfer")->text, sv1.find("costs")->find("applicability")->find("xfer")->text);
+  {  // cache_sha256 = sha256 of the canonical {elastic as written, cache_config} (golden/calib_ref.py)
     Json cc = Json::object();
-    cc["elastic"] = *canon.find("elastic");
-    Json cfg = *comps_b.find("config")->find("cache_config");
-    for (const char* r : {"dg_max_ids", "banks", "window_slots"}) cfg.obj.erase(r);
-    cc["cache_config"] = cfg;
+    cc["elastic"] = *comps_b.find("elastic");
+    cc["cache_config"] = *comps_b.find("config")->find("cache_config");
     cost_app["cache_sha256"] = Json::string(sha(cc));
   }
   cost_app["engram_store"] = Json::string("none");
@@ -1637,7 +1688,8 @@ TEST(solver_rows) {
     curve_app[k] = *cost_app.find(k);
   curve_app["policy"] = Json::string("lru");
   curve_app["usage_sha256"] = Json::string(usage_from_json(usage).sha256);
-  curve_app["evaluation"] = Json::string("kfold");
+  curve_app["evaluation"] = Json::string("holdout");  // FILE rows need holdout curves (rev 18)
+  curve_app["evaluation_sources"] = json_parse("[\"" + std::string(64, 'b') + "\"]");  // the code table's traces
   Json in = Json::object();
   in["curves"] = *sv1.find("curves");
   Json costs = *sv1.find("costs");
@@ -1672,13 +1724,13 @@ TEST(solver_rows) {
   const Json& r0 = out.find("rows")->arr[0];
   // I1 at host 74 is 64 units short; hypothetically with FILE (its staging from the costs) it is I3: 70 spilled
   CHECK_EQ(json_write(*r0.find("requires")), std::string("[\"file_expert_tier\"]"));
-  CHECK_EQ(json_write(*r0.find("placement")->find("file_units")), std::string("76"));
-  CHECK_EQ(json_write(*r0.find("placement")->find("devices")->arr[0].find("active_units")), std::string("7415"));
+  CHECK_EQ(json_write(*r0.find("placement")->find("file_units")), std::string("82"));
+  CHECK_EQ(json_write(*r0.find("placement")->find("devices")->arr[0].find("active_units")), std::string("7409"));
   const Json& p0 = *r0.find("prediction");
   CHECK_EQ(p0.find("tag")->text, std::string("interpolated"));
   // the same row of SV1 (spec-I3: 7418 active, 73 file); the code table's FILE rate over the pooled cold set
-  // code/R6 at 7,415 active: rdiv(45,000 x 1,500 - 9,000 x 415, 1,500) = 42,510
-  CHECK_EQ(json_write(*p0.find("milli_misses_total")), std::string("42510"));
+  // code/R6 at 7,409 active: rdiv(45,000 x 1,500 - 9,000 x 409, 1,500) = 42,546
+  CHECK_EQ(json_write(*p0.find("milli_misses_total")), std::string("42546"));
   CHECK_EQ(json_write(*p0.find("estimates")), std::string("[\"verify_us\"]"));  // provenance says estimate
   CHECK_EQ(json_write(*p0.find("milli_misses_file")), std::string("12"));
   CHECK_EQ(out.find("usage_lang_sha256")->find("code")->text, usage_from_json(usage_code).sha256);
@@ -1686,7 +1738,7 @@ TEST(solver_rows) {
   const Json& calib0 = *r0.find("choice")->find("calib");
   for (const Json* app : {&cost_app, &curve_app})
     for (const auto& kv : app->obj) {
-      if (kv.first == "evaluation") continue;  // a property of the curves, not a calibration key
+      if (kv.first == "evaluation" || kv.first == "evaluation_sources") continue;  // curve properties, not keys
       const Json* v = calib0.find(kv.first);
       if (!v || json_write(*v) != json_write(kv.second))
         std::printf("  calib.%s: %s vs %s\n", kv.first.c_str(), v ? json_write(*v).c_str() : "-",
@@ -1721,12 +1773,22 @@ TEST(solver_rows) {
     Json in2 = one(spec);
     (*const_cast<Json*>(in2.find("curves_applicability")))["evaluation"] = Json::string("in-sample");
     CHECK_EQ(first_tag(in2), std::string("unpredicted"));
+    // FILE rows: k-fold curves, or a language table whose traces are not evaluation traces -> unpredicted (rev 18)
+    (*const_cast<Json*>(in2.find("curves_applicability")))["evaluation"] = Json::string("kfold");
+    CHECK_EQ(first_tag(in2), std::string("unpredicted"));
+    Json in5 = one(spec);
+    (*const_cast<Json*>(in5.find("curves_applicability")))["evaluation_sources"] =
+        json_parse("[\"" + std::string(64, 'c') + "\"]");
+    CHECK_EQ(first_tag(in5), std::string("unpredicted"));
     Json e = spec;
-    e["probe_xfer"] = json_parse(R"({"h2d_mbps":21000,"d2h_mbps":23000,"h2d_lat_ns":9000,"file_read_mbps":6600})");
+    e["probe_xfer"] = json_parse(
+        R"({"rtx":{"h2d_mbps":21000,"d2h_mbps":23000,"h2d_lat_ns":9000},"store":{"file_read_mbps":6600}})");
     CHECK_EQ(first_tag(one(e)), std::string("unpredicted"));
-    e["probe_xfer"] = json_parse(R"({"h2d_mbps":22000,"d2h_mbps":23000,"h2d_lat_ns":9000,"file_read_mbps":6600})");
+    e["probe_xfer"] = json_parse(
+        R"({"rtx":{"h2d_mbps":22000,"d2h_mbps":23000,"h2d_lat_ns":9000},"store":{"file_read_mbps":6600}})");
     CHECK_EQ(first_tag(one(e)), std::string("interpolated"));
-    e["probe_xfer"] = json_parse(R"({"h2d_mbps":24000,"d2h_mbps":23000,"h2d_lat_ns":9000,"file_read_mbps":3500})");
+    e["probe_xfer"] = json_parse(
+        R"({"rtx":{"h2d_mbps":24000,"d2h_mbps":23000,"h2d_lat_ns":9000},"store":{"file_read_mbps":3500}})");
     CHECK_EQ(first_tag(one(e)), std::string("unpredicted"));  // a FILE row: file_read_mbps is checked
     Json in3 = one(spec);
     (*const_cast<Json*>(in3.find("curves_applicability")))["policy"] = Json::string("scored");
@@ -1824,7 +1886,7 @@ TEST(solver_rows) {
   const Json out2 = solve(s, "decode_rtx", probe, in);
   const Json& rf = *out2.find("rows")->arr[0].find("placement")->find("refusal");
   CHECK_EQ(rf.find("code")->text, std::string("PL_E_HOST_PINNED"));
-  CHECK_EQ(json_write(*rf.find("units_short")), std::string("69"));
+  CHECK_EQ(json_write(*rf.find("units_short")), std::string("75"));
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }

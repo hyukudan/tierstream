@@ -135,16 +135,46 @@ bool applies(const Json* app, const Json& calib, std::vector<const char*> keys, 
   return true;
 }
 
-// Every probe figure within +-10 % of the calibration's: 10 x |p - c| <= c, integers, c > 0.
+// Every probe figure within +-10 % of the calibration's (10 x |p - c| <= c, integers, c > 0), grouped (rev 18): the
+// transfer figures of every device set the calibration names, and the store's read rate for FILE rows.
 bool within(const Json* probe, const Json* calib, bool file) {
-  std::vector<const char*> names = {"h2d_mbps", "d2h_mbps", "h2d_lat_ns"};
-  if (file) names.push_back("file_read_mbps");
-  for (const char* n : names) {
-    const Json* pv = probe && probe->is_object() ? probe->find(n) : nullptr;
-    const Json* cv = calib && calib->is_object() ? calib->find(n) : nullptr;
-    if (!pv || !cv || !int_text(*pv) || !int_text(*cv)) return false;
-    const int64_t pp = json_i64(*pv, n), cc = json_i64(*cv, n);
-    if (cc <= 0 || 10 * (pp > cc ? pp - cc : cc - pp) > cc) return false;
+  if (!calib || !calib->is_object()) return false;
+  std::vector<std::pair<std::string, std::vector<const char*>>> groups;
+  for (const auto& kv : calib->obj)  // std::map: sorted
+    if (kv.first != "store") groups.push_back({kv.first, {"h2d_mbps", "d2h_mbps", "h2d_lat_ns"}});
+  if (groups.empty()) return false;
+  if (file) groups.push_back({"store", {"file_read_mbps"}});
+  for (const auto& g : groups) {
+    const Json* pg = probe && probe->is_object() ? probe->find(g.first) : nullptr;
+    const Json* cg = calib->find(g.first);
+    for (const char* n : g.second) {
+      const Json* pv = pg && pg->is_object() ? pg->find(n) : nullptr;
+      const Json* cv = cg && cg->is_object() ? cg->find(n) : nullptr;
+      if (!pv || !cv || !int_text(*pv) || !int_text(*cv)) return false;
+      const int64_t pp = json_i64(*pv, n), cc = json_i64(*cv, n);
+      if (cc <= 0 || 10 * (pp > cc ? pp - cc : cc - pp) > cc) return false;
+    }
+  }
+  return true;
+}
+
+std::vector<std::string> strings_of(const Json* v) {
+  std::vector<std::string> out;
+  if (v && v->is_array())
+    for (const Json& x : v->arr)
+      if (x.is_string()) out.push_back(x.text);
+  return out;
+}
+
+// FILE rows (rev 18): holdout curves; the language table's sources are evaluation traces of the curve and disjoint from
+// the pooled ranking table's sources (the cold set's FILE rate is measured out of sample).
+bool file_sources_ok(const Json* capp, const std::vector<std::string>& lang_src, const std::vector<std::string>& pooled) {
+  const Json* ev = capp ? capp->find("evaluation") : nullptr;
+  if (!ev || !ev->is_string() || ev->text != "holdout" || lang_src.empty()) return false;
+  const std::vector<std::string> eval = strings_of(capp->find("evaluation_sources"));
+  for (const std::string& s : lang_src) {
+    if (std::find(eval.begin(), eval.end(), s) == eval.end()) return false;
+    if (std::find(pooled.begin(), pooled.end(), s) != pooled.end()) return false;
   }
   return true;
 }
@@ -157,7 +187,8 @@ const Json* curves_applicability(const Json& in) {
 
 // The calibration gate of one row (everything but the curve lookup and the arithmetic).
 bool calibration_applies(const Json& in, const Json& calib, int64_t sequences, bool spec, bool file,
-                         const Json* probe_xfer) {
+                         const Json* probe_xfer, const std::vector<std::string>& lang_src,
+                         const std::vector<std::string>& pooled_src) {
   const Json* costs = in.find("costs");
   const Json* capp = curves_applicability(in);
   if (sequences != 1) return false;
@@ -169,6 +200,7 @@ bool calibration_applies(const Json& in, const Json& calib, int64_t sequences, b
   const Json* ev = capp ? capp->find("evaluation") : nullptr;  // in-sample curves understate misses
   if (!ev || !ev->is_string() || (ev->text != "holdout" && ev->text != "kfold")) return false;
   if (!within(probe_xfer, costs ? costs->find("xfer_measured") : nullptr, file)) return false;
+  if (file && !file_sources_ok(capp, lang_src, pooled_src)) return false;
   if (file) {  // the curves are measured at file_units = 0; only LRU keeps the total invariant to FILE homes
     const Json* pol = calib.is_object() ? calib.find("policy") : nullptr;
     if (!pol || !pol->is_string() || pol->text != "lru") return false;
@@ -201,7 +233,8 @@ Prediction predict(const std::map<std::string, Knots>& curves, const Json* costs
     base = dr < 0 || vr < 0 ? -1 : dr + vr;
     accepted = cost(costs, "accepted_milli", key);
   }
-  if (mp < 0 || mf < 0 || bd < 0 || en < 0 || base < 0 || accepted < 0 || base > kBound || bd + en > kBound) return p;
+  // every consumed scalar is checked on its own (cost(): an integer in [0, 10^7]); sums are not bounded (rev 18)
+  if (mp < 0 || mf < 0 || bd < 0 || en < 0 || base < 0 || accepted < 0) return p;
   const int64_t cold = rdiv(cold_sum, 1000);
   p.file = std::min(r * cold, total);
   p.pinned = total - p.file;
@@ -327,10 +360,7 @@ std::string xfer_of(const Json& doc, const Json& probe, const std::string& draft
     Json pp = Json::array();
     for (const Json& b : path->arr) pp.push(Json::string(normalize_pci(b.text).empty() ? b.text : normalize_pci(b.text)));
     e["pci_path"] = pp;
-    Json l = Json::object();
-    l["gen"] = *link->find("gen");
-    l["width"] = *link->find("width");
-    e["link"] = l;
+    e["link"] = Json::string("gen" + link->find("gen")->text + "x" + link->find("width")->text);
     e["via"] = *via;
     e["numa_node"] = *numa;
     devs.push(e);
@@ -344,11 +374,12 @@ std::string xfer_of(const Json& doc, const Json& probe, const std::string& draft
     h[k] = *v;
   }
   if (h.find("pinned_policy")->text != "node" && h.find("pinned_policy")->text != "interleave") return "unknown";
+  // the canonical profile as golden/gen_sv1.py writes it: {devices: [{set, pci_path, link: "gen<G>x<W>", via,
+  // numa_node}], host, drafter_link}
   Json prof = Json::object();
-  prof["schema"] = Json::string("tierstream/xfer-v1");
   prof["devices"] = devs;
   prof["host"] = h;
-  prof["drafter"] = Json::string(drafter_role != "assist" ? "none" : peer ? "peer" : "host-staged");
+  prof["drafter_link"] = Json::string(drafter_role != "assist" ? "none" : peer ? "peer" : "host-staged");
   return sha_of(prof);
 }
 
@@ -373,15 +404,7 @@ Json derive_calib(const RecipeStack& s, const std::string& route, const std::str
   calib["build_sha256"] = Json::string(comps.build_sha256);
   if (!comps.content.is_null()) calib["content_sha256"] = Json::string(sha_of(comps.content));
   if (!comps.arithmetic.is_null()) calib["arithmetic_sha256"] = Json::string(sha_of(comps.arithmetic));
-  if (!comps.cache_config.is_null()) {
-    const Json canon = components_to_json(comps);
-    Json cc = Json::object();
-    if (const Json* el = canon.find("elastic")) cc["elastic"] = *el;
-    Json cfg = comps.cache_config;
-    for (const char* r : {"dg_max_ids", "banks", "window_slots"}) cfg.obj.erase(r);  // R is a swept dimension
-    cc["cache_config"] = cfg;
-    calib["cache_sha256"] = Json::string(sha_of(cc));
-  }
+  if (!comps.cache_config.is_null()) calib["cache_sha256"] = Json::string(cache_sha256_of(comps));
   if (usage) calib["usage_sha256"] = Json::string(usage->sha256);
   calib["prefetch"] = Json::string(prefetch_of(comps));
   calib["tier_mode"] = Json::string(comps.exclusive ? "exclusive" : "inclusive");
@@ -413,6 +436,15 @@ Json derive_calib(const RecipeStack& s, const std::string& route, const std::str
 }
 
 }  // namespace
+
+// cache_sha256 (rev 18 §3.9, golden/calib_ref.py): sha256 of the canonical {elastic (as written), cache_config}; the
+// R-derived fields live in config.window and never enter it.
+std::string cache_sha256_of(const Components& c) {
+  Json cc = Json::object();
+  cc["elastic"] = c.elastic_doc;
+  cc["cache_config"] = c.cache_config;
+  return sha_of(cc);
+}
 
 Json solve_predict(const Json& in) {
   const auto curves = curves_of(in);
@@ -459,7 +491,10 @@ Json solve_predict(const Json& in) {
     const bool spec = x.mode == "spec", has_file = file > 0;
     const int64_t sequences = seq && int_text(*seq) ? json_i64(*seq, "sequences") : -1;
     Json row;
-    if (!calib || !calibration_applies(in, *calib, sequences, spec, has_file, c.find("probe_xfer"))) {
+    const Json* uls = in.find("usage_lang_sources");
+    const std::vector<std::string> lang_src = strings_of(uls ? uls->find(x.lang) : nullptr);
+    if (!calib || !calibration_applies(in, *calib, sequences, spec, has_file, c.find("probe_xfer"), lang_src,
+                                       strings_of(in.find("usage_sources")))) {
       row = prediction_json(Prediction{});
     } else {
       // FILE traffic of the row's language over the file_units coldest units of the pooled order (solver_ref:
@@ -662,7 +697,10 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
     (*const_cast<Json*>(row.find("choice")))["calib"] = calib;
     // the probe's transfer figures: the choice's own probe_xfer, else the probe report's
     const Json* pxf = c.find("probe_xfer") ? c.find("probe_xfer") : probe.find("probe_xfer");
-    const bool ok = calibration_applies(in, calib, comps.max_sequences, x.mode == "spec", file > 0, pxf);
+    const auto ul = usage_lang.find(x.lang);
+    const bool ok = calibration_applies(in, calib, comps.max_sequences, x.mode == "spec", file > 0, pxf,
+                                        ul == usage_lang.end() ? std::vector<std::string>() : ul->second.sources,
+                                        have_usage ? usage.sources : std::vector<std::string>());
     row["prediction"] = ok ? prediction_json(predict(curves, costs, x.mode, x.r, x.ctx, x.lang, active, cold, file > 0),
                                              costs)
                            : prediction_json(Prediction{});

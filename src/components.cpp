@@ -96,7 +96,7 @@ std::vector<Charge> charges_of(const Json& v, const std::string& path, uint64_t&
   for (size_t i = 0; i < v.arr.size(); ++i) {
     const std::string w = path + "[" + std::to_string(i) + "]";
     const Json& e = v.arr[i];
-    keys(e, w, {"at", "bytes", "phases", "peak_extra", "name", "allocs"});
+    keys(e, w, {"at", "bytes", "phases", "peak_extra", "name", "allocs", "kind"});
     Charge c;
     if (const Json* x = e.find("name")) c.name = str(*x, w + ".name");
     const std::string at = str(need(e, "at", w), w + ".at");
@@ -112,6 +112,12 @@ std::vector<Charge> charges_of(const Json& v, const std::string& path, uint64_t&
       bad(w + ".at", "\"" + at + "\" is not device | host_pinned | host_pageable | file");
     c.bytes = u64(need(e, "bytes", w), w + ".bytes");
     if (const Json* x = e.find("peak_extra")) c.peak_extra = u64(*x, w + ".peak_extra");
+    if (const Json* x = e.find("kind")) {
+      const std::string k = str(*x, w + ".kind");
+      if (k != "payload" && k != "driver") bad(w + ".kind", "\"" + k + "\" is not payload | driver");
+      c.driver = k == "driver";
+    }
+    c.allocs = c.driver ? 0 : 1;  // a driver charge is no allocation of the engine's (rev 18)
     if (const Json* x = e.find("allocs")) c.allocs = u64(*x, w + ".allocs");
     if (c.allocs > 1000000) bad(w + ".allocs", "more than 10^6 allocations");
     const Json& ph = need(e, "phases", w);
@@ -147,7 +153,8 @@ bool charge_less(const Charge& a, const Charge& b) {
   if (a.bytes != b.bytes) return a.bytes < b.bytes;
   if (a.peak_extra != b.peak_extra) return a.peak_extra < b.peak_extra;
   if (a.name != b.name) return a.name < b.name;  // an absent name ("") sorts first
-  return a.allocs < b.allocs;
+  if (a.allocs != b.allocs) return a.allocs < b.allocs;
+  return a.driver < b.driver;
 }
 
 // The device-gated adapter's reserved charge names (contract §2.4): component and location of each.
@@ -186,7 +193,8 @@ Json charges_json(const std::vector<Charge>& cs) {
     e["at"] = Json::string(charge_at_word(c.at));
     e["bytes"] = Json::number(c.bytes);
     e["peak_extra"] = Json::number(c.peak_extra);
-    if (c.allocs != 1) e["allocs"] = Json::number(c.allocs);  // written when not the default (hashes stay put)
+    if (c.allocs != (c.driver ? 0u : 1u)) e["allocs"] = Json::number(c.allocs);  // when not the kind's default
+    if (c.driver) e["kind"] = Json::string("driver");          // "payload" is the default, omitted
     Json ph = Json::array();
     for (int p : phase_list(c.phases)) ph.push(Json::string(kPhaseWords[p]));
     e["phases"] = ph;
@@ -295,7 +303,8 @@ bool Components::has(const std::string& capability) const {
 Components components_from_json(const Json& doc) {
   keys(doc, "components-v1",
        {"schema", "engine", "build_sha256", "model_sha256", "desc_sha256", "content", "arithmetic", "elastic", "config",
-        "capabilities", "context", "context_growth", "context_receipts", "receipts_sha256", "components"});
+        "capabilities", "context", "context_growth", "context_receipts", "receipts_sha256", "components",
+        "envelope", "stack"});
   const std::string schema = str(need(doc, "schema", "components-v1"), "schema");
   if (schema != kSchema && schema != "strix-stream/components-v1")
     bad("schema", std::string("expected \"") + kSchema + "\"");
@@ -311,9 +320,14 @@ Components components_from_json(const Json& doc) {
   if (const Json* e = doc.find("elastic")) {
     keys(*e, "elastic",
          {"unit_bytes", "units_total", "per_layer_units", "per_layer_max_active", "spares", "host_spares", "mode",
-          "spare_billing", "slot_allocs"});
+          "spare_billing", "slot_allocs", "host_chunk_bytes"});
+    if (const Json* x = e->find("host_chunk_bytes")) {
+      c.host_chunk_bytes = u64(*x, "elastic.host_chunk_bytes");
+      if (!c.host_chunk_bytes) bad("elastic.host_chunk_bytes", "must be > 0");
+    }
     if (const Json* x = e->find("slot_allocs")) c.slot_allocs = u64(*x, "elastic.slot_allocs");
     c.has_elastic = true;
+    c.elastic_doc = *e;
     c.unit_bytes = u64(need(*e, "unit_bytes", "elastic"), "elastic.unit_bytes");
     c.units_total = u64(need(*e, "units_total", "elastic"), "elastic.units_total");
     if (const Json* x = e->find("per_layer_units")) c.per_layer_units = u64(*x, "elastic.per_layer_units");
@@ -346,15 +360,41 @@ Components components_from_json(const Json& doc) {
 
   const Json& cfg = need(doc, "config", "components-v1");
   {  // config.cache_config (rev 16): every option that sizes or steers the expert cache, a table of scalars
+    // the other config values: scalars or tables of scalars (e.g. config.window, rev 18)
     Json rest = cfg;
     if (rest.is_object()) rest.obj.erase("cache_config");
+    if (rest.is_object()) rest.obj.erase("shapes");
+    if (rest.is_object())
+      for (auto it = rest.obj.begin(); it != rest.obj.end();)
+        if (it->second.is_object()) {
+          scalars_only(it->second, "config." + it->first);
+          it = rest.obj.erase(it);
+        } else {
+          ++it;
+        }
     scalars_only(rest, "config");
+    if (const Json* sh = cfg.find("shapes")) {  // config.shapes (rev 18): the finite shape set, tables of scalars
+      if (!sh->is_array()) bad("config.shapes", "expected an array of shape tables");
+      for (size_t i = 0; i < sh->arr.size(); ++i) scalars_only(sh->arr[i], "config.shapes[" + std::to_string(i) + "]");
+    }
     if (const Json* cc = cfg.find("cache_config")) {
       scalars_only(*cc, "config.cache_config");
       c.cache_config = *cc;
     }
   }
   c.config = cfg;
+  if (const Json* st = doc.find("stack")) {  // rev 18: the build's stack facts, kept as written
+    keys(*st, "stack", {"stack_bytes", "dynamic_stack"});
+    if (const Json* x = st->find("stack_bytes")) u64(*x, "stack.stack_bytes");
+    if (const Json* x = st->find("dynamic_stack")) boolean(*x, "stack.dynamic_stack");
+    c.stack = *st;
+  }
+  if (const Json* ev = doc.find("envelope")) {  // rev 18: the configuration envelope (kept as written, canonical JSON)
+    keys(*ev, "envelope", {"shapes", "limits", "pools", "allocator", "dispatch", "cache_config"});
+    c.envelope = *ev;
+    const std::string t = json_write(*ev);
+    c.envelope_sha256 = sha256_hex(t.data(), t.size());
+  }
   auto cfg_int = [&](const char* k, bool required) -> int64_t {
     const Json* v = cfg.find(k);
     if (!v) {
@@ -397,7 +437,8 @@ Components components_from_json(const Json& doc) {
       const Json& e = rc->arr[i];
       keys(e, w,
            {"arch", "device_name", "driver", "platform", "build_sha256", "allowance_bytes", "max_observed_bytes",
-            "max_growth_bytes", "alloc_granularity_bytes", "method", "runs", "receipt_sha256"});
+            "max_growth_bytes", "alloc_granularity_bytes", "envelope_sha256", "method", "runs", "receipt_sha256",
+            "host_alloc_granularity_bytes", "graph_bytes"});
       {  // the key is complete (rev 16): five non-empty strings, else PL_E_SCHEMA naming the key as written
         std::string seen;
         bool complete = true;
@@ -426,6 +467,13 @@ Components components_from_json(const Json& doc) {
       r.alloc_granularity_bytes = u64(need(e, "alloc_granularity_bytes", w), w + ".alloc_granularity_bytes");
       if (r.alloc_granularity_bytes > (uint64_t(1) << 32))
         bad(w + ".alloc_granularity_bytes", "above 4 GiB per allocation");
+      r.envelope_sha256 = hex64(need(e, "envelope_sha256", w), w + ".envelope_sha256");
+      if (const Json* x = e.find("host_alloc_granularity_bytes")) {
+        r.host_alloc_granularity_bytes = u64(*x, w + ".host_alloc_granularity_bytes");
+        if (r.host_alloc_granularity_bytes > (uint64_t(1) << 32))
+          bad(w + ".host_alloc_granularity_bytes", "above 4 GiB per allocation");
+      }
+      if (const Json* x = e.find("graph_bytes")) r.graph_bytes = int64_t(u64(*x, w + ".graph_bytes"));
       r.method = str(need(e, "method", w), w + ".method");
       r.runs = u64(need(e, "runs", w), w + ".runs");
       if (r.runs < 3) bad(w + ".runs", "a context receipt needs >= 3 quiescent runs");
@@ -662,7 +710,7 @@ UsageDoc usage_from_json(const Json& doc) {
       const Json& e = v->arr[i];
       keys(e, w, {"path", "sha256", "kind", "filter", "tokens"});
       str(need(e, "path", w), w + ".path");
-      hex64(need(e, "sha256", w), w + ".sha256");
+      u.sources.push_back(hex64(need(e, "sha256", w), w + ".sha256"));
       str(need(e, "kind", w), w + ".kind");
       std::string filter;
       if (const Json* f = e.find("filter")) {
@@ -746,11 +794,14 @@ Json components_to_json(const Components& c) {
     e["host_spares"] = Json::number(c.host_spares);
     if (c.per_layer_max_active) e["per_layer_max_active"] = Json::number(c.per_layer_max_active);
     if (c.slot_allocs != 1) e["slot_allocs"] = Json::number(c.slot_allocs);
+    if (c.host_chunk_bytes != (uint64_t(1) << 30)) e["host_chunk_bytes"] = Json::number(c.host_chunk_bytes);
     e["mode"] = Json::string(c.exclusive ? "exclusive" : "inclusive");
     if (c.has_spare_billing) e["spare_billing"] = Json::string(c.spare_billing_per_layer ? "per_layer" : "global");
     j["elastic"] = e;
   }
   j["config"] = c.config;
+  if (!c.envelope.is_null()) j["envelope"] = c.envelope;
+  if (!c.stack.is_null()) j["stack"] = c.stack;
   Json caps = Json::array();
   for (const auto& s : c.capabilities) caps.push(Json::string(s));
   j["capabilities"] = caps;
@@ -772,6 +823,10 @@ Json components_to_json(const Components& c) {
     e["max_observed_bytes"] = Json::number(r.max_observed_bytes);
     e["max_growth_bytes"] = Json::number(r.max_growth_bytes);
     e["alloc_granularity_bytes"] = Json::number(r.alloc_granularity_bytes);
+    e["envelope_sha256"] = Json::string(r.envelope_sha256);
+    if (r.host_alloc_granularity_bytes != 4096)
+      e["host_alloc_granularity_bytes"] = Json::number(r.host_alloc_granularity_bytes);
+    if (r.graph_bytes >= 0) e["graph_bytes"] = Json::number(r.graph_bytes);
     e["method"] = Json::string(r.method);
     e["runs"] = Json::number(r.runs);
     e["receipt_sha256"] = Json::string(r.receipt_sha256);

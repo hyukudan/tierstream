@@ -21,7 +21,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -29,16 +29,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -57,7 +61,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -65,10 +69,14 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
@@ -93,7 +101,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -101,10 +109,14 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
@@ -129,7 +141,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -137,16 +149,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -165,7 +181,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 32768,
    "file_units": 0,
@@ -173,16 +189,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 6,
-   "active_units": 7418,
+   "active_units": 7409,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -201,18 +221,22 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
-   "file_units": 73,
+   "file_units": 82,
    "id": "spec-I3",
    "lang": "code",
    "mode": "spec",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
@@ -237,7 +261,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 200,
@@ -245,16 +269,20 @@
    "lang": "code",
    "mode": "spec",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -273,7 +301,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -281,16 +309,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 4
   },
   {
    "R": 6,
-   "active_units": 8254,
+   "active_units": 8245,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -309,7 +341,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -317,16 +349,20 @@
    "lang": "code",
    "mode": "spec",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -345,7 +381,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -353,16 +389,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -381,7 +421,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -389,16 +429,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_89/NVIDIA GeForce RTX 4090",
@@ -417,7 +461,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -425,16 +469,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 6,
-   "active_units": 7418,
+   "active_units": 7409,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -453,24 +501,28 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=host-staged"
+    "xfer": "c75abd24787be405f07d729d2c804dc331d8298f844779873c2781b6161809d8"
    },
    "ctx": 131072,
-   "file_units": 73,
+   "file_units": 82,
    "id": "spec-other-assist-gpu",
    "lang": "code",
    "mode": "spec",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -489,7 +541,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -497,16 +549,20 @@
    "lang": "es",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -525,7 +581,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -533,16 +589,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -561,7 +621,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen4x4@chipset;drafter=none"
+    "xfer": "435098c5acd097c861d141ef4c32b7e53ab616dfb5670f9527db69a823951073"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -569,10 +629,14 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
@@ -597,7 +661,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 50,
@@ -605,16 +669,20 @@
    "lang": "en",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -633,7 +701,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -641,16 +709,20 @@
    "lang": "en",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -669,7 +741,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 50,
@@ -677,16 +749,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -705,7 +781,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 50,
@@ -713,16 +789,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -741,7 +821,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -749,16 +829,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 21000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 21000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -777,7 +861,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -785,16 +869,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 22000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 22000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 6,
-   "active_units": 7418,
+   "active_units": 7409,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -813,24 +901,28 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
-   "file_units": 73,
+   "file_units": 82,
    "id": "spec-I3-file-read-outside-envelope",
    "lang": "code",
    "mode": "spec",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 3500,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 3500
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -857,16 +949,20 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   },
   {
    "R": 1,
-   "active_units": 8314,
+   "active_units": 8305,
    "calib": {
     "adapter": "tierstream",
     "anchor_device": "sm_120/NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
@@ -885,7 +981,7 @@
     "sequences": 1,
     "tier_mode": "exclusive",
     "usage_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
-    "xfer": "rtx:gen5x16@cpu;drafter=none"
+    "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
    },
    "ctx": 131072,
    "file_units": 0,
@@ -893,10 +989,14 @@
    "lang": "code",
    "mode": "plain",
    "probe_xfer": {
-    "d2h_mbps": 23000,
-    "file_read_mbps": 6600,
-    "h2d_lat_ns": 9000,
-    "h2d_mbps": 24000
+    "rtx": {
+     "d2h_mbps": 23000,
+     "h2d_lat_ns": 9000,
+     "h2d_mbps": 24000
+    },
+    "store": {
+     "file_read_mbps": 6600
+    }
    },
    "sequences": 1
   }
@@ -924,7 +1024,7 @@
    "prefetch": "off",
    "sequences": 1,
    "tier_mode": "exclusive",
-   "xfer": "rtx:gen5x16@cpu;drafter=none"
+   "xfer": "72c58097126d9481d93bd9eaf9ec454010580009a8afb5fe5c9cead71199cf19"
   },
   "boundary_us": {
    "131072": 300
@@ -953,10 +1053,14 @@
    }
   },
   "xfer_measured": {
-   "d2h_mbps": 23000,
-   "file_read_mbps": 6600,
-   "h2d_lat_ns": 9000,
-   "h2d_mbps": 24000
+   "rtx": {
+    "d2h_mbps": 23000,
+    "h2d_lat_ns": 9000,
+    "h2d_mbps": 24000
+   },
+   "store": {
+    "file_read_mbps": 6600
+   }
   }
  },
  "curves": {
@@ -997,7 +1101,11 @@
   "cache_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
   "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
   "drafter": "anchor",
-  "evaluation": "kfold",
+  "evaluation": "holdout",
+  "evaluation_sources": [
+   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
   "policy": "lru",
   "prefetch": "off",
   "sequences": 1,
@@ -1409,5 +1517,19 @@
    199,
    200
   ]
- }
+ },
+ "usage_lang_sources": {
+  "code": [
+   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  ],
+  "en": [
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
+  "es": [
+   "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ]
+ },
+ "usage_sources": [
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ ]
 }

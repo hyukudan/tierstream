@@ -77,6 +77,7 @@ struct Line {
   ChargeAt at = ChargeAt::Device;
   int64_t bytes = 0, peak_extra = 0, slots = -1;  // slots: elastic lines only
   int64_t allocs = 0;  // separate allocations (rev 17; the charge's, 0 for the elastic lines: slot_allocs bills them)
+  bool driver = false;  // kind "driver" (rev 18): printed on the line, the same arithmetic
   unsigned phases = kAllPhases;
   int64_t live() const { return bytes + peak_extra; }
 };
@@ -90,6 +91,7 @@ struct Dev {
   bool margin_default = true;
   int64_t memory = 0, budget = 0, margin = 0, context = 0, growth = 0, allowance = 0, measured = -1;
   int64_t granularity = 0, overhead = 0;  // G of the context receipt; alloc_overhead_bytes (max over phases)
+  const Components::ContextReceipt* receipt = nullptr;  // the matched context receipt (V3)
   bool touched = false;
   std::vector<Line> lines;
   int64_t peak[kPlacePhases] = {0, 0, 0, 0};
@@ -323,11 +325,19 @@ PlaceResult place(const PlaceInput& in) {
     }
     d.context = i64(it->second);
     d.granularity = i64(matched->alloc_granularity_bytes);  // G: billed per separate allocation (rev 17)
+    d.receipt = matched;
     auto g = C->context_growth.find(d.bm->arch);
     d.growth = g == C->context_growth.end() ? 0 : i64(g->second);
-    if (i64(matched->max_growth_bytes) > d.growth) {  // the receipt measured more growth than the engine declares
-      errs.push_back("PL_E_MISSING_CONTEXT " + d.set + ": receipt max_growth_bytes " +
-                     num(i64(matched->max_growth_bytes)) + " > context_growth " + num(d.growth) + " (re-qualify)");
+    // rev 18, per touched device after the key: the receipt's configuration envelope, then the growth rule
+    if (matched->envelope_sha256.empty() || matched->envelope_sha256 != C->envelope_sha256) {
+      errs.push_back("PL_E_MISSING_CONTEXT " + d.set +
+                     ": receipt qualified on another configuration envelope (mismatch: envelope)");
+      continue;
+    }
+    constexpr int64_t kGrowthFloor = int64_t(64) << 20;  // context_growth >= 2 x max_growth_bytes + 64 MiB (§2.4)
+    if (d.growth < add(mul(2, i64(matched->max_growth_bytes)), kGrowthFloor)) {
+      errs.push_back("PL_E_MISSING_CONTEXT " + d.set + ": context_growth " + num(d.growth) + " < 2 x max_growth_bytes " +
+                     num(i64(matched->max_growth_bytes)) + " + " + num(kGrowthFloor));
       continue;
     }
     // S2 charges max(the engine's allowance, the measured context-v1 value) + growth
@@ -347,6 +357,17 @@ PlaceResult place(const PlaceInput& in) {
         }
       }
   }
+  // rev 18: the `graphs` driver charge (on the anchor: graphs is anchored) is the receipt's qualified graph bytes
+  if (errs.empty())
+    if (const ComponentDecl* g = C->find("graphs"))
+      if (A.receipt && A.receipt->graph_bytes >= 0) {
+        int64_t declared = 0;
+        for (const Charge& ch : *g->for_role(false))
+          if (ch.driver) declared = add(declared, i64(ch.bytes));
+        if (declared != A.receipt->graph_bytes)
+          errs.push_back("PL_E_STALE graphs: driver charge " + num(declared) + " != receipt graph_bytes " +
+                         num(A.receipt->graph_bytes));
+      }
   if (stop("V3")) return res;
 
   // ---- V4 feasibility: S1 destinations ------------------------------------------------------------------------
@@ -424,7 +445,7 @@ PlaceResult place(const PlaceInput& in) {
         continue;
       }
       if (d->rd->kind != SS_BACKEND_CUDA) {
-        errs.push_back("PL_E_CAPABILITY " + id + " -> " + want + ": HIP assists are not in v1");
+        errs.push_back("PL_E_CAPABILITY " + id + " -> " + want + ": HIP placement is not in v1");
         continue;
       }
       if (d->bm->host != A.bm->host) {
@@ -479,9 +500,9 @@ PlaceResult place(const PlaceInput& in) {
   for (const Dev& d : devs) n_touched += d.touched ? 1 : 0;
   if (n_touched > 1 && !C->has("multi_device"))
     errs.push_back("PL_E_CAPABILITY multi_device: the engine has not admitted multi-device processes");
-  for (const Dev& d : devs)
-    if (d.touched && d.rd->kind == SS_BACKEND_HIP && !d.rd->uuid.empty())
-      errs.push_back("PL_E_CAPABILITY " + d.set + ": a uuid selector on a hip set (no normative HIP UUID text)");
+  for (const Dev& d : devs)  // rev 18: no HIP stack_bytes derivation yet, so no HIP anchor or assist in placement mode
+    if (d.touched && d.rd->kind == SS_BACKEND_HIP)
+      errs.push_back("PL_E_CAPABILITY " + d.set + ": HIP placement is not in v1 (no stack_bytes derivation)");
   if (stop("V4")) return res;
 
   // ---- S3a quota bounds (before anything is sized) --------------------------------------------------------------
@@ -544,6 +565,7 @@ PlaceResult place(const PlaceInput& in) {
       l.peak_extra = i64(ch.peak_extra);
       l.phases = ch.phases;
       l.allocs = i64(ch.allocs);
+      l.driver = ch.driver;
       if (ch.at == ChargeAt::Device)
         on.add_line(l);
       else
@@ -629,38 +651,53 @@ PlaceResult place(const PlaceInput& in) {
 
   // ---- S4 host checks (S3 step 0 first: the mandatory pinned) -----------------------------------------------
   int64_t other_pinned = 0, pageable = 0;
+  // pinned overhead per allocation: the anchor receipt's qualified host granularity (rev 18; default 4 KiB)
+  const int64_t hgran = A.receipt ? i64(A.receipt->host_alloc_granularity_bytes) : 4096;
   for (const Line& l : host_lines) {
-    if (l.at == ChargeAt::HostPinned)  // payload + one 4 KiB page per allocation (rev 17)
-      other_pinned = add(other_pinned, add(l.live(), mul(4096, l.allocs)));
+    if (l.at == ChargeAt::HostPinned)  // payload + one granule per allocation (rev 17/18)
+      other_pinned = add(other_pinned, add(l.live(), mul(hgran, l.allocs)));
     if (l.at == ChargeAt::HostPageable) pageable = add(pageable, l.live());
   }
   const int64_t pinned_budget = i64(gib_bytes(P->get("host_pinned_gib")));
   // host blocks are billed at the host stride (round_up(unit_bytes, 4096); equal to unit_bytes for DS)
   const int64_t hstride = elastic ? (unit + 4095) / 4096 * 4096 : 0;
-  if (add(other_pinned, mul(host_spares, hstride)) > pinned_budget) {
+  // expert host blocks are allocated in chunks of at most host_chunk_bytes: one granule per chunk (rev 18)
+  const int64_t hchunk = i64(C->host_chunk_bytes);
+  auto homes_bytes = [&](int64_t n) {
+    const int64_t b = mul(n, hstride);
+    return add(b, mul(hgran, ceil_div(b, hchunk)));
+  };
+  if (add(other_pinned, homes_bytes(host_spares)) > pinned_budget) {
     // nothing elastic is sized on a host that cannot hold its fixed charges (no negative homes)
-    errs.push_back("PL_E_HOST_PINNED: mandatory pinned " + num(add(other_pinned, mul(host_spares, hstride))) +
-                   " (other " + num(other_pinned) + " + host spares " + num(mul(host_spares, hstride)) + ") > " +
+    errs.push_back("PL_E_HOST_PINNED: mandatory pinned " + num(add(other_pinned, homes_bytes(host_spares))) +
+                   " (other " + num(other_pinned) + " + host spares " + num(homes_bytes(host_spares)) + ") > " +
                    num(pinned_budget));
     stop("V4");
     return res;
   }
   blocks = add(homes, host_spares);
-  int64_t pinned = add(mul(blocks, hstride), other_pinned);
+  int64_t pinned = add(homes_bytes(blocks), other_pinned);
   if (elastic && pinned > pinned_budget && !explicit_file && C->has("file_expert_tier")) {
     // S3e: VRAM arena -> pinned RAM -> NVMe; the coldest whole units go to the file tier, never the host spares
     // never below the host spares; for a device-gated adapter never below the device spares' needs (D <= P)
     const int64_t floor_d = C->device_gated() ? std::min(homes, i64(C->spares)) : 0;
-    spilled = std::min(ceil_div(pinned - pinned_budget, hstride), homes - floor_d);
+    const int64_t cap = homes - floor_d;
+    spilled = std::min(ceil_div(pinned - pinned_budget, hstride), cap);
+    while (spilled < cap && add(homes_bytes(blocks - spilled), other_pinned) > pinned_budget)
+      ++spilled;  // the chunk granules can need one more unit than the stride division says
     file_units += spilled;
     homes -= spilled;
     blocks -= spilled;
-    pinned = add(mul(blocks, hstride), other_pinned);
+    pinned = add(homes_bytes(blocks), other_pinned);
   }
+  int64_t short_units = 0;  // the fewest blocks whose removal fits the budget
+  while (pinned > pinned_budget && short_units < blocks &&
+         add(homes_bytes(blocks - short_units), other_pinned) > pinned_budget)
+    ++short_units;
   if (pinned > pinned_budget)
     errs.push_back("PL_E_HOST_PINNED: need " + num(pinned) + " > " + num(pinned_budget) + " (expert homes " +
-                   num(blocks) + " blocks + other " + num(other_pinned) + "); " +
-                   num(hstride ? ceil_div(pinned - pinned_budget, hstride) : 0) + " units short; knob: " + rw +
+                   num(blocks) + " blocks + other " + num(other_pinned) + "); " + num(short_units) +
+                   " units short; knob: " + rw +
                    ".placement." + anchor_set + ".host_pinned_gib" +
                    (C->has("file_expert_tier") ? "" : " (or a file tier: file_expert_tier is not declared)"));
   if (q_host >= 0 && blocks > q_host)
@@ -675,7 +712,7 @@ PlaceResult place(const PlaceInput& in) {
     h.at = ChargeAt::HostPinned;
     h.source = "fill";
     h.slots = blocks;
-    h.bytes = mul(blocks, hstride);
+    h.bytes = homes_bytes(blocks);
     host_lines.push_back(h);
     Line f;
     f.component = "expert_file";
@@ -844,6 +881,7 @@ PlaceResult place(const PlaceInput& in) {
     e["bytes"] = Json::number(l.bytes);
     e["peak_extra"] = Json::number(l.peak_extra);
     if (l.slots < 0) e["allocs"] = Json::number(l.allocs);
+    if (l.driver) e["kind"] = Json::string("driver");
     e["phases"] = phases_json(l.phases);
     e["source"] = Json::string(l.source);
     if (l.component == "expert_host") {  // field mapping (§4.3): blocks = homes + host spares
