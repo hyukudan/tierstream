@@ -68,6 +68,10 @@ __global__ void unpublish_first(ss_dg_device_view v, uint32_t g, const int32_t* 
   __threadfence_system();
 }
 
+// the write-back modes a test runs in (this branch has only the copy engine)
+#define WB_MODES {0u}
+#define WB_SET(o, m) ((void)(o), (void)(m))
+
 uint64_t host_sum(const std::vector<uint8_t>& v) {
   uint64_t s = 0;
   for (size_t i = 0; i < v.size(); ++i) s += uint64_t(v[i]) * (i % 251 + 1);
@@ -527,7 +531,8 @@ TEST(dg_cuda_desync_two_steps) {
 
 // design rev 3.4 §11.3: a reader that meets an entry < 0 without abort (a host bug, injected) reports it; ss_end fails.
 TEST(dg_cuda_absent_entry) {
-  Rig r("absent", 16, 8, 8);
+  for (uint32_t wbm : WB_MODES) {
+  Rig r("absent", 16, 8, 8, 10000, true, [wbm](ss_options& o) { WB_SET(o, wbm); });
   if (!r.c) return;
   Tally k;
   for (int t = 0; t < 5; ++t) k.add(r.token(false, false));
@@ -542,11 +547,15 @@ TEST(dg_cuda_absent_entry) {
     checksum<<<r.n, 128, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
   }
   CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+  const auto t0 = std::chrono::steady_clock::now();
   CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
-  std::printf("  absent entry: %s\n", ss_last_error());
+  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("  absent entry (write-back mode %u): ss_end after %.3f s: %s\n", wbm, secs, ss_last_error());
   CHECK(std::string(ss_last_error()).find("absent entry") != std::string::npos);
   CU(cudaStreamSynchronize(r.s));
+  print("absent", r.stats());
   expect_poisoned(r);
+  }
 }
 
 // design rev 3.4 §11.6: dma_ms on the layers with misses (-1 on the others), the new counters, device_timeouts 0.
@@ -688,24 +697,40 @@ TEST(dg_cuda_absent_old_view_and_order) {
     CU(cudaStreamSynchronize(r.s));
   }
   {
-    Rig r("absent-order", 16, 8, 8);
+    // layer 0 routes residents only (no wait) and meets an unpublished entry: absent_err set, no abort; layer 1
+    // routes non-residents whose demand copies are held past the wait deadline: a timeout (abort) at layer 1. The end
+    // kernel folds ABSENT only without abort, so the timeout is what ss_end reports.
+    Rig r("absent-order", 16, 8, 8, 300);
     if (!r.c) return;
-    r.fill_ids();
-    int32_t bad = r.m.U + 3;
-    CU(cudaMemcpy(r.ids_dev, &bad, 4, cudaMemcpyHostToDevice));  // layer 0's first id out of range: BAD_ID, abort
+    std::vector<int32_t> ids(size_t(r.m.G) * r.n);
+    for (int g = 0; g < r.m.G; ++g)
+      for (uint32_t i = 0; i < r.n; ++i) ids[size_t(g) * r.n + i] = int32_t(g == 1 ? 40 + i : i);  // residents: 0..15
+    CU(cudaMemcpy(r.ids_dev, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
+    CU(cudaMemset(r.sums_dev, 0, ids.size() * 8));
+    cudaStream_t gs = nullptr;
+    cudaEvent_t gate = nullptr;
+    CU(cudaStreamCreateWithFlags(&gs, cudaStreamNonBlocking));
+    CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+    spin_ns<<<1, 1, 0, gs>>>(1000000000ull);  // 1 s > the 300 ms wait deadline, < ss_end's deadline + 5 s
+    CU(cudaEventRecord(gate, gs));
+    CHECK_OK(ss_test_dg_gate(r.c, 0, gate));  // the demand stream's next copies wait for it
     CHECK_OK(ss_begin(r.c, nullptr, 0));
     CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
     for (int g = 0; g < r.m.G; ++g) {
       CHECK_OK(ss_dg_enqueue_export(r.c, g, r.ids_dev + size_t(g) * r.n, int(r.n), 0, r.s));
       CHECK_OK(ss_dg_enqueue_wait(r.c, g, r.s));
-      if (g == 1) unpublish_first<<<1, 1, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n);
+      if (g == 0) unpublish_first<<<1, 1, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev);
       checksum<<<r.n, 128, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
     }
     CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
     CHECK_EQ(int(ss_end(r.c)), int(SS_E_BACKEND));
-    std::printf("  bad id then absent: %s\n", ss_last_error());
+    std::printf("  absent then timeout: %s\n", ss_last_error());
+    CHECK(std::string(ss_last_error()).find("a wait timed out at gated layer 1") != std::string::npos);
     CHECK(std::string(ss_last_error()).find("absent") == std::string::npos);
     CU(cudaStreamSynchronize(r.s));
+    CU(cudaStreamSynchronize(gs));
+    (void)cudaEventDestroy(gate);
+    (void)cudaStreamDestroy(gs);
   }
 }
 
