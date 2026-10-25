@@ -101,6 +101,11 @@ struct Rig {
   Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000,
       bool hooks = true, const std::function<void(ss_options&)>& tweak = {}, ss_status* open_st = nullptr)
       : m(tag), n(max_ids) {
+    // load the test's own kernels now: a first launch inside a gated step (lazy module loading) would wait for the
+    // step's spinning wait kernel, which waits for the service: a stall until the wait deadline (dgts-t3)
+    cudaFuncAttributes fa;
+    for (const void* f : {(const void*)checksum, (const void*)spin_ns, (const void*)unpublish_first})
+      CU(cudaFuncGetAttributes(&fa, f));
     CHECK_OK(ss_desc_from_json(m.json.data(), m.json.size(), &d));
     sstest::dg_budget(b, m, dyn, max_ids);
     std::vector<uint8_t> t = m.tiers(resident);
