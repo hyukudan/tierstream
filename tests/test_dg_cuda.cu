@@ -27,6 +27,7 @@
 #include "strix_stream/ss_test.h"
 #include "desc.hpp"
 #include "dg_ctx.hpp"
+#include "dg_score.hpp"
 #include "json.hpp"
 #include "sha256.hpp"
 
@@ -55,7 +56,7 @@ __global__ void spin_ns(unsigned long long ns) {
   }
 }
 
-// A gate the host releases (observed on hardware: a timed spin on the gate stream had ended before the step reached the point under
+// A gate the host releases (pw1/u2: a timed spin on the gate stream had ended before the step reached the point under
 // test). The kernel waits on a mapped host flag, bounded by max_ns; arm() pushes it past WDDM batching and proves it
 // holds before returning.
 __global__ void wait_flag(const volatile uint32_t* f, unsigned long long max_ns) {
@@ -206,6 +207,7 @@ struct Rig {
     sstest::dg_options(o, max_ids, SS_BACKEND_CUDA);
     o.dg_wait_timeout_ms = timeout_ms;
     o.dg_diag = 1;
+    o.dg_wb_defer = 0;  // the library default is 1: each test that defers says so
     o.dg_test_hooks = hooks ? 1u : 0u;  // the mutation / pressure / gate hooks (ss_test.h)
     if (tweak) tweak(o);
     if (open_st) *open_st = ss_open(d, &b, p, &o, &c);
@@ -1251,7 +1253,7 @@ TEST(dg_cuda_hooks_refused) {
   CHECK_EQ(k.wrong + k.failed, 0);
 }
 
-// ---- winpf (window prefetch, design notes): window hints between tokens (prior prefetches of gated layers 0
+// ---- winpf (window prefetch): window hints between tokens (prior prefetches of gated layers 0
 // and 1), the l+1 union ranked by row votes inside the token, unused prefetches reverted at the boundary; eager, graph,
 // pressure, with and without deferred write-backs and with a tiny prior budget. Every checksum must be exact. ----
 namespace {
@@ -1369,7 +1371,11 @@ void winpf_cases(const std::string& t, bool defer, uint32_t window_us, bool must
       for (int u = 0; u < r.m.U; u += 5) CHECK_OK(ss_check_unit(r.c, L, u));
     const ss_dg_stats x = r.stats();
     print((t + " pressure").c_str(), x);
-    CHECK(x.bank_serves > 0 && x.resurrected > 0);
+    // Without deferral a resurrection needs a re-demand before an 8 KiB write-back has completed (a timing window of
+    // microseconds: 0-11 per run on the RTX PRO); deferred victims stay evicting into the next token, so there it
+    // must happen.
+    CHECK(x.bank_serves > 0);
+    if (defer) CHECK(x.resurrected > 0);
     for (auto f : {&ss_dg_stats::winpf_hints, &ss_dg_stats::prior_issued, &ss_dg_stats::prior_used,
                    &ss_dg_stats::prior_reverted, &ss_dg_stats::l1_issued, &ss_dg_stats::l1_used,
                    &ss_dg_stats::l1_reverted, &ss_dg_stats::prior_budget_stops, &ss_dg_stats::l1_priced_out})
@@ -1550,7 +1556,7 @@ TEST(dg_cuda_winpf_delayed_prior) {
   CHECK(x.prior_issued > 0);
   CHECK(x.prior_used > 0);
   // late is observable only where the step reaches its first export while the gated copy still holds. On the RTX PRO
-  // 6000 (one copy engine, WDDM) the step itself starts only when the gate releases (every token ~200 ms = the
+  // 6000 (one copy engine, WDDM; u3) the step itself starts only when the gate releases (every token ~200 ms = the
   // release), so the prior copies have landed by the export: exactness under the held copies is what this proves
   // there; the cover-wait accounting is proven by the CPU oracle (test_dg prior_late_and_revert).
   if (token_ms_max < 150) CHECK(x.prior_late > 0);  // the gate held the copies past the export
@@ -1686,5 +1692,160 @@ TEST(dg_cuda_reset_open) {
     CHECK(st.fetched < 10000 && st.wb_completed_bytes < (1ull << 30));  // no unsigned baseline underflow
     CHECK_OK(ss_dg_timeline_sized(r.c, 0, &tl, sizeof tl));
     CHECK_OK(ss_dg_boundary_timeline_sized(r.c, &bt, sizeof bt));
+  }
+}
+
+// ---- scored eviction (docs/design.md §3.8): only the boundary's victims change; every read stays exact ----
+namespace {
+
+// eager, graph, prediction, 8 -> 0 -> 8 switching; pressure (banks, resurrections, MRU evictions); global spares with
+// fewer spare blocks than slots; deferral off or on
+void scored_cases(const std::string& t, bool defer, const std::function<void(ss_options&)>& extra = {}) {
+  auto tweak = [&](ss_options& o) {
+    o.policy = SS_POLICY_SCORED;
+    o.dg_wb_defer = defer ? 1 : 0;
+    if (extra) extra(o);
+  };
+  auto sane = [](const ss_dg_stats& x, uint32_t G) {
+    CHECK_EQ(x.score_fallbacks, 0ull);
+    CHECK_EQ(x.score_layers, x.tokens * G);
+    CHECK(x.score_candidates > 0);
+    CHECK(x.scored_victims <= x.evicted);
+  };
+  {
+    Rig r(t + "-main", 16, 8, 8, 10000, true, tweak);
+    if (!r.c) return;
+    Tally k;
+    for (int i = 0; i < 20; ++i) k.add(r.token(false, false));
+    r.capture(false);
+    r.capture(true);
+    for (int i = 0; i < 100; ++i) k.add(r.token(true, false));
+    for (int i = 0; i < 100; ++i) k.add(r.token(true, true));
+    for (int i = 0; i < 60; ++i) k.add(r.token(true, (i / 10) % 2 == 0));
+    CHECK_EQ(k.failed, 0);
+    CHECK_EQ(k.wrong, 0);
+    CHECK_OK(ss_test_dg_check(r.c));
+    for (int L = 0; L < r.m.G; ++L)
+      for (int u = 0; u < r.m.U; u += 9) CHECK_OK(ss_check_unit(r.c, L, u));
+    const ss_dg_stats x = r.stats();
+    print((t + " main").c_str(), x);
+    sane(x, uint32_t(r.m.G));
+    CHECK(x.evicted > 0 && x.scored_victims > 0);
+    if (defer) CHECK_EQ(x.wb_deferred, x.evicted);
+    char* js = nullptr;
+    size_t len = 0;
+    CHECK_OK(ss_stats_to_json(r.c, &js, &len));
+    CHECK(js && std::string(js, len).find("\"policy\":\"scored\"") != std::string::npos);
+    ss_free(js);
+    for (int i = 0; i < 10; ++i) k.add(r.token(true, true));  // after ss_check_unit's drain: still exact
+    CHECK_EQ(k.wrong + k.failed, 0);
+  }
+  {
+    Rig r(t + "-pressure", 8, 2, 8, 10000, true, tweak);
+    if (!r.c) return;
+    CHECK_OK(ss_test_dg_pressure(r.c, 2, 6));
+    r.capture(true);
+    Tally k;
+    for (int i = 0; i < 200; ++i) {
+      k.add(r.token(true, true));
+      CHECK_OK(ss_test_dg_check(r.c));
+    }
+    CHECK_EQ(k.failed + k.wrong, 0);
+    for (int L = 0; L < r.m.G; ++L)
+      for (int u = 0; u < r.m.U; u += 5) CHECK_OK(ss_check_unit(r.c, L, u));
+    const ss_dg_stats x = r.stats();
+    print((t + " pressure").c_str(), x);
+    sane(x, uint32_t(r.m.G));
+    CHECK(x.bank_serves > 0);
+    CHECK(x.resurrected > 0);
+  }
+  {
+    Rig r(t + "-gspares", 8, 2, 8, 10000, true, [&](ss_options& o) {
+      tweak(o);
+      o.dg_spare_slots = 20;
+    });
+    if (!r.c) return;
+    CHECK_OK(ss_test_dg_pressure(r.c, 2, 6));
+    r.capture(true);
+    Tally k;
+    for (int i = 0; i < 150; ++i) {
+      k.add(r.token(true, true));
+      CHECK_OK(ss_test_dg_check(r.c));
+    }
+    CHECK_EQ(k.wrong + k.failed, 0);
+    const ss_dg_stats x = r.stats();
+    print((t + " global spares").c_str(), x);
+    sane(x, uint32_t(r.m.G));
+    CHECK(x.evict_short > 0 || x.evicted > 0);
+  }
+}
+
+// A profile of the fixture model: identity from its layers and unit hashes, counts favouring "u -> u + 1".
+std::string scored_profile(const DgModel& m, const char* prov, uint64_t salt = 0) {
+  std::vector<uint32_t> units(size_t(m.G), uint32_t(m.U));
+  std::vector<std::vector<uint64_t>> h(size_t(m.G));
+  std::vector<ts::DgScoreIdLayer> idl;
+  for (int L = 0; L < m.G; ++L) {
+    h[size_t(L)] = m.hashes(L);
+    if (salt) h[size_t(L)][0] ^= salt;
+    idl.push_back({uint32_t(L), uint32_t(m.U), m.unit(), &h[size_t(L)]});
+  }
+  std::vector<std::vector<uint32_t>> cells(size_t(m.G), std::vector<uint32_t>(size_t(m.U) * size_t(m.U), 1));
+  for (auto& c : cells)
+    for (int u = 0; u < m.U; ++u) c[size_t(u) * size_t(m.U) + size_t((u + 1) % m.U)] = 1000;
+  return ts::dg_profile_write(units, ts::dg_score_identity(idl), prov, cells);
+}
+
+}  // namespace
+
+TEST(dg_cuda_scored) {
+  scored_cases("sc", false);
+  scored_cases("scd", true);
+}
+
+// A profile-seeded table: loaded at open (provenance in the stats JSON), exact reads in every mode, restored by
+// ss_dg_reset_open; a profile of another identity refuses the open.
+TEST(dg_cuda_scored_profile) {
+  const DgModel mm("scp");
+  const std::string prof = scored_profile(mm, "gpu test profile");
+  {
+    Rig r("scp", 16, 8, 8, 10000, true, [&](ss_options& o) {
+      o.policy = SS_POLICY_SCORED;
+      o.dg_score_profile = prof.data();
+      o.dg_score_profile_len = prof.size();
+    }, nullptr, true);
+    if (!r.c) return;
+    Tally k;
+    for (int i = 0; i < 20; ++i) k.add(r.token(false, false));
+    r.capture(false);
+    r.capture(true);
+    for (int i = 0; i < 80; ++i) k.add(r.token(true, i % 2 == 0));
+    CHECK_EQ(k.wrong + k.failed, 0);
+    CHECK_OK(ss_test_dg_check(r.c));
+    char* js = nullptr;
+    size_t len = 0;
+    CHECK_OK(ss_stats_to_json(r.c, &js, &len));
+    CHECK(js && std::string(js, len).find("gpu test profile") != std::string::npos);
+    ss_free(js);
+    const ss_dg_stats x = r.stats();
+    print("scored profile", x);
+    CHECK_EQ(x.score_fallbacks, 0ull);
+    CHECK(x.scored_victims > 0);
+    CHECK_OK(ss_dg_reset_open(r.c));
+    for (int i = 0; i < 40; ++i) k.add(r.token(true, true));
+    CHECK_EQ(k.wrong + k.failed, 0);
+    for (int L = 0; L < r.m.G; ++L)
+      for (int u = 0; u < r.m.U; u += 7) CHECK_OK(ss_check_unit(r.c, L, u));
+  }
+  {
+    const std::string other = scored_profile(mm, "", 1);
+    ss_status st = SS_OK;
+    Rig r("scp", 16, 8, 8, 10000, true, [&](ss_options& o) {
+      o.policy = SS_POLICY_SCORED;
+      o.dg_score_profile = other.data();
+      o.dg_score_profile_len = other.size();
+    }, &st, true);
+    CHECK_EQ(int(st), int(SS_E_INVALID));
+    CHECK(std::string(ss_last_error()).find("identity mismatch") != std::string::npos);
   }
 }

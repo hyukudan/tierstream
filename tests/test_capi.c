@@ -9,7 +9,8 @@ typedef char snapshot_flags_at_4[offsetof(ss_snapshot_info, flags) == 4 ? 1 : -1
 typedef char snapshot_sequence_at_8[offsetof(ss_snapshot_info, sequence) == 8 ? 1 : -1];
 typedef char snapshot_readahead_at_24[offsetof(ss_snapshot_info, readahead_buffers) == 24 ? 1 : -1];
 typedef char snapshot_exclusive_at_96[offsetof(ss_snapshot_info, exclusive_writebacks) == 96 ? 1 : -1];
-typedef char snapshot_size_160[sizeof(ss_snapshot_info) == 160 ? 1 : -1];
+typedef char snapshot_v1_prefix_160[offsetof(ss_snapshot_info, exclusive_blocks) == 152 ? 1 : -1];
+typedef char snapshot_discards_at_160[offsetof(ss_snapshot_info, exclusive_discards) == 160 ? 1 : -1];
 
 int main(void) {
   const char* js =

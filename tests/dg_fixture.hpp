@@ -11,6 +11,7 @@
 
 #include "fixture.hpp"
 #include "strix_stream/ss.h"
+#include "xxh64.hpp"
 
 namespace sstest {
 
@@ -62,6 +63,33 @@ struct DgModel {
       json += "]}";
     }
     json += "]}";
+  }
+
+  // The xxh64 of each unit's engine bytes of layer L, and the descriptor with them (a score profile is bound to them).
+  std::vector<uint64_t> hashes(int L) const {
+    std::vector<uint64_t> h;
+    for (int u = 0; u < U; ++u) {
+      const std::vector<uint8_t> b = bytes(L, u);
+      h.push_back(ts::xxh64(b.data(), b.size()));
+    }
+    return h;
+  }
+  std::string json_hashed() const {
+    std::string js = json;
+    for (int L = 0; L < G; ++L) {
+      const std::string key = R"({"index":)" + std::to_string(L) + R"(,"kind":"moe")";
+      std::string h = R"(,"hash":[)";
+      char buf[20];
+      const std::vector<uint64_t> v = hashes(L);
+      for (size_t i = 0; i < v.size(); ++i) {
+        std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long)v[i]);
+        h += std::string(i ? "," : "") + "\"" + buf + "\"";
+      }
+      h += "]";
+      const size_t at = js.find(key);
+      js.insert(at + key.size(), h);
+    }
+    return js;
   }
 
   // Tiers: the first `resident` units of each layer resident, the rest pinned.

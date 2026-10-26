@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The rename's symbol gate (design notes §2.1).
+"""The rename's symbol gate.
 
 The expected names come from tools/rename_abi_baseline.txt, captured once from main 4dc53b0's archive (the last commit
 before the rename) and never regenerated from the current tree: every strix-stream C ABI function and supported test

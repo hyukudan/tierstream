@@ -8,6 +8,7 @@
 #include <tuple>
 
 #include "dg_proto.hpp"
+#include "dg_score.hpp"
 #include "errors.hpp"
 
 namespace ts {
@@ -50,6 +51,29 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
   require(t_->parts() >= 1, SS_E_INVALID, "device-gated: a unit without parts");
   for (uint32_t p = 0; p < t_->parts(); ++p) unit_bytes_ += t_->part_bytes(p);
   apply_wb_defer();
+  if (c_.scored) {  // scored eviction: every table allocated now (the service never allocates)
+    require(c_.w_trans <= 1000 && c_.w_freq <= 1000 && c_.w_rec <= 1000 &&
+                c_.w_trans + c_.w_freq + c_.w_rec == 1000,
+            SS_E_INVALID, "device-gated: score weights must each be 0..1000 and sum to 1000");
+    require(c_.max_ids >= 1 && c_.max_ids <= 64, SS_E_INVALID, "device-gated: score unions need max ids 1..64");
+    (void)dg_score_cells(c_.n_units);  // checked: units <= 65536 per layer, the cell count fits
+    sc_.resize(gated());
+    for (uint32_t g = 0; g < gated(); ++g) {
+      LayerScore& l = sc_[g];
+      const size_t nu = units(g);
+      l.T.assign(nu * nu, 0);
+      l.rowsum.assign(nu, 0);
+      l.cnt.assign(nu, 0);
+      l.ring.assign(size_t(kDgScoreWindow) * c_.max_ids, 0);
+      l.ring_len.assign(kDgScoreWindow, 0);
+      l.prev.reserve(c_.max_ids);
+      l.cur.reserve(c_.max_ids);
+      l.list.reserve(std::min<size_t>(nu, c_.persistent_slots));
+    }
+    heap_.reserve(gated());
+    heap_pos_.assign(gated(), 0);
+  }
+  victims_.reserve(c_.persistent_slots);
 }
 
 // The derived write-back scheduling state of c_.wb_defer (at construction, and after set_wb_defer / reset_open).
@@ -143,6 +167,7 @@ void DgCore::place(const std::vector<uint32_t>& residents) {
   open_wp_ = wp_;
   open_rate_gbps_ = rate_gbps_;
   open_rate_set_ = rate_set_;
+  open_stamp_ = stamp_;
 }
 
 // ---- recency list ----
@@ -162,6 +187,22 @@ void DgCore::push_front(uint32_t k) {
   if (head_ != kNone) e_[head_].prev = k; else tail_ = k;
   head_ = k;
   x.in_list = true;
+  if (c_.scored) {  // unique stamps: stamp_room() keeps the counter below kStampLimit before every pushing phase
+    if (stamp_ == UINT64_MAX) broken("the recency stamp counter wrapped");
+    x.lru_stamp = ++stamp_;
+  }
+}
+
+void DgCore::stamp_room(const char* what) const {
+  if (c_.scored && stamp_ > kStampLimit)
+    fail(SS_E_BACKEND, std::string("device-gated: ") + what +
+                           ": the scored eviction's recency stamp counter is exhausted (reopen the context)");
+}
+
+size_t DgCore::pending_writebacks() const {
+  size_t pending = deferred_.size();
+  for (const Writeback& w : wbs_) pending += w.discard ? 0u : 1u;
+  return pending;
 }
 
 void* DgCore::event() {
@@ -322,6 +363,12 @@ int32_t DgCore::take_bank_slot(uint32_t g) {
 
 void DgCore::begin_token(uint32_t seq) {
   require(!reset_failed_, SS_E_BACKEND, "device-gated: reset failed; close the poisoned context");
+  if (c_.scored) {  // the token's epoch (the first is 1); one token cannot push more than 2^40 stamps
+    stamp_room("begin_token");
+    require(epoch_ < (uint64_t(1) << 63), SS_E_BACKEND,
+            "device-gated: the scored eviction's epoch counter is exhausted");
+    ++epoch_;
+  }
   seq_ = seq;
   pf_token_ = 0;
   demand_free_used_ = 0;
@@ -491,6 +538,7 @@ void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
       ++st_.miss_layers;
     }
   }
+  if (c_.scored) x.demand_epoch = epoch_;  // a demand use (never a prefetch, a resurrection, a seed)
   if (x.via_prefetch && !x.used) {
     x.used = true;
     ++st_.prefetch_used;
@@ -538,6 +586,7 @@ void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mas
   uniq_.assign(ids, ids + n);
   std::sort(uniq_.begin(), uniq_.end());
   uniq_.erase(std::unique(uniq_.begin(), uniq_.end()), uniq_.end());
+  if (c_.scored) score_history(g);  // the union saved before serve_prediction reuses uniq_
   for (uint32_t id : uniq_) {
     bool miss = false;
     for (uint32_t i = 0; i < n; ++i)
@@ -707,40 +756,31 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
   bank_seq_[0] = bank_seq_[1] = 0;
   bank_layer_[0] = bank_layer_[1] = kNone;
   collect();
-  // victims: least recently used first, until free + in-flight write-backs reach the target
+  // Victims: one acceptance loop fed by the policy's order (the recency tail, or the merged score lists), then the
+  // pressure override from the recency head. Eligible = a device home, no write-back in flight, not kept (Coming units
+  // were admitted or reverted above). A victim is accepted with a free block, until free + pending (in flight or
+  // deferred) + accepted reaches the target; at the first victim without a block nothing more is accepted (it stays on
+  // the device, coverage kept). Only the accepted list feeds the write-backs below.
   std::vector<uint8_t> keep_mask;
   if (!keep.empty()) {
     keep_mask.assign(keys_, 0);
     for (uint32_t k : keep)
       if (k < keys_) keep_mask[k] = 1;
   }
-  size_t pending = deferred_.size();  // deferred write-backs count as in flight (never discarded; issued below)
-  for (const Writeback& w : wbs_) pending += w.discard ? 0u : 1u;
-  std::vector<uint32_t> victims;
-  for (uint32_t k = tail_; k != kNone && free_slots_.size() + pending + victims.size() < c_.spare_target;
-       k = e_[k].prev) {
+  if (probe_) probe_();
+  const size_t base = free_slots_.size() + pending_writebacks();
+  victims_.clear();
+  bool short_blocks = false;
+  auto eligible = [&](uint32_t k) {
     const Entry& x = e_[k];
-    if (x.home != Home::Device || (x.wb_pending && mut_ != kReevictPending) || (!keep_mask.empty() && keep_mask[k]))
-      continue;
-    victims.push_back(k);
-  }
-  if (pressure_ && pressure_recent_) {  // the most recently used too (they come back soon)
-    uint32_t n = 0;
-    for (uint32_t k = head_; k != kNone && n < pressure_recent_; k = e_[k].next) {
-      const Entry& x = e_[k];
-      if (x.home != Home::Device || (x.wb_pending && mut_ != kReevictPending) ||
-          (!keep_mask.empty() && keep_mask[k]))
-        continue;
-      if (std::find(victims.begin(), victims.end(), k) != victims.end()) continue;
-      victims.push_back(k);
-      ++n;
-    }
-  }
-  size_t n_evict = 0;
-  for (uint32_t k : victims) {
-    if (free_blocks_.empty()) {  // stays on the device: coverage kept
+    return x.home == Home::Device && !(x.wb_pending && mut_ != kReevictPending) &&
+           !(!keep_mask.empty() && keep_mask[k] && mut_ != kIgnoreKeep);
+  };
+  auto accept = [&](uint32_t k) {
+    if (free_blocks_.empty()) {
       ++st_.evict_short;
-      break;
+      short_blocks = true;
+      return false;
     }
     Entry& x = e_[k];
     const int32_t b = free_blocks_.back();
@@ -751,8 +791,51 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
     x.block = b;
     x.wb_pending = true;
     table_[k] = -1;
-    ++n_evict;
+    victims_.push_back(k);
+    return true;
+  };
+  bool by_score = c_.scored;
+  for (uint32_t g = 0; by_score && g < gated(); ++g) by_score = sc_[g].list_epoch == epoch_;
+  if (c_.scored && !by_score) ++st_.score_fallbacks;  // invalid score metadata: this boundary uses the recency order
+  if (by_score) {
+    // heap merge of the per-layer lists (each sorted by the same total order), stopped at the accepted target
+    auto head = [&](uint32_t g) -> const ScoreCand& { return sc_[g].list[heap_pos_[g]]; };
+    auto after = [&](uint32_t a, uint32_t b) { return cand_less(head(b), head(a)); };
+    heap_.clear();
+    for (uint32_t g = 0; g < gated(); ++g) {
+      heap_pos_[g] = 0;
+      if (!sc_[g].list.empty()) heap_.push_back(g);
+    }
+    std::make_heap(heap_.begin(), heap_.end(), after);
+    while (!heap_.empty() && base + victims_.size() < c_.spare_target) {
+      std::pop_heap(heap_.begin(), heap_.end(), after);
+      const uint32_t g = heap_.back();
+      const uint32_t k = head(g).key;
+      if (++heap_pos_[g] < sc_[g].list.size()) std::push_heap(heap_.begin(), heap_.end(), after);
+      else heap_.pop_back();
+      if (!eligible(k)) continue;
+      if (!accept(k)) break;
+      ++st_.scored_victims;
+    }
+  } else {
+    for (uint32_t k = tail_; k != kNone && base + victims_.size() < c_.spare_target;) {
+      const uint32_t prev = e_[k].prev;
+      if (eligible(k) && !accept(k)) break;
+      k = prev;
+    }
   }
+  if (pressure_ && pressure_recent_ && !short_blocks) {  // the most recently used too (they come back soon)
+    uint32_t n = 0;
+    for (uint32_t k = head_; k != kNone && n < pressure_recent_;) {
+      const uint32_t next = e_[k].next;
+      if (eligible(k)) {
+        if (!accept(k)) break;
+        ++n;
+      }
+      k = next;
+    }
+  }
+  const size_t n_evict = victims_.size();
   // The table first, then the write-backs, so the upload never queues behind them on a shared copy engine (as the
   // reference, cache.cpp:552-566). The device is done with the token, and an evicting slot is reused only after its
   // write-back's event.
@@ -771,7 +854,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
   prev_evict_ = n_evict;
   credit_ = 0;
   for (size_t i = 0; c_.wb_defer && i < n_evict; ++i) {
-    const uint32_t k = victims[i];
+    const uint32_t k = victims_[i];
     Entry& x = e_[k];
     deferred_.push_back({k, x.slot, x.block, 0, 0});
     if (mut_ == kEarlyDeferredSlot) free_slots_.push_back(x.slot);
@@ -785,7 +868,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
   st_.wb_boundary_flushed += n_issued;
   st_.wb_boundary_flushed_bytes += st_.wb_issued_bytes - issued0;
   for (size_t i = 0; !c_.wb_defer && i < n_evict; ++i, ++n_issued) {
-    const uint32_t k = victims[i];
+    const uint32_t k = victims_[i];
     Entry& x = e_[k];
     t_->d2h(x.slot, x.block);
     if (mut_ == kEarlyWritebackBlock) free_blocks_.push_back(x.block);
@@ -810,6 +893,144 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
   ++st_.tokens;
 }
 
+// ---- scored eviction (docs/design.md §3.8) ----
+// serve_use of gated layer g: its unique sorted union is copied into cur first (serve_prediction reuses uniq_); then
+// every (r in the previous token's union, e in this one) cell takes one saturating increment, its row sum only with
+// it; the union enters the ring of the last kDgScoreWindow unions (ring counts follow); it becomes the previous one.
+void DgCore::score_history(uint32_t g) {
+  LayerScore& l = sc_[g];
+  const uint32_t n = units(g);
+  require(uniq_.size() <= c_.max_ids, SS_E_BACKEND, "device-gated: a score union above max ids");
+  l.cur.assign(uniq_.begin(), uniq_.end());
+  l.served = epoch_;
+  for (uint32_t r : l.prev) {
+    uint32_t* row = l.T.data() + size_t(r) * n;
+    for (uint32_t e : l.cur) {
+      if (row[e] == UINT32_MAX) {
+        ++st_.score_saturated;
+        continue;
+      }
+      ++row[e];
+      ++l.rowsum[r];
+    }
+  }
+  if (l.ring_n == kDgScoreWindow) {  // the oldest union leaves the window
+    const uint32_t* old = l.ring.data() + size_t(l.ring_head) * c_.max_ids;
+    for (uint32_t i = 0; i < l.ring_len[l.ring_head]; ++i) --l.cnt[old[i]];
+    l.ring_head = (l.ring_head + 1) % kDgScoreWindow;
+    --l.ring_n;
+  }
+  const uint32_t at = (l.ring_head + l.ring_n) % kDgScoreWindow;
+  std::copy(l.cur.begin(), l.cur.end(), l.ring.begin() + ptrdiff_t(size_t(at) * c_.max_ids));
+  l.ring_len[at] = uint8_t(l.cur.size());
+  ++l.ring_n;
+  for (uint32_t e : l.cur) ++l.cnt[e];
+  l.prev.assign(l.cur.begin(), l.cur.end());
+}
+
+// For each device or coming unit e of layer g (wb_pending ones too: eligibility is the boundary's), cur = this token's
+// union of g:
+//   N = sum_{r in cur} T[r][e], D = sum_{r in cur} rowsum[r], P = ((|cur| N) << 16) / max(1, D)
+//   F = (cnt[e] << 16) / 16, Rec = (1 << 16) / (1 + epoch - demand_epoch), S = w_t P + w_f F + w_r Rec
+// (unsigned floor divisions; N < 2^38, D < 2^54, (|cur| N) << 16 < 2^60, S < 2^33), sorted by (S, demand epoch,
+// stamp) and tagged with this epoch. A layer's union, epochs and stamps are final here: each layer is served once per
+// token, its prefetches and resurrections come before its use, collection and admission never push.
+void DgCore::score_layer(uint32_t g) {
+  if (!c_.scored) return;
+  const auto t0 = std::chrono::steady_clock::now();
+  LayerScore& l = sc_[g];
+  if (l.served != epoch_) return;  // not served this token: no list (the boundary falls back and counts it)
+  if (mut_ == kSkipRank && g == 1 && epoch_ % 3 == 0) return;  // a layer left unranked: the boundary must fall back
+  if (mut_ == kStaleList && g == 1 && (epoch_ & 1u) == 0 && l.list_epoch) {  // a list re-tagged, not re-ranked
+    l.list_epoch = epoch_;
+    return;
+  }
+  const uint32_t n = units(g);
+  std::vector<uint32_t> scratch;  // kNoUnionSave: whatever the shared scratch holds now (in range)
+  if (mut_ == kNoUnionSave)
+    for (uint32_t r : uniq_)
+      if (r < n) scratch.push_back(r);
+  const std::vector<uint32_t>& cur = mut_ == kNoUnionSave ? scratch : l.cur;
+  uint64_t D = 0;
+  for (uint32_t r : cur) D += l.rowsum[r];
+  const uint64_t nc = cur.size();
+  l.list.clear();
+  for (uint32_t u = 0; u < n; ++u) {
+    const uint32_t k = base_[g] + u;
+    const Entry& x = e_[k];
+    if (x.home != Home::Device && x.home != Home::Coming) continue;
+    uint64_t N = 0;
+    for (uint32_t r : cur) N += l.T[size_t(r) * n + u];
+    const uint64_t P = ((nc * N) << 16) / std::max<uint64_t>(1, D);
+    const uint64_t F = (uint64_t(l.cnt[u]) << 16) / kDgScoreWindow;
+    const uint64_t R = (uint64_t(1) << 16) / (1 + (epoch_ - x.demand_epoch));
+    l.list.push_back({uint64_t(c_.w_trans) * P + uint64_t(c_.w_freq) * F + uint64_t(c_.w_rec) * R, x.demand_epoch,
+                      x.lru_stamp, k});
+  }
+  std::sort(l.list.begin(), l.list.end(), [this](const ScoreCand& a, const ScoreCand& b) { return cand_less(a, b); });
+  l.list_epoch = epoch_;
+  ++st_.score_layers;
+  st_.score_candidates += l.list.size();
+  st_.score_ns += uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+void DgCore::load_profile(const void* data, uint64_t len, const std::string& identity) {
+  require(c_.scored, SS_E_INVALID, "device-gated: a score profile needs policy SCORED");
+  const DgProfileView v = dg_profile_check(data, len, c_.n_units, identity);
+  const unsigned char* p = v.cells;
+  for (uint32_t g = 0; g < gated(); ++g) {
+    LayerScore& l = sc_[g];
+    const uint32_t n = units(g);
+    for (size_t i = 0; i < l.T.size(); ++i, p += 4)
+      l.T[i] = uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+    for (uint32_t r = 0; r < n; ++r) {
+      uint64_t sum = 0;
+      for (uint32_t e = 0; e < n; ++e) sum += l.T[size_t(r) * n + e];
+      l.rowsum[r] = sum;
+    }
+    l.open_T = l.T;  // the reset_open state
+  }
+  prov_ = v.provenance;
+}
+
+std::vector<uint32_t> DgCore::score_window(uint32_t g) const {
+  const LayerScore& l = sc_[g];
+  std::vector<uint32_t> v;
+  for (uint32_t i = 0; i < l.ring_n; ++i) {
+    const uint32_t a = (l.ring_head + i) % kDgScoreWindow;
+    const auto first = l.ring.begin() + ptrdiff_t(size_t(a) * c_.max_ids);
+    v.insert(v.end(), first, first + l.ring_len[a]);
+    v.push_back(kNone);
+  }
+  return v;
+}
+
+void DgCore::reset_score() {
+  for (uint32_t g = 0; g < uint32_t(sc_.size()); ++g) {
+    LayerScore& l = sc_[g];
+    const uint32_t n = units(g);
+    if (l.open_T.empty()) std::fill(l.T.begin(), l.T.end(), 0u);
+    else std::copy(l.open_T.begin(), l.open_T.end(), l.T.begin());
+    for (uint32_t r = 0; r < n; ++r) {
+      uint64_t sum = 0;
+      for (uint32_t e = 0; e < n && !l.open_T.empty(); ++e) sum += l.T[size_t(r) * n + e];
+      l.rowsum[r] = sum;
+    }
+    std::fill(l.cnt.begin(), l.cnt.end(), uint16_t(0));
+    std::fill(l.ring.begin(), l.ring.end(), 0u);
+    std::fill(l.ring_len.begin(), l.ring_len.end(), uint8_t(0));
+    l.ring_head = l.ring_n = 0;
+    l.prev.clear();
+    l.cur.clear();
+    l.served = 0;
+    l.list.clear();
+    l.list_epoch = 0;
+  }
+  epoch_ = 0;
+  stamp_ = open_stamp_;
+}
+
 void DgCore::set_winpf(const DgWinpf& w) {
   if (!rate_set_ || w.copy_gbps != wp_.copy_gbps) {  // a learned rate survives phase toggles with the same seed rate
     rate_gbps_ = w.copy_gbps;
@@ -826,6 +1047,7 @@ void DgCore::observe_copy(double unit_ms) {
 }
 
 void DgCore::window_hint(const int32_t* symbols, const float* weights, uint32_t rows) {
+  stamp_room("window_hint");
   ++st_.winpf_hints;
   st_.winpf_hint_rows += rows;
   for (uint32_t r = 0; r < rows; ++r) {  // at most 64 rows per window (the context refuses more)
@@ -891,6 +1113,7 @@ void DgCore::issue_prior() {
 uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
   // winpf: prior prefetches issued between tokens are Coming with their entries already in the mirror; their bytes
   // land before the upload below publishes the mirror
+  stamp_room("ss_seed");
   if (!coming_.empty() && mut_ != kSeedNoPfSync) t_->sync(DgTransport::kPf);
   collect();
   uint32_t n = 0;
@@ -933,7 +1156,7 @@ bool DgCore::same_open_state(const DgCore& b) const {
   };
   auto entry = [](const Entry& x) {
     return std::tie(x.home, x.slot, x.block, x.prev, x.next, x.in_list, x.wb_pending, x.via_prefetch, x.used,
-                    x.pf_kind, x.pf_late, x.pf_bucket);
+                    x.pf_kind, x.pf_late, x.pf_bucket, x.demand_epoch, x.lru_stamp);
   };
   if (cfg(c_) != cfg(b.c_) || wp(wp_) != wp(b.wp_) || e_.size() != b.e_.size()) return false;
   for (size_t k = 0; k < e_.size(); ++k)
@@ -950,6 +1173,15 @@ bool DgCore::same_open_state(const DgCore& b) const {
     if (bank_layer_[i] != b.bank_layer_[i] || bank_next_[i] != b.bank_next_[i]) return false;
   for (unsigned i = 0; i < 15; ++i)
     if (bkt_n_[i] != b.bkt_n_[i] || bkt_hit_[i] != b.bkt_hit_[i]) return false;
+  if (std::tie(c_.scored, c_.w_trans, c_.w_freq, c_.w_rec, epoch_, stamp_) !=
+          std::tie(b.c_.scored, b.c_.w_trans, b.c_.w_freq, b.c_.w_rec, b.epoch_, b.stamp_) ||
+      sc_.size() != b.sc_.size())
+    return false;
+  for (size_t g = 0; g < sc_.size(); ++g)
+    if (score_window(uint32_t(g)) != b.score_window(uint32_t(g)) ||
+        std::tie(sc_[g].T, sc_[g].rowsum, sc_[g].cnt, sc_[g].prev, sc_[g].served, sc_[g].list_epoch) !=
+            std::tie(b.sc_[g].T, b.sc_[g].rowsum, b.sc_[g].cnt, b.sc_[g].prev, b.sc_[g].served, b.sc_[g].list_epoch))
+      return false;
   return wbs_.empty() && b.wbs_.empty() && deferred_.empty() && b.deferred_.empty() &&
          prior_.layers == b.prior_.layers && prior_.k == b.prior_.k && prior_.row == b.prior_.row &&
          prior_.unit == b.prior_.unit && prior_.p == b.prior_.p;
@@ -1032,6 +1264,7 @@ void DgCore::reset_open() {
     c_ = open_c_;
     apply_wb_defer();  // the open's scheduling mode (a runtime set_wb_defer may have changed it)
     std::copy(open_e_.begin(), open_e_.end(), e_.begin());
+    reset_score();  // scored eviction's learning state, as winpf's: the open state (the profile's counts, if any)
     std::copy(open_table_.begin(), open_table_.end(), table_.begin());
     free_slots_ = open_free_slots_;
     free_blocks_ = open_free_blocks_;
@@ -1206,6 +1439,28 @@ void DgCore::check() const {
   for (size_t i = 0; i < ev_used.size(); ++i)
     if (!ev_used[i]) broken("an event is lost");
   if (dev != on_device_ || listed != on_device_) broken("device count / recency list");
+  if (c_.scored) {  // stamps strictly decrease from the head; every row sum / ring count equals its recount
+    uint64_t last = UINT64_MAX;
+    for (uint32_t k = head_; k != kNone; k = e_[k].next) {
+      if (e_[k].lru_stamp >= last || e_[k].lru_stamp == 0 || e_[k].lru_stamp > stamp_) broken("recency stamps");
+      last = e_[k].lru_stamp;
+    }
+    for (uint32_t g = 0; g < gated(); ++g) {
+      const LayerScore& l = sc_[g];
+      const uint32_t n = units(g);
+      std::vector<uint16_t> cnt(n, 0);
+      for (uint32_t e : score_window(g))
+        if (e != kNone) ++cnt[e];
+      if (cnt != l.cnt || l.ring_n > kDgScoreWindow) broken("score ring counts");
+      for (uint32_t r = 0; r < n; ++r) {
+        uint64_t sum = 0;
+        for (uint32_t e = 0; e < n; ++e) sum += l.T[size_t(r) * n + e];
+        if (sum != l.rowsum[r]) broken("score row sum != its cells");
+      }
+      for (uint64_t ep : {l.served, l.list_epoch})
+        if (ep > epoch_) broken("a score epoch in the future");
+    }
+  }
 }
 
 }  // namespace ts

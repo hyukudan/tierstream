@@ -88,6 +88,11 @@ struct DgConfig {
   bool wb_on_d2h = false;
   uint64_t wb_layer_bytes = 0;
   uint64_t wb_max_outstanding = 0;
+  // Scored eviction (SS_POLICY_SCORED, docs/design.md §3.8): the boundary's victims in score order instead of the
+  // recency tail. Integer weights out of 1000 (sum 1000); max_ids = the most ids one export can hold (the unions).
+  bool scored = false;
+  uint32_t w_trans = 700, w_freq = 200, w_rec = 100;
+  uint32_t max_ids = 64;
 };
 
 struct DgStats {
@@ -106,16 +111,24 @@ struct DgStats {
   uint64_t wb_deferred = 0, wb_cancelled = 0, wb_forced = 0, wb_boundary_flushed = 0;
   uint64_t wb_issued_bytes = 0, wb_completed_bytes = 0, wb_cancelled_bytes = 0, wb_boundary_flushed_bytes = 0;
   uint64_t wb_forced_wait_ns = 0;
-  // winpf (design notes): window hints; prior (gated layers < P, between tokens) and l+1 (in-token) prefetch
+  // winpf: window hints; prior (gated layers < P, between tokens) and l+1 (in-token) prefetch
   // copies issued, used by their token, late (a demand of their token waited for their copies), reverted (unused, back
   // to the host block at the boundary); l+1 candidates ranked, priced out by their bucket's precision.
   uint64_t winpf_hints = 0, winpf_hint_rows = 0, prior_issued = 0, prior_used = 0, prior_late = 0, prior_reverted = 0;
   uint64_t l1_candidates = 0, l1_issued = 0, l1_used = 0, l1_late = 0, l1_reverted = 0, l1_priced_out = 0;
   uint64_t l1_skipped_ahead = 0;  // l+1 predictions not served: layer l+1 had already exported (its demand covers)
   uint64_t prior_budget_stops = 0;  // window hints whose prior prefetches stopped at the copy-engine byte budget
+  // scored eviction: boundaries that fed the recency order instead (invalid score metadata: should never happen);
+  // victims taken in score order; layers scored and the candidates they ranked; transition increments a saturated
+  // cell refused; the service's scoring time
+  uint64_t score_fallbacks = 0, scored_victims = 0, score_layers = 0, score_candidates = 0, score_saturated = 0;
+  uint64_t score_ns = 0;
+  // the service: layers whose ranking waited for a later layer (the device was ahead), and the ranking time spent
+  // after the last gated layer was served (on the terminal path)
+  uint64_t score_deferred = 0, score_last_ns = 0;
 };
 
-// Window prefetch (winpf, opt-in; design notes). Off = today's behaviour byte for byte.
+// Window prefetch (winpf, opt-in). Off = today's behaviour byte for byte.
 struct DgWinpf {
   bool enable = false;
   uint32_t prior_layers = 4;   // gated layers 0..P-1 served from the token prior at a window hint
@@ -208,7 +221,8 @@ class DgCore {
   // Test-only fault injection (tests/test_dg.cpp, the model checker): each must be caught.
   enum Mutation { kNoMutation = 0, kEntryBeforeCopy, kNoCover, kEarlyEventRecycle, kNoBankUnpublish,
                   kEarlySourceFree, kFreeResurrectedSlot, kEarlyWritebackBlock, kReevictPending,
-                  kEarlyDeferredSlot, kRecordBeforeLastPart, kRevertKeepsEntry, kSeedNoPfSync };
+                  kEarlyDeferredSlot, kRecordBeforeLastPart, kRevertKeepsEntry, kSeedNoPfSync,
+                  kIgnoreKeep, kStaleList, kNoUnionSave, kSkipRank };
   void set_mutation(int m) { mut_ = m; }
 
   // ---- boundary (the engine thread, the device done with the token) ----
@@ -272,6 +286,39 @@ class DgCore {
   void set_diag(bool on) { diag_ = on; }
   const DgBoundaryTimes& boundary_times() const { return bt_; }
 
+  // ---- scored eviction (c_.scored; docs/design.md §3.8) ----
+  // Open only, after place() and before the first token: the profile's transition counts (dg_score.hpp format,
+  // checked against units and identity; SS_E_INVALID otherwise). They are also the reset_open state.
+  void load_profile(const void* data, uint64_t len, const std::string& identity);
+  const std::string& profile_provenance() const { return prov_; }
+  // The service, right after gated layer g was served (ready, prediction, write-back slice): ranks layer g's device
+  // and coming units by (score, demand epoch, recency stamp) from this token's union of g. Nothing when not scored.
+  void score_layer(uint32_t g);
+  bool scored() const { return c_.scored; }
+  // The service's ranking schedule (counters only): a layer deferred behind a later one, the terminal ranking time.
+  void note_score_deferred() { ++st_.score_deferred; }
+  void add_score_last_ns(uint64_t ns) { st_.score_last_ns += ns; }
+  struct ScoreCand {
+    uint64_t s, epoch, stamp;
+    uint32_t key;
+  };
+  // Test hooks: the last boundary's accepted victims (both policies, in acceptance order), a call at the boundary right
+  // before victim selection (after admissions, bank returns and collection), and the scored state.
+  const std::vector<uint32_t>& last_victims() const { return victims_; }
+  void set_boundary_probe(std::function<void()> f) { probe_ = std::move(f); }
+  size_t pending_writebacks() const;  // deferred + non-discarded recorded write-backs (the boundary's pending)
+  bool wb_pending(uint32_t k) const { return e_[k].wb_pending; }
+  uint64_t lru_stamp(uint32_t k) const { return e_[k].lru_stamp; }
+  uint64_t demand_epoch(uint32_t k) const { return e_[k].demand_epoch; }
+  uint64_t epoch() const { return epoch_; }
+  uint64_t stamp_counter() const { return stamp_; }
+  void set_stamp_counter(uint64_t v) { stamp_ = v; }  // test only: start near the limit
+  static constexpr uint64_t kStampLimit = UINT64_MAX - (uint64_t(1) << 40);  // checked before every phase that pushes
+  uint32_t score_cell(uint32_t g, uint32_t r, uint32_t e) const { return sc_[g].T[size_t(r) * units(g) + e]; }
+  uint64_t score_rowsum(uint32_t g, uint32_t r) const { return sc_[g].rowsum[r]; }
+  const std::vector<ScoreCand>& score_list(uint32_t g) const { return sc_[g].list; }
+  uint64_t score_list_epoch(uint32_t g) const { return sc_[g].list_epoch; }
+
  private:
   static constexpr uint32_t kNone = 0xffffffffu;
   struct Entry {
@@ -286,6 +333,8 @@ class DgCore {
     uint8_t pf_kind = 0;        // winpf: 0 = generic / demand, 1 = prior, 2 = l+1
     bool pf_late = false;       // winpf: a demand waited for this prefetch's copies
     uint8_t pf_bucket = 0;      // winpf: the l+1 (votes, rank) bucket
+    uint64_t demand_epoch = 0;  // scored: the epoch of its last demand use (0 = never; place / seed / prefetch: 0)
+    uint64_t lru_stamp = 0;     // scored: the recency list position (unique; larger = nearer the head)
     void* pf_done = nullptr;
   };
   struct Writeback {
@@ -318,6 +367,15 @@ class DgCore {
   bool fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted);
   void apply_wb_defer();
   void issue_prior();  // window_hint's prior prefetches
+  void stamp_room(const char* what) const;  // scored: the stamp counter may take one more phase of pushes
+  void score_history(uint32_t g);           // scored: serve_use's history update of layer g (union saved first)
+  void reset_score();                       // scored: the open state of every table (reset_open)
+  std::vector<uint32_t> score_window(uint32_t g) const;  // the ring's unions in order, each closed by kNone
+  bool cand_less(const ScoreCand& a, const ScoreCand& b) const {
+    if (a.s != b.s) return a.s < b.s;
+    if (a.epoch != b.epoch) return a.epoch < b.epoch;
+    return a.stamp < b.stamp;
+  }
 
   // Captured once by place(), after configuration resolution. No device allocations are replaced at reset.
   DgConfig open_c_;
@@ -377,6 +435,26 @@ class DgCore {
     uint32_t rank, unit;
   };
   std::vector<Cand> cand_, pcand_;
+  // scored eviction, per gated layer: T (uint32 saturating cells, row-major [r][e]), exact uint64 row sums, ring counts
+  // of the last kDgScoreWindow unions, the ring, the previous and this token's union, the ranked candidates
+  struct LayerScore {
+    std::vector<uint32_t> T, open_T;  // open_T: the profile's cells (empty = zeros)
+    std::vector<uint64_t> rowsum;
+    std::vector<uint16_t> cnt;
+    std::vector<uint32_t> ring;       // kDgScoreWindow x max_ids
+    std::vector<uint8_t> ring_len;    // kDgScoreWindow
+    uint32_t ring_head = 0, ring_n = 0;
+    std::vector<uint32_t> prev, cur;  // unique sorted unions (capacity max_ids)
+    uint64_t served = 0;              // the epoch whose union cur holds
+    std::vector<ScoreCand> list;      // capacity min(units, persistent slots)
+    uint64_t list_epoch = 0;          // the epoch it was ranked in (0 = none)
+  };
+  std::vector<LayerScore> sc_;
+  uint64_t epoch_ = 0, stamp_ = 0, open_stamp_ = 0;
+  std::string prov_;
+  std::vector<uint32_t> victims_;
+  std::vector<uint32_t> heap_, heap_pos_;
+  std::function<void()> probe_;
 };
 
 }  // namespace ts

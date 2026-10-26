@@ -111,6 +111,10 @@ void options_defaults(ss_options* o) {
   o->dg_prefetch_per_token = 48;
   o->dg_wait_timeout_ms = 10000;
   o->dg_spare_target = 0xFFFFFFFFu;
+  o->dg_wb_defer = 1;  // adopted on the RTX PRO (exact; 0 keeps the boundary write-backs)
+  o->dg_score_w_trans = 700;
+  o->dg_score_w_freq = 200;
+  o->dg_score_w_recency = 100;
 #if defined(_WIN32)
   o->dg_service_boost = 1;
 #endif
@@ -137,6 +141,8 @@ void winpf_defaults(ss_dg_winpf_params* p) {
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
+  o.reserved2 = 0;
+  o.reserved3 = 0;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller

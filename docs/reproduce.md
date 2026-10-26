@@ -10,14 +10,16 @@ command lines for the model runs. This page covers the library part.
 | Feature | Default | Switch back to the old path |
 |---|---|---|
 | Pipelined startup loader (overlapped reads, staging and device copies, bounded buffers) | on | `DG_LOAD_SERIAL=1` (serial loader) |
-| Deferred, bounded write-backs (`dg_wb_defer`) | off in the library struct; the DeepSeek RTX engine turns it on | engine option `--no-wb-defer`, or `ss_dg_set_sched(c, 0, flush_ready)` between tokens |
+| Deferred, bounded write-backs (`dg_wb_defer`) | on (`ss_options_defaults` sets 1) | `dg_wb_defer = 0` at open, engine option `--no-wb-defer`, or `ss_dg_set_sched(c, 0, flush_ready)` between tokens |
 | Demand-stream flush after each ready (`dg_flush_ready`) | off | `ss_dg_set_sched(c, wb_defer, 1)` |
 | Cache reset to the fresh-load placement (`ss_dg_reset_open`) | API call | not called |
 | Residency snapshot in recency order (`ss_dg_residency`) | API call | not called |
 | Priced window prefetch (`winpf`) | off | exact, but no repeatable gain was measured |
+| Scored eviction (`SS_POLICY_SCORED`) | off (LRU) | opt-in policy; changes only which victims the boundary picks |
 
-The library field stays `0 = off` so that an existing caller's zero-initialised `ss_options` keeps its behaviour;
-the engine sets it.
+`ss_options_defaults` (and the sized variant for older option structs) sets `dg_wb_defer = 1`; a caller that fills
+`ss_options` without it keeps `0`, the immediate boundary write-backs. Both give the same bytes; only the copy
+scheduling differs.
 
 ## Hardware and software used
 
@@ -50,6 +52,11 @@ The cases that cover this release's features: `dg_cuda_wb_defer*` (write-back de
 counters, stopped service), `dg_cuda_load_serial_pipeline` (serial and pipelined loads give the same placement and the
 same bytes), `dg_cuda_reset_open` (the slot table after a reset equals the one at open, with and without deferral), `dg_cuda_flush_ready`
 and the `dg_cuda_winpf*` cases. Each case prints its counters and ends with `PASS` or the failing check.
+
+`dg_cuda_winpf_poison_with_prior_in_flight` cannot stage its premise on a GPU with a single copy engine (the RTX PRO
+under WDDM): the gated prefetch copy blocks the step's own copies, so the failed token only runs to the gate's
+timeout. Expect it to fail there; the close/drain ordering it targets is covered by the CPU tests. Every other case
+must pass.
 
 ## Full-model gates (DeepSeek V4.1 Flash, RTX PRO alone)
 

@@ -16,6 +16,9 @@ using sstest::Fixture;
 
 // Test hook (capi.cpp, not in ss.h): the context's ownership check between forwards.
 extern "C" ss_status ss_test_check_exclusive(ss_ctx* c);
+extern "C" ss_status ss_test_ra_quiesce(ss_ctx* c);
+extern "C" ss_status ss_test_hold_readers(ss_ctx* c, int hold);
+extern "C" ss_status ss_test_inject(ss_ctx* c, int what);
 
 namespace {
 
@@ -59,7 +62,7 @@ std::string tiers_json(std::initializer_list<const char*> tiers) {
 }
 
 bool open_run(Run& r, const Fixture& fx, std::initializer_list<const char*> tiers, ss_policy policy = SS_POLICY_LRU,
-              int spec_persistent = 0) {
+              int spec_persistent = 0, uint32_t discard = 0, uint32_t readahead = 0) {
   CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
   if (!r.d) return false;
   std::string js = tiers_json(tiers);
@@ -71,6 +74,8 @@ bool open_run(Run& r, const Fixture& fx, std::initializer_list<const char*> tier
   r.o.pin_planned = 0;
   r.o.staging_bytes = 64 * 1024;
   r.o.spec_persistent = spec_persistent;
+  r.o.exclusive_discard = discard;
+  r.o.readahead_units = readahead;
   CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
   return r.c != nullptr;
 }
@@ -289,6 +294,317 @@ TEST(exclusive_one_spare_keeps_coverage) {
   x = xstats(z.c);
   CHECK_EQ(x.deferred, uint64_t(2));
   CHECK_EQ(x.writebacks, uint64_t(0));
+}
+
+// exclusive_discard, pinned budget full (no spare fits). Layer 2: residents 0-1, disk 2-3, pinned 4-7. Option off: the
+// misses are deferred to the ring and the resident set never changes. On: the victims past the free blocks are
+// discarded to their files and the misses take their slots; a later fetch of a discarded unit reads its file. Every
+// table entry exact, the ownership invariant after every forward, the blocks keep their count.
+namespace {
+struct DiscardRun {
+  Fixture fx;
+  Run r;
+  explicit DiscardRun(const char* tag, uint32_t discard, uint32_t readahead = 0) : fx(tag) {
+    const uint64_t units = 32 * H1 + 4 * H2 + H3;
+    budget(r.b, units, 1);  // a spare asked, none fits
+    open_run(r, fx, {"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"}, SS_POLICY_LRU, 0, discard, readahead);
+    if (r.c) ss_stats_reset(r.c);
+  }
+  // One forward routing `ids` on layer 2 (host read-ahead of `ahead` first, finished before the routes).
+  void fwd(std::vector<int32_t> ids, std::vector<int32_t> ahead = {}) {
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    if (!ahead.empty()) {
+      CHECK_OK(ss_host_prefetch(r.c, 2, ahead.data(), int(ahead.size())));
+      CHECK_OK(ss_test_ra_quiesce(r.c));
+    }
+    CHECK_OK(ss_layer_routes(r.c, 2, ids.data(), int(ids.size())));
+    ss_layer_view v{};
+    CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+    for (int32_t u : ids) CHECK(same(v, fx, 2, u));
+    CHECK_OK(ss_check_unit(r.c, 2, ids[0]));
+    CHECK_OK(ss_release(r.c, 2, nullptr));
+    CHECK_OK(ss_end(r.c));
+    CHECK_OK(ss_test_check_exclusive(r.c));
+  }
+  ss_layer_stats total() {
+    ss_layer_stats t{};
+    CHECK_OK(ss_stats_total(r.c, &t));
+    return t;
+  }
+};
+}  // namespace
+
+TEST(exclusive_discard_off_keeps_todays_behaviour) {
+  DiscardRun d("x-disc-off", 0);
+  if (!d.r.c) return;
+  for (int k = 0; k < 2; ++k) d.fwd({2, 5});  // both deferred both times: the set never adapts
+  ss_layer_stats t = d.total();
+  CHECK_EQ(t.admitted, uint64_t(0));
+  CHECK_EQ(t.transient, uint64_t(4));
+  CHECK_EQ(t.evicted, uint64_t(0));
+  CHECK_EQ(t.bytes_disk, uint64_t(2 * 8192));
+  CHECK_EQ(t.bytes_pinned, uint64_t(2 * 8192));
+  ss_exclusive_stats x = xstats(d.r.c);
+  CHECK_EQ(x.deferred, uint64_t(4));
+  CHECK_EQ(x.writebacks, uint64_t(0));
+  CHECK_EQ(x.discards, uint64_t(0));
+  CHECK_EQ(x.free_blocks, uint64_t(0));
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(d.r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"discards\":0,"));
+  ss_free(js);
+}
+
+TEST(exclusive_discard_full_budget_adapts) {
+  DiscardRun d("x-disc-on", 1);
+  if (!d.r.c) return;
+  // 2 (disk) and 5 (pinned) are admitted; no block is free: the victims 0, 1 are discarded.
+  d.fwd({2, 5});
+  ss_layer_stats t = d.total();
+  CHECK_EQ(t.admitted, uint64_t(2));
+  CHECK_EQ(t.transient, uint64_t(0));
+  CHECK_EQ(t.evicted, uint64_t(2));
+  CHECK_EQ(t.bytes_disk, uint64_t(8192));
+  CHECK_EQ(t.bytes_pinned, uint64_t(8192));
+  ss_exclusive_stats x = xstats(d.r.c);
+  CHECK_EQ(x.discards, uint64_t(2));
+  CHECK_EQ(x.writebacks, uint64_t(0));
+  CHECK_EQ(x.writeback_bytes, uint64_t(0));
+  CHECK_EQ(x.deferred, uint64_t(0));
+  CHECK_EQ(x.promoted, uint64_t(1));     // 5's block is free now (reusable from the next forward)
+  CHECK_EQ(x.free_blocks, uint64_t(1));
+  // The set adapted: 2 and 5 are hits now.
+  d.fwd({2, 5});
+  t = d.total();
+  CHECK_EQ(t.hits, uint64_t(2));
+  CHECK_EQ(t.bytes_disk, uint64_t(8192));
+  // 0 and 1 are file-homed: read from their files. Victims 2, 5: one free block (5's) takes a write-back, the other
+  // victim is discarded.
+  d.fwd({0, 1});
+  t = d.total();
+  CHECK_EQ(t.bytes_disk, uint64_t(3 * 8192));
+  x = xstats(d.r.c);
+  CHECK_EQ(x.writebacks, uint64_t(1));
+  CHECK_EQ(x.writeback_bytes, uint64_t(8192));
+  CHECK_EQ(x.discards, uint64_t(3));
+  CHECK_EQ(x.deferred, uint64_t(0));
+  CHECK_EQ(x.free_blocks, uint64_t(0));  // layer 2's 4 blocks (its pinned units at open), all owned again
+  CHECK_EQ(t.evicted, x.writebacks + x.discards);
+  // Whatever lives where, the next forwards are exact (written-back from its block, discarded from its file).
+  d.fwd({2, 5});
+  d.fwd({3, 4, 6});  // two slots: two misses admitted (their victims leave), the third from the ring
+  d.fwd({7, 0});
+  t = d.total();
+  x = xstats(d.r.c);
+  CHECK_EQ(t.evicted, x.writebacks + x.discards);
+  CHECK_EQ(t.transient, uint64_t(1));
+  CHECK_EQ(x.deferred, uint64_t(0));
+}
+
+// exclusive_discard over the random decode loop (slots + blocks exactly cover the model, no spare): every demand
+// admission proceeds (speculative ones keep the cap), evictions are write-backs or discards, every byte exact, the
+// invariant after every forward.
+TEST(exclusive_discard_loop) {
+  for (int spec : {0, 1}) {
+    Fixture fx(spec ? "x-disc-loop-spec" : "x-disc-loop");
+    Run r;
+    const uint64_t units = 24 * H1 + 4 * H2 + H3;
+    budget(r.b, units, 1);
+    if (!open_run(r, fx, kCovered, SS_POLICY_LRU, spec, 1)) return;
+    ss_stats_reset(r.c);
+    loop(r, fx, 60, spec != 0, 91);
+    ss_layer_stats t;
+    CHECK_OK(ss_stats_total(r.c, &t));
+    ss_exclusive_stats x = xstats(r.c);
+    CHECK(x.discards > 0);
+    if (!spec) CHECK_EQ(x.deferred, uint64_t(0));  // speculative admissions keep the cap: only they may defer
+    CHECK_EQ(t.evicted, x.writebacks + x.discards);
+    CHECK(t.bytes_disk > 0);  // discarded units come back from their files
+  }
+}
+
+// A discarded unit is file-homed: host read-ahead takes it, and its admission lands from the buffer (the landing's
+// victim is discarded too: no write-back to wait for).
+TEST(exclusive_discard_then_readahead) {
+  DiscardRun d("x-disc-ra", 1, 2);
+  if (!d.r.c) return;
+  d.fwd({2, 3});  // victims 0, 1 discarded
+  d.fwd({0, 1}, {0, 1});
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(d.r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"landed\":2,"));
+  ss_free(js);
+  ss_layer_stats t = d.total();
+  CHECK_EQ(t.bytes_disk, uint64_t(4 * 8192));  // 2, 3 by ordinary reads; 0, 1 once each by their read-ahead
+  ss_exclusive_stats x = xstats(d.r.c);
+  CHECK_EQ(x.discards, uint64_t(4));
+  CHECK_EQ(x.writebacks, uint64_t(0));
+}
+
+// exclusive_discard refused with a descriptor whose tiers are "pinned" (its units must not live on disk); a speculative
+// admission keeps the cap under discard (a guess defers, never discards).
+TEST(exclusive_discard_refusal_and_speculative_cap) {
+  Fixture fx("x-disc-refuse");
+  std::string pinned_only = fx.json;
+  const std::string from = "\"tiers\":\"pinned|disk\"";
+  const size_t at = pinned_only.find(from);
+  CHECK(at != std::string::npos);
+  if (at == std::string::npos) return;
+  pinned_only.replace(at, from.size(), "\"tiers\":\"pinned\"");
+  Run r;
+  CHECK_OK(ss_desc_from_json(pinned_only.data(), pinned_only.size(), &r.d));
+  if (!r.d) return;
+  budget(r.b, 4 << 20, 0);
+  std::string js = tiers_json(kCovered);
+  CHECK_OK(ss_plan_from_json(r.d, &r.b, js.data(), js.size(), &r.p));
+  if (!r.p) return;
+  ss_options_defaults(&r.o);
+  r.o.pin_planned = 0;
+  r.o.exclusive_discard = 1;
+  CHECK_EQ(int(ss_open(r.d, &r.b, r.p, &r.o, &r.c)), int(SS_E_INVALID));
+  CHECK(std::strstr(ss_last_error(), "exclusive_discard") != nullptr);
+  CHECK(r.c == nullptr);
+  r.o.exclusive_discard = 0;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  // Speculative cap: full budget (no free block), spec_persistent, discard on. A speculative prefetch of 5 defers (no
+  // victim discarded, 5 goes to the ring); the demand routes then admit 6, discarding a victim.
+  Fixture fs("x-disc-spec");
+  Run s;
+  budget(s.b, 32 * H1 + 4 * H2 + H3, 1);
+  if (!open_run(s, fs, {"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"}, SS_POLICY_LRU, 1, 1)) return;
+  CHECK_OK(ss_begin(s.c, nullptr, 0));
+  int32_t five[1] = {5};
+  CHECK_OK(ss_prefetch(s.c, 2, five, 1, SS_PREFETCH_SPECULATIVE));
+  ss_exclusive_stats x = xstats(s.c);
+  CHECK_EQ(x.deferred, uint64_t(1));
+  CHECK_EQ(x.discards, uint64_t(0));
+  int32_t ids[2] = {5, 6};
+  CHECK_OK(ss_layer_routes(s.c, 2, ids, 2));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(s.c, 2, nullptr, &v));
+  CHECK(same(v, fs, 2, 5) && same(v, fs, 2, 6));
+  CHECK_OK(ss_release(s.c, 2, nullptr));
+  CHECK_OK(ss_end(s.c));
+  CHECK_OK(ss_test_check_exclusive(s.c));
+  x = xstats(s.c);
+  CHECK_EQ(x.deferred, uint64_t(1));
+  CHECK_EQ(x.discards, uint64_t(1));
+}
+
+// A speculative persistent admission (spec_persistent) of a unit with a Ready read-ahead entry abandons it and reads
+// the file (speculation stays off the buffers, as in the ring): landed 0, unused 1, the file read twice.
+TEST(exclusive_spec_persistent_abandons_readahead) {
+  Fixture fx("x-spec-ra");
+  Run r;
+  budget(r.b, 4 << 20, 0);
+  if (!open_run(r, fx, {"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"}, SS_POLICY_LRU, 1, 0, 2)) return;
+  ss_stats_reset(r.c);
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t two[1] = {2};
+  CHECK_OK(ss_host_prefetch(r.c, 2, two, 1));
+  CHECK_OK(ss_test_ra_quiesce(r.c));  // Ready
+  CHECK_OK(ss_prefetch(r.c, 2, two, 1, SS_PREFETCH_SPECULATIVE));  // admitted (0 written back), the entry abandoned
+  CHECK_OK(ss_layer_routes(r.c, 2, two, 1));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+  CHECK(same(v, fx, 2, 2));
+  CHECK_OK(ss_check_unit(r.c, 2, 2));
+  CHECK_OK(ss_release(r.c, 2, nullptr));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"landed\":0,") && std::strstr(js, "\"unused\":1}"));
+  ss_free(js);
+  ss_layer_stats t;
+  CHECK_OK(ss_stats_total(r.c, &t));
+  CHECK_EQ(t.spec_used, uint64_t(1));
+  CHECK_EQ(t.bytes_disk, uint64_t(2 * 8192));  // the read-ahead read and the ordinary read
+  CHECK_EQ(xstats(r.c).writebacks, uint64_t(1));
+}
+
+// Failures of a persistent landing (exclusive, into a written-back victim's slot): the read fails with the landing
+// parked on it (5, readers held), the landing copy fails before any copy (3) or after its first piece (4, the buffer
+// quarantined). The forward fails, the unit is dropped (file-homed), the victim lives in its block, the next forward
+// is exact.
+TEST(exclusive_persistent_landing_failures) {
+  for (int inj : {5, 3, 4}) {
+    Fixture fx(std::string("x-land-fail-") + std::to_string(inj));
+    Run r;
+    budget(r.b, 4 << 20, 0);
+    if (!open_run(r, fx, {"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"}, SS_POLICY_LRU, 0, 0, 2)) return;
+    ss_stats_reset(r.c);
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    int32_t two[1] = {2};
+    if (inj == 5) {  // parked: the read is still queued when the slot is given
+      CHECK_OK(ss_test_hold_readers(r.c, 1));
+      CHECK_OK(ss_host_prefetch(r.c, 2, two, 1));
+      CHECK_OK(ss_test_inject(r.c, 5));
+      CHECK_OK(ss_layer_routes(r.c, 2, two, 1));
+      CHECK_OK(ss_test_hold_readers(r.c, 0));
+    } else {  // Ready
+      CHECK_OK(ss_host_prefetch(r.c, 2, two, 1));
+      CHECK_OK(ss_test_ra_quiesce(r.c));
+      CHECK_OK(ss_test_inject(r.c, inj));
+      CHECK_OK(ss_layer_routes(r.c, 2, two, 1));
+    }
+    ss_layer_view v{};
+    CHECK_EQ(int(ss_acquire(r.c, 2, nullptr, &v)), int(SS_E_IO));
+    CHECK(ss_end(r.c) != SS_OK);
+    CHECK_OK(ss_test_check_exclusive(r.c));
+    CHECK_EQ(xstats(r.c).writebacks, uint64_t(1));
+    // 2 was dropped (not resident): fetched again; 0 comes back from its block.
+    CHECK_OK(ss_begin(r.c, nullptr, 0));
+    int32_t ids[2] = {0, 2};
+    CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));
+    CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+    CHECK(same(v, fx, 2, 0) && same(v, fx, 2, 2));
+    CHECK_OK(ss_check_unit(r.c, 2, 2));
+    CHECK_OK(ss_release(r.c, 2, nullptr));
+    CHECK_OK(ss_end(r.c));
+    CHECK_OK(ss_test_check_exclusive(r.c));
+    ss_layer_stats t;
+    CHECK_OK(ss_stats_total(r.c, &t));
+    CHECK_EQ(t.hits, uint64_t(0));  // 2 did not stay resident after its failed landing
+  }
+}
+
+// ABI: an old caller's ss_options (struct_size up to dg_flush_ready) with garbage after it: exclusive_discard reads as
+// 0, so a full pinned budget defers as before.
+TEST(exclusive_discard_old_options_read_as_off) {
+  static_assert(offsetof(ss_options, exclusive_discard) == offsetof(ss_options, dg_prior) + sizeof(const void*),
+                "exclusive_discard is the first field after the window-prefetch prior: the old struct ends there");
+  const uint32_t old_size = uint32_t(offsetof(ss_options, exclusive_discard));
+  Fixture fx("x-disc-abi");
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  if (!r.d) return;
+  budget(r.b, 32 * H1 + 4 * H2 + H3, 1);
+  std::string js = tiers_json({"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"});
+  CHECK_OK(ss_plan_from_json(r.d, &r.b, js.data(), js.size(), &r.p));
+  if (!r.p) return;
+  unsigned char raw[sizeof(ss_options)];
+  std::memset(raw, 0xA5, sizeof raw);
+  ss_options_defaults_sized(reinterpret_cast<ss_options*>(raw), old_size);
+  ss_options* old = reinterpret_cast<ss_options*>(raw);
+  CHECK_EQ(old->struct_size, old_size);
+  CHECK_EQ(old->exclusive_discard, 0xA5A5A5A5u);  // untouched: past the caller's struct
+  old->verify_hash = 1;
+  old->pin_planned = 0;
+  old->staging_bytes = 64 * 1024;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, old, &r.c));
+  if (!r.c) return;
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t ids[2] = {2, 5};
+  CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+  CHECK(same(v, fx, 2, 2) && same(v, fx, 2, 5));
+  CHECK_OK(ss_release(r.c, 2, nullptr));
+  CHECK_OK(ss_end(r.c));
+  ss_exclusive_stats x = xstats(r.c);
+  CHECK_EQ(x.deferred, uint64_t(2));
+  CHECK_EQ(x.discards, uint64_t(0));
 }
 
 // Certain prefetch of layer 2 evicts resident 0 (LRU, lowest id), then layer 2's routes route 0: it is read back from

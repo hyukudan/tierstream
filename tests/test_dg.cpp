@@ -5,7 +5,10 @@
 // bytes and that no copy lands in a slot while a layer reads it. check() runs after every service step. Each
 // mutation of the core must be caught.
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -17,6 +20,7 @@
 
 #include "check.hpp"
 #include "dg_core.hpp"
+#include "dg_score.hpp"
 #include "errors.hpp"
 
 using ts::DgConfig;
@@ -271,7 +275,136 @@ struct Shape {
   uint32_t max_rows = 0, top_k = 0, predict_k = 0;
   bool revert = true;
   uint32_t prior_window_us = 1500;
+  // scored eviction: every boundary checked against the brute-force oracle below; vary = random keep lists and spare
+  // targets between tokens (their own random stream)
+  bool scored = false;
+  bool vary = false;
 };
+
+// Scored eviction's exhaustive boundary oracle (design scored.md 8.3, 8.5, 10): its own history (transition counts
+// saturating at 2^32 - 1, the last 16 unions, demand epochs) from the routes the run serves, row sums and ring counts
+// recounted from scratch, every eligible unit scored and fully sorted by (score, demand epoch, recency stamp), then the
+// acceptance rule (free + pending + accepted < target, a free block per victim, nothing after the first shortage) and
+// the pressure override from the most recent unit. It reads only the cache's homes, write-back flags, recency stamps,
+// free slots / blocks, pending write-backs and target at the boundary (the same state), never a score or a list.
+struct Oracle {
+  std::vector<uint32_t> units, base;
+  std::vector<std::vector<uint64_t>> T;
+  std::vector<std::deque<std::vector<uint32_t>>> ring;
+  std::vector<std::vector<uint32_t>> cur;
+  std::vector<uint64_t> epoch_of;
+  uint64_t epoch = 0;
+  uint64_t wt = 700, wf = 200, wr = 100;
+  struct Expect {
+    std::vector<uint32_t> victims;
+    bool short_blocks = false;
+    bool armed = false;
+  };
+  explicit Oracle(const std::vector<uint32_t>& u) : units(u) {
+    base.push_back(0);
+    for (uint32_t n : u) base.push_back(base.back() + n);
+    for (uint32_t n : u) T.emplace_back(size_t(n) * n, 0);
+    ring.resize(u.size());
+    cur.resize(u.size());
+    epoch_of.assign(base.back(), 0);
+  }
+  void reset() {
+    for (auto& t : T) std::fill(t.begin(), t.end(), 0);
+    for (auto& r : ring) r.clear();
+    for (auto& c : cur) c.clear();
+    std::fill(epoch_of.begin(), epoch_of.end(), 0);
+    epoch = 0;
+  }
+  void begin() { ++epoch; }
+  void serve(uint32_t g, const uint32_t* ids, uint32_t n) {
+    std::vector<uint32_t> u(ids, ids + n);
+    std::sort(u.begin(), u.end());
+    u.erase(std::unique(u.begin(), u.end()), u.end());
+    for (uint32_t r : cur[g])  // cur still holds the previous token's union of g
+      for (uint32_t e : u)
+        if (T[g][size_t(r) * units[g] + e] < 0xFFFFFFFFull) ++T[g][size_t(r) * units[g] + e];
+    ring[g].push_back(u);
+    if (ring[g].size() > 16) ring[g].pop_front();
+    cur[g] = u;
+    for (uint32_t e : u) epoch_of[base[g] + e] = epoch;
+  }
+  uint64_t score(uint32_t k) const {
+    uint32_t g = 0;
+    while (base[g + 1] <= k) ++g;
+    const uint32_t e = k - base[g], n = units[g];
+    uint64_t N = 0, D = 0;
+    for (uint32_t r : cur[g]) {
+      N += T[g][size_t(r) * n + e];
+      for (uint32_t j = 0; j < n; ++j) D += T[g][size_t(r) * n + j];
+    }
+    uint64_t c = 0;
+    for (const auto& un : ring[g]) c += std::count(un.begin(), un.end(), e) ? 1 : 0;
+    const uint64_t P = ((uint64_t(cur[g].size()) * N) << 16) / (D ? D : 1);
+    return wt * P + wf * ((c << 16) / 16) + wr * ((uint64_t(1) << 16) / (1 + epoch - epoch_of[k]));
+  }
+  // by_lru: the fallback order (recency tail first)
+  Expect boundary(const DgCore& c, const std::vector<uint32_t>& keep, uint32_t pressure_recent, bool by_lru) const {
+    Expect x;
+    x.armed = true;
+    auto elig = [&](uint32_t k) {
+      return c.home(k) == DgCore::Home::Device && !c.wb_pending(k) &&
+             std::find(keep.begin(), keep.end(), k) == keep.end();
+    };
+    struct C {
+      uint64_t s, ep, st;
+      uint32_t k;
+    };
+    // recency: the scored core's stamps; under LRU (no stamps) the positions of the recency list
+    std::vector<uint64_t> pos;
+    if (!c.scored()) {
+      pos.assign(c.keys(), 0);
+      const std::vector<uint32_t> r = c.residency();  // device homes, most recent first
+      for (size_t i = 0; i < r.size(); ++i) pos[r[i]] = uint64_t(r.size() - i);
+    }
+    std::vector<C> all;
+    for (uint32_t k = 0; k < c.keys(); ++k)
+      if (elig(k))
+        all.push_back({by_lru ? 0 : score(k), by_lru ? 0 : epoch_of[k], c.scored() ? c.lru_stamp(k) : pos[k], k});
+    std::sort(all.begin(), all.end(), [](const C& a, const C& b) {
+      return a.s != b.s ? a.s < b.s : a.ep != b.ep ? a.ep < b.ep : a.st < b.st;
+    });
+    const size_t base_n = c.free_slots() + c.pending_writebacks();
+    size_t blocks = c.free_blocks();
+    for (const C& a : all) {
+      if (base_n + x.victims.size() >= c.spare_target()) break;
+      if (!blocks) {
+        x.short_blocks = true;
+        break;
+      }
+      --blocks;
+      x.victims.push_back(a.k);
+    }
+    if (pressure_recent && !x.short_blocks) {
+      std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.st > b.st; });
+      uint32_t n = 0;
+      for (const C& a : all) {
+        if (n >= pressure_recent) break;
+        if (std::find(x.victims.begin(), x.victims.end(), a.k) != x.victims.end()) continue;
+        if (!blocks) {
+          x.short_blocks = true;
+          break;
+        }
+        --blocks;
+        x.victims.push_back(a.k);
+        ++n;
+      }
+    }
+    return x;
+  }
+};
+
+// What the scored runs exercised at their boundaries (the oracle's coverage).
+struct OracleCoverage {
+  uint64_t boundaries = 0, victims = 0, unsubmitted = 0, partial = 0, recorded = 0, wb_pending_skipped = 0;
+  uint64_t kept_skipped = 0, short_boundaries = 0, pressure_boundaries = 0, target_changes = 0, coming_at_score = 0;
+  uint64_t lru_boundaries = 0, fallbacks = 0;
+};
+OracleCoverage g_cov;
 
 struct Outcome {
   std::string violation;
@@ -352,6 +485,7 @@ void reset_compare(DgCore& core, Scripted& t, const DgConfig& c, const std::vect
           x.serve_prediction(g + 1, &pred, 1, 1, tok % 3 == 0);
         }
         x.issue_writebacks(g, [] { return false; });
+        x.score_layer(g);
         tr.sync(DgTransport::kDem);
       }
       x.end_token({});
@@ -389,8 +523,12 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.wb_on_d2h = sh.on_d2h;
   c.wb_layer_bytes = sh.wb_bytes;
   c.wb_max_outstanding = sh.wb_out;
+  c.scored = sh.scored;
   Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks, G, seed, &v);
   t.set_slow_d2h(sh.slow_d2h);
+  Oracle orc(sh.units);
+  std::mt19937_64 vr(seed * 1000003u + 17u);  // scored runs: keep lists and targets (not the scheduler's stream)
+  std::vector<uint32_t> keep;
   try {
     DgCore core(c, &t);
     core.set_mutation(mutation);
@@ -470,7 +608,16 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         core.set_wb_defer(!core.wb_defer());
         core.check();
       }
+      keep.clear();
+      if (sh.vary) {
+        if (vr() % 4 == 0) {
+          core.set_spare_target(uint32_t(vr() % (sh.spare + 1)));
+          ++g_cov.target_changes;
+        }
+        for (uint32_t i = 0, n = uint32_t(vr() % 6); i < n; ++i) keep.push_back(uint32_t(vr() % keys));
+      }
       core.begin_token(seq);
+      orc.begin();
       std::vector<uint32_t> pred;
       for (uint32_t g = 0; g < G && v.what.empty(); ++g) {
         // export: the ids, the miss bits from the published table; a hit's slot must already hold its bytes
@@ -487,6 +634,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         }
         t.steps(jitter);
         core.serve(g, ids.data(), n, mask);
+        if (sh.scored) orc.serve(g, ids.data(), n);
         core.check();
         t.steps(jitter);
         // the prediction for g + 1 (from the graph), served after the demand
@@ -504,6 +652,9 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         // ahead: the next export was already seen). Never called without a deferred record (no draw without defer).
         core.issue_writebacks(g, [&] { return rng() % 4 == 0; });
         core.check();
+        core.score_layer(g);  // scored eviction: layer g ranked after its write-back slice (nothing under LRU)
+        if (sh.scored)
+          for (const auto& cd : core.score_list(g)) g_cov.coming_at_score += core.home(cd.key) == DgCore::Home::Coming;
         // wait: only if a miss; ready must come
         if (mask)
           while (int32_t(t.ready(g) - seq) < 0)
@@ -532,7 +683,48 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
       }
       // the end edge, then the boundary: the table is uploaded before any write-back is issued (design rev 3.4 §11.4)
       t.clear_issued();
-      core.end_token({});
+      // the oracle at every boundary: scored runs always (also under a mutation it must catch), LRU runs without a
+      // mutation (the recency order; the LRU mutation counts above stay those of the cache invariants and the model)
+      Oracle::Expect want;
+      const uint64_t short0 = core.stats().evict_short, fb0 = core.stats().score_fallbacks;
+      bool lists_ok = true;
+      const bool probed = sh.scored || mutation == DgCore::kNoMutation;
+      if (!sh.scored && probed)
+        core.set_boundary_probe([&] {
+          want = orc.boundary(core, keep, sh.pressure_recent, true);
+          ++g_cov.lru_boundaries;
+        });
+      if (sh.scored)
+        core.set_boundary_probe([&] {
+          // a list not tagged with this token (only a skipped-rank fault leaves one): the recency order, counted
+          for (uint32_t g = 0; g < G; ++g) lists_ok = lists_ok && core.score_list_epoch(g) == core.epoch();
+          want = orc.boundary(core, keep, sh.pressure_recent, !lists_ok);
+          ++g_cov.boundaries;
+          const size_t dfr = core.deferred(), part = core.deferred_parts_issued() ? 1 : 0;
+          g_cov.unsubmitted += dfr > part;
+          g_cov.partial += part;
+          g_cov.recorded += core.pending_writebacks() > dfr;
+          for (uint32_t k = 0; k < keys; ++k) {
+            const bool dev = core.home(k) == DgCore::Home::Device;
+            g_cov.wb_pending_skipped += dev && core.wb_pending(k);
+            g_cov.kept_skipped += dev && std::find(keep.begin(), keep.end(), k) != keep.end();
+          }
+        });
+      core.end_token(keep);
+      if (probed) {
+        core.set_boundary_probe(nullptr);
+        if (!want.armed || core.last_victims() != want.victims)
+          v.set("boundary " + std::to_string(tok) + ": victims differ from the oracle's (" +
+                std::to_string(core.last_victims().size()) + " vs " + std::to_string(want.victims.size()) + ")");
+        if ((core.stats().evict_short - short0 != 0) != want.short_blocks) v.set("boundary: evict_short");
+      }
+      if (sh.scored) {
+        g_cov.victims += core.last_victims().size();
+        g_cov.short_boundaries += want.short_blocks;
+        g_cov.pressure_boundaries += sh.pressure_recent != 0;
+        if ((core.stats().score_fallbacks != fb0) == lists_ok) v.set("scored boundary: fallback != invalid lists");
+        g_cov.fallbacks += !lists_ok;
+      }
       {
         const auto& is = t.issued();
         const auto up = std::find(is.begin(), is.end(), Scripted::Upload);
@@ -1525,7 +1717,7 @@ TEST(dg_defer_drain) {
   CHECK(m->homes_ok());
 }
 
-// ---- winpf: deterministic edges (review finding 6) ----
+// ---- winpf: deterministic edges ----
 namespace {
 
 // A prior for gated layer 0: symbol s -> units {s, s + 1} with P(used) 0.9 / 0.8.
@@ -1894,4 +2086,795 @@ TEST(dg_reset_open_unconsumed_prior) {
   CHECK(m.core->home(10) == DgCore::Home::Coming);
   // No synthetic token/end boundary: copies and source/event ownership are reset directly.
   reset_compare(*m.core, *m.t, m.c, order, m.v, 0);
+}
+
+// ---- scored eviction (docs/design.md §3.8; design scored.md sections 8-10) ----
+namespace {
+
+// Every model shape with scored eviction on, random keep lists and spare targets, deferral (on, toggled), fewer spare
+// blocks than spare slots (shortage), and the window-prefetch shapes (prior copies Coming at their layer's ranking).
+std::vector<Shape> scored_shapes() {
+  std::vector<Shape> v;
+  for (const Shape* sh : kShapes) {
+    Shape a = *sh;
+    a.scored = true;
+    a.vary = true;
+    v.push_back(a);
+    if (!a.winpf) {
+      a.defer = true;
+      v.push_back(a);
+      a.toggle_defer = true;
+      a.slow_d2h = true;
+      v.push_back(a);
+    }
+  }
+  Shape s = kPredictPressure;  // 3 spare blocks for 16 spare slots: boundaries run short
+  s.host_spares = 3;
+  s.scored = true;
+  s.vary = true;
+  v.push_back(s);
+  s.defer = true;
+  v.push_back(s);
+  return v;
+}
+
+// A small core for the deterministic cases: gated layers of `units`, the first `residents` keys (or `order`) on the
+// device, `spares` spare slots (the target) and as many spare blocks.
+struct Solo {
+  Violation v;
+  DgConfig c;
+  std::unique_ptr<Scripted> t;
+  std::unique_ptr<DgCore> core;
+  uint32_t seq = 0;
+  Solo(const std::vector<uint32_t>& units, uint32_t residents, uint32_t spares, bool scored, uint32_t max_ids = 64) {
+    uint32_t keys = 0;
+    for (uint32_t u : units) keys += u;
+    c.n_units = units;
+    c.persistent_slots = residents + spares;
+    c.bank_slots = max_ids;
+    c.blocks = keys - residents + spares;
+    c.spare_target = spares;
+    c.prefetch_reserve = 0;
+    c.scored = scored;
+    c.max_ids = max_ids;
+    t = std::make_unique<Scripted>(keys, c.persistent_slots + 2 * c.bank_slots, c.blocks, uint32_t(units.size()), 5, &v);
+    core = std::make_unique<DgCore>(c, t.get());
+    core->place(keys_in_order(residents));
+    for (uint32_t k = 0; k < keys; ++k) {
+      if (core->slot_of(k) >= 0) t->fill_slot(core->slot_of(k), int32_t(k));
+      if (core->block_of(k) >= 0) t->fill_block(core->block_of(k), int32_t(k));
+    }
+    t->set_table(core->table());
+  }
+  void begin() { core->begin_token(++seq); }
+  void serve(uint32_t g, const std::vector<uint32_t>& ids, bool rank = true) {
+    uint64_t m = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+      if (t->entry(core->key(g, ids[i])) < 0) m |= 1ull << i;
+    core->serve(g, ids.data(), uint32_t(ids.size()), m);
+    if (rank) core->score_layer(g);
+  }
+  void end() {
+    core->end_token({});
+    t->drain_all();
+    core->check();
+  }
+};
+
+std::string fake_identity(const std::vector<uint32_t>& units, uint64_t salt, std::vector<std::vector<uint64_t>>& h) {
+  h.assign(units.size(), {});
+  std::vector<ts::DgScoreIdLayer> l;
+  for (size_t g = 0; g < units.size(); ++g) {
+    for (uint32_t u = 0; u < units[g]; ++u) h[g].push_back(salt * 1000003u + g * 977u + u);
+    l.push_back({uint32_t(g), units[g], 8192, &h[g]});
+  }
+  return ts::dg_score_identity(l);
+}
+
+template <class F>
+std::string error_of(F f, ss_status want) {
+  try {
+    f();
+  } catch (const ts::Error& e) {
+    return e.status() == want ? std::string(e.what()) : std::string("wrong status: ") + e.what();
+  }
+  return "no error";
+}
+
+}  // namespace
+
+// Every boundary of every scored run equals the oracle's brute-force choice (victims and their order, shortage, no
+// fallback), across deferred unsubmitted / partly submitted / recorded write-backs, resurrections and collections after
+// a layer was ranked, prefetched and prior units Coming at ranking, keep lists, changing targets, shortage, pressure.
+TEST(dg_scored_oracle_runs) {
+  g_cov = OracleCoverage{};
+  ts::DgStats sum{};
+  int runs = 0;
+  for (const Shape& sh : scored_shapes())
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+      Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+      if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+      ++runs;
+      sum.resurrected += o.st.resurrected;
+      sum.collected_mid += o.st.collected_mid;
+      sum.wb_cancelled += o.st.wb_cancelled;
+      sum.scored_victims += o.st.scored_victims;
+      sum.score_fallbacks += o.st.score_fallbacks;
+      sum.bank_serves += o.st.bank_serves;
+    }
+  const OracleCoverage& c = g_cov;
+  std::printf("  %d runs, %llu boundaries, %llu victims (%llu in score order), deferred unsubmitted %llu / partial %llu / "
+              "recorded %llu, wb_pending skipped %llu, kept skipped %llu, short %llu, pressure %llu, target changes "
+              "%llu, coming at ranking %llu, resurrected %llu, mid-token collects %llu, cancelled %llu\n",
+              runs, (unsigned long long)c.boundaries, (unsigned long long)c.victims,
+              (unsigned long long)sum.scored_victims, (unsigned long long)c.unsubmitted, (unsigned long long)c.partial,
+              (unsigned long long)c.recorded, (unsigned long long)c.wb_pending_skipped,
+              (unsigned long long)c.kept_skipped, (unsigned long long)c.short_boundaries,
+              (unsigned long long)c.pressure_boundaries, (unsigned long long)c.target_changes,
+              (unsigned long long)c.coming_at_score, (unsigned long long)sum.resurrected,
+              (unsigned long long)sum.collected_mid, (unsigned long long)sum.wb_cancelled);
+  CHECK_EQ(sum.score_fallbacks, 0ull);
+  for (uint64_t x : {c.unsubmitted, c.partial, c.recorded, c.wb_pending_skipped, c.kept_skipped, c.short_boundaries,
+                     c.pressure_boundaries, c.target_changes, c.coming_at_score, sum.resurrected, sum.collected_mid,
+                     sum.wb_cancelled, sum.scored_victims})
+    CHECK(x > 0);
+}
+
+// Faults the oracle (or the cache invariants) must catch: a victim with a write-back in flight, a kept unit evicted,
+// a list re-tagged without being re-ranked, ranking from the shared scratch after the prediction overwrote it.
+TEST(dg_scored_mutations_caught) {
+  const struct {
+    int m;
+    const char* name;
+  } muts[] = {{DgCore::kReevictPending, "scored: re-evict with a pending write-back"},
+              {DgCore::kIgnoreKeep, "scored: keep list ignored"},
+              {DgCore::kStaleList, "scored: stale list used"},
+              {DgCore::kNoUnionSave, "scored: union read after the prediction"}};
+  for (const auto& mu : muts) {
+    int caught = 0, runs = 0;
+    for (const Shape& sh : scored_shapes())
+      for (uint64_t seed = 1; seed <= 3; ++seed) {
+        ++runs;
+        if (!run(sh, 40, seed, mu.m).violation.empty()) ++caught;
+      }
+    std::printf("  %-44s caught in %d/%d runs\n", mu.name, caught, runs);
+    CHECK(caught > 0);
+  }
+}
+
+// A layer left unranked now and then (an internal fault the guard exists for): those boundaries fall back to the
+// recency order and count it, and the oracle, expecting the recency order there, still sees no mismatch.
+TEST(dg_scored_skipped_rank_falls_back) {
+  g_cov = OracleCoverage{};
+  uint64_t fallbacks = 0;
+  for (const Shape& sh : scored_shapes())
+    for (uint64_t seed = 1; seed <= 2; ++seed) {
+      Outcome o = run(sh, 40, seed, DgCore::kSkipRank);
+      if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+      fallbacks += o.st.score_fallbacks;
+    }
+  std::printf("  %llu fallbacks, all matched by the oracle\n", (unsigned long long)fallbacks);
+  CHECK(fallbacks > 0);
+  CHECK_EQ(fallbacks, g_cov.fallbacks);
+}
+
+// The oracle also checks every boundary of the LRU runs (no mutation): exact victims in the recency order, shortage.
+TEST(dg_lru_oracle_runs) {
+  g_cov = OracleCoverage{};
+  for (const Shape* sh : kShapes)
+    for (uint64_t seed = 1; seed <= 4; ++seed) {
+      Shape a = *sh;
+      a.defer = seed % 2 == 0;
+      Outcome o = run(a, 40, seed, DgCore::kNoMutation);
+      if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+    }
+  std::printf("  %llu LRU boundaries matched\n", (unsigned long long)g_cov.lru_boundaries);
+  CHECK(g_cov.lru_boundaries > 0);
+}
+
+// ss_dg_reset_open with scored eviction: the learning state goes back to the open blueprint (empty tables, epoch 0,
+// the open stamps) with everything else; the reset core then decides exactly as a fresh one.
+TEST(dg_scored_reset_open_randomized) {
+  int runs = 0;
+  for (const Shape& sh : scored_shapes())
+    for (uint64_t seed = 1; seed <= 2; ++seed) {
+      Outcome o = run(sh, 12 + int(seed) * 7, seed, DgCore::kNoMutation, 6, true);
+      if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+      ++runs;
+    }
+  std::printf("  %d reset histories\n", runs);
+}
+
+// Invalid score metadata after a successful token (a layer left unranked): that boundary takes the recency order into
+// the same acceptance loop and counts a fallback; the next token is scored again.
+TEST(dg_scored_fallback_on_missing_list) {
+  Solo s({16, 16, 16}, 16, 4, true, 8);
+  s.begin();
+  s.serve(0, {0, 1});
+  s.serve(1, {0, 1, 2, 3, 4});  // 4 into the spares, one bank serve
+  s.serve(2, {0}, false);       // served, never ranked
+  std::vector<std::pair<uint64_t, uint32_t>> dev;
+  for (uint32_t k = 0; k < s.core->keys(); ++k)
+    if (s.core->home(k) == DgCore::Home::Device || s.core->home(k) == DgCore::Home::Coming)
+      dev.push_back({s.core->lru_stamp(k), k});
+  std::sort(dev.begin(), dev.end());
+  s.end();
+  CHECK_EQ(s.core->stats().score_fallbacks, 1ull);
+  CHECK_EQ(s.core->stats().scored_victims, 0ull);
+  std::vector<uint32_t> want;
+  for (size_t i = 0; i < 4; ++i) want.push_back(dev[i].second);
+  CHECK(s.core->last_victims() == want);
+  s.begin();
+  for (uint32_t g = 0; g < 3; ++g) s.serve(g, {5, 6, 7});
+  s.end();
+  CHECK_EQ(s.core->stats().score_fallbacks, 1ull);
+  CHECK(s.core->stats().scored_victims > 0);
+  CHECK(s.v.what.empty());
+}
+
+// The epoch starts at 1 and moves once per token; a demand use sets the unit's epoch, a prefetch does not; the list
+// holds the device and coming units of the layer in (score, epoch, stamp) order with the exact integer scores; the
+// transition counts pair the previous token's union with this one; the ring holds 16 unions.
+TEST(dg_scored_epochs_history_order) {
+  Solo s({8, 8}, 8, 4, true, 8);
+  CHECK_EQ(s.core->epoch(), 0ull);
+  s.begin();
+  CHECK_EQ(s.core->epoch(), 1ull);
+  s.serve(0, {3, 1, 3});
+  s.core->serve_prediction(1, std::vector<uint32_t>{5}.data(), 1);
+  s.serve(1, {2});
+  CHECK_EQ(s.core->demand_epoch(1), 1ull);
+  CHECK_EQ(s.core->demand_epoch(3), 1ull);
+  CHECK_EQ(s.core->demand_epoch(0), 0ull);
+  CHECK_EQ(s.core->demand_epoch(8 + 5), 0ull);  // prefetched, not used
+  std::vector<uint32_t> keys;
+  for (const auto& c : s.core->score_list(0)) keys.push_back(c.key);
+  CHECK(keys == std::vector<uint32_t>({7, 6, 5, 4, 2, 0, 1, 3}));  // unused (epoch 0, place order), then 1, 3
+  const auto& l0 = s.core->score_list(0);
+  CHECK_EQ(l0.front().s, 100ull * 32768);                // P = 0 (empty table), F = 0, Rec = 1/2
+  CHECK_EQ(l0.back().s, 200ull * 4096 + 100ull * 65536);  // F = 1/16, Rec = 1
+  bool coming = false;
+  for (const auto& c : s.core->score_list(1)) coming = coming || c.key == 8 + 5;
+  CHECK(coming);  // a Coming prefetch is a candidate (eligibility is the boundary's)
+  CHECK_EQ(s.core->score_list_epoch(1), 1ull);
+  s.end();
+  s.begin();
+  s.serve(0, {1});
+  s.serve(1, {2});
+  CHECK_EQ(s.core->score_cell(0, 1, 1), 1u);
+  CHECK_EQ(s.core->score_cell(0, 3, 1), 1u);
+  CHECK_EQ(s.core->score_rowsum(0, 3), 1ull);
+  CHECK_EQ(s.core->score_cell(1, 2, 2), 1u);
+  s.end();
+  for (int i = 0; i < 18; ++i) {
+    s.begin();
+    s.serve(0, {0});
+    s.serve(1, {2});
+    s.end();  // check(): ring counts == their recount
+  }
+  // key 0: F = 16/16, Rec = 1, P = |cur| N / D = 1 (every row-0 count went to 0)
+  for (const auto& c : s.core->score_list(0))
+    if (c.key == 0) CHECK_EQ(c.s, 700ull * 65536 + 200ull * 65536 + 100ull * 65536);
+  CHECK(s.v.what.empty());
+}
+
+// The profile format end to end: written, loaded (cells, exact row sums, provenance), restored by reset_open; every
+// malformed or mismatched file refused with SS_E_INVALID before any cell is read.
+TEST(dg_scored_profile_roundtrip_and_refusals) {
+  const std::vector<uint32_t> units = {8, 12};
+  std::vector<std::vector<uint64_t>> h;
+  const std::string id = fake_identity(units, 1, h);
+  std::mt19937_64 r(5);
+  std::vector<std::vector<uint32_t>> cells(2);
+  for (size_t g = 0; g < 2; ++g)
+    for (uint32_t i = 0; i < units[g] * units[g]; ++i)
+      cells[g].push_back(i % 7 == 0 ? 0xFFFFFFFFu - uint32_t(r() % 3) : uint32_t(r() % 100000));
+  const std::string prof = ts::dg_profile_write(units, id, "fit: unit test", cells);
+  Solo s(units, 8, 4, true, 8);
+  s.core->load_profile(prof.data(), prof.size(), id);
+  CHECK_EQ(s.core->profile_provenance(), std::string("fit: unit test"));
+  bool same = true;
+  for (uint32_t g = 0; g < 2; ++g)
+    for (uint32_t a = 0; a < units[g]; ++a) {
+      uint64_t sum = 0;
+      for (uint32_t e = 0; e < units[g]; ++e) {
+        same = same && s.core->score_cell(g, a, e) == cells[g][a * units[g] + e];
+        sum += cells[g][a * units[g] + e];
+      }
+      same = same && s.core->score_rowsum(g, a) == sum;
+    }
+  CHECK(same);
+  s.core->check();
+  for (int i = 0; i < 3; ++i) {  // learning moves the table; reset_open puts the profile's counts back
+    s.begin();
+    s.serve(0, {1, 2});
+    s.serve(1, {3, 4});
+    s.end();
+  }
+  CHECK(s.core->score_cell(0, 1, 1) != cells[0][1 * 8 + 1] || s.core->score_cell(0, 1, 1) == 0xFFFFFFFFu);
+  s.core->reset_open();
+  CHECK_EQ(s.core->score_cell(0, 1, 1), cells[0][1 * 8 + 1]);
+  CHECK_EQ(s.core->score_cell(1, 3, 4), cells[1][3 * 12 + 4]);
+  CHECK_EQ(s.core->epoch(), 0ull);
+  auto refused = [&](const std::string& bytes, const std::string& ident, const char* needle) {
+    Solo x(units, 8, 4, true, 8);
+    const std::string e = error_of([&] { x.core->load_profile(bytes.data(), bytes.size(), ident); }, SS_E_INVALID);
+    if (e.find(needle) == std::string::npos) std::printf("  wanted '%s', got '%s'\n", needle, e.c_str());
+    CHECK(e.find(needle) != std::string::npos);
+  };
+  refused(prof.substr(0, 20), id, "truncated header");
+  refused(prof + "x", id, "size");
+  refused(prof.substr(0, prof.size() - 1), id, "size");
+  std::string b = prof;
+  b[0] = 'X';
+  refused(b, id, "bad magic");
+  b = prof;
+  b[8] = 2;
+  refused(b, id, "unsupported version");
+  std::vector<std::vector<uint64_t>> h1;
+  refused(ts::dg_profile_write({8}, fake_identity({8}, 1, h1), "", {cells[0]}), id, "n_gated");
+  std::vector<std::vector<uint32_t>> c11 = {cells[0], std::vector<uint32_t>(121, 1)};
+  refused(ts::dg_profile_write({8, 11}, id, "", c11), id, "units of gated layer 1");
+  std::vector<std::vector<uint64_t>> h2;
+  refused(prof, fake_identity(units, 2, h2), "identity mismatch");
+  b = prof;
+  b[b.size() - 40] ^= 1;  // a cell
+  refused(b, id, "checksum mismatch");
+  b = prof;
+  const size_t at_prov = 8 + 4 + 4 + 4 * 2 + 32;
+  const unsigned char lo = 0x88;  // prov_len 0x1388 = 5000
+  b[at_prov] = char(lo);
+  b[at_prov + 1] = char(0x13);
+  refused(b, id, "provenance longer than 4096");
+  std::vector<ts::DgScoreIdLayer> nohash = {{0, 8, 8192, nullptr}};
+  CHECK(error_of([&] { (void)ts::dg_score_identity(nohash); }, SS_E_INVALID).find("per-unit hashes") !=
+        std::string::npos);
+  Solo lru(units, 8, 4, false, 8);
+  CHECK(error_of([&] { lru.core->load_profile(prof.data(), prof.size(), id); }, SS_E_INVALID).find("policy SCORED") !=
+        std::string::npos);
+  CHECK(error_of([&] { (void)ts::dg_score_cells({65537}); }, SS_E_INVALID).find("65536") != std::string::npos);
+  DgConfig bad = s.c;
+  bad.w_rec = 200;  // 700 + 200 + 200
+  Violation bv;
+  Scripted bt(20, 20, 20, 2, 1, &bv);
+  CHECK(error_of([&] { DgCore x(bad, &bt); }, SS_E_INVALID).find("sum to 1000") != std::string::npos);
+}
+
+// The integer contract at its edges: a cell at 2^32 - 2 takes one increment and then saturates while its row sum keeps
+// equal to the cells; a 64-id union over fully saturated rows (the largest intermediate) scores exactly.
+TEST(dg_scored_saturation_and_max_union) {
+  {
+    const std::vector<uint32_t> units = {8};
+    std::vector<std::vector<uint64_t>> h;
+    const std::string id = fake_identity(units, 3, h);
+    std::vector<std::vector<uint32_t>> cells(1, std::vector<uint32_t>(64, 0));
+    cells[0][0 * 8 + 1] = 0xFFFFFFFEu;
+    const std::string prof = ts::dg_profile_write(units, id, "", cells);
+    Solo s(units, 8, 2, true, 8);
+    s.core->load_profile(prof.data(), prof.size(), id);
+    for (int i = 0; i < 4; ++i) {
+      s.begin();
+      s.serve(0, i % 2 ? std::vector<uint32_t>{1, 2} : std::vector<uint32_t>{0});
+      s.end();  // check(): every row sum == the sum of its cells
+    }
+    CHECK_EQ(s.core->score_cell(0, 0, 1), 0xFFFFFFFFu);
+    CHECK_EQ(s.core->score_cell(0, 0, 2), 2u);
+    CHECK_EQ(s.core->score_rowsum(0, 0), 0xFFFFFFFFull + 2);
+    CHECK_EQ(s.core->stats().score_saturated, 1ull);
+  }
+  {
+    const std::vector<uint32_t> units = {64};
+    std::vector<std::vector<uint64_t>> h;
+    const std::string id = fake_identity(units, 4, h);
+    std::vector<std::vector<uint32_t>> cells(1, std::vector<uint32_t>(64 * 64, 0xFFFFFFFFu));
+    const std::string prof = ts::dg_profile_write(units, id, "", cells);
+    Solo s(units, 64, 4, true, 64);
+    s.core->load_profile(prof.data(), prof.size(), id);
+    std::vector<uint32_t> all = keys_in_order(64);
+    static_assert(((64ull * 64ull * 0xFFFFFFFFull) << 16) < (1ull << 60), "the largest intermediate");
+    for (int i = 0; i < 2; ++i) {
+      s.begin();
+      s.serve(0, all);
+      if (i == 0) s.end();
+    }
+    const auto& l = s.core->score_list(0);
+    CHECK_EQ(l.size(), size_t(64));
+    bool ok = true;  // P = ((64 x 64 M) << 16) / (64 x 64 M) = 1 << 16, F = 2/16, Rec = 1; ties by stamp (use order)
+    for (size_t i = 0; i < l.size(); ++i)
+      ok = ok && l[i].key == i && l[i].s == 700ull * 65536 + 200ull * 8192 + 100ull * 65536;
+    CHECK(ok);
+    CHECK_EQ(s.core->stats().score_saturated, 64ull * 64);
+    s.end();
+  }
+}
+
+// The stamp counter is checked before every phase that pushes (a token, a seed, a window hint): past the limit the
+// phase fails before touching anything (the service's failure poisons the context); at the limit it still runs.
+TEST(dg_scored_stamp_overflow_refused) {
+  Solo s({8, 8}, 8, 4, true, 8);
+  s.core->set_stamp_counter(DgCore::kStampLimit + 1);
+  CHECK(error_of([&] { s.core->begin_token(1); }, SS_E_BACKEND).find("stamp counter") != std::string::npos);
+  CHECK(error_of([&] { s.core->seed({9}); }, SS_E_BACKEND).find("stamp counter") != std::string::npos);
+  CHECK_EQ(s.core->epoch(), 0ull);
+  CHECK(s.core->home(9) == DgCore::Home::Host);
+  s.core->set_stamp_counter(DgCore::kStampLimit);
+  s.begin();
+  s.serve(0, {1, 2});
+  s.serve(1, {1});
+  s.end();
+  CHECK(s.core->stamp_counter() > DgCore::kStampLimit);
+  CHECK(error_of([&] { s.core->begin_token(9); }, SS_E_BACKEND).find("stamp counter") != std::string::npos);
+  CHECK(s.v.what.empty());
+}
+
+// ---- replay: the real core against a C++ port of the reference simulator's integer path ----
+namespace {
+
+// A route trace: sequences of tokens, each token L layers x K ids (flat, uint16).
+struct Trace {
+  uint32_t L = 0, E = 0, K = 0;
+  std::vector<std::string> name;
+  std::vector<std::vector<uint16_t>> ids;  // [seq][(t * L + l) * K + i]
+  size_t tokens(size_t s) const { return ids[s].size() / (size_t(L) * K); }
+};
+
+// The W1 text format: "# seq <name> rows <n>" starts a sequence; a row is "l:id,id,..." for every layer.
+bool load_trace(const char* path, uint32_t E, Trace& tr) {
+  FILE* f = std::fopen(path, "rb");
+  if (!f) return false;
+  tr = Trace{};
+  tr.E = E;
+  std::string line;
+  for (int ch;;) {
+    line.clear();
+    while ((ch = std::fgetc(f)) != EOF && ch != '\n') line.push_back(char(ch));
+    if (line.empty() && ch == EOF) break;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) continue;
+    if (line[0] == '#') {
+      char a[64], b[64], name[512];
+      if (std::sscanf(line.c_str(), "%63s %63s %511s", a, b, name) == 3) tr.name.push_back(name);
+      tr.ids.emplace_back();
+      continue;
+    }
+    std::vector<std::vector<uint16_t>> row;
+    size_t p = 0;
+    while (p < line.size()) {
+      while (p < line.size() && line[p] == ' ') ++p;
+      if (p >= line.size()) break;
+      const size_t c = line.find(':', p);
+      const uint32_t l = uint32_t(std::strtoul(line.c_str() + p, nullptr, 10));
+      if (row.size() <= l) row.resize(l + 1);
+      p = c + 1;
+      while (p < line.size() && line[p] != ' ') {
+        char* end = nullptr;
+        row[l].push_back(uint16_t(std::strtoul(line.c_str() + p, &end, 10)));
+        p = size_t(end - line.c_str());
+        if (p < line.size() && line[p] == ',') ++p;
+      }
+    }
+    if (!tr.L) {
+      tr.L = uint32_t(row.size());
+      tr.K = uint32_t(row[0].size());
+    }
+    for (const auto& r : row) {
+      if (r.size() != tr.K || row.size() != tr.L) {
+        std::fclose(f);
+        return false;
+      }
+      tr.ids.back().insert(tr.ids.back().end(), r.begin(), r.end());
+    }
+  }
+  std::fclose(f);
+  return !tr.ids.empty();
+}
+
+// The simulator's fold mapping: fold f = the sequences with index % 5 == f; the seed order is the other folds'
+// per-key frequency (key = layer x E + unit), descending, ties by key (numpy's stable argsort of -counts).
+std::vector<uint32_t> hot_order(const Trace& tr, int fold) {
+  std::vector<uint64_t> cnt(size_t(tr.L) * tr.E, 0);
+  for (size_t s = 0; s < tr.ids.size(); ++s) {
+    if (int(s % 5) == fold) continue;
+    const auto& v = tr.ids[s];
+    for (size_t i = 0; i < v.size(); ++i) {
+      const uint32_t l = uint32_t(i / tr.K % tr.L);
+      ++cnt[size_t(l) * tr.E + v[i]];
+    }
+  }
+  std::vector<uint32_t> order(cnt.size());
+  for (uint32_t k = 0; k < order.size(); ++k) order[k] = k;
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return cnt[a] > cnt[b]; });
+  return order;
+}
+
+std::vector<uint32_t> union_of(const Trace& tr, size_t s, size_t t, uint32_t l) {
+  const uint16_t* p = tr.ids[s].data() + (t * tr.L + l) * tr.K;
+  std::vector<uint32_t> u(p, p + tr.K);
+  std::sort(u.begin(), u.end());
+  u.erase(std::unique(u.begin(), u.end()), u.end());
+  return u;
+}
+
+struct ReplayOut {
+  std::vector<uint32_t> miss;
+  std::vector<std::vector<uint32_t>> vict;
+  uint64_t misses = 0;
+};
+
+// scoresim.py v3's step function, INT=1 HIST=context SEEDAGE=0 PROTECT=0 ONLINE=1 (an empty transition table): every
+// demand miss is admitted into a free slot if one is left (else served transiently); at the step's end the victims
+// (lowest (score, demand epoch, LRU stamp), or the lowest LRU stamp) bring free + in flight back to the spares; they
+// are free again at the next step.
+ReplayOut port_run(const Trace& tr, int fold, const std::vector<uint32_t>& order, uint32_t active, uint32_t spares,
+                   bool scored) {
+  const uint32_t L = tr.L, E = tr.E, NK = L * E;
+  ReplayOut out;
+  std::vector<uint8_t> resident(NK, 0);
+  std::vector<int64_t> epoch(NK, 0), lru(NK, 0);
+  for (uint32_t i = 0; i < active; ++i) {
+    resident[order[i]] = 1;
+    lru[order[i]] = -int64_t(i);
+  }
+  int64_t clk = 0, tok = 0, free = spares;
+  std::deque<std::pair<int64_t, int64_t>> pending;
+  std::vector<uint32_t> T(size_t(L) * E * E, 0);
+  std::vector<uint64_t> rs(size_t(L) * E, 0);
+  std::vector<uint16_t> cnt(size_t(L) * E, 0);
+  std::vector<std::deque<std::vector<uint32_t>>> ring(L);
+  std::vector<std::vector<uint32_t>> prev(L);
+  std::vector<uint8_t> has_prev(L, 0);
+  struct C {
+    uint64_t s;
+    int64_t ep, st;
+    uint32_t k;
+  };
+  std::vector<C> cand;
+  for (size_t s = 0; s < tr.ids.size(); ++s) {
+    if (int(s % 5) != fold) continue;
+    for (size_t t = 0; t < tr.tokens(s); ++t) {
+      ++tok;
+      while (!pending.empty() && pending.front().first <= tok) {
+        free += pending.front().second;
+        pending.pop_front();
+      }
+      uint32_t m = 0;
+      for (uint32_t l = 0; l < L; ++l) {
+        const std::vector<uint32_t> cur = union_of(tr, s, t, l);
+        for (uint32_t e : cur) {
+          const uint32_t k = l * E + e;
+          if (!resident[k]) {
+            ++m;
+            if (free > 0) {
+              --free;
+              resident[k] = 1;
+            }
+          }
+          epoch[k] = tok;
+          lru[k] = ++clk;
+        }
+        if (scored && has_prev[l])
+          for (uint32_t r : prev[l])
+            for (uint32_t e : cur) {
+              uint32_t& cell = T[(size_t(l) * E + r) * E + e];
+              if (cell < 0xFFFFFFFFu) {
+                ++cell;
+                ++rs[size_t(l) * E + r];
+              }
+            }
+        prev[l] = cur;
+        has_prev[l] = 1;
+        ring[l].push_back(cur);
+        for (uint32_t e : cur) ++cnt[size_t(l) * E + e];
+        if (ring[l].size() > 16) {
+          for (uint32_t e : ring[l].front()) --cnt[size_t(l) * E + e];
+          ring[l].pop_front();
+        }
+      }
+      out.miss.push_back(m);
+      out.misses += m;
+      int64_t inflight = 0;
+      for (const auto& pd : pending) inflight += pd.second;
+      const int64_t need = int64_t(spares) - free - inflight;
+      out.vict.emplace_back();
+      if (need <= 0) continue;
+      cand.clear();
+      for (uint32_t k = 0; k < NK; ++k) {
+        if (!resident[k]) continue;
+        uint64_t S = 0;
+        if (scored) {
+          const uint32_t l = k / E, e = k % E;
+          const std::vector<uint32_t>& cur = prev[l];
+          uint64_t N = 0, D = 0;
+          for (uint32_t r : cur) {
+            N += T[(size_t(l) * E + r) * E + e];
+            D += rs[size_t(l) * E + r];
+          }
+          const uint64_t P = ((uint64_t(cur.size()) * N) << 16) / (D ? D : 1);
+          const uint64_t F = (uint64_t(cnt[k]) << 16) / 16;
+          const uint64_t R = (uint64_t(1) << 16) / uint64_t(1 + tok - epoch[k]);
+          S = 700 * P + 200 * F + 100 * R;
+        }
+        cand.push_back({S, scored ? epoch[k] : 0, lru[k], k});
+      }
+      const size_t n = std::min<size_t>(size_t(need), cand.size());
+      std::partial_sort(cand.begin(), cand.begin() + ptrdiff_t(n), cand.end(), [](const C& a, const C& b) {
+        return a.s != b.s ? a.s < b.s : a.ep != b.ep ? a.ep < b.ep : a.st < b.st;
+      });
+      for (size_t i = 0; i < n; ++i) {
+        resident[cand[i].k] = 0;
+        out.vict.back().push_back(cand[i].k);
+      }
+      pending.push_back({tok + 1, int64_t(n)});
+    }
+  }
+  return out;
+}
+
+// The same fold through the real core (prefetch off, every write-back completed and collected before the next token,
+// as the simulator's next-step completion): ids in ascending unique order (the simulator admits in that order).
+ReplayOut core_run(const Trace& tr, int fold, const std::vector<uint32_t>& order, uint32_t active, uint32_t spares,
+                   bool scored) {
+  const uint32_t L = tr.L, E = tr.E, NK = L * E;
+  DgConfig c;
+  c.n_units.assign(L, E);
+  c.persistent_slots = active + spares;
+  c.bank_slots = tr.K;
+  c.blocks = NK - active + spares;
+  c.spare_target = spares;
+  c.prefetch_reserve = 0;
+  c.prefetch_per_layer = 0;
+  c.prefetch_per_token = 0;
+  c.scored = scored;
+  c.max_ids = tr.K;
+  Violation v;
+  Scripted t(NK, c.persistent_slots + 2 * c.bank_slots, c.blocks, L, 1, &v);
+  DgCore core(c, &t);
+  core.place(order);
+  t.set_table(core.table());
+  ReplayOut out;
+  uint32_t seq = 0;
+  uint64_t m0 = 0;
+  for (size_t s = 0; s < tr.ids.size(); ++s) {
+    if (int(s % 5) != fold) continue;
+    for (size_t tk = 0; tk < tr.tokens(s); ++tk) {
+      core.seed({});  // collects the completed write-backs (the simulator frees victims at the next step)
+      core.begin_token(++seq);
+      for (uint32_t l = 0; l < L; ++l) {
+        const std::vector<uint32_t> u = union_of(tr, s, tk, l);
+        uint64_t mask = 0;
+        for (size_t i = 0; i < u.size(); ++i)
+          if (t.entry(core.key(l, u[i])) < 0) mask |= 1ull << i;
+        core.serve(l, u.data(), uint32_t(u.size()), mask);
+        core.score_layer(l);
+      }
+      core.end_token({});
+      t.drain_all();
+      const uint64_t m = core.stats().misses;
+      out.miss.push_back(uint32_t(m - m0));
+      out.misses += m - m0;
+      m0 = m;
+      out.vict.push_back(core.last_victims());
+    }
+  }
+  if (!v.what.empty()) std::printf("  core replay: %s\n", v.what.c_str());
+  return out;
+}
+
+struct ReplaySummary {
+  uint64_t tokens = 0, misses_port[2] = {0, 0}, misses_core[2] = {0, 0}, mismatched[2] = {0, 0}, victims[2] = {0, 0};
+  uint64_t first_bad[2] = {0, 0};
+};
+
+ReplaySummary replay(const Trace& tr, uint32_t active, uint32_t spares) {
+  ReplaySummary r;
+  for (int f = 0; f < 5; ++f) {
+    const std::vector<uint32_t> order = hot_order(tr, f);
+    for (int arm = 0; arm < 2; ++arm) {
+      const ReplayOut a = port_run(tr, f, order, active, spares, arm == 1);
+      const ReplayOut b = core_run(tr, f, order, active, spares, arm == 1);
+      if (arm == 0) r.tokens += a.miss.size();
+      r.misses_port[arm] += a.misses;
+      r.misses_core[arm] += b.misses;
+      for (size_t i = 0; i < a.miss.size(); ++i) {
+        r.victims[arm] += a.vict[i].size();
+        if (i >= b.miss.size() || a.miss[i] != b.miss[i] || a.vict[i] != b.vict[i]) {
+          if (!r.mismatched[arm]) r.first_bad[arm] = uint64_t(f) << 32 | i;
+          ++r.mismatched[arm];
+        }
+      }
+    }
+  }
+  return r;
+}
+
+void print_replay(const ReplaySummary& r) {
+  for (int arm = 0; arm < 2; ++arm)
+    std::printf("  %-6s port %.4f misses/token, core %.4f, %llu victims, %llu mismatched tokens\n",
+                arm ? "scored" : "lru", double(r.misses_port[arm]) / double(r.tokens),
+                double(r.misses_core[arm]) / double(r.tokens), (unsigned long long)r.victims[arm],
+                (unsigned long long)r.mismatched[arm]);
+}
+
+// A small synthetic trace with per-layer transitions (a unit tends to be followed by its successors), so scored and
+// LRU choose differently.
+Trace synthetic_trace() {
+  Trace tr;
+  tr.L = 4;
+  tr.E = 40;
+  tr.K = 3;
+  std::mt19937_64 r(11);
+  for (int s = 0; s < 10; ++s) {
+    tr.name.push_back("syn-" + std::to_string(s));
+    tr.ids.emplace_back();
+    std::vector<std::vector<uint32_t>> last(tr.L);
+    for (int t = 0; t < 30; ++t)
+      for (uint32_t l = 0; l < tr.L; ++l) {
+        std::vector<uint32_t> row;
+        while (row.size() < tr.K) {
+          uint32_t e;
+          if (!last[l].empty() && r() % 10 < 6) e = (last[l][r() % last[l].size()] * 7 + 3 + l) % tr.E;
+          else {
+            const double x = std::uniform_real_distribution<double>(0, 1)(r);
+            e = uint32_t(double(tr.E) * x * x) % tr.E;
+          }
+          if (std::find(row.begin(), row.end(), e) == row.end()) row.push_back(e);
+        }
+        last[l] = row;
+        for (uint32_t e : row) tr.ids.back().push_back(uint16_t(e));
+      }
+  }
+  return tr;
+}
+
+}  // namespace
+
+// The real core replays a route trace exactly as the reference simulator's integer path decides it: per token the
+// same misses and the same victims in the same order, for both policies (5 folds, the simulator's seed order).
+TEST(dg_scored_replay_synthetic) {
+  const Trace tr = synthetic_trace();
+  const ReplaySummary r = replay(tr, 70, 8);
+  print_replay(r);
+  CHECK_EQ(r.mismatched[0], 0ull);
+  CHECK_EQ(r.mismatched[1], 0ull);
+  CHECK(r.misses_port[0] != r.misses_port[1]);  // the policies really differ on this trace
+  CHECK(r.victims[1] > 0);
+}
+
+// The same replay of a W1 route file (TS_W1_ROUTES; TS_W1_ACTIVE / TS_W1_SPARES, default 8576 / 96, 384 units per
+// layer): skipped when the variable is not set. scoresim.py v3 (INT=1 HIST=context SEEDAGE=0 ONLINE=1) reads 8.140
+// (LRU) and 7.652 (scored) misses per token on w1-routes-r0.txt.
+TEST(dg_scored_replay_w1) {
+  const char* path = std::getenv("TS_W1_ROUTES");
+  if (!path || !*path) {
+    std::printf("  skipped (set TS_W1_ROUTES to a W1 route file)\n");
+    return;
+  }
+  const char* a = std::getenv("TS_W1_ACTIVE");
+  const char* sp = std::getenv("TS_W1_SPARES");
+  const uint32_t active = a ? uint32_t(std::strtoul(a, nullptr, 10)) : 8576;
+  const uint32_t spares = sp ? uint32_t(std::strtoul(sp, nullptr, 10)) : 96;
+  Trace tr;
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK(load_trace(path, 384, tr));
+  if (tr.ids.empty()) return;
+  size_t toks = 0;
+  for (size_t s = 0; s < tr.ids.size(); ++s) toks += tr.tokens(s);
+  std::printf("  %zu sequences, %zu tokens, %u layers x %u ids, active %u + spares %u\n", tr.ids.size(), toks, tr.L,
+              tr.K, active, spares);
+  const ReplaySummary r = replay(tr, active, spares);
+  print_replay(r);
+  std::printf("  %.1f s\n",
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  CHECK_EQ(r.mismatched[0], 0ull);
+  CHECK_EQ(r.mismatched[1], 0ull);
+  if (active == 8576 && spares == 96 && toks == 49430) {  // w1-routes-r0.txt: scoresim v3's exact counts
+    CHECK_EQ(r.misses_port[0], 402375ull);                // 8.1403 misses / token
+    CHECK_EQ(r.misses_core[0], 402375ull);
+    CHECK_EQ(r.misses_port[1], 378245ull);  // 7.6521
+    CHECK_EQ(r.misses_core[1], 378245ull);
+  }
 }

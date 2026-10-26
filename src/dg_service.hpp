@@ -87,6 +87,7 @@ class DgService {
   mutable std::mutex err_mu_;
   std::string err_;
   std::vector<uint32_t> ids_, pred_;
+  std::vector<uint32_t> unranked_;  // scored eviction: served layers whose ranking waits (the device ran ahead)
   std::vector<DgLayerTimeline> tl_, tl_done_;
   std::atomic<bool> new_origin_{false};
   bool boosted_ = false;

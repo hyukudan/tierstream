@@ -46,6 +46,7 @@ DgService::DgService(DgCore* core, const DgMapped& m, const DgServiceConfig& cfg
   require(cfg_.max_ids >= 1 && cfg_.max_ids <= kDgMaxIds, SS_E_INVALID, "device-gated: max ids outside 1..64");
   ids_.reserve(kDgMaxIds);
   pred_.reserve(kDgMaxIds);
+  unranked_.reserve(core_->gated());
   tl_.assign(core_->gated(), DgLayerTimeline{});
   tl_done_.assign(core_->gated(), DgLayerTimeline{});  // preallocated: publishing it never allocates
 }
@@ -187,6 +188,7 @@ void DgService::run(uint32_t seen) {
 
 void DgService::serve_token(uint32_t seq) {
   const uint32_t G = core_->gated();
+  unranked_.clear();
   core_->begin_token(seq);
   auto t_prev = new_origin_.exchange(false, std::memory_order_acquire) ? clock_type::now() : t_served_;
   wait_began(seq);  // every flag deadline starts once the step began
@@ -229,6 +231,25 @@ void DgService::serve_token(uint32_t seq) {
     // exported (the device ran ahead over layers without a miss: its demand comes first), asked before every part
     if (core_->deferred() && g + 1 < G)
       core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.flag[g + 1]) == seq; });
+    // scored eviction: layer g's candidates ranked now that its union, epochs and stamps are final (after the ready,
+    // the next layer's prefetches and the write-back slice). When the next layer already exported (the device ran
+    // ahead) the ranking waits behind that layer's service, at the latest until the token is published: a served
+    // layer's device / coming set, epochs and stamps do not change any more. The ranking after the last layer is on
+    // the terminal path and timed.
+    if (core_->scored()) {
+      if (g + 1 < G && dg_load_acquire(&m_.flag[g + 1]) == seq) {
+        unranked_.push_back(g);
+        core_->note_score_deferred();
+      } else {
+        const auto t_rank = clock_type::now();
+        for (uint32_t d : unranked_) core_->score_layer(d);
+        unranked_.clear();
+        core_->score_layer(g);
+        if (g + 1 == G)
+          core_->add_score_last_ns(uint64_t(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now() - t_rank).count()));
+      }
+    }
     const auto t_end = clock_type::now();
     t.serve_us = us_since(t_seen, t_end);
     if (cfg_.diag) {

@@ -6,6 +6,10 @@ ss.h-sha256 bdc137af7b7969da4abb395561d4d8fad60eab402030a5faff27d12bbd62cec9
 ss.h-sha256 5792e20a9809f1e8e6f4154687f636448c86e8b960de4998f9f86aba60b95cba
 # winpf (additive: window prefetch declarations, appended option / stats fields; no baseline declaration changed, diff wbsched..winpf)
 ss.h-sha256 80a072a5577b80772ab8d3c60c811e8de2734436e014aac872be6eff5888590c
+# hostfix (additive: ss_options.exclusive_discard + reserved2, ss_exclusive_stats.discards, ss_snapshot_info.exclusive_discards; no baseline declaration changed, diff 58fed05..hostfix)
+ss.h-sha256 a759d5315b8aac3d080050964244abd0bb52af9de638bece30f1ec7ec05f438d
+# integrate-1026 (additive: wbsched / winpf / persist fields first, then hostfix's exclusive_discard after dg_prior; diff persist-all + hostfix)
+ss.h-sha256 12f6307a19b3beb29e74b067b51accfd1f2a3c67e5e781640fe560feb20a8bcd
 abi ss_abi_version
 abi ss_acquire
 abi ss_acquire_groups
@@ -80,6 +84,7 @@ ss.h-sha256 06d6e64a1d7ad730c309720e4b6c6c8442b1d29bc582c71bbfb698c36d07c1fe
 ss.h-sha256 80082006c0385d876385253b42572cb79c9c9ed79210a2743f5b47e310fd0b86
 ss.h-sha256 2427912bf477ce43af3214c1c749ee9d817d09d10722bb1134b54e8bff64e37f
 ss.h-sha256 5cadc3f05cb6e01237d32f33505b22eb3c44eab41d208b6de1bd52f641b8db34
-
-# public release: comment-only edits (design references generalised); declarations unchanged.
-ss.h-sha256 2a77968897e6d00d586def2fff4d1e8c63ffb91caa43b5e844dc552641251408
+# scored (additive: scored eviction for device-gated mode, appended ss_options / ss_dg_stats fields and SS_DG_SCORED; no existing declaration changed)
+ss.h-sha256 1dfa094b96b980e19c3457a8616434cacc72c0158bda929280a819429ecf87f3
+# integrate-1026 + scored (scored fields after exclusive_discard; its padding is reserved3)
+ss.h-sha256 26425365314ead3b0383a6927684c0c44df5bbb500f1fc941f63b54141c4ace1

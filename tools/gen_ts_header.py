@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates the tierstream names of the C ABI from include/strix_stream/ss.h (design notes §2.1).
+"""Generates the tierstream names of the C ABI from include/strix_stream/ss.h.
 
 For this release the strix-stream names stay the real ones: ss.h is never edited by this tool, the ss_* functions keep
 their definitions, and the outputs only ADD names:

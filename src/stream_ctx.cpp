@@ -71,6 +71,9 @@ void Ctx::init() {
           "same memory)");
   // A resident's slot is the only copy an eviction writes back: it must hold the unit's bytes from open.
   require(!(excl_ && !o_.fill_residents), SS_E_INVALID, "open: the exclusive tier mode needs fill_residents = 1");
+  // A descriptor whose tiers are "pinned" keeps every non-resident unit off its file: a discard would file-home one.
+  require(!(excl_ && o_.exclusive_discard && d_.tiers == Tiers::Pinned), SS_E_INVALID,
+          "open: exclusive_discard needs a descriptor whose tiers allow disk (tiers = \"pinned\" refuses it)");
   switch (o_.backend) {
     case SS_BACKEND_CPU: be_ = make_cpu_backend(); break;
     case SS_BACKEND_CUDA: be_ = make_cuda_backend(o_.device); break;
@@ -677,7 +680,7 @@ JobPtr Ctx::make_job(int layer, int unit, void* dst, bool spec) {
 
 void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* dst_wb_ev) {
   LayerState& s = L_[size_t(layer)];
-  if (ra_on() && s.ra[size_t(unit)]) {  // read-ahead lands only in ring slots: this unit takes the ordinary path
+  if (ra_on() && spec && s.ra[size_t(unit)]) {  // a speculative admission takes the ordinary path, as in the ring
     std::lock_guard<std::mutex> lk(q_mu_);
     ra_abandon_locked(*s.ra[size_t(unit)]);
   }
@@ -687,6 +690,9 @@ void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* 
   s.loc[size_t(unit)] = Persistent;
   s.slot[size_t(unit)] = slot;
   s.job[size_t(unit)] = j;
+  // Read-ahead: as in fetch_into_ring, the copy out of the buffer counts in neither bytes_disk nor bytes_pinned (the
+  // file bytes are counted once, at ss_end); the landing keeps both destination waits (release, victim write-back).
+  if (ra_on() && !spec && ra_land(layer, unit, j)) return;
   (j->from_pinned ? fwd_stats_[size_t(layer)].bytes_pinned : fwd_stats_[size_t(layer)].bytes_disk) +=
       d_.layers[size_t(layer)].unit_bytes;
   submit(j);
@@ -694,7 +700,7 @@ void Ctx::fetch_into_persistent(int layer, int unit, int slot, bool spec, void* 
 
 int Ctx::block_class(int layer) const { return excl_ ? layer_class_[size_t(layer)] : -1; }
 
-// ---- host read-ahead (design notes §7-11) -------------------------------------------------
+// ---- host read-ahead ---------------------------------------------------------------------------------------------------
 
 void Ctx::test_ra_quiesce() {
   for (const JobPtr& p : ra_jobs_) wait_job_quiet(*p);
@@ -841,6 +847,10 @@ bool Ctx::ra_eligible(int layer, int unit, bool pending_ok) const {
   if (!s.rs || !l.streamable || unit < 0 || unit >= l.n_units || s.ra[size_t(unit)]) return false;
   const int64_t g = gidx(layer, unit);
   if (plan_.tier[size_t(g)] == SS_TIER_PAIR || pinned_of_[size_t(g)] || s.rs->slot(unit) >= 0) return false;
+  // Never a unit larger than the buffers (sized for the units the plan can leave without a pinned source). Defensive:
+  // an exclusive discard needs more victims than free blocks, which only resident or disk units of the block size
+  // (that is, of a size the buffers hold) can cause; a block size of only pinned units has a free block per victim.
+  if (host_stride(l.unit_bytes) > ra_bytes_) return false;
   if (s.job[size_t(unit)]) return false;
   if (s.loc[size_t(unit)] != None) return pending_ok && s.loc[size_t(unit)] == Ring;  // waiting for a ring slot
   return true;
@@ -905,8 +915,8 @@ void Ctx::ra_pump() {
   }
 }
 
-// The unit got ring slot `child`: land from its read-ahead buffer when it has one (true), else the caller reads the
-// file (false).
+// The unit got a device slot (ring or persistent; `child` is its job): land from its read-ahead buffer when it has one
+// (true), else the caller reads the file (false).
 bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
   std::shared_ptr<RaEntry> ep = L_[size_t(layer)].ra[size_t(unit)];
   if (!ep) return false;
@@ -967,15 +977,21 @@ bool Ctx::ra_land(int layer, int unit, const JobPtr& child) {
   return attached;
 }
 
-// FromRA copy: the RA buffer into the ring slot, after the slot's previous reader (ring owner release).
+// FromRA copy: the RA buffer into the slot, after the slot's previous reader (ring owner / layer release) and, in a
+// persistent slot of the exclusive mode, after the write-back of the victim that held it.
 void Ctx::run_ra_child(Job& j) {
   const Layer& l = d_.layers[size_t(j.layer)];
   const size_t b = size_t(j.ra->buf);  // stable while this job runs: only a terminal child gives it back
   const char* src = static_cast<const char*>(ra_host_[b]);
   if (test_inject_.load() == 3 && test_inject_.exchange(0) == 3) fail(SS_E_IO, "read-ahead: injected copy failure");
+  // Test-only mutation 10 (must make the CUDA test fail): skip the wait for the victim's write-back once.
+  const bool skip_wb = j.dst_wb_ev && test_inject_.load() == 10 && test_inject_.exchange(0) == 10;
+  if (skip_wb)  // the mutation reports that it acted (a test that cannot observe it says so, not a silent pass)
+    std::fprintf(stderr, "mutation 10: write-back wait skipped (unit %d, %d)\n", j.layer, j.unit);
   if (be_->unified()) {
     // Test-only mutation 6 (must make the GPU test fail): skip this landing's wait for the slot's previous reader.
     if (!(test_inject_.load() == 6 && test_inject_.exchange(0) == 6)) be_->event_sync(j.dst_release_ev);
+    if (!skip_wb) be_->event_sync(j.dst_wb_ev);
     j.issued_piece = true;
     std::memcpy(j.dst, src, size_t(l.unit_bytes));
     if (test_inject_.load() == 4 && test_inject_.exchange(0) == 4) fail(SS_E_IO, "read-ahead: injected copy failure");
@@ -984,6 +1000,7 @@ void Ctx::run_ra_child(Job& j) {
   std::lock_guard<std::mutex> lk(copy_mu_);
   // Test-only mutation 6 (must make the CUDA test fail): skip this landing's wait for the slot's previous reader.
   if (!(test_inject_.load() == 6 && test_inject_.exchange(0) == 6)) be_->stream_wait(nullptr, j.dst_release_ev);
+  if (!skip_wb) be_->stream_wait(nullptr, j.dst_wb_ev);
   for (uint64_t off = 0; off < l.unit_bytes; off += o_.copy_piece_bytes) {
     be_->copy_h2d(at(j.dst, off), src + off, size_t(std::min<uint64_t>(o_.copy_piece_bytes, l.unit_bytes - off)),
                   nullptr);
@@ -994,10 +1011,9 @@ void Ctx::run_ra_child(Job& j) {
   be_->event_record(j.done_ev, nullptr);
 }
 
-// Exclusive tier mode: evictions this admission may make, one free block per victim. A speculative admission
+// Exclusive tier mode: free blocks an admission may write victims back into. A speculative admission
 // (spec_persistent) leaves half of the class's spares to demands.
-int Ctx::eviction_cap(int layer, bool speculative) const {
-  if (!excl_) return -1;
+uint64_t Ctx::writeback_blocks(int layer, bool speculative) const {
   const int cls = block_class(layer);
   if (cls < 0) return 0;
   uint64_t f = free_blocks_[size_t(cls)].size();
@@ -1005,18 +1021,39 @@ int Ctx::eviction_cap(int layer, bool speculative) const {
     const uint64_t reserve = (spares_of_[size_t(cls)] + 1) / 2;
     f = f > reserve ? f - reserve : 0;
   }
-  return int(std::min<uint64_t>(f, uint64_t(INT32_MAX)));
+  return f;
+}
+
+// Exclusive tier mode: evictions this admission may make, one free block per victim; a demand admission is uncapped
+// with exclusive_discard (a victim past the free blocks is discarded to its file). A speculative admission keeps the
+// cap: a guess never discards a resident.
+int Ctx::eviction_cap(int layer, bool speculative) const {
+  if (!excl_) return -1;
+  if (block_class(layer) < 0) return 0;
+  if (o_.exclusive_discard && !speculative) return -1;
+  return int(std::min<uint64_t>(writeback_blocks(layer, speculative), uint64_t(INT32_MAX)));
 }
 
 // Exclusive tier mode: the admission's victims leave their slots for free blocks (device to host on the write-back
-// stream) before anything is written into those slots; admission capped the evictions at the free blocks. Returns the
-// event the admitted units' writes into the victims' slots wait for (nullptr on synchronous backends).
-void* Ctx::write_back(int layer, const Admission& a) {
+// stream) before anything is written into those slots; admission capped the evictions at the free blocks. With
+// exclusive_discard a demand admission's evictions are uncapped: the first *n_wb victims are written back while free
+// blocks last, the rest are discarded (no copy, no block: weights are immutable and every unit's bytes are in its
+// file, so the unit is file-homed from here, exactly like a disk unit). Returns the event the admitted units' writes into the written-back
+// victims' slots wait for (nullptr on synchronous backends or when nothing is written back).
+void* Ctx::write_back(int layer, const Admission& a, bool speculative, size_t* n_wb) {
   const LayerState& s = L_[size_t(layer)];
   const Layer& l = d_.layers[size_t(layer)];
   const int cls = block_class(layer);
-  if (cls < 0 || free_blocks_[size_t(cls)].size() < a.evicted.size())
+  const uint64_t room = writeback_blocks(layer, speculative);
+  if (cls < 0 || (!o_.exclusive_discard && room < a.evicted.size()))
     fail(SS_E_BACKEND, "exclusive: more victims than free blocks (internal)");
+  const size_t nw = size_t(std::min<uint64_t>(room, a.evicted.size()));
+  *n_wb = nw;
+  for (size_t i = 0; i < a.evicted.size(); ++i)
+    if (pinned_of_[size_t(gidx(layer, a.evicted[i]))] != nullptr)
+      fail(SS_E_BACKEND, "exclusive: an evicted resident still owns a block (internal)");
+  xst_.discards += a.evicted.size() - nw;  // a discard is no write-back: no bytes, no block, no event
+  if (!nw) return nullptr;
   void* ev = nullptr;
   if (!be_->unified()) {
     // Blocks freed by earlier forwards: their last H2D reader is before blocks_ev_ on the copy stream, and so is the
@@ -1038,9 +1075,8 @@ void* Ctx::write_back(int layer, const Admission& a) {
       throw;
     }
   }
-  for (size_t i = 0; i < a.evicted.size(); ++i) {
+  for (size_t i = 0; i < nw; ++i) {
     const int64_t g = gidx(layer, a.evicted[i]);
-    if (pinned_of_[size_t(g)] != nullptr) fail(SS_E_BACKEND, "exclusive: an evicted resident still owns a block (internal)");
     void* b = free_blocks_[size_t(cls)].back();
     free_blocks_[size_t(cls)].pop_back();
     pinned_of_[size_t(g)] = b;
@@ -1051,8 +1087,8 @@ void* Ctx::write_back(int layer, const Admission& a) {
   }
   if (ev) be_->event_record(ev, wb_stream_);
   // Published after the record: a read of one of these blocks in the same forward waits for it.
-  for (int32_t v : a.evicted) {
-    const int64_t g = gidx(layer, v);
+  for (size_t i = 0; i < nw; ++i) {
+    const int64_t g = gidx(layer, a.evicted[i]);
     wb_pending_[size_t(g)] = ev;
     wb_units_.push_back(g);  // reserved for every unit at open: never reallocates
   }
@@ -1060,11 +1096,12 @@ void* Ctx::write_back(int layer, const Admission& a) {
 }
 
 void Ctx::fetch_admitted(int layer, const Admission& a, bool spec) {
-  void* ev = excl_ && !a.evicted.empty() ? write_back(layer, a) : nullptr;
+  size_t n_wb = 0;
+  void* ev = excl_ && !a.evicted.empty() ? write_back(layer, a, spec, &n_wb) : nullptr;
   for (size_t k = 0; k < a.admitted.size(); ++k) {
-    void* wait = nullptr;  // only a write into a victim's slot waits for the victims' write-back
+    void* wait = nullptr;  // only a write into a written-back victim's slot waits for the victims' write-back
     if (ev)
-      for (size_t i = 0; i < a.evicted.size() && !wait; ++i)
+      for (size_t i = 0; i < n_wb && !wait; ++i)
         if (a.evicted_slot[i] == a.slot_of[k]) wait = ev;
     fetch_into_persistent(layer, a.admitted[k], a.slot_of[k], spec, wait);
   }
@@ -1742,6 +1779,7 @@ bool Ctx::snapshot(ss_layer_stats* total, ss_snapshot_info* info) const {
       i.exclusive_free_blocks = snap_.x.free_blocks;
       i.exclusive_min_free_blocks = snap_.x.min_free_blocks;
       i.exclusive_rereads = snap_.x.rereads;
+      i.exclusive_discards = snap_.x.discards;
     }
   }
   // Fixed at open (never written after ss_open returned).
@@ -1827,6 +1865,7 @@ Json Ctx::format_stats(const StatsView& v) const {
     Json x = Json::object();
     x["writebacks"] = Json::number(v.x->writebacks);
     x["writeback_bytes"] = Json::number(v.x->writeback_bytes);
+    x["discards"] = Json::number(v.x->discards);
     x["deferred"] = Json::number(v.x->deferred);
     x["rereads"] = Json::number(v.x->rereads);
     x["promoted"] = Json::number(v.x->promoted);
