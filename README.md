@@ -157,6 +157,12 @@ layer, but a layer whose weights are already available needs no host reply.
   oldest deferred one. Unfinished write-backs carry into the next token, up to about one boundary's worth of victims,
   and the next boundary copies the older excess. Results are bit-for-bit identical. `ss_stats_dg` reports the deferred, cancelled, forced and
   boundary-flushed counts and bytes.
+- **Between requests:** `ss_dg_set_sched` switches write-back deferral and ready flushing between tokens, so an
+  engine can choose scheduling per request; outputs remain bitwise identical. `ss_dg_reset_open` restores the
+  resolved open-time cache state. `ss_dg_residency` snapshots resident units in recency order for a later load's
+  `dg_seed`. These APIs and the pipelined startup loader are merged in [PR #1](https://github.com/hyukudan/tierstream/pull/1).
+  Write-back deferral is on by default through `ss_options_defaults` since
+  [PR #2](https://github.com/hyukudan/tierstream/pull/2); a zero-initialized options struct still selects immediate copies.
 - **Scored eviction (opt-in):** with `policy = SS_POLICY_SCORED` the boundary still keeps the same number of slots
   free, but it picks the experts least likely to be needed soon instead of the least recently used ones. Each expert
   gets an integer score from three parts: how often, in this context, the experts routed in the previous token were
@@ -276,7 +282,8 @@ matched bit for bit (924 checks, no failures); this does not qualify full-model 
 | 128K, current state buffers | 5,113 / 7,233 / 3,014 | 32.7 | 18.9 % | 78.5 / 4.5 |
 
 Host read-ahead did not help this decode replay: persistent-slot admissions re-read the file instead of consuming
-ready read-ahead buffers. That path needs repair before claiming a decode prefetch gain.
+ready read-ahead buffers. PR #2 fixes that host-mode path and adds opt-in `exclusive_discard` when no free host block
+is available. A decode prefetch speedup has not been measured with the fix.
 
 Retained host-copy pools did not justify their memory cost in CPU trace simulation. Lossless compression also gave
 no useful gain: 298 sampled experts across all 40 DeepSeek V4.1 Flash MoE layers, with the same IQ2_XXS/Q2_K bytes,
@@ -481,12 +488,24 @@ landing throughput into GPU-mapped host memory: about 29 GB/s from the pinned ti
 file. Exclusive mode requires a discrete device in this implementation and is refused by the unified-memory HIP
 backend.
 
-Device-gated decode is opt-in and CUDA only. Its GPU unit test passes on the RTX PRO 6000 (18 cases: graph-captured
-decode with prediction, statistics, memory pressure, global spares with fewer spare blocks than spare slots, a stopped
-service, an out-of-range id, sequence desyncs, an absent entry, open-time refusals and seeding, test-hook gating,
-budgets, DMA timing, and two protocol mutations that the test must catch). The full-model DeepSeek bit-for-bit
+Device-gated decode is opt-in and CUDA only. Its GPU tests cover graph-captured decode, prediction, memory pressure,
+protocol failures, deferred write-backs, pipelined loading, reset, seeding and scored eviction. The single-copy-engine
+exception and required gates are documented in [docs/reproduce.md](docs/reproduce.md). The full-model DeepSeek bit-for-bit
 comparison against the replica's own cache passed, and so did speed parity against that cache (no slower chat,
 A/B/A); tierstream is now that replica's only cache.
+
+Measured 2026-10-25/26: DeepSeek V4.1 Flash on one RTX PRO 6000 (96 GB), Windows WDDM, device-gated mode,
+Q2 GGUF experts (IQ2_XXS gate/up, Q2_K down; dense Q8_0), exclusive VRAM + pinned-host cache.
+
+| Merged feature | Measured comparison | Exactness / conditions |
+|---|---|---|
+| Pipelined loading (on by default) | Full load: 108.7 → 61.8 s; expert fill: 83.1 → 38.0 s; 2.25 → 6.73 GB/s | Serial vs pipelined with 8 readers; disk-bound; bitwise-identical placement and outputs. `DG_LOAD_SERIAL=1` restores serial loading. |
+| Reset to open state | About 3.4 s to restore the fresh-load cache state | Requests after reset were bitwise identical to a fresh process. |
+| Residency snapshot / seed | Fresh-process step 0: 332.6 → 156.0 ms; mean steps 0–15: 56.05 → 44.67 ms/step | Fresh load seeded from a prior request's resident set vs baseline fresh load; bitwise-identical outputs. |
+
+Window prefetch (`winpf`) is merged, exact and off by default. Evaluation is closed: matched warm comparisons showed
+no repeatable gain. Persistent loaded workers and graph pre-capture/warm-up are in development in the engine
+(replica); tierstream supplies the cache reset, scheduling and residency APIs.
 
 ## Credits
 

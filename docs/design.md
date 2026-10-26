@@ -569,9 +569,16 @@ the host-controlled per-layer pools described in §3. See [the engine contract i
 The older 31-32.5 GB/s transfer measurements above are not a fixed platform limit; see
 [the current PCIe conditions](../README.md#when-it-pays-and-when-it-does-not).
 
-Deferred, bounded write-backs (`wbsched`) are adopted in the DeepSeek RTX engine: pending victims carry across
-token boundaries and background submissions are bounded to limit copy-engine queueing. Exact full-model gates pass
-with the warm controller, now the engine default; see [results and conditions](../README.md#status).
+Deferred, bounded write-backs (`wbsched`) are merged and on by default through `ss_options_defaults`: pending victims
+carry across token boundaries and background submissions are bounded to limit copy-engine queueing.
+`ss_dg_set_sched` switches deferral and ready flushing between tokens, including per-request choices by the engine;
+outputs are bitwise identical. See [results and conditions](../README.md#status).
+
+The pipelined startup loader is merged and on by default; `DG_LOAD_SERIAL=1` restores serial loading.
+`ss_dg_reset_open` restores the resolved open-time cache state. `ss_dg_residency` snapshots device-resident units in
+recency order for a later load's `dg_seed`. Measured startup, reset and seed results are in the
+[README](../README.md#status). Window prefetch (`winpf`) is merged, exact and off by default; evaluation is closed
+with no repeatable gain in matched warm comparisons.
 
 ## 9. Versioning
 
@@ -589,13 +596,7 @@ with the warm controller, now the engine default; see [results and conditions](.
 - **Mapped-flag gates** (`cuStreamWaitValue32` / `hipStreamWaitValue64`) instead of host waits for file jobs.
 - **Per-layer row splits** from miss curves (dynamic slots per layer instead of a uniform count).
 - **A rate-tally file across runs.** Measured to generalize poorly in the study, so only as an opt-in.
-- **Priced window prefetch** (`winpf`, implemented in development, default off): bound multi-row speculative
-  copies by observed usefulness and copy cost. Exact; gain not established and still under investigation.
 - **Adaptive memory planning** (`adaptive`, in development): usage tables rank VRAM / pinned / NVMe homes after
   reserving context state. The measured replay and its limits are in the [README](../README.md#adaptive-memory-and-nvme-measurements-in-development).
-- **Pipelined startup loading** (`coldload`, in development branches): overlap reads, staging and device copies
-  with bounded buffers; measured load-time reduction with bitwise-identical placement and outputs.
-- **Persistent loaded worker and cache reset-to-open** (in development branches): reuse a loaded process and
-  restore its fresh-load cache state; requests are bitwise identical to a fresh process.
-
-The measured startup and reset timings and their conditions are in the [README](../README.md#status).
+- **Persistent loaded worker and graph pre-capture/warm-up** are in development in the engine (replica).
+  The cache reset-to-open, runtime scheduling and residency APIs are already merged in tierstream.
