@@ -1,4 +1,4 @@
-// Format ids across the strix-stream -> tierstream rename (design notes §3): every parser accepts
+// Format ids across the strix-stream -> tierstream rename: every parser accepts
 // "strix-stream/<x>" and "tierstream/<x>" as the same format; every output keeps writing "strix-stream/<x>" for one
 // release, so no hashed document changes.
 #pragma once

@@ -7,6 +7,7 @@
 
 #include "check.hpp"
 #include "dg_fixture.hpp"
+#include "dg_score.hpp"
 #include "strix_stream/ss.h"
 
 using sstest::DgModel;
@@ -29,9 +30,10 @@ struct Case {
 // Opens with the model's default gated setup after `tweak`; returns the status and ss_last_error.
 template <class F>
 std::pair<ss_status, std::string> try_open(const DgModel& m, F tweak, int resident = 16, uint32_t dyn = 4,
-                                           uint32_t max_ids = 8) {
+                                           uint32_t max_ids = 8, const std::string* json = nullptr) {
   Case k;
-  if (ss_desc_from_json(m.json.data(), m.json.size(), &k.d) != SS_OK) return {SS_E_DESC, ss_last_error()};
+  const std::string& js = json ? *json : m.json;
+  if (ss_desc_from_json(js.data(), js.size(), &k.d) != SS_OK) return {SS_E_DESC, ss_last_error()};
   sstest::dg_budget(k.b, m, dyn, max_ids);
   sstest::dg_options(k.o, max_ids, SS_BACKEND_CPU);
   std::vector<uint8_t> t = m.tiers(resident);
@@ -63,7 +65,7 @@ TEST(dg_open_valid_layout_needs_cuda) {
 TEST(dg_open_refusals) {
   DgModel m("open");
   expect(try_open(m, [](B& b, O&, T&) { b.tier_mode = SS_TIER_MODE_INCLUSIVE; }), SS_E_INVALID, "tier_mode EXCLUSIVE");
-  expect(try_open(m, [](B&, O& o, T&) { o.policy = SS_POLICY_SCORED; }), SS_E_UNSUPPORTED, "only policy LRU");
+  expect(try_open(m, [](B&, O& o, T&) { o.policy = ss_policy(7); }), SS_E_INVALID, "policy must be LRU or SCORED");
   expect(try_open(m, [](B&, O& o, T&) { o.pin_planned = 1; }), SS_E_INVALID, "pin_planned = 0");
   expect(try_open(m, [](B&, O& o, T&) { o.fill_residents = 0; }), SS_E_INVALID, "fill_residents = 1");
   expect(try_open(m, [](B&, O& o, T&) { o.readahead_units = 2; }), SS_E_INVALID, "readahead_units must be 0");
@@ -161,7 +163,7 @@ TEST(dg_open_wb_defer_options) {
            o.dg_wb_max_outstanding = 4096;
          }),
          SS_E_UNSUPPORTED, "needs the CUDA backend");
-  // an older caller's struct ends before the write-back fields: whatever lies past its size is not read (0 = off)
+  // an older caller's struct ends before the write-back fields: whatever lies past its size is not read (the defaults apply)
   expect(try_open(m, [](B&, O& o, T&) {
            o.struct_size = uint32_t(offsetof(ss_options, dg_wb_defer));
            o.dg_wb_defer = 7;
@@ -310,4 +312,78 @@ TEST(dg_winpf_abi_cpu) {
 
 TEST(dg_reset_open_null_refused) {
   CHECK_EQ(int(ss_dg_reset_open(nullptr)), int(SS_E_INVALID));
+}
+
+// Scored eviction's open options: weights (each 0..1000, sum 1000; all 0 = the defaults), the profile (needs SCORED,
+// both fields, a hashed descriptor, the exact format and identity); valid settings reach the backend refusal. An older
+// caller's struct ends before these fields: their bytes are not read.
+TEST(dg_open_scored_options) {
+  DgModel m("open-scored");
+  const std::string hashed = m.json_hashed();
+  auto scored = [](O& o) { o.policy = SS_POLICY_SCORED; };
+  expect(try_open(m, [&](B&, O& o, T&) { scored(o); }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           scored(o);
+           o.dg_score_w_trans = o.dg_score_w_freq = o.dg_score_w_recency = 0;
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           scored(o);
+           o.dg_score_w_recency = 200;
+         }),
+         SS_E_INVALID, "sum to 1000");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           scored(o);
+           o.dg_score_w_trans = 1001;
+           o.dg_score_w_freq = 0;
+           o.dg_score_w_recency = 0;
+         }),
+         SS_E_INVALID, "each be 0..1000");
+  // the profile of this model: identity from its descriptor's layers and hashes, zero counts
+  std::vector<uint32_t> units(size_t(m.G), uint32_t(m.U));
+  std::vector<std::vector<uint64_t>> h(size_t(m.G));
+  std::vector<ts::DgScoreIdLayer> idl;
+  for (int L = 0; L < m.G; ++L) {
+    h[size_t(L)] = m.hashes(L);
+    idl.push_back({uint32_t(L), uint32_t(m.U), m.unit(), &h[size_t(L)]});
+  }
+  const std::string id = ts::dg_score_identity(idl);
+  std::vector<std::vector<uint32_t>> cells(size_t(m.G), std::vector<uint32_t>(size_t(m.U) * size_t(m.U), 1));
+  const std::string prof = ts::dg_profile_write(units, id, "open test", cells);
+  auto with = [&](const std::string& bytes) {
+    return [&bytes, scored](B&, O& o, T&) {
+      scored(o);
+      o.dg_score_profile = bytes.data();
+      o.dg_score_profile_len = bytes.size();
+    };
+  };
+  expect(try_open(m, with(prof), 16, 4, 8, &hashed), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, with(prof), 16, 4, 8, nullptr), SS_E_INVALID, "per-unit hashes");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           o.dg_score_profile = prof.data();
+           o.dg_score_profile_len = prof.size();
+         }, 16, 4, 8, &hashed),
+         SS_E_INVALID, "needs policy SCORED");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           scored(o);
+           o.dg_score_profile_len = prof.size();
+         }, 16, 4, 8, &hashed),
+         SS_E_INVALID, "given together");
+  const std::string shorter = prof.substr(0, prof.size() - 4);
+  expect(try_open(m, with(shorter), 16, 4, 8, &hashed), SS_E_INVALID, "size");
+  std::string flipped = prof;
+  flipped[50] ^= 1;  // inside the identity
+  expect(try_open(m, with(flipped), 16, 4, 8, &hashed), SS_E_INVALID, "identity mismatch");
+  std::vector<uint32_t> other = units;
+  other[0] = 63;
+  std::vector<std::vector<uint32_t>> c2 = cells;
+  c2[0].resize(63 * 63);
+  const std::string wrong_units = ts::dg_profile_write(other, id, "", c2);
+  expect(try_open(m, with(wrong_units), 16, 4, 8, &hashed), SS_E_INVALID, "units of gated layer 0");
+  expect(try_open(m, [&](B&, O& o, T&) {
+           o.struct_size = uint32_t(offsetof(ss_options, dg_score_w_trans));
+           o.dg_score_w_trans = 5;
+           o.dg_score_profile_len = 3;
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
 }

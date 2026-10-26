@@ -28,7 +28,8 @@ static_assert(offsetof(ss_snapshot_info, sequence) == 8, "sequence");
 static_assert(offsetof(ss_snapshot_info, forwards) == 16, "forwards");
 static_assert(offsetof(ss_snapshot_info, readahead_buffers) == 24, "first read-ahead field");
 static_assert(offsetof(ss_snapshot_info, exclusive_writebacks) == 96, "first exclusive field");
-static_assert(sizeof(ss_snapshot_info) == 160, "v1 size");
+static_assert(offsetof(ss_snapshot_info, exclusive_blocks) == 152, "v1 prefix: 160 bytes (fields only appended)");
+static_assert(offsetof(ss_snapshot_info, exclusive_discards) == 160, "first appended field");
 
 struct Run {
   ss_desc* d = nullptr;
@@ -191,6 +192,7 @@ Expect expect_now(ss_ctx* c, uint64_t seq) {
     i.exclusive_min_free_blocks = x.min_free_blocks;
     i.exclusive_rereads = x.rereads;
     i.exclusive_blocks = json_u64(e.json, "exclusive", "blocks");
+    i.exclusive_discards = x.discards;
   }
   return e;
 }
@@ -481,7 +483,7 @@ TEST(snapshot_abi_sizes) {
   CHECK_OK(ss_stats_snapshot(r.c, &t, nullptr));
   CHECK(same_stats(t, e.total));
   const size_t big = sizeof(ss_snapshot_info) + 32;
-  for (uint32_t size : {0u, 1u, 3u, 4u, 8u, 12u, 16u, 24u, 100u, 160u, 192u}) {
+  for (uint32_t size : {0u, 1u, 3u, 4u, 8u, 12u, 16u, 24u, 100u, 160u, 168u, 192u}) {
     unsigned char raw[sizeof(ss_snapshot_info) + 32];
     std::memset(raw, 0xEE, big);
     std::memset(&t, 0xEE, sizeof t);
@@ -495,7 +497,7 @@ TEST(snapshot_abi_sizes) {
     }
     CHECK_OK(st);
     CHECK(same_stats(t, e.total));
-    const uint32_t wrote = size < 160 ? size : 160;
+    const uint32_t wrote = size < uint32_t(sizeof(ss_snapshot_info)) ? size : uint32_t(sizeof(ss_snapshot_info));
     uint32_t ss = 0;
     std::memcpy(&ss, raw, 4);
     CHECK_EQ(ss, wrote);

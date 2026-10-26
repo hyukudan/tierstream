@@ -1,4 +1,4 @@
-// The rename's device-side gate (design notes §4): tierstream/ts.h's ts_dg_slot, called from a
+// The rename's device-side gate: tierstream/ts.h's ts_dg_slot, called from a
 // kernel, gives what ss_dg_slot gives for a resident id, an absent id, an out-of-range id and an aborted view.
 // The view is synthetic (no context): 2 gated layers of 3 and 2 units, guard slot 7.
 #include <cstdio>

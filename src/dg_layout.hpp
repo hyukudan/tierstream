@@ -32,6 +32,10 @@ struct DgLayout {
   uint64_t bounce_bytes = 0;        // pinned: the covering aligned reads of unaligned parts
   uint64_t staging_bytes = 0;       // pinned: one resident's bytes on their way to the arena at open
   bool load_serial = false;
+  // scored eviction (policy SCORED): the resolved weights, the profile's identity (empty without a profile)
+  bool scored = false;
+  uint32_t w_trans = 700, w_freq = 200, w_rec = 100;
+  std::string score_identity;
   uint32_t load_readers = 0, load_buffers = 0;
   uint64_t load_buffer_bytes = 0;  // additional temporary pinned ring, admitted at open
   // Exactly what the context allocates, so admission bills what it allocates.

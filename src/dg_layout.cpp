@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "dg_proto.hpp"
+#include "dg_score.hpp"
 #include "errors.hpp"
 
 namespace ts {
@@ -39,7 +40,9 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   const ss_budget& b = p.budget;
   if (b.tier_mode != SS_TIER_MODE_EXCLUSIVE) refuse(SS_E_INVALID, "needs tier_mode EXCLUSIVE");
   if (b.pinned_backing) refuse(SS_E_INVALID, "pinned_backing is refused (each unit has one home)");
-  if (o.policy != SS_POLICY_LRU) refuse(SS_E_UNSUPPORTED, "only policy LRU (SCORED is not ported)");
+  if (o.policy != SS_POLICY_LRU && o.policy != SS_POLICY_SCORED) refuse(SS_E_INVALID, "policy must be LRU or SCORED");
+  if ((o.dg_score_profile_len || o.dg_score_profile) && o.policy != SS_POLICY_SCORED)
+    refuse(SS_E_INVALID, "dg_score_profile needs policy SCORED");
   if (o.pin_planned) refuse(SS_E_INVALID, "needs pin_planned = 0 (planned residents are a warm start)");
   if (!o.fill_residents) refuse(SS_E_INVALID, "needs fill_residents = 1 (a resident's slot is its only copy)");
   if (o.readahead_units) refuse(SS_E_INVALID, "readahead_units must be 0 (no gated unit is read from its file)");
@@ -141,6 +144,30 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               "host_spare_units or the host budget)");
   require(uint64_t(x.P) + x.Q < 0x7fffffffull, SS_E_INVALID, "device-gated: more than 2^31 - 1 host blocks");
   x.blocks = x.P + x.Q;
+
+  // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
+  // format; the context loads it before the service starts).
+  if (o.policy == SS_POLICY_SCORED) {
+    x.scored = true;
+    if (o.dg_score_w_trans || o.dg_score_w_freq || o.dg_score_w_recency) {
+      if (o.dg_score_w_trans > 1000 || o.dg_score_w_freq > 1000 || o.dg_score_w_recency > 1000 ||
+          o.dg_score_w_trans + o.dg_score_w_freq + o.dg_score_w_recency != 1000)
+        refuse(SS_E_INVALID, "dg_score_w_trans / _freq / _recency must each be 0..1000 and sum to 1000");
+      x.w_trans = o.dg_score_w_trans;
+      x.w_freq = o.dg_score_w_freq;
+      x.w_rec = o.dg_score_w_recency;
+    }
+    std::vector<uint32_t> units;
+    for (int L : x.gated) units.push_back(uint32_t(d.layers[size_t(L)].n_units));
+    const uint64_t cells = dg_score_cells(units);
+    if (cells > uint64_t(SIZE_MAX / 8)) refuse(SS_E_INVALID, "the score tables do not fit the address space");
+    if (o.dg_score_profile_len || o.dg_score_profile) {
+      if (!o.dg_score_profile || !o.dg_score_profile_len)
+        refuse(SS_E_INVALID, "dg_score_profile and dg_score_profile_len must be given together");
+      x.score_identity = dg_score_identity(d, x.gated);
+      (void)dg_profile_check(o.dg_score_profile, o.dg_score_profile_len, units, x.score_identity);
+    }
+  }
 
   x.persistent_slots = x.R + x.D;
   const uint64_t S = uint64_t(x.persistent_slots) + 2ull * x.B + 1;

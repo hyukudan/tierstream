@@ -80,7 +80,7 @@ struct Rig {
   // with_began: the service waits for the begin kernel's word before any flag (design rev 3.4 §11.2).
   // wb_defer: the boundary's write-backs are issued by the service after each served layer.
   explicit Rig(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000), uint32_t max_ids = 8,
-               bool with_began = false, bool wb_defer = false) {
+               bool with_began = false, bool wb_defer = false, bool scored = false) {
     ts::DgConfig c;
     c.n_units.assign(G, U);
     c.persistent_slots = 48 + 12;
@@ -89,6 +89,8 @@ struct Rig {
     c.spare_target = 12;
     c.prefetch_reserve = 3;
     c.wb_defer = wb_defer;
+    c.scored = scored;
+    c.max_ids = max_ids;
     t = std::make_unique<Immediate>(G * U, c.persistent_slots + 2 * c.bank_slots, c.blocks, ready.data());
     core = std::make_unique<DgCore>(c, t.get());
     std::vector<uint32_t> res;
@@ -233,6 +235,63 @@ TEST(dg_service_tokens_wb_defer) {
   CHECK(st.evicted > 0);
   CHECK_EQ(st.wb_deferred, st.evicted);
   CHECK(st.wb_deferred > st.wb_boundary_flushed);  // most write-backs went out inside a token
+}
+
+// Scored eviction: a layer whose next layer already exported (the device ran ahead) is ranked after that layer's
+// service, at the latest before the token is published; every list is this token's when the engine gets the core, and
+// equals a ranking made afterwards (a served layer's candidates, epochs and stamps are final). Half the tokens export
+// every layer up front.
+TEST(dg_service_scored_deferred_ranking) {
+  Rig r(std::chrono::milliseconds(2000), 8, false, true, true);
+  std::mt19937 rng(9);
+  int bad_reads = 0, stale = 0, differ = 0;
+  for (int tok = 0; tok < 120; ++tok) {
+    r.seq = uint32_t(tok + 1);
+    r.svc->begin(r.seq);
+    std::vector<std::vector<uint32_t>> ids(Rig::G);
+    std::vector<uint64_t> mask(Rig::G, 0);
+    const bool ahead = tok % 2 == 1;
+    for (uint32_t g = 0; g < Rig::G; ++g) {
+      ids[g] = routes(rng, 1 + uint32_t(rng() % 8));
+      if (ahead) continue;
+      mask[g] = r.do_export(g, ids[g], 0, r.seq);
+      if (mask[g]) CHECK(r.do_wait(g));
+      if (!r.do_read(g, ids[g])) ++bad_reads;
+    }
+    if (ahead) {  // every export first (each layer's mask from the table as it stood), then the waits and reads
+      for (uint32_t g = 0; g < Rig::G; ++g) mask[g] = r.do_export(g, ids[g], 0, r.seq);
+      for (uint32_t g = 0; g < Rig::G; ++g) {
+        if (mask[g]) CHECK(r.do_wait(g));
+        if (!r.do_read(g, ids[g])) ++bad_reads;
+      }
+    }
+    ts::dg_store_release(&r.done, r.seq);
+    CHECK_EQ(int(r.svc->wait_terminal(r.seq, std::chrono::milliseconds(5000))), int(DgService::kServed));
+    for (uint32_t g = 0; g < Rig::G; ++g) {
+      stale += r.core->score_list_epoch(g) != r.core->epoch();
+      const std::vector<DgCore::ScoreCand> was = r.core->score_list(g);
+      r.core->score_layer(g);
+      const auto& now = r.core->score_list(g);
+      bool same = was.size() == now.size();
+      for (size_t i = 0; same && i < was.size(); ++i)
+        same = was[i].key == now[i].key && was[i].s == now[i].s && was[i].stamp == now[i].stamp;
+      differ += !same;
+    }
+    r.core->end_token({});
+    r.core->check();
+  }
+  const ts::DgStats& st = r.core->stats();
+  std::printf("  ranked layers %llu, deferred %llu, terminal ranking %llu ns, fallbacks %llu, scored victims %llu\n",
+              (unsigned long long)st.score_layers, (unsigned long long)st.score_deferred,
+              (unsigned long long)st.score_last_ns, (unsigned long long)st.score_fallbacks,
+              (unsigned long long)st.scored_victims);
+  CHECK_EQ(bad_reads, 0);
+  CHECK_EQ(stale, 0);
+  CHECK_EQ(differ, 0);
+  CHECK(st.score_deferred > 0);
+  CHECK_EQ(st.score_fallbacks, 0ull);
+  CHECK_EQ(st.score_layers, 2ull * 120 * Rig::G);  // the service's and the re-ranking above
+  CHECK(st.score_last_ns > 0 && st.scored_victims > 0);
 }
 
 // The service fails a token, sets host_abort, returns, and reports why; the engine sees Failed.

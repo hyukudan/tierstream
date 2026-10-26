@@ -46,6 +46,7 @@ add_library(tierstream STATIC
   src/backend_cpu.cpp
   src/dg_core.cpp
   src/dg_prior.cpp
+  src/dg_score.cpp
   src/dg_service.cpp
   src/dg_load.cpp
   src/dg_layout.cpp
@@ -190,7 +191,7 @@ if(TS_TESTS)
   set_target_properties(ts-test-capi PROPERTIES LINKER_LANGUAGE CXX)
   add_test(NAME capi COMMAND ts-test-capi)
 
-  # The rename's compatibility gates (design notes §2.1, §4).
+  # The rename's compatibility gates.
   # (1) the new header: both inclusion orders, member names, token pasting, C++ type identity, every ts_ wrapper
   add_executable(ts-test-names-c tests/test_ts_names.c)
   target_link_libraries(ts-test-names-c PRIVATE tierstream)
@@ -239,8 +240,8 @@ if(TS_TESTS)
   set_tests_properties(ts-prefix-ss-recipe PROPERTIES PASS_REGULAR_EXPRESSION "^ss-recipe: recipe: cannot open recipe no-such-file.toml")
   add_test(NAME ts-prefix-ss-recipe-usage COMMAND ss-recipe)
   set_tests_properties(ts-prefix-ss-recipe-usage PROPERTIES PASS_REGULAR_EXPRESSION "^ss-recipe: ")
-  # ss-plan prints what strix-stream's ss-plan printed (no prefix; the reference comparison is
-  # a byte-identity gate); ts-plan prefixes every diagnostic.
+  # ss-plan prints what strix-stream's ss-plan printed (no prefix; checked against a reference
+  # comparison); ts-plan prefixes every diagnostic.
   add_test(NAME ts-prefix-ss-plan COMMAND ss-plan)
   set_tests_properties(ts-prefix-ss-plan PROPERTIES PASS_REGULAR_EXPRESSION "^usage: ss-plan ")
   add_test(NAME ts-prefix-ss-plan-open COMMAND ss-plan no-such-file.json --device-gib 1)
@@ -295,6 +296,25 @@ if(TS_TESTS)
         message(FATAL_ERROR "TS_RENAME_GATES: git show ${ts_base}:tests/${f} failed")
       endif()
     endforeach()
+    # Intended behaviour changes since 4dc53b0, applied to the extracted tests as exact replacements (each must match):
+    # (a) a miss admitted into a persistent slot lands its read-ahead entry instead of reading the file again;
+    # (b) ss_snapshot_info grew by an appended field (a sized struct): the v1 prefix is checked instead of the size.
+    function(ts_base_edit ef eold enew)
+      file(READ ${ts_old_dir}/${ef} etext)
+      string(FIND "${etext}" "${eold}" epos)
+      if(epos EQUAL -1)
+        message(FATAL_ERROR "TS_RENAME_GATES: the expected 4dc53b0 text was not found in ${ef}")
+      endif()
+      string(REPLACE "${eold}" "${enew}" etext "${etext}")
+      file(WRITE ${ts_old_dir}/${ef} "${etext}")
+    endfunction()
+    ts_base_edit(test_readahead.cpp
+                 "CHECK_EQ(stat_u64(s, \"landed\"), uint64_t(0));\n  CHECK_EQ(stat_u64(s, \"unused\"), uint64_t(2));"
+                 "CHECK_EQ(stat_u64(s, \"landed\"), uint64_t(2));\n  CHECK_EQ(stat_u64(s, \"unused\"), uint64_t(0));")
+    ts_base_edit(test_snapshot.cpp "static_assert(sizeof(ss_snapshot_info) == 160, \"v1 size\");"
+                 "static_assert(offsetof(ss_snapshot_info, exclusive_discards) == 160, \"v1 size\");")
+    ts_base_edit(test_snapshot.cpp "const uint32_t wrote = size < 160 ? size : 160;"
+                 "const uint32_t wrote = size < sizeof(ss_snapshot_info) ? size : uint32_t(sizeof(ss_snapshot_info));")
     foreach(t core runtime recipe exclusive readahead snapshot)
       add_executable(ts-test-base-${t} ${ts_old_dir}/test_${t}.cpp)
       target_include_directories(ts-test-base-${t} PRIVATE src)

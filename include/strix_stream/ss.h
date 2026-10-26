@@ -108,8 +108,9 @@ typedef enum ss_tier {
  * INCLUSIVE: a unit promoted into a device slot keeps its pinned copy; an evicted unit without one reloads from its
  *   file. EXCLUSIVE: each unit lives in exactly one place at a forward boundary: a device slot, a pinned block, or (when
  *   neither holds it) only its file. A promotion frees the unit's block; an evicted unit is written back from its slot
- *   into a free block (device to host, on a second copy stream), or falls back to its file when no block is free. With
- *   device + host room for every unit, files are read only at open. */
+ *   into a free block (device to host, on a second copy stream); when no block is free the miss is deferred (served
+ *   from the stream ring, the victim stays), or with ss_options.exclusive_discard the victim falls back to its file.
+ *   With device + host room for every unit, files are read only at open. */
 typedef enum ss_tier_mode {
   SS_TIER_MODE_INCLUSIVE = 0,
   SS_TIER_MODE_EXCLUSIVE = 1
@@ -139,8 +140,9 @@ typedef struct ss_budget {
   /* EXCLUSIVE: free pinned blocks wanted per unit size (units whose 4 KiB-strided host bytes are equal share blocks).
    * Coverage first: they come from the host budget left after host_fixed and the pinned tier, never displacing a
    * unit's home (the plan JSON says how many fit). A miss that needs an eviction while no block is free is served from
-   * the stream ring and its victim stays (counted as deferred); blocks freed by promotions are reusable from the next
-   * forward. 0 = auto: min(64, units of that size). */
+   * the stream ring and its victim stays (counted as deferred; ss_options.exclusive_discard discards the victim to its
+   * file instead); blocks freed by promotions are reusable from the next forward. 0 = auto: min(64, units of that
+   * size). */
   uint32_t host_spare_units;
 } ss_budget;
 
@@ -182,7 +184,8 @@ typedef enum ss_backend_kind {
 
 typedef enum ss_policy {
   SS_POLICY_LRU = 0,     /* least recently used among unpinned residents; hits refresh recency */
-  SS_POLICY_SCORED = 1   /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency */
+  SS_POLICY_SCORED = 1   /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency (device-gated:
+                            design.md §3.8, the boundary's victims) */
 } ss_policy;
 
 struct ss_dg_unit; /* device-gated seed entry (below) */
@@ -206,9 +209,10 @@ typedef struct ss_options {
    * admission into persistent slots (only after a trace shows the extra evictions pay). */
   int spec_persistent;
   uint32_t reserved0;             /* never read: the bytes where older callers' structs had padding */
-  /* Host read-ahead (design notes): pinned host buffers, each as large as the largest unit
+  /* Host read-ahead: pinned host buffers, each as large as the largest unit
    * that can be read from its file. ss_host_prefetch* and units waiting for a ring slot read their file into one
-   * ahead of time; the unit then lands in its ring slot from that buffer. 0 = off (default), at most 64. */
+   * ahead of time; the unit then lands in its device slot (ring, or persistent when admitted) from that buffer. 0 = off
+   * (default), at most 64. */
   uint32_t readahead_units;
   uint32_t reserved1;             /* explicit padding (never read) */
   /* Device-gated decode mode (docs/design.md §3.7): SS_FORWARD_DEVICE_GATED moves route -> slot resolution and the
@@ -243,8 +247,9 @@ typedef struct ss_options {
    * after the layers it serves (after the layer's ready and prefetches, where the copy engine is idle; never after
    * the last gated layer); a boundary carries what is left into the next token, up to the larger of its own and the
    * previous boundary's victim count, and submits the older excess; a victim demanded or prefetched before any of its parts was submitted costs no
-   * copy at all. 0 (default) = every write-back is enqueued at the boundary, right after the table upload. (The
-   * timeline's wb_left_ms measures the boundary's write-backs: meaningful with 0 only.) */
+   * copy at all; the default (also for an older caller's struct, which ends before this field). 0 = every write-back
+   * is enqueued at the boundary, right after the table upload. (The timeline's wb_left_ms measures the boundary's
+   * write-backs: meaningful with 0 only.) */
   uint32_t dg_wb_defer;
   /* dg_wb_defer = 1: 0 (default) = the parts go on the demand stream right after the layer's ready (stream order
    * keeps them behind it); 1 = on the write-back stream, made to wait for the ready by an event */
@@ -259,6 +264,27 @@ typedef struct ss_options {
    * ss_open (validated, copied into the context); 0 / NULL = no prior */
   uint64_t dg_prior_len;
   const void* dg_prior;
+  /* EXCLUSIVE tier mode (host forward mode; ignored otherwise): 1 = an admission whose victims outnumber the free
+   * blocks of their size is not deferred: the victims past the free blocks are discarded to their files (no device to
+   * host copy, no block; exact, since weights are immutable and every unit's bytes are in its file) and the misses
+   * take their slots, so the resident set keeps adapting when the pinned budget is full. A discarded unit is then
+   * file-homed like a disk unit (read from its file, host read-ahead included, when it is fetched again); the blocks
+   * keep their units. Speculative admissions (spec_persistent) keep the cap: a guess never discards. Counted in
+   * ss_exclusive_stats.discards. 0 (default) = such misses are served from the stream ring and their victims stay
+   * (deferred). ss_open refuses it with a descriptor whose tiers are "pinned". ss_recipe_plan rebuilds the options it
+   * fills from the recipe: set this field after that call. */
+  uint32_t exclusive_discard;
+  uint32_t reserved2;             /* explicit padding (never read) */
+  /* appended, scored eviction (policy SS_POLICY_SCORED in device-gated mode, docs/design.md §3.8): the score's integer
+   * weights out of 1000 (transition, window frequency, recency), each 0..1000 and summing to 1000; all three 0 = the
+   * defaults 700 / 200 / 100 (also what ss_options_defaults sets). Not read under SS_POLICY_LRU. */
+  uint32_t dg_score_w_trans, dg_score_w_freq, dg_score_w_recency;
+  uint32_t reserved3;  /* explicit padding (never read) */
+  /* appended, scored eviction: a score profile's bytes (the transition counts the table starts from; format and
+   * identity in "Device-gated decode" below), read only during ss_open (validated, copied into the context); 0 / NULL
+   * = an empty table (online learning only). Needs SS_POLICY_SCORED and a descriptor with per-unit hashes. */
+  uint64_t dg_score_profile_len;
+  const void* dg_score_profile;
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -376,6 +402,8 @@ typedef struct ss_exclusive_stats {
   uint64_t free_blocks;       /* free pinned blocks now (all sizes) */
   uint64_t min_free_blocks;   /* fewest free blocks at any forward start since open */
   uint64_t rereads;           /* copies out of a block whose write-back of the same forward had to land first */
+  /* appended: victims discarded to their files (ss_options.exclusive_discard; not write-backs: no bytes copied) */
+  uint64_t discards;
 } ss_exclusive_stats;
 SS_API ss_status ss_stats_exclusive_sized(const ss_ctx* c, ss_exclusive_stats* out, uint32_t size);
 static inline ss_status ss_stats_exclusive(const ss_ctx* c, ss_exclusive_stats* out) {
@@ -409,9 +437,11 @@ typedef struct ss_snapshot_info {
   /* Host read-ahead (0 unless SS_SNAPSHOT_READAHEAD), as the JSON's "readahead" object. */
   uint64_t readahead_buffers, readahead_buffer_bytes, readahead_requested, readahead_read, readahead_landed;
   uint64_t readahead_unused, readahead_failed, readahead_fallback, readahead_bytes;
-  /* EXCLUSIVE tier (0 unless SS_SNAPSHOT_EXCLUSIVE), as ss_exclusive_stats plus the block count. */
+  /* EXCLUSIVE tier (0 unless SS_SNAPSHOT_EXCLUSIVE), as ss_exclusive_stats plus the block count (the JSON's
+   * "exclusive" object); exclusive_discards is appended after the first version's last field. */
   uint64_t exclusive_writebacks, exclusive_writeback_bytes, exclusive_deferred, exclusive_promoted;
   uint64_t exclusive_free_blocks, exclusive_min_free_blocks, exclusive_rereads, exclusive_blocks;
+  uint64_t exclusive_discards;
 } ss_snapshot_info;
 /* total_out (may be NULL): the per-layer counters of the publication summed, as ss_stats_total. info_out (may be
  * NULL; not both): struct_size is set to the bytes written; info_size < 4 with info_out = SS_E_INVALID. */
@@ -425,7 +455,7 @@ static inline ss_status ss_stats_snapshot(const ss_ctx* c, ss_layer_stats* total
 SS_API ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t* out_len);
 
 /* ---------------------------------------------------------------------------------------------------------------
- * Device-gated decode (docs/design.md §3.7; CUDA backend, tier_mode EXCLUSIVE, policy LRU, pin_planned 0).
+ * Device-gated decode (docs/design.md §3.7; CUDA backend, tier_mode EXCLUSIVE, policy LRU or SCORED, pin_planned 0).
  *
  * Sequence: ss_begin authorizes exactly one step (its begin kernel compares its sequence with the host's; any other
  * step is aborted on the device and reads only the guard slot). ss_begin and ss_end also check that no step ran
@@ -527,6 +557,23 @@ typedef struct ss_dg_boundary_timeline {
   double sync_us, select_us, upload_us, issue_us;
 } ss_dg_boundary_timeline;
 SS_API ss_status ss_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size);
+/* Scored eviction (policy = SS_POLICY_SCORED; docs/design.md §3.8). Only the boundary's choice of victims changes: the
+ * eligible units (on the device, no write-back in flight, not kept by ss_dg_keep) are taken lowest score first,
+ * score = w_t P + w_f F + w_r Rec in integers: P = the transition estimate from this token's union of the layer's
+ * routed ids (counts of "previous token's union -> this union" per gated layer, uint32 cells that saturate), F = how
+ * many of the layer's last 16 unions hold the unit, Rec = 1 / (1 + tokens since its last routed use); ties go to the
+ * older use, then to the less recent unit. The history lives as long as the context (ss_stats_reset keeps it;
+ * ss_dg_reset_open restores the open state: the profile's counts or an empty table). One ss_begin / ss_end is one
+ * history step, every exported row included. Pressure tests and the write-backs are the same in both policies.
+ * Profile file (little endian, frozen): "TSSCPRF1", u32 version 1, u32 n_gated, u32 units[n_gated], identity[32],
+ * u32 prov_len (<= 4096), prov[prov_len] (provenance, reported in the stats JSON), then per gated layer units^2 u32
+ * counts row-major [previous unit][unit], then sha256[32] of every byte before it. identity = sha256 of u32 n_gated,
+ * then per gated layer: u32 model layer index, u32 units, u64 unit_bytes, the descriptor's per-unit xxh64 list (a
+ * descriptor without them cannot load a profile). Any mismatch (size, magic, version, units, identity, checksum) fails
+ * ss_open. Host memory: 4 x units^2 bytes per gated layer (twice that with a profile: its counts are kept for
+ * reset), pageable, outside the pinned admission. Device-gated ss_open refuses a policy other than LRU / SCORED with
+ * SS_E_INVALID (before scored eviction, SCORED itself was SS_E_UNSUPPORTED). */
+#define SS_DG_SCORED 1
 /* Counters since open (or the last ss_stats_reset), folded at each ss_end. */
 typedef struct ss_dg_stats {
   uint32_t struct_size, reserved0;
@@ -554,12 +601,21 @@ typedef struct ss_dg_stats {
   uint64_t winpf_hints, winpf_hint_rows, prior_issued, prior_used, prior_late, prior_reverted;
   uint64_t l1_candidates, l1_issued, l1_used, l1_late, l1_reverted, l1_priced_out, l1_skipped_ahead;
   uint64_t prior_budget_stops;  /* hints whose prior prefetches stopped at the copy-engine byte budget */
+  /* appended, scored eviction (0 under LRU): score_fallbacks = boundaries that used the recency order because the
+   * score lists were not this token's (an internal consistency guard: should stay 0); scored_victims = victims taken
+   * in score order; score_layers / score_candidates = layers ranked and the units they ranked; score_saturated =
+   * transition increments refused by a saturated (2^32 - 1) cell; score_ns = the service thread's ranking time */
+  uint64_t score_fallbacks, scored_victims, score_layers, score_candidates, score_saturated, score_ns;
+  /* appended, scored eviction: score_deferred = layers whose ranking waited behind a later layer because the device
+   * had already exported it; score_last_ns = ranking time after the last gated layer was served (the terminal path,
+   * part of score_ns) */
+  uint64_t score_deferred, score_last_ns;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
   return ss_stats_dg_sized(c, out, (uint32_t)sizeof *out);
 }
-/* Window prefetch (winpf; design notes): an opt-in placement policy for multi-row (speculative verify)
+/* Window prefetch (winpf): an opt-in placement policy for multi-row (speculative verify)
  * windows. Off until ss_dg_winpf_set enables it; off = today's prefetch byte for byte. Only placement changes (which
  * units are copied when): the copies, the table protocol and the engine's arithmetic are those of every prefetch.
  * - l+1, for a token that got a window hint (otherwise today's prefetch): the prediction an export promised (rows x K

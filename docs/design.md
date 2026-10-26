@@ -5,7 +5,7 @@ resident set of weight units in device memory. It streams the rest from a pinned
 unbuffered, and it reads every streamed or resident unit through one pointer table per layer. The library holds no
 model or engine code. A model plugs in with a **descriptor** (§2) and a small **adapter** in the engine (§6).
 
-Sources: the weight-streaming study (the weight-streaming study notes), the RTX prefill spec §6 (`spec-rtx-prefill.md`, the
+Sources: the weight-streaming study, the RTX prefill spec §6 (`spec-rtx-prefill.md`, the
 `ss_` names come from there unchanged), the DeepSeek and MiniMax streaming specs, and hyperloom vramplan's third
 tier (the planner rule of §5).
 
@@ -154,7 +154,7 @@ lower id.
     - age is counted in routes.
   - Hits do not refresh recency; misses do.
   - Misses below the cut are transient. Residents below the cut are evicted only as needed.
-  - It has to beat LRU on our traces (the hit-rate curves in the cache hit-rate curves) before it becomes a default.
+  - It has to beat LRU on our traces (measured hit-rate curves) before it becomes a default.
 - **Seed** (`ss_seed`): load ranked units into free slots between forwards (usage profile, warm start). It never
   evicts.
 
@@ -207,10 +207,18 @@ Exclusive mechanics:
   direction), and the admitted unit's copy into that slot waits for the write-back. A miss past the cap is served
   from the stream ring and its victim stays (`deferred`): no unit ever falls back to its file. With no spare and full
   slots the cache cannot adapt (every miss from the ring) but stays covered.
+- **Discard** (`ss_options.exclusive_discard = 1`, default 0). A demand admission is not capped: the victims past
+  the free blocks are discarded instead of deferred (no D2H, no block; exact, since weights are immutable and every
+  unit's bytes are in its file) and the misses take their slots, so the cache keeps adapting with the pinned budget
+  full. A speculative admission keeps the cap (a guess never discards). A discarded unit is file-homed from then on
+  (fetched from its file; host read-ahead takes a unit only when its size fits the read-ahead buffers, which hold
+  every size that has resident or disk units, the only sizes a discard can happen in). Blocks keep their units;
+  `discards` counts the victims (not write-backs, no bytes). Set it after `ss_recipe_plan`, which rebuilds the
+  options.
 - **Speculation.** A speculative admission (`spec_persistent`) leaves half of the spares to demands.
 - **Refused:** `pinned_backing` / tier `B` (the second copy), `fill_residents = 0` (a resident's slot is its only
   copy), the HIP backend (on unified memory a slot and a block are the same memory), descriptors whose tiers do not
-  allow pinned.
+  allow pinned; `exclusive_discard` with a descriptor whose tiers are `pinned` (its units must not live on disk).
 
 Exclusive ordering (CUDA; the CPU backend copies synchronously):
 
@@ -237,11 +245,13 @@ that can be read from its file.
   - Requests are idempotent per forward. A unit that is resident, in flight, computed by a peer or pinned is skipped.
 - **Reads.** A reader reads the unit into a free buffer, with the hash checked as on every path, at a priority below
   demands. Unattached read-ahead reads use at most max(1, readers - 1) readers.
-- **Landing.** When the unit gets its ring slot, a copy job takes it from the buffer: H2D on the copy stream after
-  the slot's release event; memcpy on unified backends. If the read has not finished, the copy is queued the moment
-  it does, and a still-queued read is promoted to a demand. A buffer is reused only after its last copy's event.
-- **Not used:** a unit admitted into a persistent slot (decode, exclusive eviction) abandons its request and takes the
-  ordinary path. A failed read falls back to an ordinary file read; it fails the forward only when a landing was
+- **Landing.** When the unit gets a device slot (its ring slot, or a persistent slot when a certain fetch admits it),
+  a copy job takes it from the buffer: H2D on the copy stream after the slot's release event and, in the exclusive
+  mode, after the write-back of the victim that held a persistent slot; memcpy on unified backends. If the read has
+  not finished, the copy is queued the moment it does, and a still-queued read is promoted to a demand. A buffer is
+  reused only after its last copy's event.
+- **Not used:** a speculative fetch abandons (persistent) or ignores (ring) the request and takes the ordinary
+  path. A failed read falls back to an ordinary file read; it fails the forward only when a landing was
   already waiting on it.
 - **Shutdown.** `ss_end` and `ss_close` sweep and drain every request: unused reads, waiting requests, parked and
   queued landings.
@@ -253,7 +263,7 @@ that can be read from its file.
 ### 3.7 Device-gated write-back scheduling
 
 In device-gated decode (README, "Device-gated decode") each boundary evicts least recently used experts into free
-pinned blocks. With `dg_wb_defer = 1` the boundary still chooses the victims, reserves their blocks and unpublishes
+pinned blocks. With `dg_wb_defer = 1` (the default) the boundary still chooses the victims, reserves their blocks and unpublishes
 them in the table upload, but copies nothing. Each victim waits in a FIFO of records: unsubmitted, partly submitted
 (only the oldest, with a part cursor), or submitted with its completion event recorded after its last part. Only
 submitted records are ever queried for completion. The service thread submits parts after a layer's ready signal and
@@ -270,6 +280,73 @@ discarded, so its block returns once those copies finish and the remaining parts
 the existing rules: a victim's slot is not written until its write-back's event completes, the device never reads an
 unpublished slot, and a block becomes a unit's home only after every part landed. Close drops unsubmitted records
 without new device work and frees memory only after the submitted copies are drained.
+
+### 3.8 Device-gated scored eviction
+
+With `policy = SS_POLICY_SCORED` in device-gated decode only the boundary's choice of victims changes. Demand misses,
+banks, prefetch, resurrection, write-backs (deferred or not), the table protocol and the device kernels are those of
+LRU, so results are bit-for-bit identical and only residency (and so timing) differs.
+
+- **Eligibility** is LRU's exactly: a device home, no write-back in flight, not in the keep list. Units of the current
+  token are eligible. Coming units are never victims: at the boundary each one has been admitted (then it is a device
+  home) or reverted to its block.
+- **One acceptance loop** serves both policies. It takes candidates from a policy order (LRU: the recency list from
+  its tail; scored: the merged score lists) and accepts an eligible one while `free + pending + accepted < target`
+  and a free block exists; at the first victim without a block nothing more is accepted. `pending` counts the
+  deferred write-back records and the in-flight ones that were not discarded. Only the accepted list feeds the
+  deferred records, the boundary's copies and the carry bound. The pressure test override then walks the recency
+  list from its head through the same loop and counts accepted victims.
+- **The score**, per gated layer g, in integers. `T_g[r][e]` are uint32 counts that saturate at 2^32 - 1 and are
+  never aged; each row sum is an exact uint64 that moves only when one of its cells does; `cnt_g[e]` counts the last
+  16 unions of g that contain e. With `cur` the token's unique union of g's routed ids (every exported row included),
+  `N = sum_{r in cur} T[r][e]`, `D = sum_{r in cur} rowsum[r]`:
+  `P = ((|cur| * N) << 16) / max(1, D)`, `F = (cnt[e] << 16) / 16`, `Rec = (1 << 16) / (1 + epoch - demand_epoch[e])`,
+  `S = w_t * P + w_f * F + w_r * Rec`. All divisions are unsigned floor divisions; with at most 65536 units per layer
+  and 64 ids per export every intermediate stays below 2^60. The order everywhere is (S, demand epoch, recency
+  stamp), ascending: a total order, because stamps are unique.
+- **State and its lifetime.** The epoch starts at 0 and each token adds 1 (the first token is epoch 1). A demand use
+  sets a unit's demand epoch; seeding, prefetch and resurrection never do. Every push to the recency list takes the
+  next stamp of one uint64 counter, checked before each phase that can push (a token, a seed, a window hint): past a
+  limit 2^40 below the maximum the phase fails before changing anything (the service's failure poisons the context),
+  so the counter never wraps. The history (counts, rings, previous unions, epochs) lives as long as the context:
+  `ss_stats_reset` keeps it and `ss_dg_reset_open` restores the open state (the profile's counts or an empty table,
+  epoch 0, the open stamps). Toggling write-back deferral between tokens does not touch it.
+- **Where the work runs.** For each layer the service thread serves the demand and signals ready, then `serve_use`
+  copies the unique union into the layer's own buffer before anything can reuse the shared scratch, updates the
+  counts (previous union x this union), the ring and the previous union, and stamps the used units. Then come the next
+  layer's prefetches and the write-back slice, and only then the ranking: every device or coming unit of the layer
+  (write-back pending ones included, since a later collection may clear the flag) is scored and the complete list is
+  sorted and tagged with the epoch. All of this happens before the service publishes the token as served; the engine
+  reads the lists only after acquiring that word. A layer's union, epochs and stamps are final once it is served,
+  because each layer is served once per token and its prefetches and resurrections come before its use. So when the
+  next layer has already exported (the device is ahead), the ranking waits until that layer has been served, and at
+  the latest until just before the token is published; `score_deferred` counts these, and `score_last_ns` is the
+  ranking time after the last layer (the part on the terminal path).
+- **Fallback.** A failed or stopped token, a timeout or a device error poisons the context as before; the boundary
+  never runs. If the handoff succeeded but some list is not tagged with this token's epoch, that boundary feeds the
+  LRU order into the same loop and counts `score_fallbacks` (an internal-consistency guard that should stay at 0).
+- **Profile.** The optional `dg_score_profile` holds starting counts: magic `TSSCPRF1`, version 1, the gated layer
+  count and units, a 32-byte identity, a provenance string (at most 4096 bytes, reported in the stats JSON), the
+  counts row-major per layer, then a SHA-256 of everything before it. The identity is the SHA-256 of the layer count
+  and, per gated layer, its model layer index, units, unit bytes and the descriptor's per-unit xxh64 list, so a
+  descriptor without unit hashes cannot load one. `ss_open` checks the exact size, magic, version, units, identity and
+  checksum, rebuilds the row sums and loads the counts before the service starts. Any mismatch fails the open. The
+  counts are kept for `ss_dg_reset_open`, so a profile doubles the tables' host memory (4 x units^2 bytes per layer,
+  pageable).
+- **Admission.** The tables are ordinary pageable host memory, not pinned, so the pinned host admission
+  (`host_pinned_bytes`) does not bill them; `ss_open` only checks that their size fits the address space (with at most
+  65536 units per layer). A recipe's host estimate for `policy = scored` already includes one transition table per
+  layer; the profile's kept copy is not in it. On DeepSeek (40 layers x 384 units) that is 22.5 MiB, or 45 MiB with a
+  profile.
+- **Policy values.** Device-gated `ss_open` accepts LRU and SCORED and refuses any other policy value with
+  `SS_E_INVALID`. Before this mode existed, SCORED itself was refused with `SS_E_UNSUPPORTED`.
+- **Gates.** A brute-force oracle recomputes every boundary of the randomized core runs from the same state
+  (deferred, partial and recorded write-backs, resurrections and collections after ranking, keep lists, changing
+  targets, shortage, pressure) and must match exactly; injected faults (a pending victim, an ignored keep list, a stale
+  list, ranking from overwritten scratch) must be caught. A replay drives the real core through a route trace and
+  matches a port of the reference simulator token by token (misses and victims, both policies). On a DeepSeek decode
+  route trace (8,576 residents, 96 spares, 49,430 tokens, five folds) both read 8.140 misses per token for LRU and 7.652
+  for scored with an empty starting table. Profile-seeded counts reach 7.18 in the simulator.
 
 ## 4. Sources and the copy path
 

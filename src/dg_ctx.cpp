@@ -688,6 +688,14 @@ class CudaDgCtx final : public DgCtx {
     out->l1_priced_out = a.l1_priced_out;
     out->l1_skipped_ahead = a.l1_skipped_ahead;
     out->prior_budget_stops = a.prior_budget_stops;
+    out->score_fallbacks = a.score_fallbacks;
+    out->scored_victims = a.scored_victims;
+    out->score_layers = a.score_layers;
+    out->score_candidates = a.score_candidates;
+    out->score_saturated = a.score_saturated;
+    out->score_ns = a.score_ns;
+    out->score_deferred = a.score_deferred;
+    out->score_last_ns = a.score_last_ns;
     out->wb_outstanding_bytes = fold_wb_outstanding_;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
@@ -858,6 +866,14 @@ class CudaDgCtx final : public DgCtx {
     d.l1_priced_out = a.l1_priced_out - b.l1_priced_out;
     d.l1_skipped_ahead = a.l1_skipped_ahead - b.l1_skipped_ahead;
     d.prior_budget_stops = a.prior_budget_stops - b.prior_budget_stops;
+    d.score_fallbacks = a.score_fallbacks - b.score_fallbacks;
+    d.scored_victims = a.scored_victims - b.scored_victims;
+    d.score_layers = a.score_layers - b.score_layers;
+    d.score_candidates = a.score_candidates - b.score_candidates;
+    d.score_saturated = a.score_saturated - b.score_saturated;
+    d.score_ns = a.score_ns - b.score_ns;
+    d.score_deferred = a.score_deferred - b.score_deferred;
+    d.score_last_ns = a.score_last_ns - b.score_last_ns;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -971,8 +987,18 @@ class CudaDgCtx final : public DgCtx {
         {"l1_reverted", s.l1_reverted},
         {"l1_priced_out", s.l1_priced_out},
         {"l1_skipped_ahead", s.l1_skipped_ahead},
-        {"prior_budget_stops", s.prior_budget_stops}};
+        {"prior_budget_stops", s.prior_budget_stops},
+        {"score_fallbacks", s.score_fallbacks},
+        {"scored_victims", s.scored_victims},
+        {"score_layers", s.score_layers},
+        {"score_candidates", s.score_candidates},
+        {"score_saturated", s.score_saturated},
+        {"score_ns", s.score_ns},
+        {"score_deferred", s.score_deferred},
+        {"score_last_ns", s.score_last_ns}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
+    if (x_.scored) g["policy"] = Json::string("scored");
+    if (!core_->profile_provenance().empty()) g["score_profile"] = Json::string(core_->profile_provenance());
     j["device_gated"] = g;
     return j;
   }
@@ -1213,6 +1239,11 @@ class CudaDgCtx final : public DgCtx {
     c.wb_on_d2h = o_.dg_wb_stream == 1;
     c.wb_layer_bytes = o_.dg_wb_layer_bytes;
     c.wb_max_outstanding = o_.dg_wb_max_outstanding;
+    c.scored = x_.scored;  // scored eviction (dg_layout resolved and checked the weights)
+    c.w_trans = x_.w_trans;
+    c.w_freq = x_.w_freq;
+    c.w_rec = x_.w_rec;
+    c.max_ids = x_.B;
     core_ = std::make_unique<DgCore>(c, transport_.get());
     // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()
     // keeps the first persistent_slots - T distinct keys, and that order is the recency order.
@@ -1239,6 +1270,10 @@ class CudaDgCtx final : public DgCtx {
     }
     o_.dg_prior = nullptr;  // read only during ss_open
     o_.dg_prior_len = 0;
+    if (o_.dg_score_profile_len)  // scored eviction: into the context's tables before the service starts
+      core_->load_profile(o_.dg_score_profile, o_.dg_score_profile_len, x_.score_identity);
+    o_.dg_score_profile = nullptr;  // read only during ss_open
+    o_.dg_score_profile_len = 0;
     if (o_.dg_diag) {
       transport_->enable_diag(G);
       core_->set_diag(true);

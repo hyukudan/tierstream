@@ -40,7 +40,8 @@ struct Job {
   std::atomic<int> state{Queued};
   ss_status err_status = SS_OK;
   std::string err;
-  // Host read-ahead: a producer reads the unit's file into an RA buffer; a child copies that buffer into a ring slot.
+  // Host read-ahead: a producer reads the unit's file into an RA buffer; a child copies that buffer into the unit's
+  // slot (ring or persistent).
   bool ra_producer = false;
   bool ra_child = false;
   bool issued_piece = false;          // child: at least one copy out of the buffer was issued
@@ -109,7 +110,8 @@ class Ctx {
   void test_hold_readers(bool hold);
   // Tests: one-shot read-ahead fault injection (1 = queueing a read throws, 2 = queueing a landing throws,
   // 3 = the next landing copy fails before any copy, 4 = it fails after its first piece, 5 = the next read fails,
-  // 8 = the next read fails after its first part, 9 = the next read's hash check fails though its bytes are right).
+  // 8 = the next read fails after its first part, 9 = the next read's hash check fails though its bytes are right,
+  // 10 = the next landing into a victim's slot skips its wait for the victim's write-back: a mutation, CUDA test).
   void test_inject(int what) { test_inject_.store(what); }
   // Tests: wait until every read-ahead read of this forward has ended (a deterministic Ready state).
   void test_ra_quiesce();
@@ -186,8 +188,9 @@ class Ctx {
   void open_forward();
   void retire_ring(int layer);
   void wait_job_quiet(Job& j);
-  void* write_back(int layer, const Admission& a);
+  void* write_back(int layer, const Admission& a, bool speculative, size_t* n_wb);
   void fetch_admitted(int layer, const Admission& a, bool spec);
+  uint64_t writeback_blocks(int layer, bool speculative) const;
   int eviction_cap(int layer, bool speculative) const;
   void free_block(int layer, int unit);
   int block_class(int layer) const;

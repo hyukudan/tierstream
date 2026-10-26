@@ -1,4 +1,4 @@
-// Host read-ahead (design notes §7-11) on the CPU backend: byte identity against
+// Host read-ahead on the CPU backend: byte identity against
 // readahead_units = 0, both completion / landing orders, failures with and without a waiting landing, cancellation,
 // shutdown without ss_end, deduplication, one reader, ABI and the R = 0 boundary.
 #include <cstddef>
@@ -408,54 +408,72 @@ TEST(readahead_close_without_end) {
 }
 
 TEST(readahead_exclusive_persistent_admission) {
-  // Exclusive decode: a unit with a read-ahead request admitted into a persistent slot abandons the request (read-ahead
-  // lands only in ring slots) and takes the ordinary path, with its victim's write-back.
-  Fixture fx("ra-excl");
-  Run r;
-  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
-  if (!r.d) return;
-  ss_budget_defaults(&r.b);
-  r.b.margin_gib = 1.0 / 1024;
-  r.b.margin_fraction = 0;
-  r.b.device_bytes = uint64_t(256) << 20;
-  r.b.ring_slots = 16;
-  r.b.host_pinned_bytes = 4 << 20;
-  r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
-  const char* js = "{\"tiers\":[\"\",\"PPPPPPPPPPPPPPPP\",\"RRRRDDDD\",\"P\",\"PPPPPPPPPPPPPPPP\"]}";
-  CHECK_OK(ss_plan_from_json(r.d, &r.b, js, std::strlen(js), &r.p));
-  if (!r.p) return;
-  ss_options_defaults(&r.o);
-  r.o.verify_hash = 1;
-  r.o.pin_planned = 0;
-  r.o.staging_bytes = 64 * 1024;
-  r.o.readahead_units = 2;
-  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
-  if (!r.c) return;
-  CHECK_OK(ss_begin(r.c, nullptr, 0));
-  int32_t ids[2] = {5, 6};
-  CHECK_OK(ss_host_prefetch(r.c, 2, ids, 2));
-  CHECK_OK(ss_test_ra_quiesce(r.c));
-  CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));  // both admitted (evicting residents 0, 1): their requests are abandoned
-  ss_layer_view v{};
-  CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
-  CHECK(same(v, fx, 2, 5) && same(v, fx, 2, 6));
-  CHECK_OK(ss_check_unit(r.c, 2, 5));
-  CHECK_OK(ss_release(r.c, 2, nullptr));
-  CHECK_OK(ss_end(r.c));
-  const std::string s = stats(r.c);
-  CHECK_EQ(stat_u64(s, "landed"), uint64_t(0));
-  CHECK_EQ(stat_u64(s, "unused"), uint64_t(2));
-  ss_exclusive_stats x{};
-  CHECK_OK(ss_stats_exclusive(r.c, &x));
-  CHECK_EQ(x.writebacks, uint64_t(2));
-  // The written-back residents come back from their blocks.
-  CHECK_OK(ss_begin(r.c, nullptr, 0));
-  int32_t back[2] = {0, 1};
-  CHECK_OK(ss_layer_routes(r.c, 2, back, 2));
-  CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
-  CHECK(same(v, fx, 2, 0) && same(v, fx, 2, 1));
-  CHECK_OK(ss_release(r.c, 2, nullptr));
-  CHECK_OK(ss_end(r.c));
+  // Decode: a unit with a read-ahead request admitted into a persistent slot lands from its buffer, whether the read is
+  // Ready (finished) or Reading (readers held: the landing is parked, the read is promoted and queues it). Exclusive:
+  // the landing goes into a victim's slot after the victim's write-back; inclusive: the victims just leave. Each unit's
+  // file bytes are counted once (by its read), the landing copy nowhere.
+  for (int excl : {1, 0})
+    for (int reading : {0, 1}) {
+      const std::string tag = std::string(excl ? "ra-excl" : "ra-incl") + (reading ? "-reading" : "-ready");
+      Fixture fx(tag);
+      Run r;
+      CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+      if (!r.d) return;
+      ss_budget_defaults(&r.b);
+      r.b.margin_gib = 1.0 / 1024;
+      r.b.margin_fraction = 0;
+      r.b.device_bytes = uint64_t(256) << 20;
+      r.b.ring_slots = 16;
+      r.b.host_pinned_bytes = 4 << 20;
+      r.b.tier_mode = excl ? SS_TIER_MODE_EXCLUSIVE : SS_TIER_MODE_INCLUSIVE;
+      const char* js = "{\"tiers\":[\"\",\"PPPPPPPPPPPPPPPP\",\"RRRRDDDD\",\"P\",\"PPPPPPPPPPPPPPPP\"]}";
+      CHECK_OK(ss_plan_from_json(r.d, &r.b, js, std::strlen(js), &r.p));
+      if (!r.p) return;
+      ss_options_defaults(&r.o);
+      r.o.verify_hash = 1;
+      r.o.pin_planned = 0;
+      r.o.staging_bytes = 64 * 1024;
+      r.o.readahead_units = 2;
+      CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+      if (!r.c) return;
+      ss_stats_reset(r.c);
+      CHECK_OK(ss_begin(r.c, nullptr, 0));
+      int32_t ids[2] = {5, 6};
+      if (reading) CHECK_OK(ss_test_hold_readers(r.c, 1));
+      CHECK_OK(ss_host_prefetch(r.c, 2, ids, 2));
+      if (!reading) CHECK_OK(ss_test_ra_quiesce(r.c));
+      CHECK_OK(ss_layer_routes(r.c, 2, ids, 2));  // both admitted (evicting residents 0, 1): they land from the buffers
+      if (reading) CHECK_OK(ss_test_hold_readers(r.c, 0));
+      ss_layer_view v{};
+      CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+      CHECK(same(v, fx, 2, 5) && same(v, fx, 2, 6));
+      CHECK_OK(ss_check_unit(r.c, 2, 5));
+      CHECK_OK(ss_release(r.c, 2, nullptr));
+      CHECK_OK(ss_end(r.c));
+      const std::string s = stats(r.c);
+      CHECK_EQ(stat_u64(s, "landed"), uint64_t(2));
+      CHECK_EQ(stat_u64(s, "unused"), uint64_t(0));
+      CHECK_EQ(stat_u64(s, "bytes"), uint64_t(2 * 8192));
+      CHECK_EQ(disk_bytes(r.c), uint64_t(2 * 8192));  // read once, landed without a second read
+      ss_layer_stats t;
+      CHECK_OK(ss_stats_total(r.c, &t));
+      CHECK_EQ(t.admitted, uint64_t(2));
+      CHECK_EQ(t.bytes_pinned, uint64_t(0));
+      ss_exclusive_stats x{};
+      CHECK_OK(ss_stats_exclusive(r.c, &x));
+      CHECK_EQ(x.writebacks, uint64_t(excl ? 2 : 0));
+      // 5 and 6 are resident (hits); the evicted residents come back from their blocks (exclusive) or files.
+      CHECK_OK(ss_begin(r.c, nullptr, 0));
+      int32_t back[4] = {0, 1, 5, 6};
+      CHECK_OK(ss_layer_routes(r.c, 2, back, 4));
+      CHECK_OK(ss_acquire(r.c, 2, nullptr, &v));
+      for (int32_t u : back) CHECK(same(v, fx, 2, u));
+      CHECK_OK(ss_release(r.c, 2, nullptr));
+      CHECK_OK(ss_end(r.c));
+      CHECK_OK(ss_stats_total(r.c, &t));
+      CHECK_EQ(t.hits, uint64_t(2));
+      CHECK_EQ(t.bytes_disk, uint64_t(excl ? 2 * 8192 : 4 * 8192));
+    }
 }
 
 TEST(readahead_off_and_abi) {

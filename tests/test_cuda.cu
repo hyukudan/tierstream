@@ -194,6 +194,68 @@ std::vector<int32_t> route(std::mt19937& g, int E, int k, int rows) {
   return ids;
 }
 
+// Can an H2D on one stream finish while a D2H queued earlier on another stream waits for a gate (probe_order.cu's
+// "disjoint" condition, disjoint buffers)? 1 = yes, 0 = no (the copies serialize: one async copy engine, as the RTX PRO
+// under WDDM reports, runs every stream's copies in submission order, so a held D2H holds every later H2D), -1 =
+// unknown (the gate ended before the H2D was submitted, or a query failed). Measured once per process. A test whose
+// hazard needs an H2D to overtake a held write-back can only observe it when this is 1.
+int h2d_overtakes_held_d2h() {
+  static int cached = -2;
+  if (cached != -2) return cached;
+  const size_t n = 8192;
+  cudaStream_t gs = nullptr, wb = nullptr, cp = nullptr;
+  cudaEvent_t gate = nullptr, h2d = nullptr;
+  unsigned char *a = nullptr, *c = nullptr, *x = nullptr, *rr = nullptr;
+  for (cudaStream_t* s : {&gs, &wb, &cp}) CU(cudaStreamCreateWithFlags(s, cudaStreamNonBlocking));
+  for (cudaEvent_t* e : {&gate, &h2d}) CU(cudaEventCreateWithFlags(e, cudaEventDisableTiming));
+  CU(cudaHostAlloc(reinterpret_cast<void**>(&a), n, cudaHostAllocPortable));
+  CU(cudaHostAlloc(reinterpret_cast<void**>(&c), n, cudaHostAllocPortable));
+  CU(cudaMalloc(&x, n));
+  CU(cudaMalloc(&rr, n));
+  for (cudaStream_t s : {wb, cp}) {  // warm-up: a copy each way on both copy streams
+    CU(cudaMemcpyAsync(rr, a, n, cudaMemcpyHostToDevice, s));
+    CU(cudaMemcpyAsync(c, x, n, cudaMemcpyDeviceToHost, s));
+  }
+  CU(cudaDeviceSynchronize());
+  int khz = 0;
+  CU(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0));
+  spin<<<1, 1, 0, gs>>>((long long)khz * 300);  // ~300 ms
+  CU(cudaEventRecord(gate, gs));
+  CU(cudaStreamWaitEvent(wb, gate, 0));
+  CU(cudaMemcpyAsync(c, x, n, cudaMemcpyDeviceToHost, wb));
+  const bool pending_at_submit = cudaEventQuery(gate) == cudaErrorNotReady;
+  CU(cudaMemcpyAsync(rr, a, n, cudaMemcpyHostToDevice, cp));
+  CU(cudaEventRecord(h2d, cp));
+  int obs = -1;
+  if (pending_at_submit) {
+    for (;;) {
+      const cudaError_t q = cudaEventQuery(h2d);
+      if (q == cudaSuccess) {
+        obs = cudaEventQuery(gate) == cudaErrorNotReady ? 1 : 0;
+        break;
+      }
+      if (q != cudaErrorNotReady) break;
+      if (cudaEventQuery(gate) == cudaSuccess) {  // the gate ended first: the H2D waited behind the held D2H
+        obs = 0;  // an 8 KiB H2D free to run finishes within microseconds of a ~300 ms gate
+        break;
+      }
+    }
+  }
+  CU(cudaDeviceSynchronize());
+  int engines = 0;
+  CU(cudaDeviceGetAttribute(&engines, cudaDevAttrAsyncEngineCount, 0));
+  std::printf("  platform: async engines %d; an H2D overtakes a held D2H: %s\n", engines,
+              obs == 1 ? "yes" : obs == 0 ? "no (copies serialized)" : "unknown");
+  for (cudaEvent_t e : {gate, h2d}) cudaEventDestroy(e);
+  cudaFreeHost(a);
+  cudaFreeHost(c);
+  cudaFree(x);
+  cudaFree(rr);
+  for (cudaStream_t s : {gs, wb, cp}) cudaStreamDestroy(s);
+  cached = obs;
+  return obs;
+}
+
 // exclusive: every unit resident or pinned (slots + blocks cover the model), the victims written back D2H while the
 // engine stream still has queued readers; spares = host_spare_units (1 forces deferred misses).
 void decode_variant(const char* name, ss_policy policy, int spec_persistent, bool backing, bool exclusive = false,
@@ -345,7 +407,7 @@ void exclusive_same_forward(const char* name, uint32_t spares, bool readahead = 
   r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
   r.b.host_spare_units = spares;
   // Read-ahead variant: units 4-7 of layer 2 come from the file, so 5 can hold a read-ahead request when its certain
-  // prefetch admits it into a persistent slot (the request is abandoned; the ordinary path keeps its waits).
+  // prefetch admits it into a persistent slot (it lands from the buffer, after the victim's write-back).
   if (readahead) plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRDDDD", "P", "PPPPPPPPPPPPPPPP"});
   else plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRPPPP", "P", "PPPPPPPPPPPPPPPP"});
   ss_options_defaults(&r.o);
@@ -471,7 +533,7 @@ TEST(cuda_exclusive_source_wait_only) {
   (void)cudaStreamDestroy(gate_s);
 }
 
-// Host read-ahead, layer-major, async (design notes): every unit read from its file, host lookahead
+// Host read-ahead, layer-major, async: every unit read from its file, host lookahead
 // H = 2, 4 buffers. Layers 1 and 4 share the 11,008-B ring, so layer 4's landings reuse slots layer 1 released while
 // its checksums are still queued behind a spin: a landing that skipped the slot's release wait shows as a wrong sum.
 TEST(cuda_readahead_layer_major_async) {
@@ -574,6 +636,196 @@ std::vector<std::pair<int, int>> ra_dependency_run(int mutation, bool* landed_wh
   wrong = gpu.verify(mutation == 0);
   (void)cudaEventDestroy(l1_read);
   return wrong;
+}
+
+// Read-ahead landing into a victim's persistent slot (exclusive), deterministic. Layer 2: residents 0-3, disk 4-7,
+// one read-ahead buffer. Unit 5 is read ahead (Ready); the write-back stream is gated behind a ~2 s spin; a certain
+// prefetch admits 5, evicting 0 (LRU, lowest id) into a spare block: 0's write-back is pending while 5's landing into
+// 0's slot is issued (checked: the gate is pending then). The landing must wait for the write-back: with it, the copy
+// stream cannot finish before the gate. Without it (mutation 10), on a platform where an H2D can overtake a held D2H,
+// 5 overwrites the slot first, 0's block receives 5's bytes, and the next forward reads 0 back from that block wrong.
+// Where the copies serialize (one async copy engine: the RTX PRO under WDDM, measured by h2d_overtakes_held_d2h and by
+// probe_order), the landing is queued behind the held write-back whatever its own wait, so the mutation cannot show:
+// the run must then be exact and the landing still finish after the gate, and the test says the mutation was
+// unobservable (the library prints "mutation 10: ..." when it acted).
+std::vector<std::pair<int, int>> ra_writeback_run(int mutation, bool* landed_while_gated) {
+  Fixture fx(std::string("cuda-ra-wb-") + std::to_string(mutation));
+  Gpu gpu;
+  Run r;
+  std::vector<std::pair<int, int>> wrong;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 32;
+  r.b.host_pinned_bytes = 4 << 20;
+  r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
+  plan(r, {"", "PPPPPPPPPPPPPPPP", "RRRRDDDD", "P", "PPPPPPPPPPPPPPPP"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.pin_planned = 0;
+  r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;
+  r.o.readahead_units = 1;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return wrong;
+  CHECK_OK(ss_test_fill_free_blocks(r.c, 0xEE));
+  cudaStream_t gate_s = nullptr;
+  cudaEvent_t gate = nullptr;
+  CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
+  CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+  spin<<<1, 1, 0, gate_s>>>(4000000000LL);  // ~2 s
+  CU(cudaEventRecord(gate, gate_s));
+  CHECK_OK(ss_test_gate_writeback(r.c, gate));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  int32_t five[1] = {5};
+  CHECK_OK(ss_host_prefetch(r.c, 2, five, 1));
+  CHECK_OK(ss_test_ra_quiesce(r.c));  // 5 is Ready in the only buffer
+  if (mutation) CHECK_OK(ss_test_inject(r.c, mutation));
+  CHECK_OK(ss_prefetch(r.c, 2, five, 1, SS_PREFETCH_CERTAIN));  // evicts 0 (gated write-back), lands 5 in its slot
+  CHECK_OK(ss_layer_routes(r.c, 2, five, 1));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));  // the landing copy is issued
+  CHECK(cudaEventQuery(gate) == cudaErrorNotReady);
+  CHECK_OK(ss_test_sync_copy(r.c));
+  *landed_while_gated = cudaEventQuery(gate) == cudaErrorNotReady;
+  gpu.check(v, fx, 2, {5}, false);
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  ss_exclusive_stats x{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK_EQ(x.writebacks, uint64_t(1));
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"landed\":1,"));
+  ss_free(js);
+  // The next forward reads 0 back from its block (and 5 as a hit).
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  std::vector<int32_t> ids = {0, 5};
+  CHECK_OK(ss_layer_routes(r.c, 2, ids.data(), int(ids.size())));
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
+  gpu.check(v, fx, 2, ids);
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  wrong = gpu.verify(mutation == 0);
+  cudaStreamSynchronize(gate_s);
+  cudaEventDestroy(gate);
+  cudaStreamDestroy(gate_s);
+  return wrong;
+}
+
+TEST(cuda_readahead_persistent_writeback_wait) {
+  const int overtakes = h2d_overtakes_held_d2h();
+  CHECK(overtakes != -1);  // the platform answer must be known: a gate that ended too early proves nothing
+  bool gated = false;
+  auto w0 = ra_writeback_run(0, &gated);
+  std::printf("  normal: landing finished while the write-back was gated: %s\n", gated ? "yes" : "no");
+  CHECK(w0.empty());
+  CHECK(!gated);  // the landing waited for 0's write-back, which waited for the gate
+  auto w10 = ra_writeback_run(10, &gated);
+  std::printf("  mutation 10 (no write-back wait): landed while gated: %s, wrong %zu\n", gated ? "yes" : "no",
+              w10.size());
+  if (overtakes == 1) {
+    CHECK(gated);
+    CHECK(w10.size() == 1 && w10[0] == std::make_pair(2, 0));
+  } else {  // serialized copies: the held write-back runs first whatever the landing waits for
+    std::printf("  mutation 10 unobservable here (copies serialized): the run must be exact\n");
+    CHECK(!gated);
+    CHECK(w10.empty());
+  }
+}
+
+// exclusive_discard, one admission that writes back AND discards. Layer 2: residents 0-1,
+// disk 2-3, pinned 4-7; the host budget holds the pinned units plus ONE spare block of layer 2's size. Readers held,
+// write-back stream gated (~2 s): the routes {2, 5} evict 0 (written back into the spare, gated) and 1 (discarded). 2
+// (a file read, held) goes into 0's slot and must wait for 0's write-back; 5 (from its block, issued at once) goes into
+// 1's slot and must not wait for anything. Where an H2D can overtake a held D2H, the copy stream drains while the gate
+// is still pending (5's copy alone); where the copies serialize (h2d_overtakes_held_d2h = 0) 5's copy sits behind the
+// held write-back in the one copy engine whatever its waits, so that check is reported, not asserted. Once the readers
+// run, the copy stream cannot drain before the gate (2's copy waits for it). The next forward reads 0 from its block
+// and 1 from its file: both exact.
+TEST(cuda_exclusive_discard_mixed_admission) {
+  const int overtakes = h2d_overtakes_held_d2h();
+  CHECK(overtakes != -1);
+  Fixture fx("cuda-x-discard");
+  Gpu gpu;
+  Run r;
+  CHECK_OK(ss_desc_from_json(fx.json.data(), fx.json.size(), &r.d));
+  ss_budget_defaults(&r.b);
+  r.b.device_bytes = uint64_t(1) << 30;
+  r.b.margin_fraction = 0;
+  r.b.margin_gib = 1.0 / 1024;
+  r.b.ring_slots = 32;
+  // Pinned units (layers 1, 4: 32 x 12,288 B; layer 2: 4 x 8,192 B; the blob: 1,052,672 B) + one 8,192-B spare (the
+  // smallest block size takes the spare bytes first).
+  r.b.host_pinned_bytes = 32 * 12288 + 4 * 8192 + 1052672 + 8192;
+  r.b.tier_mode = SS_TIER_MODE_EXCLUSIVE;
+  r.b.host_spare_units = 1;
+  plan(r, {"", "PPPPPPPPPPPPPPPP", "RRDDPPPP", "P", "PPPPPPPPPPPPPPPP"});
+  ss_options_defaults(&r.o);
+  r.o.backend = SS_BACKEND_CUDA;
+  r.o.pin_planned = 0;
+  r.o.verify_hash = 1;
+  r.o.staging_bytes = 64 * 1024;
+  r.o.exclusive_discard = 1;
+  CHECK_OK(ss_open(r.d, &r.b, r.p, &r.o, &r.c));
+  if (!r.c) return;
+  ss_exclusive_stats x{};
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK_EQ(x.free_blocks, uint64_t(1));
+  CHECK_OK(ss_test_fill_free_blocks(r.c, 0xEE));
+  cudaStream_t gate_s = nullptr;
+  cudaEvent_t gate = nullptr;
+  CU(cudaStreamCreateWithFlags(&gate_s, cudaStreamNonBlocking));
+  CU(cudaEventCreateWithFlags(&gate, cudaEventDisableTiming));
+  spin<<<1, 1, 0, gate_s>>>(4000000000LL);  // ~2 s
+  CU(cudaEventRecord(gate, gate_s));
+  CHECK_OK(ss_test_gate_writeback(r.c, gate));
+  CHECK_OK(ss_test_hold_readers(r.c, 1));
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  std::vector<int32_t> ids = {2, 5};
+  CHECK_OK(ss_layer_routes(r.c, 2, ids.data(), int(ids.size())));
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK_EQ(x.writebacks, uint64_t(1));
+  CHECK_EQ(x.discards, uint64_t(1));
+  CHECK(cudaEventQuery(gate) == cudaErrorNotReady);
+  CHECK_OK(ss_test_sync_copy(r.c));  // the copy stream holds only 5's copy into the discarded victim's slot
+  const bool discard_copy_waited = cudaEventQuery(gate) != cudaErrorNotReady;
+  std::printf("  copy into the discarded victim's slot waited for the gate: %s\n", discard_copy_waited ? "yes" : "no");
+  if (overtakes == 1) CHECK(!discard_copy_waited);
+  else CHECK(discard_copy_waited);  // serialized copies: behind the held write-back (no wait of its own needed)
+  CHECK_OK(ss_test_hold_readers(r.c, 0));
+  ss_layer_view v{};
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));  // 2's copy into the written-back victim's slot is issued
+  CHECK_OK(ss_test_sync_copy(r.c));
+  const bool wb_copy_waited = cudaEventQuery(gate) == cudaSuccess;
+  std::printf("  copy into the written-back victim's slot waited for the gate: %s\n", wb_copy_waited ? "yes" : "no");
+  CHECK(wb_copy_waited);
+  gpu.check(v, fx, 2, ids, false);
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  // 0 from the block its write-back filled, 1 from its file.
+  CHECK_OK(ss_begin(r.c, nullptr, 0));
+  std::vector<int32_t> back = {0, 1};
+  CHECK_OK(ss_layer_routes(r.c, 2, back.data(), int(back.size())));
+  CHECK_OK(ss_acquire(r.c, 2, gpu.s, &v));
+  gpu.check(v, fx, 2, back);
+  for (int32_t u : back) CHECK_OK(ss_check_unit(r.c, 2, u));
+  CHECK_OK(ss_release(r.c, 2, gpu.s));
+  CHECK_OK(ss_end(r.c));
+  CHECK_OK(ss_test_check_exclusive(r.c));
+  gpu.verify();
+  ss_layer_stats t;
+  CHECK_OK(ss_stats_total(r.c, &t));
+  CHECK_OK(ss_stats_exclusive(r.c, &x));
+  CHECK_EQ(t.evicted, x.writebacks + x.discards);
+  CHECK_EQ(x.deferred, uint64_t(0));
+  cudaStreamSynchronize(gate_s);
+  cudaEventDestroy(gate);
+  cudaStreamDestroy(gate_s);
 }
 
 TEST(cuda_readahead_copy_dependencies) {

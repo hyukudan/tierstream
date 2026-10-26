@@ -393,7 +393,7 @@ const Json* field_of(const Json& explain, const std::string& path) {
 
 }  // namespace
 
-// The rename (design notes §3): the tierstream spellings of the recipe, profile and overrides
+// The rename: the tierstream spellings of the recipe, profile and overrides
 // schemas are accepted and give exactly what the strix-stream spellings give (one canonical JSON, one effective hash,
 // the same explain); the canonical output keeps the old id; the profile binds to the recipe file's raw bytes, so a
 // respelled recipe is another file for its old profile.
