@@ -810,3 +810,49 @@ ts_status ts_solve_pick(const ts_recipe* r, const char* route, const char* probe
 `--margin-gib X`, `--margin-fraction X`; `DEV` = `gpuN` (PCI order among the probe's devices of the backend on the host
 of runtime ordinal 0) | `uuid:` (CUDA only) | `pci:` | `name:` (exactly one match)) and plans the recipe they make
 (sets named `gpuN`, route `flags`). A refusal returns `SS_E_RECIPE` with the `PL_E_*` lines as the message.
+
+### 8.6 Saved placement and content verification
+
+```text
+ts-recipe verify RECIPE --placement PLAN.json --route R --probe PROBE.json --components COMPONENTS.json
+                  [--desc DESC.json] [--usage USAGE.json] [--context CONTEXT.json] [--json-out FILE] [LAYERS]
+ts-recipe manifest [--full] [--json-out FILE] [--header-bytes N] FILE...
+ts-recipe manifest --verify MANIFEST.json [--full] [FILE...]
+ts-recipe costs --from rtx-unit-costs-v1 INPUT.json [--json-out FILE]
+```
+
+`verify` parses the placement, recomputes its canonical JSON and `placement_sha256`, checks the effective recipe,
+route, component/build/model/descriptor identities, optional usage/context inputs and probe device identities,
+then re-plans. Device and host allocations, unit assignments and seed must match exactly. Allocation-line `source`
+and FILE `spilled`, plus explanatory decisions/alternatives, are provenance and excluded from re-plan equality,
+as with `solve --pick`. Input hashes remain checked. A difference returns `PL_E_STALE` with its field path
+(for example `devices[0].lines[0].bytes`); success prints the canonical saved placement. Whitespace and JSON object
+key order do not affect identity. `ts_placement_verify` in `tierstream/ts_place.h` exposes the same operation with
+the inputs of `ts_place`, plus placement JSON and its length. Its output is untouched on failure.
+
+`manifest` prints `tierstream/content-manifest-v1` with a `files` array sorted by absolute, normalized file path.
+Each entry contains `path`, `size`, Unix-epoch `mtime_ns`, and `header_sha256`. Files can also be supplied using
+repeatable `--model`, `--draft` and `--overlay` options; all three use the same file identity rules. GGUF v2/v3
+headers include metadata and every tensor info, ending before tensor-data alignment padding. Safetensors headers
+include the eight-byte length and the JSON header. For another format, an explicit positive `--header-bytes N`
+defines its header range; this extent is saved in that entry for later verification. Unknown formats are refused.
+Header reads use exact positional OS ranges without CRT read-ahead.
+
+Only `--full` computes a full-file `sha256`, streaming bounded chunks; otherwise that field is absent. A header-only
+manifest does not supply full content hashes for engine admission: create the admission manifest explicitly with
+`--full`. `manifest --verify` checks cached size/mtime before opening content, then the header hash. With `--full`
+it also verifies the cached full hash (which must already exist). Optional file arguments must match the complete
+cached set. Verification preserves cached hashes and never refreshes them. Changed metadata/header/content returns
+`PL_E_STALE` and names the file/field. Size/mtime are checked again after scanning to refuse concurrent changes.
+An in-place tensor-data edit preserving size, mtime and header remains outside header-only verification's trust
+boundary; explicit full verification catches it.
+
+The cost converter accepts schema `wdsrtx/rtx-unit-costs-v1` (or `rtx-unit-costs-v1`) and maps `allhit_ms`,
+`verify_ms`, `draft_ms`, `miss_pinned_ms`, `miss_file_ms`, `boundary_ms` and `engram_ms` to their `_us` counterparts.
+Scalar or keyed tables retain their context/R keys, for example `verify_ms: {"8192": {"6": 1.2345}}` becomes
+`verify_us: {"8192": {"6": 1235}}`. Each parsed double is formatted using its shortest round-trip decimal,
+scaled by 1000 using decimal digits and rounded half up, with checked integer overflow. Negative, null and absent
+measurements remain absent. `accepted` (tokens/window) similarly becomes `accepted_milli`; existing
+`accepted_milli`, `file_staging_bytes`, `applicability` and `xfer_measured` pass through. Provenance is preserved,
+with `_ms` keys renamed to `_us` and `accepted` to `accepted_milli`. Output is canonical
+`tierstream/solver-costs-v1` JSON; no calibration identity or missing measurement is invented.

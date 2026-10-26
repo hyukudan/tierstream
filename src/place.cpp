@@ -1350,4 +1350,79 @@ PlaceResult place_from_flags(const Json& probe, const Components& c, const std::
   return place(in);
 }
 
+namespace {
+void placement_numbers(Json& j) {
+  if (j.is_number()) {
+    j = !j.text.empty() && j.text[0] == '-' ? Json::number(json_i64(j, "placement"))
+                                          : Json::number(json_u64(j, "placement"));
+  }
+  for (auto& v : j.arr) placement_numbers(v);
+  for (auto& kv : j.obj) placement_numbers(kv.second);
+}
+
+std::string placement_difference(const Json& a, const Json& b, const std::string& path) {
+  if (a.kind != b.kind) return path;
+  if (a.is_object()) {
+    for (const auto& kv : a.obj) {
+      const Json* v = b.find(kv.first);
+      const std::string p = path.empty() ? kv.first : path + "." + kv.first;
+      if (!v) return p;
+      const std::string diff = placement_difference(kv.second, *v, p);
+      if (!diff.empty()) return diff;
+    }
+    for (const auto& kv : b.obj)
+      if (!a.find(kv.first)) return path.empty() ? kv.first : path + "." + kv.first;
+  } else if (a.is_array()) {
+    if (a.arr.size() != b.arr.size()) return path;
+    for (size_t i = 0; i < a.arr.size(); ++i) {
+      const std::string diff = placement_difference(a.arr[i], b.arr[i], path + "[" + std::to_string(i) + "]");
+      if (!diff.empty()) return diff;
+    }
+  } else if (json_write(a) != json_write(b)) {
+    return path;
+  }
+  return "";
+}
+
+void placement_provenance(Json& doc) {
+  doc.obj.erase("placement_sha256");
+  doc.obj.erase("decisions");
+  doc.obj.erase("alternatives");
+  auto lines = [](Json& owner) {
+    if (Json* ls = const_cast<Json*>(owner.find("lines")))
+      for (Json& l : ls->arr) {
+        l.obj.erase("source");
+        l.obj.erase("spilled");
+      }
+  };
+  if (Json* ds = const_cast<Json*>(doc.find("devices")))
+    for (Json& d : ds->arr) lines(d);
+  if (Json* host = const_cast<Json*>(doc.find("host"))) lines(*host);
+}
+}  // namespace
+
+Json placement_from_json(const Json& doc) {
+  const Json* schema = doc.find("schema");
+  require(schema && schema->is_string() && schema->text == kSchema, SS_E_RECIPE,
+          "PL_E_SCHEMA placement.schema: expected tierstream/placement-v1");
+  const Json* digest = doc.find("placement_sha256");
+  require(digest && digest->is_string(), SS_E_RECIPE, "PL_E_STALE placement_sha256: missing digest");
+  Json canonical = doc;
+  placement_numbers(canonical);
+  canonical.obj.erase("placement_sha256");
+  const std::string bytes = json_write(canonical);
+  require(digest->text == sha256_hex(bytes.data(), bytes.size()), SS_E_RECIPE,
+          "PL_E_STALE placement_sha256: canonical digest differs");
+  canonical["placement_sha256"] = *digest;
+  return canonical;
+}
+
+void placement_verify(const Json& stored, const Json& replanned) {
+  Json a = placement_from_json(stored), b = replanned;
+  placement_provenance(a);
+  placement_provenance(b);
+  const std::string diff = placement_difference(a, b, "");
+  require(diff.empty(), SS_E_RECIPE, "PL_E_STALE " + diff + ": placement differs from re-plan");
+}
+
 }  // namespace ts

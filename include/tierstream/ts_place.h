@@ -26,6 +26,16 @@ SS_API ss_status ts_place(const ss_recipe* r, const char* route, const char* pro
                           const char* usage_json, size_t usage_len, const char* context_json, size_t context_len,
                           char** out_json, size_t* out_len, char** explain, size_t* explain_len);
 
+/* Verifies a saved placement-v1 digest and re-plans with the same inputs as ts_place. A differing identity,
+ * device/host allocation, units or seed refuses PL_E_STALE with its JSON field path. No output is modified on
+ * failure. out_json receives the canonical saved placement; optional input conventions are the same as ts_place. */
+SS_API ss_status ts_placement_verify(const ss_recipe* r, const char* route,
+                                     const char* placement_json, size_t placement_len,
+                                     const char* probe_json, size_t probe_len,
+                                     const char* components_json, size_t components_len, const ss_desc* desc,
+                                     const char* usage_json, size_t usage_len,
+                                     const char* context_json, size_t context_len, char** out_json, size_t* out_len);
+
 /* The engine's sugar flags (argv, without the program name): --anchor DEV, --gpu-budget-gib DEV=X[,...],
  * --device-map COMP=DEV[,...], --host-pinned-gib X, --host-pageable-gib X, --host-available-floor-gib X,
  * --margin-gib X, --margin-fraction X. DEV = gpuN (PCI order) | uuid:<GPU-...> | pci:<dddd:bb:dd.f> |

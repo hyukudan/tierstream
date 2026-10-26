@@ -39,6 +39,11 @@ struct PlaceResult {
 
 PlaceResult place(const PlaceInput& in);
 
+// Reads canonical placement-v1, checks its digest, then compares every planned field against a fresh plan.
+// Differences name the JSON path and refuse PL_E_STALE. Line quota provenance follows --pick equality.
+Json placement_from_json(const Json& doc);
+void placement_verify(const Json& stored, const Json& replanned);
+
 // The engine's sugar flags (contract §4.1), as one placement-mode recipe planned by place():
 //   --anchor DEV  --gpu-budget-gib DEV=X[,DEV=X]...  --device-map COMP=DEV[,COMP=DEV]...
 //   --host-pinned-gib X  --host-pageable-gib X  --host-available-floor-gib X  --margin-gib X  --margin-fraction X

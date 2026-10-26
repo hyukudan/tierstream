@@ -19,6 +19,7 @@
 #include "errors.hpp"
 #include "json.hpp"
 #include "place.hpp"
+#include "placement_io.hpp"
 #include "recipe.hpp"
 #include "sha256.hpp"
 #include "solve.hpp"
@@ -2307,6 +2308,180 @@ TEST(solver_desc_context_passthrough) {
   in["choices"].arr[0]["desc"] = desc_to_json(g8_desc());
   CHECK_EQ(solve(s, "decode_rtx", probe_of(fx), in).find("rows")->arr[0].find("placement")->find("refusal")
                ->find("code")->text, std::string("PL_E_STALE"));
+}
+
+
+namespace {
+void rehash_placement(Json& doc) {
+  doc.obj.erase("placement_sha256");
+  const std::string text = json_write(doc);
+  doc["placement_sha256"] = Json::string(sha256_hex(text.data(), text.size()));
+}
+}
+
+TEST(placement_reader_verify_fields) {
+  const Json fx = fixture("B-pro-only-spec-host76");
+  const Json expected = run_place(recipe_of(fx), probe_of(fx), components_of(fx)).r.doc;
+  CHECK_EQ(json_write(placement_from_json(expected)), json_write(expected));
+  placement_verify(expected, expected);
+  Json corrupt = expected;
+  corrupt["seed"] = Json::array();
+  CHECK_REFUSED(placement_from_json(corrupt), "PL_E_STALE placement_sha256");
+  auto stale = [&](Json changed, const std::string& field) {
+    rehash_placement(changed);
+    CHECK_REFUSED(placement_verify(changed, expected), ("PL_E_STALE " + field).c_str());
+  };
+  stale(corrupt, "seed");
+  corrupt = expected;
+  corrupt["devices"].arr[0]["lines"].arr[0]["bytes"] = Json::number(int64_t(1));
+  stale(corrupt, "devices[0].lines[0].bytes");
+  corrupt = expected;
+  corrupt["host"]["lines"].arr[0]["bytes"] = Json::number(int64_t(1));
+  stale(corrupt, "host.lines[0].bytes");
+  corrupt = expected;
+  corrupt["units"] = Json::array();
+  stale(corrupt, "units");
+  for (const char* field : {"effective_sha256", "components_sha256", "usage_sha256", "context_sha256",
+                            "build_sha256", "model_sha256", "manifest_sha256", "route"}) {
+    corrupt = expected;
+    corrupt[field] = Json::string("changed");
+    stale(corrupt, field);
+  }
+  corrupt = expected;
+  corrupt["devices"].arr[0]["signature"] = Json::string(std::string(64, 'a'));
+  stale(corrupt, "devices[0].signature");
+  // The same quota provenance exclusions as --pick; allocation bytes and assignments remain exact.
+  corrupt = expected;
+  corrupt["devices"].arr[0]["lines"].arr[0]["source"] = Json::string("recipe");
+  rehash_placement(corrupt);
+  placement_verify(corrupt, expected);
+}
+
+TEST(placement_verify_cabi) {
+  const std::string recipe = slurp(kData + "J2-recipe.toml"), comps = slurp(kData + "J2-components.json");
+  Json probe = fixture("J2-probe");
+  probe["model"] = Json::string("DeepSeek-V4.1-Flash");
+  probe["engine"] = Json::string("strix-cuda-ds41-replica");
+  const std::string pr = json_write(probe);
+  ss_recipe* r = nullptr;
+  CHECK_OK(ss_recipe_from_text(recipe.data(), recipe.size(), "verify.toml", &r));
+  char* planned = nullptr;
+  CHECK_OK(ts_place(r, "decode_rtx", pr.data(), pr.size(), comps.data(), comps.size(), nullptr,
+                    nullptr, 0, nullptr, 0, &planned, nullptr, nullptr, nullptr));
+  const std::string saved = planned;
+  ss_free(planned);
+  char* verified = nullptr;
+  CHECK_OK(ts_placement_verify(r, "decode_rtx", saved.data(), saved.size(), pr.data(), pr.size(),
+                               comps.data(), comps.size(), nullptr, nullptr, 0, nullptr, 0, &verified, nullptr));
+  CHECK_EQ(std::string(verified), saved);
+  ss_free(verified);
+  Json bad = json_parse(saved);
+  bad["seed"] = Json::array();
+  rehash_placement(bad);
+  const std::string bt = json_write(bad);
+  char sentinel = '!';
+  verified = &sentinel;
+  size_t len = 123;
+  CHECK(ts_placement_verify(r, "decode_rtx", bt.data(), bt.size(), pr.data(), pr.size(), comps.data(),
+                               comps.size(), nullptr, nullptr, 0, nullptr, 0, &verified, &len) == SS_E_RECIPE);
+  CHECK(verified == &sentinel);
+  CHECK_EQ(len, size_t(123));
+  CHECK(has(ss_last_error(), "PL_E_STALE seed"));
+  // Descriptor and context inputs also survive the C ABI round trip and are checked before re-planning.
+  const std::string dt = json_write(desc_to_json(g8_desc()));
+  ss_desc* desc = nullptr;
+  CHECK_OK(ss_desc_from_json(dt.data(), dt.size(), &desc));
+  Json cc = json_parse(comps);
+  cc["desc_sha256"] = Json::string(sha256_hex(dt.data(), dt.size()));
+  const std::string ct = json_write(cc);
+  const std::string ctx = R"({"schema":"tierstream/context-v1","entries":[]})";
+  CHECK_OK(ts_place(r, "decode_rtx", pr.data(), pr.size(), ct.data(), ct.size(), desc,
+                    nullptr, 0, ctx.data(), ctx.size(), &planned, nullptr, nullptr, nullptr));
+  const std::string saved_inputs = planned;
+  ss_free(planned);
+  CHECK_OK(ts_placement_verify(r, "decode_rtx", saved_inputs.data(), saved_inputs.size(), pr.data(), pr.size(),
+                               ct.data(), ct.size(), desc, nullptr, 0, ctx.data(), ctx.size(), &verified, nullptr));
+  CHECK_EQ(std::string(verified), saved_inputs);
+  ss_free(verified);
+  verified = &sentinel;
+  CHECK(ts_placement_verify(r, "decode_rtx", saved_inputs.data(), saved_inputs.size(), pr.data(), pr.size(),
+                             ct.data(), ct.size(), desc, nullptr, 0, nullptr, 0, &verified, &len) == SS_E_RECIPE);
+  CHECK(has(ss_last_error(), "PL_E_STALE context_sha256"));
+  CHECK(verified == &sentinel);
+  ss_desc_free(desc);
+  ss_recipe_free(r);
+}
+
+TEST(content_header_bounded_reads) {
+  auto le = [](std::string& s, uint64_t v, size_t n) {
+    for (size_t i = 0; i < n; ++i) s += char((v >> (8 * i)) & 255);
+  };
+  auto str = [&](std::string& s, const std::string& v) { le(s, v.size(), 8); s += v; };
+  std::string header = "GGUF";
+  le(header, 3, 4); le(header, 1, 8); le(header, 2, 8);
+  str(header, "name"); le(header, 8, 4); str(header, "tiny");
+  str(header, "array"); le(header, 9, 4); le(header, 8, 4); le(header, 2, 8);
+  str(header, "one"); str(header, "two");
+  str(header, "tensor"); le(header, 1, 4); le(header, 4, 8); le(header, 0, 4); le(header, 0, 8);
+  auto check = [&](const std::string& h, uint64_t extent) {
+    size_t at = 0;
+    auto read = [&](void* out, size_t n) {
+      // There is deliberately no accessible body. Any read crossing the boundary fails the test.
+      require(at <= h.size() && n <= h.size() - at, SS_E_IO, "body read attempted");
+      std::memcpy(out, h.data() + at, n);
+      at += n;
+    };
+    CHECK_EQ(content_header_sha256(read, uint64_t(h.size()) + (1ULL << 40), extent),
+             sha256_hex(h.data(), h.size()));
+    CHECK_EQ(at, h.size());
+  };
+  check(header, 0);
+  std::string safe;
+  const std::string metadata = R"({"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})";
+  le(safe, metadata.size(), 8); safe += metadata;
+  check(safe, 0);
+  check("raw overlay header", 18);
+  size_t at = 0;
+  auto truncated = [&](void* out, size_t n) {
+    require(at + n <= header.size(), SS_E_IO, "truncated");
+    std::memcpy(out, header.data() + at, n); at += n;
+  };
+  CHECK_REFUSED(content_header_sha256(truncated, 24), "PL_E_SCHEMA");
+}
+
+TEST(content_streaming_sha256_vectors) {
+  Sha256 hash;
+  hash.update("a", 1); hash.update("bc", 2);
+  CHECK_EQ(hash.hex(), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+  CHECK_EQ(hash.hex(), sha256_hex("abc", 3));
+  const std::string chunk(1000, 'a');
+  Sha256 million;
+  for (int i = 0; i < 1000; ++i) million.update(chunk.data(), chunk.size());
+  CHECK_EQ(million.hex(), std::string("cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+}
+
+TEST(costs_decimal_round_half_up) {
+  const Json report = json_parse(R"({"schema":"wdsrtx/rtx-unit-costs-v1",
+    "allhit_ms":{"0":0,"1":0.0005,"2":0.0015,"3":1.2345,"4":-0.01,"5":null,
+                 "6":0.0004999999999999999,"7":0.0005000000000000001,"8":1e-100,
+                 "9":123456789.0005,"10":1.2344999999999999},
+    "verify_ms":{"8192":{"1":0.1235,"6":-1}},"miss_pinned_ms":-0.1,
+    "draft_ms":{"1":1e-3},"accepted":{"code/R6":3.4565},
+    "provenance":{"allhit_ms":{"source":"local","estimate":true}},
+    "applicability":{"build_sha256":"known"}})");
+  const Json out = convert_rtx_costs(report);
+  const Json& a = *out.find("allhit_us");
+  for (const auto& kv : std::vector<std::pair<std::string, uint64_t>>{
+           {"0",0}, {"1",1}, {"2",2}, {"3",1235}, {"6",0}, {"7",1}, {"8",0}, {"9",123456789001}, {"10",1235}})
+    CHECK_EQ(json_u64(*a.find(kv.first), kv.first), kv.second);
+  CHECK(!a.find("4") && !a.find("5") && !out.find("miss_pinned_us") && !out.find("miss_file_us"));
+  CHECK_EQ(json_u64(*out.find("verify_us")->find("8192")->find("1"), "verify"), uint64_t(124));
+  CHECK(!out.find("verify_us")->find("8192")->find("6"));
+  CHECK_EQ(json_u64(*out.find("accepted_milli")->find("code/R6"), "accepted"), uint64_t(3457));
+  CHECK(out.find("provenance")->find("allhit_us") != nullptr);
+  CHECK_EQ(out.find("applicability")->find("build_sha256")->text, std::string("known"));
+  CHECK_REFUSED(convert_rtx_costs(json_parse(R"({"schema":"wdsrtx/rtx-unit-costs-v1","miss_file_ms":1e20})")),
+                "overflows");
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }

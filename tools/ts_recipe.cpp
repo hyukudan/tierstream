@@ -10,6 +10,9 @@
 //                      [--usage USAGE.json] [--context CONTEXT.json] [--explain] [--json-out FILE] [LAYERS]
 //   ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--desc D] [--context X]
 //                      [--table] [--json-out FILE] [--pick ROW_ID --emit-overrides FILE] [LAYERS]
+//   ts-recipe verify   RECIPE --placement FILE --route R --probe P --components C [--desc D] [--usage U] [--context X]
+//   ts-recipe manifest [--full] [--verify MANIFEST.json] [--json-out FILE] [--header-bytes N] FILE...
+//   ts-recipe costs    --from rtx-unit-costs-v1 INPUT.json [--json-out FILE]
 //   LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 // JSON on stdout; exit 0 = success, 1 = refusal (message on stderr), 2 = usage error.
 #include <cstdio>
@@ -21,6 +24,7 @@
 #include <vector>
 
 #include "json.hpp"
+#include "placement_io.hpp"
 #include "strix_stream/ss.h"
 #include "tierstream/ts_place.h"
 
@@ -32,7 +36,7 @@
 namespace {
 
 const char* kUsage =
-    "usage: " TS_TOOL_NAME " validate|explain|match|select|plan|place|solve RECIPE [...]\n"
+    "usage: " TS_TOOL_NAME " validate|explain|match|select|plan|place|verify|solve RECIPE [...]\n"
     "  validate RECIPE [LAYERS]\n"
     "  explain  RECIPE [LAYERS] [--json]\n"
     "  match    RECIPE PROBE.json [LAYERS]\n"
@@ -43,6 +47,9 @@ const char* kUsage =
     "           [--usage USAGE.json] [--context CONTEXT.json] [--explain] [--json-out FILE] [LAYERS]\n"
     "  solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--desc D] [--context X]\n"
     "           [--table] [--json-out FILE] [--pick ROW_ID --emit-overrides FILE] [LAYERS]\n"
+    "  verify   RECIPE --placement FILE --route R --probe P --components C [--desc D] [--usage U] [--context X] [LAYERS]\n"
+    "  manifest [--full] [--verify MANIFEST.json] [--json-out FILE] [--header-bytes N] FILE...\n"
+    "  costs    --from rtx-unit-costs-v1 INPUT.json [--json-out FILE]\n"
     "  LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...\n";
 
 [[noreturn]] void usage(const std::string& why) {
@@ -99,12 +106,61 @@ struct DescHolder {
   ~DescHolder() { ss_desc_free(d); }
 };
 
+int content_command(int argc, char** argv, bool manifest) {
+  bool full = false;
+  uint64_t extent = 0;
+  std::string verify, output, from, input;
+  std::vector<std::string> paths;
+  for (int i = 2; i < argc; ++i) {
+    const std::string arg = argv[i];
+    auto next = [&]() -> std::string {
+      if (i + 1 >= argc) usage(arg + " needs a value");
+      return argv[++i];
+    };
+    if (arg == "--json-out" || arg == "--out") output = next();
+    else if (manifest && arg == "--full") full = true;
+    else if (manifest && arg == "--verify") verify = next();
+    else if (manifest && arg == "--header-bytes") {
+      try { extent = ts::json_u64(ts::json_parse(next()), "--header-bytes"); }
+      catch (const std::exception&) { usage("--header-bytes needs a positive integer"); }
+      if (!extent) usage("--header-bytes needs a positive integer");
+    } else if (manifest && (arg == "--model" || arg == "--draft" || arg == "--overlay")) paths.push_back(next());
+    else if (!manifest && arg == "--from") from = next();
+    else if (!manifest && arg == "--input") input = next();
+    else if (!arg.empty() && arg[0] == '-') usage("unknown argument " + arg);
+    else if (manifest) paths.push_back(arg);
+    else if (input.empty()) input = arg;
+    else usage("costs takes one input file");
+  }
+  if (manifest && paths.empty() && verify.empty()) usage("manifest needs files or --verify");
+  if (!manifest && (from != "rtx-unit-costs-v1" || input.empty()))
+    usage("costs needs --from rtx-unit-costs-v1 INPUT.json");
+  try {
+    ts::Json result;
+    if (manifest) {
+      result = verify.empty() ? ts::content_manifest(paths, full, extent)
+                              : ts::content_manifest_verify(ts::json_parse(slurp(verify)), paths, full, extent);
+    } else {
+      result = ts::convert_rtx_costs(ts::json_parse(slurp(input)));
+    }
+    const std::string text = ts::json_write(result) + "\n";
+    if (!output.empty()) write_file(output, text);
+    std::printf("%s", text.c_str());
+    return 0;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, TS_TOOL_NAME ": %s: %s\n", manifest ? "manifest" : "costs", e.what());
+    return 1;
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 3) usage("missing command or recipe");
+  if (argc < 2) usage("missing command");
   const std::string cmd = argv[1];
-  if (cmd != "validate" && cmd != "explain" && cmd != "match" && cmd != "select" && cmd != "plan" && cmd != "place" && cmd != "solve")
+  if (cmd == "manifest" || cmd == "costs") return content_command(argc, argv, cmd == "manifest");
+  if (argc < 3) usage("missing recipe");
+  if (cmd != "validate" && cmd != "explain" && cmd != "match" && cmd != "select" && cmd != "plan" && cmd != "place" && cmd != "verify" && cmd != "solve")
     usage("unknown command " + cmd);
   const std::string recipe_path = argv[2];
   int i = 3;
@@ -115,7 +171,7 @@ int main(int argc, char** argv) {
     i = 4;
   }
   std::string profile, identity, route, set, desc_path, benefit_path, id, probe_path, components_path, usage_path,
-      context_path, inputs_path, json_path, pick, emit_path;
+      context_path, inputs_path, json_path, pick, emit_path, placement_path;
   int member = 0;
   bool json_out = false, explain_out = false;
   std::vector<std::string> overrides, sets, refs;
@@ -135,21 +191,23 @@ int main(int argc, char** argv) {
       sets.push_back(next());
     else if (a == "--json" && cmd == "explain")
       json_out = true;
-    else if (a == "--route" && (cmd == "plan" || cmd == "place" || cmd == "solve"))
+    else if (a == "--route" && (cmd == "plan" || cmd == "place" || cmd == "verify" || cmd == "solve"))
       route = next();
-    else if (a == "--probe" && (cmd == "place" || cmd == "solve"))
+    else if (a == "--probe" && (cmd == "place" || cmd == "verify" || cmd == "solve"))
       probe_path = next();
-    else if (a == "--components" && cmd == "place")
+    else if (a == "--components" && (cmd == "place" || cmd == "verify"))
       components_path = next();
-    else if (a == "--usage" && cmd == "place")
+    else if (a == "--placement" && cmd == "verify")
+      placement_path = next();
+    else if (a == "--usage" && (cmd == "place" || cmd == "verify"))
       usage_path = next();
-    else if (a == "--context" && (cmd == "place" || cmd == "solve"))
+    else if (a == "--context" && (cmd == "place" || cmd == "verify" || cmd == "solve"))
       context_path = next();
     else if (a == "--explain" && cmd == "place")
       explain_out = true;
     else if (a == "--inputs" && cmd == "solve")
       inputs_path = next();
-    else if (a == "--json-out" && (cmd == "place" || cmd == "solve"))
+    else if (a == "--json-out" && (cmd == "place" || cmd == "verify" || cmd == "solve"))
       json_path = next();
     else if (a == "--pick" && cmd == "solve")
       pick = next();
@@ -161,7 +219,7 @@ int main(int argc, char** argv) {
       id = next();
     else if (a == "--member" && cmd == "plan")
       member = std::atoi(next().c_str());
-    else if (a == "--desc" && (cmd == "plan" || cmd == "place" || cmd == "solve"))
+    else if (a == "--desc" && (cmd == "plan" || cmd == "place" || cmd == "verify" || cmd == "solve"))
       desc_path = next();
     else if (a == "--benefit" && cmd == "plan")
       benefit_path = next();
@@ -269,7 +327,7 @@ int main(int argc, char** argv) {
     print_owned(out);
     return 0;
   }
-  if (cmd == "place") {
+  if (cmd == "place" || cmd == "verify") {
     if (route.empty() || probe_path.empty() || components_path.empty())
       usage("place needs --route, --probe and --components");
     const std::string probe = slurp(probe_path), comps = slurp(components_path);
@@ -277,6 +335,18 @@ int main(int argc, char** argv) {
     const std::string context_text = context_path.empty() ? std::string() : slurp(context_path);
     DescHolder desc;
     if (!desc_path.empty() && ss_desc_from_file(desc_path.c_str(), &desc.d) != SS_OK) refuse("descriptor");
+    if (cmd == "verify") {
+      if (placement_path.empty()) usage("verify needs --placement");
+      const std::string saved = slurp(placement_path);
+      if (ts_placement_verify(r, route.c_str(), saved.data(), saved.size(), probe.data(), probe.size(),
+                              comps.data(), comps.size(), desc.d,
+                              usage_path.empty() ? nullptr : usage_text.data(), usage_text.size(),
+                              context_path.empty() ? nullptr : context_text.data(), context_text.size(),
+                              &out, nullptr) != SS_OK) refuse("verify");
+      if (!json_path.empty()) write_file(json_path, std::string(out) + "\n");
+      print_owned(out);
+      return 0;
+    }
     char* ex = nullptr;
     if (ts_place(r, route.c_str(), probe.data(), probe.size(), comps.data(), comps.size(), desc.d,
                  usage_path.empty() ? nullptr : usage_text.data(), usage_text.size(),

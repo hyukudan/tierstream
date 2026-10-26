@@ -50,6 +50,7 @@ add_library(tierstream STATIC
   src/recipe_run.cpp
   src/components.cpp
   src/place.cpp
+  src/placement_io.cpp
   src/solve.cpp
   src/resident_set.cpp
   src/file_reader.cpp
@@ -340,6 +341,9 @@ if(TS_TESTS)
     add_test(NAME "example:${r}" COMMAND ts-recipe validate ${r} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endforeach()
   if(Python3_FOUND)
+    add_test(NAME placement-io-cli
+             COMMAND ${Python3_EXECUTABLE} -I tests/test_placement_io_cli.py $<TARGET_FILE:ts-recipe> ${CMAKE_CURRENT_SOURCE_DIR}
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME place-cli-round-trip
              COMMAND ${Python3_EXECUTABLE} -I tests/test_place_cli.py $<TARGET_FILE:ts-recipe> ${CMAKE_CURRENT_SOURCE_DIR}
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
