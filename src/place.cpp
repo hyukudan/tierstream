@@ -409,6 +409,8 @@ PlaceResult place(const PlaceInput& in) {
     const bool elastic_decl = C->has_elastic && (id == "arena" || id == "spares" || id == "expert_host");
     const bool declared = id == "context" || decl || elastic_decl;
     const char* cap = capability_of(id);
+    // An explicit zero FILE quota records a no-FILE solver row; it neither places storage nor needs a capability.
+    if (id == "expert_file" && x && x->units == 0 && !x->has_layers && x->device == "auto" && !decl) continue;
     if (x) {
       if (x->has_layers) {
         errs.push_back("PL_E_CAPABILITY " + id + ": layers needs layer-granular placement (capability \"layers\"), "

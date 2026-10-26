@@ -532,7 +532,43 @@ Json solve_predict(const Json& in) {
   return out;
 }
 
-Json solve(const RecipeStack& stack, const std::string& route, const Json& probe, const Json& in) {
+namespace {
+
+// Descriptor documents can be embedded or name a local JSON file, just like components and usage.
+Json load_document(const Json& v) {
+  if (!v.is_string()) return v;
+  std::ifstream f(v.text, std::ios::binary);
+  require(bool(f), SS_E_IO, "solver: cannot open document " + v.text);
+  std::stringstream s;
+  s << f.rdbuf();
+  return json_parse(s.str());
+}
+
+}  // namespace
+
+void verify_picked_placement(const Json& expected, const Json& actual) {
+  auto material = [](const Json& doc) {
+    Json out = Json::object();
+    for (const char* key : {"devices", "host", "units", "seed"})
+      if (const Json* v = doc.find(key)) out[key] = *v;
+    auto lines = [](Json& owner) {
+      if (Json* ls = const_cast<Json*>(owner.find("lines")))
+        for (Json& l : ls->arr) {
+          l.obj.erase("source");  // fill/default -> recipe after saving exact quotas
+          l.obj.erase("spilled");  // automatically spilled units become an explicit FILE quota
+        }
+    };
+    if (Json* ds = const_cast<Json*>(out.find("devices")))
+      for (Json& d : ds->arr) lines(d);
+    if (Json* h = const_cast<Json*>(out.find("host"))) lines(*h);
+    return out;
+  };
+  require(json_write(material(expected)) == json_write(material(actual)), SS_E_RECIPE,
+          "PL_E_STALE picked row does not re-plan identically");
+}
+
+Json solve(const RecipeStack& stack, const std::string& route, const Json& probe, const Json& in,
+           const std::string& pick, std::string* overrides) {
   const auto curves = curves_of(in);
   const Json* costs = in.find("costs");
   if (!costs || !costs->is_object()) bad("costs", "expected tierstream/solver-costs-v1");
@@ -564,10 +600,13 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
   const std::string anchor = rt->devices[0];
   const Json* cs = in.find("choices");
   if (!cs || !cs->is_array() || cs->arr.empty()) bad("choices", "expected a non-empty array");
+  size_t picked = 0;
+  std::string picked_overrides;
   Json rows = Json::array();
   for (size_t i = 0; i < cs->arr.size(); ++i) {
     const Json& c = cs->arr[i];
     const Choice x = choice_of(c, i);
+    if (!pick.empty() && x.id == pick) ++picked;
     const Json* cdoc = c.find("components");
     if (!cdoc) bad("choices[" + std::to_string(i) + "]", "missing \"components\" (components-v1 for this choice)");
     if (c.find("calib"))
@@ -594,6 +633,18 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
     pin.binding = &b;
     pin.components = &comps;
     if (have_usage) pin.usage = &usage;
+    Desc desc;
+    ContextDoc context;
+    const Json* dd = c.find("desc") ? c.find("desc") : in.find("desc");
+    const Json* ctx = c.find("context") ? c.find("context") : in.find("context");
+    if (dd) {
+      desc = desc_from_json(load_document(*dd));
+      pin.desc = &desc;
+    }
+    if (ctx) {
+      context = context_from_json(load_document(*ctx));
+      pin.context = &context;
+    }
     PlaceResult pr = place(pin);
     Json requires = Json::array();
     Components hypo;
@@ -692,6 +743,36 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
     pl["pinned_total_bytes"] = *doc.find("host")->find("pinned_total_bytes");
     pl["file_units"] = Json::number(file);
     row["placement"] = pl;
+    if (!pick.empty() && x.id == pick) {
+      require(requires.arr.empty(), SS_E_RECIPE, "PL_E_CAPABILITY picked row requires file_expert_tier");
+      // Write the existing recipe-overrides-v1 syntax, then parse and apply those exact bytes before checking.
+      picked_overrides = "schema = \"tierstream/recipe-overrides-v1\"\nrecipe = " +
+                         json_write(Json::string(stack.effective().name)) + "\n[set]\n";
+      auto emit = [&](const std::string& path, int64_t value) {
+        picked_overrides += json_write(Json::string("routes." + route + "." + path)) + " = " +
+                            std::to_string(value) + "\n";
+      };
+      emit("placement." + anchor + ".max_context_tokens", x.ctx);
+      emit("max_rows", x.r);  // mode is represented by max_rows (plain = 1) and the selected components-v1
+      emit("max_sequences", comps.max_sequences);
+      if (comps.has_elastic) {
+        emit("components.arena.units", active);
+        emit("components.expert_file.units", file);
+      }
+      RecipeStack saved = stack;
+      try {
+        saved.add_overrides(picked_overrides, "solver pick");
+      } catch (const Error&) {
+        fail(SS_E_RECIPE, "PL_E_STALE picked row does not re-plan identically");
+      }
+      Binding saved_binding = recipe_bind(saved.effective(), probe);
+      pin.recipe = &saved.effective();
+      pin.effective_sha256 = saved.effective_sha256();
+      pin.binding = &saved_binding;
+      const PlaceResult replanned = place(pin);
+      require(replanned.errors.empty(), SS_E_RECIPE, "PL_E_STALE picked row does not re-plan identically");
+      verify_picked_placement(doc, replanned.doc);
+    }
     // FILE rate (rev 16): the row's language's selections over the file_units coldest units of the pooled rank (the
     // units S3 sent to FILE); no FILE units needs no table; FILE units without the pooled usage or the language's
     // table are unpredicted
@@ -729,6 +810,12 @@ Json solve(const RecipeStack& stack, const std::string& route, const Json& probe
                                              costs)
                            : prediction_json(Prediction{});
     rows.push(row);
+  }
+  if (!pick.empty()) {
+    require(picked == 1, SS_E_RECIPE, "PL_E_SCHEMA pick must name exactly one solver row");
+    require(!picked_overrides.empty(), SS_E_RECIPE, "PL_E_STALE picked row does not re-plan identically");
+    require(overrides != nullptr, SS_E_RECIPE, "PL_E_SCHEMA pick needs an overrides output");
+    *overrides = picked_overrides;
   }
   Json out = Json::object();
   out["schema"] = Json::string("tierstream/solver-v1");

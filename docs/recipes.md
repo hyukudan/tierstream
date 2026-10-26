@@ -162,7 +162,19 @@ unbound optional set appears as `"<set>": []` in `recipe-match-v1`, and as `{unb
 never matches a run with it unbound, and vice versa. Optional sets are written to the canonical form after the others,
 in set-id order. **Binding mode is per recipe:** a recipe with a placement-mode route (§5.4) merges probe alias rows
 (rows sharing a PCI address or UUID are one device; rows that disagree are refused `PL_E_DUPLICATE_DEVICE`) and refuses
-malformed probe `pci` values; any other recipe binds exactly as before. Probe rows may carry `uuid`, `pci`, `arch`
+malformed probe `pci` values; any other recipe binds exactly as before. Placement selectors only consider the
+configured machine's non-excluded devices. A name matching multiple candidates, or a UUID/PCI/index matching none,
+is `PL_E_UNKNOWN_DEVICE` before model/budget admission. Optional sets can be unbound when all their eligible devices
+are already used (or on another host), as above; absence needs a matching configured row.
+
+Placement probe reports list configured devices, including missing optional devices, using the usual identity and
+configured kind/name/host/memory fields. The additive boolean `devices[].present` defaults to `true`; `false` marks
+a configured device absent at probe time, so a matching optional set can stay unbound without treating a selector
+typo as absence. Absent rows cannot bind or occupy an index (index counts present devices; identify an absent
+optional device by UUID/PCI/name). `devices[].excluded = true` omits a row from binding and absence checks; callers
+can instead leave excluded devices out of the report. Legacy binding ignores both fields.
+
+Probe rows may carry `uuid`, `pci`, `arch`
 (`sm_XY` / `gfxNNNN`) and `memory_bytes` for the planner.
 
 ## 4. `[limits]`
@@ -742,14 +754,34 @@ ts-recipe select   RECIPE STATE.json [LAYERS]
 ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json
                    [--benefit FILE] [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
 ts-recipe place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]
-                   [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]
-ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]
+                   [--usage USAGE.json] [--context CONTEXT.json] [--explain] [--json-out FILE] [LAYERS]
+ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--desc D] [--context X]
+                   [--table] [--json-out FILE] [--pick ROW_ID --emit-overrides FILE] [LAYERS]
 LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 ```
 
 JSON on stdout. Exit 0 on success, 1 on a refusal (message on stderr), 2 on a usage error. `place` prints
 `tierstream/placement-v1` (or, with `--explain`, the explanation printed from the same numbers); a refusal lists one
 `PL_E_<CODE>` line per error. `solve` prints `tierstream/solver-v1` (or, with `--table`, the rows as a table).
+`--json-out FILE` also writes the default JSON, with an LF terminator, alongside either text mode or JSON stdout.
+
+`solve --pick ROW_ID --emit-overrides FILE` writes an ordinary `tierstream/recipe-overrides-v1` TOML layer only after
+re-planning its exact bytes. It writes the anchor's `max_context_tokens`, route `max_rows` (plain = 1; mode also
+selects the configuration's components-v1), `max_sequences`, and elastic `components.arena.units` /
+`components.expert_file.units`. A later quota replaces an earlier GiB or units quota for that component; specifying
+both in one recipe or override layer remains invalid. A zero FILE quota is a no-storage request and requires no
+FILE capability when the descriptor declares no FILE component. Refused or hypothetical capability rows cannot be
+saved. A pick must identify exactly one row; rows are never picked automatically.
+
+The comparison checks the touched devices, device and host allocation lines, unit assignment and seed. Hashes
+such as `effective_sha256` legitimately change; allocation-line `source` and FILE `spilled` provenance also change
+when an automatic allocation becomes an explicit quota. Those fields are excluded from the comparison; allocation
+values remain exact. A mismatch refuses with `PL_E_STALE picked row does not re-plan identically`, exit 1.
+Reload the layer with `place ... --overrides FILE` and the selected configuration's components-v1.
+
+Solver inputs can supply optional `desc` and `context` JSON documents or local paths, globally or per choice
+(choice fields take precedence). They pass through unchanged to that choice's `place`, including unit benefit
+ranking and measured context charges. CLI `--desc` / `--context` supply the global defaults.
 
 ### 8.5 Placement C ABI (`include/tierstream/ts_place.h`)
 
@@ -767,6 +799,10 @@ ts_status ts_place_from_flags(const char* probe_json, size_t probe_len, const ch
 ts_status ts_solve(const ts_recipe* r, const char* route, const char* probe_json, size_t probe_len,
                    const char* inputs_json, size_t inputs_len, char** out_json, size_t* out_len, char** table,
                    size_t* table_len);
+ts_status ts_solve_pick(const ts_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                        const char* inputs_json, size_t inputs_len, const char* row_id,
+                        char** overrides, size_t* overrides_len, char** out_json, size_t* out_len,
+                        char** table, size_t* table_len);
 ```
 
 `ts_place_from_flags` takes the engine's sugar flags (`--anchor DEV`, `--gpu-budget-gib DEV=X[,...]`,

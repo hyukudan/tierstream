@@ -208,6 +208,10 @@ void set_path(Json& doc, const std::string& path, const Json& value) {
   s.pop_back();
   Json* parent = walk(doc, s, true);
   require(parent && parent->is_object(), SS_E_RECIPE, "path \"" + path + "\": not found in the recipe");
+  // A later exact quota replaces an earlier GiB quota (and vice versa), including one written in the base recipe.
+  // A single layer specifying both is rejected by read_layer, just as a recipe specifying both is rejected.
+  if (s.size() == 4 && s[0] == "routes" && s[2] == "components" && (leaf == "units" || leaf == "gib"))
+    parent->obj.erase(leaf == "units" ? "gib" : "units");
   (*parent)[leaf] = value;
 }
 
@@ -409,6 +413,12 @@ RecipeLayer RecipeStack::read_layer(const std::string& text, const std::string& 
       check_path(base_, kv.first, false);
     } catch (const Error& e) {
       fail(e.status(), with_origin(origin, e));
+    }
+    const std::vector<std::string> path = split(kv.first);
+    if (path.size() == 5 && path[0] == "routes" && path[2] == "components" &&
+        (path[4] == "units" || path[4] == "gib")) {
+      const std::string other = kv.first.substr(0, kv.first.rfind('.') + 1) + (path[4] == "units" ? "gib" : "units");
+      if (set.find(other)) bad("PL_E_SCHEMA gib and units are exclusive in one override layer");
     }
     L.set.push_back({kv.first, kv.second});
   }

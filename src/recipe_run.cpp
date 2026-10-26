@@ -42,6 +42,7 @@ struct ProbeDev {
   std::string id, kind, name, host, driver;
   double memory_gib = 0, host_ram_gib = -1, disk = -1, h2d = -1;
   int64_t ordinal = -1;
+  bool present = true;  // placement probe: configured device absent at probe time when false
   // Placement identity (all optional in the report): normalized uuid / pci, arch (sm_XY / gfxNNNN), exact bytes.
   std::string uuid, pci, arch, phys, platform;
   int64_t memory_bytes = -1;
@@ -89,6 +90,13 @@ int64_t pint(const Json& o, const char* k, const std::string& w, bool required, 
   return std::strtoll(t.c_str(), nullptr, 10);
 }
 
+bool pbool(const Json& o, const char* k, const std::string& w, bool dflt) {
+  const Json* v = field(o, k);
+  if (!v) return dflt;
+  require(v->kind == Json::Kind::Bool, SS_E_RECIPE, w + "." + k + ": expected a boolean");
+  return v->b;
+}
+
 bool kind_ok(const std::string& want, const std::string& got) { return want == "other" || want == got; }
 
 const char* backend_word(ss_backend_kind k) {
@@ -134,6 +142,7 @@ std::vector<ProbeDev> merge_aliases(std::vector<ProbeDev> devs) {
       auto same = [&](const std::string& a, const std::string& b) { return a.empty() || b.empty() || a == b; };
       std::string bad;
       if (y.kind != m.kind) bad = "kind";
+      else if (y.present != m.present) bad = "present";
       else if (y.host != m.host) bad = "host";
       else if (y.name != m.name) bad = "name";
       else if (y.memory_gib != m.memory_gib) bad = "memory_gib";
@@ -602,7 +611,9 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   for (size_t i = 0; i < pd->arr.size(); ++i) {
     const Json& e = pd->arr[i];
     const std::string w = "probe.devices[" + std::to_string(i) + "]";
+    if (placement && pbool(e, "excluded", w, false)) continue;
     ProbeDev x;
+    if (placement) x.present = pbool(e, "present", w, true);
     x.id = pstr(e, "id", w, true);
     require(seen.insert(x.id).second, SS_E_RECIPE, w + ": duplicate id \"" + x.id + "\"");
     x.kind = pstr(e, "kind", w, true);
@@ -639,13 +650,13 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   for (auto& x : devs) {
     x.index = 0;
     for (const auto& y : devs)
-      if (&y != &x && y.host == x.host && y.kind == x.kind && pci_order(y, x)) ++x.index;
+      if (&y != &x && y.host == x.host && y.kind == x.kind && (!placement || y.present) && pci_order(y, x)) ++x.index;
   }
   // index needs every candidate's PCI address (CUDA's enumeration order is never an index).
   for (const auto& d : r.devices)
     if (d.index >= 0)
       for (const auto& x : devs)
-        require(x.kind != backend_word(d.kind) || !x.pci.empty(), SS_E_RECIPE,
+        require((placement && !x.present) || x.kind != backend_word(d.kind) || !x.pci.empty(), SS_E_RECIPE,
                 "match.devices." + d.id + ".index: PL_E_SCHEMA the probe has no PCI address for \"" + x.id +
                     "\" (index counts devices in PCI order)");
   std::vector<ProbeLink> links;
@@ -671,6 +682,7 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   for (size_t s = 0; s < r.devices.size(); ++s) {
     const RDevice& rd = r.devices[s];
     std::string why;
+    bool configured_absent = false;
     for (size_t i = 0; i < devs.size(); ++i) {
       const ProbeDev& x = devs[i];
       std::string miss;
@@ -692,10 +704,21 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
       if (miss.empty() && !rd.uuid.empty() && x.uuid != rd.uuid) miss = x.uuid.empty() ? "uuid not probed" : "uuid";
       if (miss.empty() && !rd.pci.empty() && x.pci != rd.pci) miss = x.pci.empty() ? "pci not probed" : "pci " + x.pci;
       if (miss.empty() && rd.index >= 0 && x.index != rd.index) miss = "index " + std::to_string(x.index);
+      if (placement && !x.present) {
+        if (miss.empty() && rd.index < 0) configured_absent = true;
+        continue;
+      }
       if (miss.empty())
         elig[s].push_back(i);
       else
         why += (why.empty() ? "" : ", ") + x.name + " (" + x.id + "): " + miss;
+    }
+    if (placement) {
+      const std::string w = "match.devices." + rd.id + ": PL_E_UNKNOWN_DEVICE ";
+      require(rd.name.empty() || elig[s].size() <= 1, SS_E_RECIPE, w + "name matches more than one candidate");
+      require(!elig[s].empty() || (rd.optional && configured_absent) ||
+                  (rd.uuid.empty() && rd.pci.empty() && rd.index < 0 && rd.name.empty() && !rd.optional),
+              SS_E_RECIPE, w + "selector matches no probed non-excluded device");
     }
     if (!rd.optional && elig[s].size() < size_t(rd.count)) {
       std::string need = "match.devices." + rd.id + ": needs " + std::to_string(rd.count) + " " +

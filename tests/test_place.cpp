@@ -381,7 +381,7 @@ TEST(placement_optional_binding) {
     CHECK_EQ(bound("pci = \"0000:06:00.0\"\n"), std::string("GPU-4090"));
     CHECK_EQ(bound("index = 1\n"), std::string("GPU-4090"));
     CHECK_EQ(bound("index = 0\n"), std::string("-"));  // the PRO is index 0 and the anchor's
-    CHECK_EQ(bound("pci = \"0000:09:00.0\"\n"), std::string("-"));
+
   }
   {
     // Alias rows (one physical device reported twice) are merged; conflicting aliases are refused.
@@ -400,6 +400,62 @@ TEST(placement_optional_binding) {
     std::reverse(const_cast<Json*>(perm.find("devices"))->arr.begin(), const_cast<Json*>(perm.find("devices"))->arr.end());
     CHECK_EQ(json_write(binding_json(recipe_bind(parse_recipe(with_aux("", kPm)), perm))), json_write(binding_json(b)));
   }
+}
+
+TEST(placement_strict_selectors) {
+  Json probe = json_parse(kProbe2);
+  Json dup = probe.find("devices")->arr[0];
+  dup["id"] = Json::string("000-a-pro");
+  dup["pci"] = Json::string("0000:02:00.0");
+  dup["uuid"] = Json::string("GPU-22222222-2222-3333-4444-555555555555");
+  probe["devices"].push(dup);
+  const std::string pm = legacy() + "[routes.components.drafter]\n";
+  CHECK_REFUSED(recipe_bind(parse_recipe(pm), probe), "PL_E_UNKNOWN_DEVICE name matches more than one candidate");
+  // Legacy first-candidate substring binding, even when placement-only probe flags are present.
+  dup["present"] = Json::boolean(false);
+  dup["excluded"] = Json::boolean(true);
+  probe["devices"].arr.back() = dup;
+  CHECK_EQ(recipe_bind(parse_recipe(legacy()), probe).of("rtx")->at(0).id, std::string("000-a-pro"));
+  CHECK_EQ(recipe_bind(parse_recipe(pm), probe).of("rtx")->at(0).id, std::string("GPU-pro"));
+
+  auto optional = [&](const std::string& selector) {
+    return parse_recipe(std::string(kHead) + kAux + selector + kRoute + kPlacement + kPm);
+  };
+  const std::string uuid = "uuid = \"GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\"\n";
+  Json two = json_parse(kProbe2);
+  CHECK_REFUSED(recipe_bind(optional("uuid = \"GPU-00000000-0000-0000-0000-000000000000\"\n"), two),
+                "PL_E_UNKNOWN_DEVICE");
+  CHECK_REFUSED(recipe_bind(optional("pci = \"0000:09:00.0\"\n"), two), "PL_E_UNKNOWN_DEVICE");
+  CHECK_REFUSED(recipe_bind(optional("index = 9\n"), two), "PL_E_UNKNOWN_DEVICE");
+  Json absent = two;
+  absent["devices"].arr[1]["present"] = Json::boolean(false);
+  CHECK(recipe_bind(optional(uuid), absent).of("aux")->empty());
+  const Recipe required_absent = parse_recipe(std::string(kHead) +
+      "uuid = \"GPU-11111111-2222-3333-4444-555555555555\"\n" + kRoute + kPlacement +
+      "[routes.components.drafter]\n");
+  CHECK_EQ(recipe_bind(required_absent, two).of("rtx")->size(), size_t(1));
+  Json missing_anchor = two;
+  missing_anchor["devices"].arr[0]["present"] = Json::boolean(false);
+  CHECK_REFUSED(recipe_bind(required_absent, missing_anchor), "PL_E_UNKNOWN_DEVICE");
+  Json ambiguous = two;
+  Json other = two.find("devices")->arr[1];
+  other["id"] = Json::string("second-4090");
+  other["uuid"] = Json::string("GPU-bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee");
+  other["pci"] = Json::string("0000:07:00.0");
+  ambiguous["devices"].push(other);
+  CHECK_REFUSED(recipe_bind(optional("name = \"4090\"\n"), ambiguous), "PL_E_UNKNOWN_DEVICE");
+  // A typo is not configured absence; an excluded device is not a candidate either.
+  CHECK_REFUSED(recipe_bind(optional("name = \"missing\"\n"), absent), "PL_E_UNKNOWN_DEVICE");
+  absent["devices"].arr[1]["excluded"] = Json::boolean(true);
+  CHECK_REFUSED(recipe_bind(optional(uuid), absent), "PL_E_UNKNOWN_DEVICE");
+  // Unknown identity takes precedence over model / engine mismatches and ordinary hardware shortfalls.
+  two["model"] = Json::string("wrong");
+  const Recipe required = parse_recipe(std::string(kHead) +
+      "uuid = \"GPU-00000000-0000-0000-0000-000000000000\"\n" + kRoute + kPlacement +
+      "[routes.components.drafter]\n");
+  const std::string error = error_of([&] { recipe_bind(required, two); });
+  CHECK(has(error, "PL_E_UNKNOWN_DEVICE"));
+  CHECK(!has(error, "match.model"));
 }
 
 // ---- G4: the frozen fixtures of golden/place_ref.py (tests/data/placement), through the C++ inputs ------------------
@@ -2102,6 +2158,155 @@ TEST(solver_rows) {
   const Json& rf = *out2.find("rows")->arr[0].find("placement")->find("refusal");
   CHECK_EQ(rf.find("code")->text, std::string("PL_E_HOST_PINNED"));
   CHECK_EQ(json_write(*rf.find("units_short")), std::string("89"));
+}
+
+namespace {
+
+Json pick_inputs(const Json& comps, const std::string& id = "picked") {
+  Json in = Json::object();
+  in["costs"] = Json::object();  // no measured costs: feasible, unpredicted rows are still pickable
+  Json c = Json::object();
+  c["id"] = Json::string(id);
+  c["mode"] = Json::string("spec");
+  c["R"] = Json::number(int64_t(6));
+  c["ctx"] = Json::number(int64_t(131072));
+  c["lang"] = Json::string("code");
+  c["components"] = comps;
+  in["choices"] = Json::array();
+  in["choices"].push(c);
+  return in;
+}
+
+}  // namespace
+
+TEST(solver_pick_round_trip) {
+  const Json b = fixture("B-pro-only-spec-host76");
+  for (const bool literal : {false, true}) {
+    const std::string text = literal ? slurp(kData + "J2-recipe.toml") : recipe_of(b);
+    Json probe = literal ? fixture("J2-probe") : probe_of(b);
+    if (literal) {
+      probe["model"] = Json::string("DeepSeek-V4.1-Flash");
+      probe["engine"] = Json::string("strix-cuda-ds41-replica");
+    }
+    const Json comps = literal ? fixture("J2-components") : components_of(b);
+    RecipeStack s(text, "pick.toml");
+    const Json inputs = pick_inputs(comps);
+    std::string ov;
+    const Json picked = solve(s, "decode_rtx", probe, inputs, "picked", &ov);
+    CHECK_EQ(json_write(picked), json_write(solve(s, "decode_rtx", probe, inputs)));
+    RecipeStack saved = s;
+    saved.add_overrides(ov, "picked.toml");
+    CHECK_EQ(saved.effective().route("decode_rtx")->component("arena")->units, int64_t(7395));
+    CHECK_EQ(saved.effective().route("decode_rtx")->component("expert_file")->units, int64_t(0));
+    CHECK(has(ov, "max_context_tokens\" = 131072"));
+    CHECK(has(ov, "max_rows\" = 6"));
+    CHECK(s.effective_sha256() != saved.effective_sha256());
+    const Run original = run_place(text, probe, comps);
+    const Run again = run_place(json_write(recipe_to_json(saved.effective())), probe, comps);
+    CHECK(original.r.errors.empty() && again.r.errors.empty());
+    verify_picked_placement(original.r.doc, again.r.doc);
+    CHECK_REFUSED(solve(s, "decode_rtx", probe, inputs, "missing", &ov), "PL_E_SCHEMA pick");
+    Json duplicate = inputs;
+    duplicate["choices"].push(inputs.find("choices")->arr[0]);
+    CHECK_REFUSED(solve(s, "decode_rtx", probe, duplicate, "picked", &ov), "PL_E_SCHEMA pick");
+  }
+  // A picked unit quota supersedes a GiB quota already present in the recipe or a prior layer.
+  RecipeStack sized(recipe_of(b) + "[routes.components.arena]\ngib = 68.5\n", "sized.toml");
+  std::string sized_ov;
+  solve(sized, "decode_rtx", probe_of(b), pick_inputs(components_of(b)), "picked", &sized_ov);
+  sized.add_overrides(sized_ov, "picked.toml");
+  CHECK(!sized.effective().route("decode_rtx")->component("arena")->has_gib);
+  CHECK(sized.effective().route("decode_rtx")->component("arena")->units > 0);
+  CHECK_REFUSED(sized.add_overrides("schema = \"tierstream/recipe-overrides-v1\"\nrecipe = \"g4\"\n[set]\n"
+      "\"routes.decode_rtx.components.arena.gib\" = 68.5\n\"routes.decode_rtx.components.arena.units\" = 1\n", "both.toml"),
+      "PL_E_SCHEMA gib and units are exclusive");
+  // Actual FILE capability: saving a spill as an explicit quota keeps all allocation and assignment values.
+  const Json fx = fixture("I3-pro-only-spec-host74-file-auto");
+  RecipeStack file(recipe_of(fx), "file.toml");
+  std::string ov;
+  solve(file, "decode_rtx", probe_of(fx), pick_inputs(components_of(fx)), "picked", &ov);
+  CHECK(has(ov, "expert_file.units\" = 96"));
+  RecipeStack hypothetical(slurp(kData + "J2-recipe.toml"), "hypothetical.toml");
+  hypothetical.set("routes.decode_rtx.placement.rtx.host_pinned_gib", "74", "test");
+  Json in = pick_inputs(fixture("J2-components"));
+  in["costs"]["file_staging_bytes"] = Json::number(int64_t(67108864));
+  Json probe = fixture("J2-probe");
+  probe["model"] = Json::string("DeepSeek-V4.1-Flash");
+  probe["engine"] = Json::string("strix-cuda-ds41-replica");
+  CHECK_REFUSED(solve(hypothetical, "decode_rtx", probe, in, "picked", &ov), "PL_E_CAPABILITY");
+}
+
+TEST(solver_pick_material_mismatch) {
+  const Json fx = fixture("B-pro-only-spec-host76");
+  const Json expected = run_place(recipe_of(fx), probe_of(fx), components_of(fx)).r.doc;
+  Json provenance = expected;
+  provenance["effective_sha256"] = Json::string(std::string(64, 'e'));
+  provenance["placement_sha256"] = Json::string(std::string(64, 'f'));
+  provenance["devices"].arr[0]["lines"].arr[0]["source"] = Json::string("recipe");
+  verify_picked_placement(expected, provenance);
+  auto stale = [&](const Json& actual) {
+    CHECK_REFUSED(verify_picked_placement(expected, actual), "PL_E_STALE picked row does not re-plan identically");
+  };
+  Json device = expected;
+  device["devices"].arr[0]["lines"].arr[0]["bytes"] = Json::number(int64_t(1));
+  stale(device);
+  Json host = expected;
+  host["host"]["lines"].arr[0]["bytes"] = Json::number(int64_t(1));
+  stale(host);
+  Json units = expected;
+  units["units"] = Json::array();
+  stale(units);
+  Json seed = expected;
+  seed["seed"] = Json::array();
+  stale(seed);
+  // A feasible but perturbed saved arena also fails the exact comparison (including its changed unit assignment).
+  const Run perturbed = run_place(recipe_of(fx) + "[routes.components.arena]\nunits = 7394\n",
+                                  probe_of(fx), components_of(fx));
+  CHECK(perturbed.r.errors.empty());
+  stale(perturbed.r.doc);
+}
+
+TEST(solver_desc_context_passthrough) {
+  const Json fx = fixture("B-pro-only-spec-host76");
+  RecipeStack s(recipe_of(fx), "inputs.toml");
+  Desc d = g8_desc();
+  d.layers[0].benefit.assign(384, 0.0);
+  d.layers[0].benefit[383] = 100.0;
+  const Json dd = desc_to_json(d);
+  const std::string dt = json_write(dd);
+  Json comps = components_of(fx);
+  comps["desc_sha256"] = Json::string(sha256_hex(dt.data(), dt.size()));
+  const Json ctx = json_parse(R"({"schema":"tierstream/context-v1","entries":[{"build_sha256":")" + kBuild +
+      R"(","arch":"sm_120","device_name":"NVIDIA RTX PRO 6000 Blackwell Workstation Edition",)"
+      R"("driver":"617.14","platform":"windows-wddm","samples":[)"
+      R"({"bytes":744245094,"method":"pdh-process-dedicated"},)"
+      R"({"bytes":744245094,"method":"pdh-process-dedicated"},)"
+      R"({"bytes":744245094,"method":"pdh-process-dedicated"}]}]})");
+  Json in = pick_inputs(comps);
+  in["desc"] = dd;
+  in["context"] = ctx;
+  std::string ov;
+  const Json solved = solve(s, "decode_rtx", probe_of(fx), in, "picked", &ov);
+  Binding binding = recipe_bind(s.effective(), probe_of(fx));
+  const Components c = components_from_json(comps);
+  const ContextDoc context = context_from_json(ctx);
+  PlaceInput pin;
+  pin.recipe = &s.effective();
+  pin.route = "decode_rtx";
+  pin.effective_sha256 = s.effective_sha256();
+  pin.binding = &binding;
+  pin.components = &c;
+  pin.desc = &d;
+  pin.context = &context;
+  const PlaceResult direct = place(pin);
+  CHECK(direct.errors.empty());
+  CHECK_EQ(solved.find("rows")->arr[0].find("placement")->find("placement_sha256")->text,
+           direct.doc.find("placement_sha256")->text);
+  CHECK_EQ(ival(*doc_dev(direct.doc, "rtx")->find("context_measured_bytes")), int64_t(744245094));
+  // Per-choice inputs override the defaults and are checked exactly as place checks them.
+  in["choices"].arr[0]["desc"] = desc_to_json(g8_desc());
+  CHECK_EQ(solve(s, "decode_rtx", probe_of(fx), in).find("rows")->arr[0].find("placement")->find("refusal")
+               ->find("code")->text, std::string("PL_E_STALE"));
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }

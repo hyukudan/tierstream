@@ -38,10 +38,19 @@ SS_API ss_status ts_place_from_flags(const char* probe_json, size_t probe_len, c
  * usage (tierstream/usage-v1, optional), usage_lang ({lang: usage-v1}, the FILE rate per language), choices: [{id, mode: "plain"|"spec", R, ctx, lang, sequences?,
  * components: <components-v1 for that configuration>}]}. Returns tierstream/solver-v1 (one row per choice, in order:
  * the placement or its refusal, the predicted tok/s and its tag) and, when table is non-NULL, the same as a table.
- * Nothing is ranked or picked. */
+ * Optional desc and context documents (embedded or local file paths) may be given on inputs or each choice and
+ * are passed to place unchanged. Nothing is ranked or picked by default. */
 SS_API ss_status ts_solve(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
                           const char* inputs_json, size_t inputs_len, char** out_json, size_t* out_len, char** table,
                           size_t* table_len);
+
+/* Explicit operator pick: same solver output as ts_solve, plus recipe-overrides-v1 text. The selected row must be
+ * feasible without hypothetical capabilities. Re-plans the emitted overrides, comparing device/host allocations,
+ * units and seed (ignoring hashes and quota provenance); a difference is PL_E_STALE. No files are written. */
+SS_API ss_status ts_solve_pick(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                              const char* inputs_json, size_t inputs_len, const char* row_id,
+                              char** overrides, size_t* overrides_len, char** out_json, size_t* out_len,
+                              char** table, size_t* table_len);
 
 #ifdef __cplusplus
 }

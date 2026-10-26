@@ -1433,26 +1433,45 @@ ss_status ts_place(const ss_recipe* r, const char* route, const char* probe_json
 ss_status ts_solve(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
                    const char* inputs_json, size_t inputs_len, char** out_json, size_t* out_len, char** table,
                    size_t* table_len) {
-  std::string doc, tab;
+  return ts_solve_pick(r, route, probe_json, probe_len, inputs_json, inputs_len, nullptr, nullptr, nullptr,
+                        out_json, out_len, table, table_len);
+}
+
+ss_status ts_solve_pick(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                        const char* inputs_json, size_t inputs_len, const char* row_id, char** overrides,
+                        size_t* overrides_len, char** out_json, size_t* out_len, char** table, size_t* table_len) {
+  std::string doc, tab, ov;
   ss_status st = guard([&] {
     need(r && route && probe_json && inputs_json && out_json, "ts_solve: null argument");
+    need(!row_id || (*row_id && overrides), "ts_solve_pick: needs row_id and overrides output");
     const ts::Json sv = ts::solve(r->s, route, parse_input(probe_json, probe_len, "probe"),
-                                  parse_input(inputs_json, inputs_len, "solver inputs"));
+                                  parse_input(inputs_json, inputs_len, "solver inputs"), row_id ? row_id : "",
+                                  row_id ? &ov : nullptr);
     doc = ts::json_write(sv);
     if (table) tab = ts::solve_table(sv);
   });
   if (st != SS_OK) return st;
-  char* d = nullptr;
-  st = give_text(doc, &d, out_len);
-  if (st != SS_OK) return st;
-  if (table) {
-    st = give_text(tab, table, table_len);
-    if (st != SS_OK) {
-      std::free(d);
-      return st;
-    }
+  char *d = nullptr, *t = nullptr, *o = nullptr;
+  size_t dl = 0, tl = 0, ol = 0;
+  st = give_text(doc, &d, &dl);
+  if (st == SS_OK && table) st = give_text(tab, &t, &tl);
+  if (st == SS_OK && row_id) st = give_text(ov, &o, &ol);
+  if (st != SS_OK) {
+    std::free(d);
+    std::free(t);
+    std::free(o);
+    return st;
   }
   *out_json = d;
+  if (out_len) *out_len = dl;
+  if (table) {
+    *table = t;
+    if (table_len) *table_len = tl;
+  }
+  if (row_id) {
+    *overrides = o;
+    if (overrides_len) *overrides_len = ol;
+  }
   return SS_OK;
 }
 

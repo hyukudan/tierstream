@@ -7,8 +7,9 @@
 //   ts-recipe plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]
 //                      [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]
 //   ts-recipe place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]
-//                      [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]
-//   ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]
+//                      [--usage USAGE.json] [--context CONTEXT.json] [--explain] [--json-out FILE] [LAYERS]
+//   ts-recipe solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--desc D] [--context X]
+//                      [--table] [--json-out FILE] [--pick ROW_ID --emit-overrides FILE] [LAYERS]
 //   LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...
 // JSON on stdout; exit 0 = success, 1 = refusal (message on stderr), 2 = usage error.
 #include <cstdio>
@@ -39,8 +40,9 @@ const char* kUsage =
     "  plan     RECIPE --route R --device-set S [--member M] [--id PROBE_ID] --desc DESC.json [--benefit FILE]\n"
     "           [--ref SET=DESC.json[,BENEFIT]]... [LAYERS]\n"
     "  place    RECIPE --route R --probe PROBE.json --components COMPONENTS.json [--desc DESC.json]\n"
-    "           [--usage USAGE.json] [--context CONTEXT.json] [--explain] [LAYERS]\n"
-    "  solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--table] [LAYERS]\n"
+    "           [--usage USAGE.json] [--context CONTEXT.json] [--explain] [--json-out FILE] [LAYERS]\n"
+    "  solve    RECIPE --route R --probe PROBE.json --inputs SOLVER-INPUTS.json [--desc D] [--context X]\n"
+    "           [--table] [--json-out FILE] [--pick ROW_ID --emit-overrides FILE] [LAYERS]\n"
     "  LAYERS: [--profile P --identity IDENTITY.json] [--overrides O]... [--set path=value]...\n";
 
 [[noreturn]] void usage(const std::string& why) {
@@ -62,6 +64,16 @@ std::string slurp(const std::string& path) {
   std::stringstream s;
   s << f.rdbuf();
   return s.str();
+}
+
+void write_file(const std::string& path, const std::string& text) {
+  std::ofstream f(path, std::ios::binary);
+  f << text;
+  f.close();
+  if (!f) {
+    std::fprintf(stderr, TS_TOOL_NAME ": cannot write %s\n", path.c_str());
+    std::exit(1);
+  }
 }
 
 void print_owned(char* s) {
@@ -103,7 +115,7 @@ int main(int argc, char** argv) {
     i = 4;
   }
   std::string profile, identity, route, set, desc_path, benefit_path, id, probe_path, components_path, usage_path,
-      context_path, inputs_path;
+      context_path, inputs_path, json_path, pick, emit_path;
   int member = 0;
   bool json_out = false, explain_out = false;
   std::vector<std::string> overrides, sets, refs;
@@ -131,19 +143,25 @@ int main(int argc, char** argv) {
       components_path = next();
     else if (a == "--usage" && cmd == "place")
       usage_path = next();
-    else if (a == "--context" && cmd == "place")
+    else if (a == "--context" && (cmd == "place" || cmd == "solve"))
       context_path = next();
     else if (a == "--explain" && cmd == "place")
       explain_out = true;
     else if (a == "--inputs" && cmd == "solve")
       inputs_path = next();
+    else if (a == "--json-out" && (cmd == "place" || cmd == "solve"))
+      json_path = next();
+    else if (a == "--pick" && cmd == "solve")
+      pick = next();
+    else if (a == "--emit-overrides" && cmd == "solve")
+      emit_path = next();
     else if (a == "--table" && cmd == "solve")
       explain_out = true;
     else if (a == "--id" && cmd == "plan")
       id = next();
     else if (a == "--member" && cmd == "plan")
       member = std::atoi(next().c_str());
-    else if (a == "--desc" && (cmd == "plan" || cmd == "place"))
+    else if (a == "--desc" && (cmd == "plan" || cmd == "place" || cmd == "solve"))
       desc_path = next();
     else if (a == "--benefit" && cmd == "plan")
       benefit_path = next();
@@ -156,6 +174,9 @@ int main(int argc, char** argv) {
   }
   // "--set" is the override flag; plan names its device set with --device-set (and accepts S=... in --ref).
   if (!profile.empty() && identity.empty()) usage("--profile needs --identity (the current probe report + workload)");
+
+  if (pick.empty() != emit_path.empty()) usage("--pick and --emit-overrides must be used together");
+  if (!json_path.empty() && json_path == emit_path) usage("--json-out and --emit-overrides need different files");
 
   ss_recipe* r = nullptr;
   if (ss_recipe_from_file(recipe_path.c_str(), &r) != SS_OK) refuse("recipe");
@@ -215,11 +236,30 @@ int main(int argc, char** argv) {
 
   if (cmd == "solve") {
     if (route.empty() || probe_path.empty() || inputs_path.empty()) usage("solve needs --route, --probe and --inputs");
-    const std::string probe = slurp(probe_path), inputs = slurp(inputs_path);
+    const std::string probe = slurp(probe_path);
+    std::string inputs = slurp(inputs_path);
+    if (!desc_path.empty() || !context_path.empty()) {
+      try {
+        ts::Json in = ts::json_parse(inputs);
+        if (!desc_path.empty()) in["desc"] = ts::Json::string(desc_path);
+        if (!context_path.empty()) in["context"] = ts::Json::string(context_path);
+        inputs = ts::json_write(in);
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, TS_TOOL_NAME ": solve: %s\n", e.what());
+        return 1;
+      }
+    }
     char* tab = nullptr;
-    if (ts_solve(r, route.c_str(), probe.data(), probe.size(), inputs.data(), inputs.size(), &out, nullptr,
-                 explain_out ? &tab : nullptr, nullptr) != SS_OK)
+    char* emitted = nullptr;
+    if (ts_solve_pick(r, route.c_str(), probe.data(), probe.size(), inputs.data(), inputs.size(),
+                      pick.empty() ? nullptr : pick.c_str(), pick.empty() ? nullptr : &emitted, nullptr,
+                      &out, nullptr, explain_out ? &tab : nullptr, nullptr) != SS_OK)
       refuse("solve");
+    if (!emit_path.empty()) {
+      write_file(emit_path, emitted);
+      ss_free(emitted);
+    }
+    if (!json_path.empty()) write_file(json_path, std::string(out) + "\n");
     if (explain_out) {
       std::printf("%s", tab);
       ss_free(tab);
@@ -243,6 +283,7 @@ int main(int argc, char** argv) {
                  context_path.empty() ? nullptr : context_text.data(), context_text.size(), &out, nullptr,
                  explain_out ? &ex : nullptr, nullptr) != SS_OK)
       refuse("place");
+    if (!json_path.empty()) write_file(json_path, std::string(out) + "\n");
     if (explain_out) {
       std::printf("%s", ex);
       ss_free(ex);

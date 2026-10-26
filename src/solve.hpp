@@ -39,8 +39,16 @@ std::string cache_sha256_of(const Components& c);
 // with routes.<route>.placement.<anchor>.max_context_tokens = ctx, routes.<route>.max_rows = R (1 for plain) and
 // max_sequences when given; a choice refused only for pinned host while the engine lacks file_expert_tier is planned
 // hypothetically with the capability and costs.file_staging_bytes of FILE staging (requires: [file_expert_tier]).
+// Optional desc/context documents or paths on inputs (or a choice, taking precedence) pass through to place.
+// An explicit pick returns the exact re-planned recipe-overrides-v1 bytes through overrides, refusing a material
+// mismatch with PL_E_STALE; hypothetical rows cannot be picked. Default output is unchanged.
 // Returns tierstream/solver-v1 (solver_sha256 over the object without that key).
-Json solve(const RecipeStack& stack, const std::string& route, const Json& probe, const Json& inputs);
+Json solve(const RecipeStack& stack, const std::string& route, const Json& probe, const Json& inputs,
+           const std::string& pick = "", std::string* overrides = nullptr);
+
+// Compare the material plan (device/host lines, units and seed), ignoring hashes and line provenance that
+// changes when an automatic quota becomes explicit. Refuses PL_E_STALE on any material difference.
+void verify_picked_placement(const Json& expected, const Json& actual);
 
 // The solver-v1 rows as a table (tok/s with three decimals).
 std::string solve_table(const Json& solver);

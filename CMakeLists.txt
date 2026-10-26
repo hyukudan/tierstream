@@ -339,6 +339,11 @@ if(TS_TESTS)
   foreach(r ${ts_example_recipes})
     add_test(NAME "example:${r}" COMMAND ts-recipe validate ${r} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   endforeach()
+  if(Python3_FOUND)
+    add_test(NAME place-cli-round-trip
+             COMMAND ${Python3_EXECUTABLE} -I tests/test_place_cli.py $<TARGET_FILE:ts-recipe> ${CMAKE_CURRENT_SOURCE_DIR}
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
   # ts-recipe place on the contract's §2.5 recipe (placement-v1 out), and its PRO-only refusal (exit 1, units short).
   add_test(NAME place-cli COMMAND ts-recipe place tests/data/placement/cli-recipe.toml --route decode_rtx
            --probe tests/data/placement/cli-probe.json --components tests/data/placement/cli-components.json
