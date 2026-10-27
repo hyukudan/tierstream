@@ -88,3 +88,6 @@ ss.h-sha256 5cadc3f05cb6e01237d32f33505b22eb3c44eab41d208b6de1bd52f641b8db34
 ss.h-sha256 1dfa094b96b980e19c3457a8616434cacc72c0158bda929280a819429ecf87f3
 # integrate-1026 + scored (scored fields after exclusive_discard; its padding is reserved3)
 ss.h-sha256 26425365314ead3b0383a6927684c0c44df5bbb500f1fc941f63b54141c4ace1
+
+# auto (additive policy value, row-aware boundary and drained policy setter; existing struct layouts unchanged)
+ss.h-sha256 42489510e3c63d99c15cea284c3b7ee04794f2f540719413c923e866862ad187

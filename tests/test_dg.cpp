@@ -279,6 +279,9 @@ struct Shape {
   // targets between tokens (their own random stream)
   bool scored = false;
   bool vary = false;
+  bool boundary_score = false;
+  bool scored_auto = false;
+  uint32_t auto_rows = 6;  // 0 alternates R1 and R6
 };
 
 // Scored eviction's exhaustive boundary oracle (design scored.md 8.3, 8.5, 10): its own history (transition counts
@@ -410,6 +413,7 @@ struct Outcome {
   std::string violation;
   ts::DgStats st;
   bool threw = false;
+  std::vector<std::vector<uint32_t>> victims;
 };
 
 std::vector<uint64_t> counters(const ts::DgStats& s) { return {s.tokens, s.lookups, s.misses, s.covered, s.fetched, s.prefetched, s.prefetch_used, s.resurrected, s.bank_serves, s.collected_mid, s.evicted, s.evict_short, s.writebacks_done, s.stalled, s.pred_invalid, s.covered_waits, s.predicted, s.predicted_true, s.miss_layers, s.wb_deferred, s.wb_cancelled, s.wb_forced, s.wb_boundary_flushed, s.wb_issued_bytes, s.wb_completed_bytes, s.wb_cancelled_bytes, s.wb_boundary_flushed_bytes, s.winpf_hints, s.winpf_hint_rows, s.prior_issued, s.prior_used, s.prior_late, s.prior_reverted, s.l1_candidates, s.l1_issued, s.l1_used, s.l1_late, s.l1_reverted, s.l1_priced_out, s.l1_skipped_ahead, s.prior_budget_stops}; }
@@ -524,6 +528,8 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.wb_layer_bytes = sh.wb_bytes;
   c.wb_max_outstanding = sh.wb_out;
   c.scored = sh.scored;
+  c.boundary_score = sh.boundary_score;
+  c.scored_auto = sh.scored_auto;
   Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks, G, seed, &v);
   t.set_slow_d2h(sh.slow_d2h);
   Oracle orc(sh.units);
@@ -686,6 +692,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
       // the oracle at every boundary: scored runs always (also under a mutation it must catch), LRU runs without a
       // mutation (the recency order; the LRU mutation counts above stay those of the cache invariants and the model)
       Oracle::Expect want;
+      const uint32_t rows = sh.auto_rows ? sh.auto_rows : (tok % 2 ? 1u : 6u);
       const uint64_t short0 = core.stats().evict_short, fb0 = core.stats().score_fallbacks;
       bool lists_ok = true;
       const bool probed = sh.scored || mutation == DgCore::kNoMutation;
@@ -698,7 +705,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         core.set_boundary_probe([&] {
           // a list not tagged with this token (only a skipped-rank fault leaves one): the recency order, counted
           for (uint32_t g = 0; g < G; ++g) lists_ok = lists_ok && core.score_list_epoch(g) == core.epoch();
-          want = orc.boundary(core, keep, sh.pressure_recent, !lists_ok);
+          want = orc.boundary(core, keep, sh.pressure_recent, !lists_ok || (sh.scored_auto && rows == 1));
           ++g_cov.boundaries;
           const size_t dfr = core.deferred(), part = core.deferred_parts_issued() ? 1 : 0;
           g_cov.unsubmitted += dfr > part;
@@ -710,7 +717,8 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
             g_cov.kept_skipped += dev && std::find(keep.begin(), keep.end(), k) != keep.end();
           }
         });
-      core.end_token(keep);
+      core.end_token(keep, rows);
+      out.victims.push_back(core.last_victims());
       if (probed) {
         core.set_boundary_probe(nullptr);
         if (!want.armed || core.last_victims() != want.victims)
@@ -2126,7 +2134,8 @@ struct Solo {
   std::unique_ptr<Scripted> t;
   std::unique_ptr<DgCore> core;
   uint32_t seq = 0;
-  Solo(const std::vector<uint32_t>& units, uint32_t residents, uint32_t spares, bool scored, uint32_t max_ids = 64) {
+  Solo(const std::vector<uint32_t>& units, uint32_t residents, uint32_t spares, bool scored, uint32_t max_ids = 64,
+       bool boundary_score = false) {
     uint32_t keys = 0;
     for (uint32_t u : units) keys += u;
     c.n_units = units;
@@ -2136,6 +2145,7 @@ struct Solo {
     c.spare_target = spares;
     c.prefetch_reserve = 0;
     c.scored = scored;
+    c.boundary_score = boundary_score;
     c.max_ids = max_ids;
     t = std::make_unique<Scripted>(keys, c.persistent_slots + 2 * c.bank_slots, c.blocks, uint32_t(units.size()), 5, &v);
     core = std::make_unique<DgCore>(c, t.get());
@@ -2219,6 +2229,110 @@ TEST(dg_scored_oracle_runs) {
                      c.pressure_boundaries, c.target_changes, c.coming_at_score, sum.resurrected, sum.collected_mid,
                      sum.wb_cancelled, sum.scored_victims})
     CHECK(x > 0);
+}
+
+TEST(dg_scored_bounded_heap_differential_auto) {
+  uint64_t boundaries = 0;
+  for (const Shape& sh : scored_shapes())
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+      const Outcome ref = run(sh, 40, seed, DgCore::kNoMutation);
+      Shape fast = sh;
+      fast.boundary_score = true;
+      const Outcome bounded = run(fast, 40, seed, DgCore::kNoMutation);
+      CHECK(ref.violation.empty());
+      CHECK(bounded.violation.empty());
+      CHECK(ref.victims == bounded.victims);
+      CHECK(counters(ref.st) == counters(bounded.st));
+      fast.scored_auto = true;
+      const Outcome windows = run(fast, 40, seed, DgCore::kNoMutation);
+      CHECK(windows.violation.empty());
+      CHECK(windows.victims == bounded.victims);
+      fast.auto_rows = 1;
+      const Outcome r1 = run(fast, 40, seed, DgCore::kNoMutation);
+      fast.scored = fast.scored_auto = false;
+      const Outcome lru = run(fast, 40, seed, DgCore::kNoMutation);
+      CHECK(r1.violation.empty());
+      CHECK(lru.violation.empty());
+      CHECK(r1.victims == lru.victims);
+      CHECK(counters(r1.st) == counters(lru.st));
+      CHECK_EQ(r1.st.score_candidates, 0ull);
+      CHECK_EQ(r1.st.scored_victims, 0ull);
+      fast.scored = fast.scored_auto = true;
+      fast.auto_rows = 0;
+      const Outcome mixed = run(fast, 40, seed, DgCore::kNoMutation);
+      CHECK(mixed.violation.empty());  // each boundary matched to the appropriate oracle on its current state
+      boundaries += ref.victims.size() * 6;
+    }
+  std::printf("  %llu differential / oracle boundaries (public, heap, auto windows, auto R1, LRU, mixed)\n",
+              (unsigned long long)boundaries);
+}
+
+TEST(dg_runtime_policy_resets_learning) {
+  Solo s({16, 16}, 16, 4, true, 8, true);
+  for (uint32_t policy : {2u, 0u, 1u, 2u}) {
+    s.core->set_policy(policy);
+    CHECK_EQ(s.core->policy(), policy);
+    CHECK_EQ(s.core->epoch(), 0ull);
+    CHECK_EQ(s.core->score_rowsum(0, 1), 0ull);
+    for (int i = 0; i < 3; ++i) {
+      s.begin();
+      s.serve(0, {1, 2, 3});
+      s.serve(1, {1, 2, 3});
+      s.core->end_token({}, i == 1 ? 6 : 1);
+      s.t->drain_all();
+      s.core->check();
+    }
+    if (policy) CHECK(s.core->score_rowsum(0, 1) > 0);
+    const auto before = s.core->residency();
+    s.core->set_policy(policy);
+    CHECK(before == s.core->residency());
+    CHECK_EQ(s.core->score_rowsum(0, 1), 0ull);
+    CHECK(s.v.what.empty());
+  }
+  s.core->reset_open();
+  CHECK_EQ(s.core->policy(), 1u);
+  CHECK_EQ(s.core->epoch(), 0ull);
+  Solo lru({8}, 4, 2, false);
+  CHECK(error_of([&] { lru.core->set_policy(1); }, SS_E_INVALID).find("provisioned") != std::string::npos);
+  CHECK(error_of([&] { s.core->set_policy(3); }, SS_E_INVALID).find("policy") != std::string::npos);
+  CHECK(error_of([&] { s.core->end_token({}, 0); }, SS_E_INVALID).find("rows") != std::string::npos);
+}
+
+TEST(dg_bounded_profile_and_runtime_reset) {
+  const std::vector<uint32_t> units{16, 16};
+  std::vector<std::vector<uint64_t>> hashes;
+  const auto identity = fake_identity(units, 91, hashes);
+  std::vector<std::vector<uint32_t>> cells(2, std::vector<uint32_t>(256));
+  for (size_t g = 0; g < cells.size(); ++g)
+    for (size_t i = 0; i < cells[g].size(); ++i) cells[g][i] = i % 7 ? uint32_t(i * 7919) : UINT32_MAX;
+  const auto profile = ts::dg_profile_write(units, identity, "bounded differential", cells);
+  Solo ref(units, 16, 4, true, 8), fast(units, 16, 4, true, 8, true);
+  for (Solo* s : {&ref, &fast}) s->core->load_profile(profile.data(), profile.size(), identity);
+  for (uint32_t tok = 0; tok < 40; ++tok) {
+    for (Solo* s : {&ref, &fast}) {
+      s->begin();
+      s->serve(0, {tok % 16, (tok + 3) % 16, (tok + 9) % 16});
+      s->serve(1, {(tok + 1) % 16, (tok + 7) % 16});
+      s->end();
+    }
+    CHECK(ref.core->last_victims() == fast.core->last_victims());
+  }
+  fast.core->set_policy(2);
+  CHECK_EQ(fast.core->score_cell(0, 0, 0), UINT32_MAX);
+  CHECK_EQ(fast.core->epoch(), 0ull);
+  for (int i = 0; i < 2; ++i) {
+    fast.begin();
+    fast.serve(0, {1});
+    fast.serve(1, {2});
+    fast.core->end_token({}, 1);
+    fast.t->drain_all();
+  }
+  CHECK_EQ(fast.core->score_cell(0, 1, 1), cells[0][17] + 1);
+  fast.core->set_policy(0);
+  fast.core->set_policy(1);
+  CHECK_EQ(fast.core->score_cell(0, 1, 1), cells[0][17]);
+  fast.core->check();
+  CHECK(fast.v.what.empty());
 }
 
 // Faults the oracle (or the cache invariants) must catch: a victim with a write-back in flight, a kept unit evicted,

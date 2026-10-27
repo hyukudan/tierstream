@@ -321,6 +321,8 @@ TEST(dg_open_scored_options) {
   DgModel m("open-scored");
   const std::string hashed = m.json_hashed();
   auto scored = [](O& o) { o.policy = SS_POLICY_SCORED; };
+  expect(try_open(m, [](B&, O& o, T&) { o.policy = SS_POLICY_SCORED_AUTO; }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
   expect(try_open(m, [&](B&, O& o, T&) { scored(o); }), SS_E_UNSUPPORTED, "needs the CUDA backend");
   expect(try_open(m, [&](B&, O& o, T&) {
            scored(o);

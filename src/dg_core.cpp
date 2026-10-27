@@ -72,6 +72,7 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
     }
     heap_.reserve(gated());
     heap_pos_.assign(gated(), 0);
+    select_heap_.reserve(c_.persistent_slots);
   }
   victims_.reserve(c_.persistent_slots);
 }
@@ -681,7 +682,8 @@ void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n,
   for (uint32_t id : uniq_) fetch(g_next, id, true);
 }
 
-void DgCore::end_token(const std::vector<uint32_t>& keep) {
+void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
+  require(rows > 0, SS_E_INVALID, "device-gated: boundary rows must be positive");
   // every copy and table write of the token has landed before anything is invalidated
   DgBoundaryTimes bt = bt_;  // published in one step at the end (a throw leaves the last complete one)
   std::chrono::steady_clock::time_point t;
@@ -794,10 +796,43 @@ void DgCore::end_token(const std::vector<uint32_t>& keep) {
     victims_.push_back(k);
     return true;
   };
-  bool by_score = c_.scored;
+  const bool want_score = c_.scored && (!c_.scored_auto || rows > 1);
+  bool by_score = want_score;
   for (uint32_t g = 0; by_score && g < gated(); ++g) by_score = sc_[g].list_epoch == epoch_;
-  if (c_.scored && !by_score) ++st_.score_fallbacks;  // invalid score metadata: this boundary uses the recency order
-  if (by_score) {
+  if (want_score && !by_score) ++st_.score_fallbacks;  // invalid score metadata: this boundary uses the recency order
+  if (by_score && c_.boundary_score) {
+    // Same victims as the public sorted lists + merge: only eligibility can change after ranking, never a key's
+    // score / epochs / stamp. At the boundary score only eligible keys and retain the needed smallest candidates.
+    const auto start = std::chrono::steady_clock::now();
+    const size_t need = c_.spare_target > base ? c_.spare_target - base : 0;
+    auto less = [this](const ScoreCand& a, const ScoreCand& b) { return cand_less(a, b); };
+    select_heap_.clear();
+    for (uint32_t g = 0; need && g < gated(); ++g) {
+      uint64_t D = 0;
+      for (uint32_t r : sc_[g].cur) D += sc_[g].rowsum[r];
+      ++st_.score_layers;
+      for (uint32_t u = 0; u < units(g); ++u) {
+        if (!eligible(base_[g] + u)) continue;
+        ++st_.score_candidates;
+        const ScoreCand cd = score_candidate(g, u, D, select_heap_.size() == need ? &select_heap_.front() : nullptr);
+        if (select_heap_.size() < need) {
+          select_heap_.push_back(cd);
+          std::push_heap(select_heap_.begin(), select_heap_.end(), less);
+        } else if (less(cd, select_heap_.front())) {
+          std::pop_heap(select_heap_.begin(), select_heap_.end(), less);
+          select_heap_.back() = cd;
+          std::push_heap(select_heap_.begin(), select_heap_.end(), less);
+        }
+      }
+    }
+    std::sort_heap(select_heap_.begin(), select_heap_.end(), less);
+    for (const ScoreCand& cd : select_heap_) {
+      if (!accept(cd.key)) break;
+      ++st_.scored_victims;
+    }
+    st_.score_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+  } else if (by_score) {
     // heap merge of the per-layer lists (each sorted by the same total order), stopped at the accepted target
     auto head = [&](uint32_t g) -> const ScoreCand& { return sc_[g].list[heap_pos_[g]]; };
     auto after = [&](uint32_t a, uint32_t b) { return cand_less(head(b), head(a)); };
@@ -937,7 +972,6 @@ void DgCore::score_history(uint32_t g) {
 // token, its prefetches and resurrections come before its use, collection and admission never push.
 void DgCore::score_layer(uint32_t g) {
   if (!c_.scored) return;
-  const auto t0 = std::chrono::steady_clock::now();
   LayerScore& l = sc_[g];
   if (l.served != epoch_) return;  // not served this token: no list (the boundary falls back and counts it)
   if (mut_ == kSkipRank && g == 1 && epoch_ % 3 == 0) return;  // a layer left unranked: the boundary must fall back
@@ -945,6 +979,11 @@ void DgCore::score_layer(uint32_t g) {
     l.list_epoch = epoch_;
     return;
   }
+  if (c_.boundary_score) {  // the service only closes the layer; AUTO's row count arrives at the boundary
+    l.list_epoch = epoch_;
+    return;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
   const uint32_t n = units(g);
   std::vector<uint32_t> scratch;  // kNoUnionSave: whatever the shared scratch holds now (in range)
   if (mut_ == kNoUnionSave)
@@ -953,19 +992,15 @@ void DgCore::score_layer(uint32_t g) {
   const std::vector<uint32_t>& cur = mut_ == kNoUnionSave ? scratch : l.cur;
   uint64_t D = 0;
   for (uint32_t r : cur) D += l.rowsum[r];
-  const uint64_t nc = cur.size();
   l.list.clear();
   for (uint32_t u = 0; u < n; ++u) {
     const uint32_t k = base_[g] + u;
     const Entry& x = e_[k];
     if (x.home != Home::Device && x.home != Home::Coming) continue;
-    uint64_t N = 0;
-    for (uint32_t r : cur) N += l.T[size_t(r) * n + u];
-    const uint64_t P = ((nc * N) << 16) / std::max<uint64_t>(1, D);
-    const uint64_t F = (uint64_t(l.cnt[u]) << 16) / kDgScoreWindow;
-    const uint64_t R = (uint64_t(1) << 16) / (1 + (epoch_ - x.demand_epoch));
-    l.list.push_back({uint64_t(c_.w_trans) * P + uint64_t(c_.w_freq) * F + uint64_t(c_.w_rec) * R, x.demand_epoch,
-                      x.lru_stamp, k});
+    // Keep the shared-scratch mutation meaningful in the reference path.
+    if (mut_ == kNoUnionSave) l.cur.swap(scratch);
+    l.list.push_back(score_candidate(g, u, D));
+    if (mut_ == kNoUnionSave) l.cur.swap(scratch);
   }
   std::sort(l.list.begin(), l.list.end(), [this](const ScoreCand& a, const ScoreCand& b) { return cand_less(a, b); });
   l.list_epoch = epoch_;
@@ -973,6 +1008,34 @@ void DgCore::score_layer(uint32_t g) {
   st_.score_candidates += l.list.size();
   st_.score_ns += uint64_t(
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+DgCore::ScoreCand DgCore::score_candidate(uint32_t g, uint32_t u, uint64_t D, const ScoreCand* cutoff) const {
+  const LayerScore& l = sc_[g];
+  const Entry& x = e_[base_[g] + u];
+  const uint64_t F = (uint64_t(l.cnt[u]) << 16) / kDgScoreWindow;
+  const uint64_t R = (uint64_t(1) << 16) / (1 + (epoch_ - x.demand_epoch));
+  ScoreCand cd{uint64_t(c_.w_freq) * F + uint64_t(c_.w_rec) * R, x.demand_epoch, x.lru_stamp, base_[g] + u};
+  // All terms are nonnegative: if even F + Rec cannot enter the heap, skip the transition row reads entirely.
+  if (cutoff && !cand_less(cd, *cutoff)) return cd;
+  uint64_t N = 0;
+  for (uint32_t r : l.cur) N += l.T[size_t(r) * units(g) + u];
+  const uint64_t P = ((uint64_t(l.cur.size()) * N) << 16) / std::max<uint64_t>(1, D);
+  cd.s += uint64_t(c_.w_trans) * P;
+  return cd;
+}
+
+void DgCore::set_policy(uint32_t policy) {
+  require(policy <= 2, SS_E_INVALID, "device-gated: policy must be LRU, SCORED or SCORED_AUTO");
+  require(!policy || !sc_.empty(), SS_E_INVALID, "device-gated: scoring must be provisioned at open");
+  drain();
+  collect();
+  c_.scored = policy != 0;
+  c_.scored_auto = policy == 2;
+  reset_score();
+  for (Entry& x : e_) x.demand_epoch = x.lru_stamp = 0;
+  stamp_ = 0;
+  for (uint32_t k = tail_; k != kNone; k = e_[k].prev) e_[k].lru_stamp = ++stamp_;
 }
 
 void DgCore::load_profile(const void* data, uint64_t len, const std::string& identity) {
@@ -1173,8 +1236,9 @@ bool DgCore::same_open_state(const DgCore& b) const {
     if (bank_layer_[i] != b.bank_layer_[i] || bank_next_[i] != b.bank_next_[i]) return false;
   for (unsigned i = 0; i < 15; ++i)
     if (bkt_n_[i] != b.bkt_n_[i] || bkt_hit_[i] != b.bkt_hit_[i]) return false;
-  if (std::tie(c_.scored, c_.w_trans, c_.w_freq, c_.w_rec, epoch_, stamp_) !=
-          std::tie(b.c_.scored, b.c_.w_trans, b.c_.w_freq, b.c_.w_rec, b.epoch_, b.stamp_) ||
+  if (std::tie(c_.scored, c_.scored_auto, c_.boundary_score, c_.w_trans, c_.w_freq, c_.w_rec, epoch_, stamp_) !=
+          std::tie(b.c_.scored, b.c_.scored_auto, b.c_.boundary_score, b.c_.w_trans, b.c_.w_freq, b.c_.w_rec,
+                   b.epoch_, b.stamp_) ||
       sc_.size() != b.sc_.size())
     return false;
   for (size_t g = 0; g < sc_.size(); ++g)

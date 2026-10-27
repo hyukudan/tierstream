@@ -28,7 +28,8 @@ class DgCtx {
 
   // Host side, the engine thread.
   virtual void begin(const uint32_t* rows, int n_layers) = 0;
-  virtual void end() = 0;
+  virtual void end(uint32_t rows = 1) = 0;
+  virtual void set_policy(ss_policy policy) = 0;
   virtual void reset_open() = 0;
   virtual void seed(int layer, const int32_t* units, int n) = 0;
   virtual void keep(int g, const int32_t* ids, int n) = 0;

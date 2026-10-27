@@ -342,7 +342,8 @@ class CudaDgCtx final : public DgCtx {
     svc_->begin(seq_);
   }
 
-  void end() override {
+  void end(uint32_t rows = 1) override {
+    require(rows > 0, SS_E_INVALID, "ss_dg_end_rows: rows must be positive");
     require(in_token_, SS_E_INVALID, "ss_end: no gated token is open");
     in_token_ = false;
     // One deadline for both waits.
@@ -402,7 +403,7 @@ class CudaDgCtx final : public DgCtx {
     // 4. The boundary.
     std::vector<uint32_t> keep;
     for (const auto& k : keep_) keep.insert(keep.end(), k.begin(), k.end());
-    core_->end_token(keep);  // syncs the demand stream: the diagnostics marks have completed
+    core_->end_token(keep, rows);  // syncs the demand stream: the diagnostics marks have completed
     if (o_.dg_diag) {
       transport_->diag_collect();
       for (uint32_t g = 0; g < uint32_t(diag_.size()); ++g) {
@@ -451,6 +452,18 @@ class CudaDgCtx final : public DgCtx {
       poisoned_ = true;
       throw;
     }
+  }
+
+  void set_policy(ss_policy policy) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_set_policy: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_set_policy: poisoned context");
+    require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_,
+            SS_E_BACKEND, "ss_dg_set_policy: device sequence desync");
+    const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
+    require(seq_ ? state == DgService::kServed : state == DgService::kIdle,
+            SS_E_BACKEND, "ss_dg_set_policy: service does not have terminal ownership");
+    core_->set_policy(uint32_t(policy));
+    fold(false);  // publish the drain's counters without reporting a synthetic token to the hook
   }
 
   void reset_open() override {
@@ -997,7 +1010,7 @@ class CudaDgCtx final : public DgCtx {
         {"score_deferred", s.score_deferred},
         {"score_last_ns", s.score_last_ns}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
-    if (x_.scored) g["policy"] = Json::string("scored");
+    g["policy"] = Json::string(core_->policy() == 2 ? "auto" : core_->policy() == 1 ? "scored" : "lru");
     if (!core_->profile_provenance().empty()) g["score_profile"] = Json::string(core_->profile_provenance());
     j["device_gated"] = g;
     return j;
@@ -1005,7 +1018,7 @@ class CudaDgCtx final : public DgCtx {
   // After a successful boundary (and at open): copy the core's counters, call the hook with this token's numbers,
   // publish the snapshot when armed. Nothing here allocates (every buffer is sized at open), so a token whose ss_end
   // fails never shows in the stats.
-  void fold() {
+  void fold(bool call_hook = true) {
     std::copy(fold_l_.begin(), fold_l_.end(), prev_l_.begin());
     fold_ = core_->stats();
     const std::vector<DgLayerCounts>& lc = core_->layer_counts();
@@ -1014,7 +1027,7 @@ class CudaDgCtx final : public DgCtx {
     fold_free_blocks_ = core_->free_blocks();
     fold_wb_outstanding_ = core_->wb_outstanding_bytes();
     min_free_blocks_ = std::min(min_free_blocks_, fold_free_blocks_);
-    if (hook_) {
+    if (hook_ && call_hook) {
       std::fill(hook_fwd_.begin(), hook_fwd_.end(), ss_layer_stats{});
       ss_layer_stats tot{};
       for (size_t g = 0; g < fold_l_.size(); ++g) {
@@ -1240,6 +1253,8 @@ class CudaDgCtx final : public DgCtx {
     c.wb_layer_bytes = o_.dg_wb_layer_bytes;
     c.wb_max_outstanding = o_.dg_wb_max_outstanding;
     c.scored = x_.scored;  // scored eviction (dg_layout resolved and checked the weights)
+    c.scored_auto = o_.policy == SS_POLICY_SCORED_AUTO;
+    c.boundary_score = true;
     c.w_trans = x_.w_trans;
     c.w_freq = x_.w_freq;
     c.w_rec = x_.w_rec;

@@ -307,6 +307,7 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
       auto dg = ts::open_dg_ctx(d->d, p, o);
       *out = new ss_ctx{nullptr, std::move(dg)};
     } else {
+      need(o.policy != SS_POLICY_SCORED_AUTO, "ss_open: SCORED_AUTO needs device-gated mode");
       *out = new ss_ctx{std::make_unique<ts::Ctx>(d->d, bb, p, o), nullptr};
     }
   });
@@ -415,6 +416,14 @@ ss_status ss_acquire_groups(ss_ctx* c, int layer, void* s, ss_layer_view* out) {
 ss_status ss_group_wait(ss_ctx* c, int layer, int group, void* s) { CTX_CALL(group_wait(layer, group, s)); }
 ss_status ss_release(ss_ctx* c, int layer, void* s) { CTX_CALL(release(layer, s)); }
 ss_status ss_end(ss_ctx* c) { CTX_CALL_BOTH(end(), end()); }
+
+ss_status ss_dg_end_rows(ss_ctx* c, uint32_t rows) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_end_rows").end(rows); });
+}
+
+ss_status ss_dg_set_policy(ss_ctx* c, ss_policy policy) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_policy").set_policy(policy); });
+}
 ss_status ss_check_unit(ss_ctx* c, int layer, int unit) { CTX_CALL_BOTH(check_unit(layer, unit), check_unit(layer, unit)); }
 
 ss_status ss_lookahead_select(const float* scores, int rows, int n_experts, int top_k, int32_t* out, int max_out,
