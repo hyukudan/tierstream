@@ -59,6 +59,7 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_OK SS_OK
 #define TS_POLICY_LRU SS_POLICY_LRU
 #define TS_POLICY_SCORED SS_POLICY_SCORED
+#define TS_POLICY_SCORED_AUTO SS_POLICY_SCORED_AUTO
 #define TS_PREFETCH_CERTAIN SS_PREFETCH_CERTAIN
 #define TS_PREFETCH_SPECULATIVE SS_PREFETCH_SPECULATIVE
 #define TS_TIER_DISK SS_TIER_DISK
@@ -69,12 +70,14 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_TIER_RESIDENT SS_TIER_RESIDENT
 #define TS_TIER_RESIDENT_BACKED SS_TIER_RESIDENT_BACKED
 #define TS_ABI_VERSION SS_ABI_VERSION
+#define TS_DG_AUTO_EVICT SS_DG_AUTO_EVICT
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
 #define TS_DG_RESET_OPEN SS_DG_RESET_OPEN
 #define TS_DG_RESIDENCY SS_DG_RESIDENCY
 #define TS_DG_SCORED SS_DG_SCORED
+#define TS_DG_SET_POLICY SS_DG_SET_POLICY
 #define TS_DG_SET_SCHED SS_DG_SET_SCHED
 #define TS_HAVE_STATS_SNAPSHOT SS_HAVE_STATS_SNAPSHOT
 #define TS_SNAPSHOT_EXCLUSIVE SS_SNAPSHOT_EXCLUSIVE
@@ -163,6 +166,8 @@ TS_API ss_status ts_recipe_match(const ss_recipe* r, const char* probe_json, siz
 TS_API ss_status ts_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen);
 TS_API ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member, const char* device_id, const ss_desc* desc, const double* benefit, size_t n_benefit, const ss_desc* const* ref_descs, const double* const* ref_benefits, const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options, ss_plan** plan, char** out, size_t* olen);
 TS_API ss_status ts_dg_reset_open(ss_ctx* c);
+TS_API ss_status ts_dg_end_rows(ss_ctx* c, uint32_t rows);
+TS_API ss_status ts_dg_set_policy(ss_ctx* c, ss_policy policy);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }

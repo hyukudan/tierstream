@@ -82,5 +82,7 @@ ss_status ts_recipe_match(const ss_recipe* r, const char* probe_json, size_t len
 ss_status ts_recipe_select(const ss_recipe* r, const char* state_json, size_t len, char** out, size_t* olen) { return ss_recipe_select(r, state_json, len, out, olen); }
 ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const char* set, int member, const char* device_id, const ss_desc* desc, const double* benefit, size_t n_benefit, const ss_desc* const* ref_descs, const double* const* ref_benefits, const size_t* ref_n_benefits, size_t n_refs, ss_budget* budget, ss_options* options, ss_plan** plan, char** out, size_t* olen) { return ss_recipe_plan(r, route, set, member, device_id, desc, benefit, n_benefit, ref_descs, ref_benefits, ref_n_benefits, n_refs, budget, options, plan, out, olen); }
 ss_status ts_dg_reset_open(ss_ctx* c) { return ss_dg_reset_open(c); }
+ss_status ts_dg_end_rows(ss_ctx* c, uint32_t rows) { return ss_dg_end_rows(c, rows); }
+ss_status ts_dg_set_policy(ss_ctx* c, ss_policy policy) { return ss_dg_set_policy(c, policy); }
 
 }  // extern "C"

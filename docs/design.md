@@ -287,11 +287,18 @@ With `policy = SS_POLICY_SCORED` in device-gated decode only the boundary's choi
 banks, prefetch, resurrection, write-backs (deferred or not), the table protocol and the device kernels are those of
 LRU, so results are bit-for-bit identical and only residency (and so timing) differs.
 
+`SS_POLICY_SCORED_AUTO` shares that scorer and learns on every cycle. `ss_dg_end_rows(c, R)` closes the completed
+window (all verify rows, including rejected rows): AUTO selects scored victims only for `R > 1`, and walks the
+unchanged LRU tail for R1. `ss_end` is one row. Between tokens, `ss_dg_set_policy(c, policy)` drains write-backs,
+switches LRU / SCORED / AUTO, and resets learning to the open profile (or zero) and demand epochs while retaining
+placement and recency. Open with SCORED or AUTO to provision tables for later switches; an LRU-only open refuses a
+switch to scoring. `ss_dg_reset_open` restores the open policy as well as its learning and placement.
+
 - **Eligibility** is LRU's exactly: a device home, no write-back in flight, not in the keep list. Units of the current
   token are eligible. Coming units are never victims: at the boundary each one has been admitted (then it is a device
   home) or reverted to its block.
 - **One acceptance loop** serves both policies. It takes candidates from a policy order (LRU: the recency list from
-  its tail; scored: the merged score lists) and accepts an eligible one while `free + pending + accepted < target`
+  its tail; scored: the smallest eligible scores) and accepts an eligible one while `free + pending + accepted < target`
   and a free block exists; at the first victim without a block nothing more is accepted. `pending` counts the
   deferred write-back records and the in-flight ones that were not discarded. Only the accepted list feeds the
   deferred records, the boundary's copies and the carry bound. The pressure test override then walks the recency
@@ -311,17 +318,15 @@ LRU, so results are bit-for-bit identical and only residency (and so timing) dif
   so the counter never wraps. The history (counts, rings, previous unions, epochs) lives as long as the context:
   `ss_stats_reset` keeps it and `ss_dg_reset_open` restores the open state (the profile's counts or an empty table,
   epoch 0, the open stamps). Toggling write-back deferral between tokens does not touch it.
-- **Where the work runs.** For each layer the service thread serves the demand and signals ready, then `serve_use`
-  copies the unique union into the layer's own buffer before anything can reuse the shared scratch, updates the
-  counts (previous union x this union), the ring and the previous union, and stamps the used units. Then come the next
-  layer's prefetches and the write-back slice, and only then the ranking: every device or coming unit of the layer
-  (write-back pending ones included, since a later collection may clear the flag) is scored and the complete list is
-  sorted and tagged with the epoch. All of this happens before the service publishes the token as served; the engine
-  reads the lists only after acquiring that word. A layer's union, epochs and stamps are final once it is served,
-  because each layer is served once per token and its prefetches and resurrections come before its use. So when the
-  next layer has already exported (the device is ahead), the ranking waits until that layer has been served, and at
-  the latest until just before the token is published; `score_deferred` counts these, and `score_last_ns` is the
-  ranking time after the last layer (the part on the terminal path).
+- **Where the work runs.** The service's `serve_use` saves the unique union, updates the transition counts and ring,
+  and stamps routed uses every cycle. After the next layer's prefetches and the write-back slice it tags the layer
+  with the epoch before publishing terminal ownership. Ranking runs at the boundary, after admissions and collection
+  establish final eligibility. A max heap retains only the needed smallest candidates in the same public total order;
+  an F + Rec lower bound skips transition reads when a candidate cannot enter the heap. AUTO R1 and boundaries needing
+  no victims do no ranking. A layer's union, epochs and stamps are final once it is served, so this produces exactly
+  the original sorted-list / merge victims. That original implementation remains an internal CPU differential
+  reference. `score_ns` includes boundary ranking; `score_candidates` counts eligible keys considered (including
+  lower-bound rejections). Service `score_last_ns` now measures only tagging, not boundary ranking.
 - **Fallback.** A failed or stopped token, a timeout or a device error poisons the context as before; the boundary
   never runs. If the handoff succeeded but some list is not tagged with this token's epoch, that boundary feeds the
   LRU order into the same loop and counts `score_fallbacks` (an internal-consistency guard that should stay at 0).

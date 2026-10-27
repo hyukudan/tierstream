@@ -40,8 +40,9 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   const ss_budget& b = p.budget;
   if (b.tier_mode != SS_TIER_MODE_EXCLUSIVE) refuse(SS_E_INVALID, "needs tier_mode EXCLUSIVE");
   if (b.pinned_backing) refuse(SS_E_INVALID, "pinned_backing is refused (each unit has one home)");
-  if (o.policy != SS_POLICY_LRU && o.policy != SS_POLICY_SCORED) refuse(SS_E_INVALID, "policy must be LRU or SCORED");
-  if ((o.dg_score_profile_len || o.dg_score_profile) && o.policy != SS_POLICY_SCORED)
+  if (o.policy != SS_POLICY_LRU && o.policy != SS_POLICY_SCORED && o.policy != SS_POLICY_SCORED_AUTO)
+    refuse(SS_E_INVALID, "policy must be LRU or SCORED or SCORED_AUTO");
+  if ((o.dg_score_profile_len || o.dg_score_profile) && o.policy != SS_POLICY_SCORED && o.policy != SS_POLICY_SCORED_AUTO)
     refuse(SS_E_INVALID, "dg_score_profile needs policy SCORED");
   if (o.pin_planned) refuse(SS_E_INVALID, "needs pin_planned = 0 (planned residents are a warm start)");
   if (!o.fill_residents) refuse(SS_E_INVALID, "needs fill_residents = 1 (a resident's slot is its only copy)");
@@ -147,7 +148,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
 
   // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
   // format; the context loads it before the service starts).
-  if (o.policy == SS_POLICY_SCORED) {
+  if (o.policy == SS_POLICY_SCORED || o.policy == SS_POLICY_SCORED_AUTO) {
     x.scored = true;
     if (o.dg_score_w_trans || o.dg_score_w_freq || o.dg_score_w_recency) {
       if (o.dg_score_w_trans > 1000 || o.dg_score_w_freq > 1000 || o.dg_score_w_recency > 1000 ||

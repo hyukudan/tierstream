@@ -231,11 +231,12 @@ void DgService::serve_token(uint32_t seq) {
     // exported (the device ran ahead over layers without a miss: its demand comes first), asked before every part
     if (core_->deferred() && g + 1 < G)
       core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.flag[g + 1]) == seq; });
-    // scored eviction: layer g's candidates ranked now that its union, epochs and stamps are final (after the ready,
+    // scored eviction: close layer g now that its union, epochs and stamps are final (after the ready,
     // the next layer's prefetches and the write-back slice). When the next layer already exported (the device ran
     // ahead) the ranking waits behind that layer's service, at the latest until the token is published: a served
     // layer's device / coming set, epochs and stamps do not change any more. The ranking after the last layer is on
-    // the terminal path and timed.
+    // the terminal path and timed. The bounded selector only tags the layer here; ranking waits for the boundary's
+    // final eligibility and row count. The original full-list path remains an internal differential reference.
     if (core_->scored()) {
       if (g + 1 < G && dg_load_acquire(&m_.flag[g + 1]) == seq) {
         unranked_.push_back(g);

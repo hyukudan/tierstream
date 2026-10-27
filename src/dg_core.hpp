@@ -91,6 +91,8 @@ struct DgConfig {
   // Scored eviction (SS_POLICY_SCORED, docs/design.md §3.8): the boundary's victims in score order instead of the
   // recency tail. Integer weights out of 1000 (sum 1000); max_ids = the most ids one export can hold (the unions).
   bool scored = false;
+  bool scored_auto = false;
+  bool boundary_score = false;  // context: bounded selection of eligible keys; false keeps the public reference
   uint32_t w_trans = 700, w_freq = 200, w_rec = 100;
   uint32_t max_ids = 64;
 };
@@ -229,7 +231,9 @@ class DgCore {
   // Drains the token's copies, returns bank units to their blocks, collects write-backs, evicts LRU victims (never a
   // key in keep) until free + pending (in flight or deferred) reaches spare_target, uploads the table, then issues the
   // write-backs: the ones still deferred from the last boundary, then this boundary's (or defers these).
-  void end_token(const std::vector<uint32_t>& keep);
+  void end_token(const std::vector<uint32_t>& keep, uint32_t rows = 1);
+  void set_policy(uint32_t policy);  // drained, between tokens; resets learning, retains placement / recency
+  uint32_t policy() const { return c_.scored ? (c_.scored_auto ? 2u : 1u) : 0u; }
   // Between tokens: HOST keys into free slots (no eviction, no bank), synchronously. Returns how many moved.
   uint32_t seed(const std::vector<uint32_t>& keys);
   // Between tokens: every deferred write-back submitted, then every stream synchronized.
@@ -370,6 +374,7 @@ class DgCore {
   void stamp_room(const char* what) const;  // scored: the stamp counter may take one more phase of pushes
   void score_history(uint32_t g);           // scored: serve_use's history update of layer g (union saved first)
   void reset_score();                       // scored: the open state of every table (reset_open)
+  ScoreCand score_candidate(uint32_t g, uint32_t u, uint64_t denominator, const ScoreCand* cutoff = nullptr) const;
   std::vector<uint32_t> score_window(uint32_t g) const;  // the ring's unions in order, each closed by kNone
   bool cand_less(const ScoreCand& a, const ScoreCand& b) const {
     if (a.s != b.s) return a.s < b.s;
@@ -454,6 +459,7 @@ class DgCore {
   std::string prov_;
   std::vector<uint32_t> victims_;
   std::vector<uint32_t> heap_, heap_pos_;
+  std::vector<ScoreCand> select_heap_;  // at most the needed victims, ordered by the public total order
   std::function<void()> probe_;
 };
 

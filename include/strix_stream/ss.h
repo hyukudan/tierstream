@@ -184,8 +184,9 @@ typedef enum ss_backend_kind {
 
 typedef enum ss_policy {
   SS_POLICY_LRU = 0,     /* least recently used among unpinned residents; hits refresh recency */
-  SS_POLICY_SCORED = 1   /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency (device-gated:
+  SS_POLICY_SCORED = 1,  /* design.md §3.2: 0.7 transition + 0.2 window frequency + 0.1 recency (device-gated:
                             design.md §3.8, the boundary's victims) */
+  SS_POLICY_SCORED_AUTO = 2 /* device-gated only: learn every cycle; scored victims after rows > 1, LRU otherwise */
 } ss_policy;
 
 struct ss_dg_unit; /* device-gated seed entry (below) */
@@ -571,7 +572,7 @@ SS_API ss_status ss_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_t
  * then per gated layer: u32 model layer index, u32 units, u64 unit_bytes, the descriptor's per-unit xxh64 list (a
  * descriptor without them cannot load a profile). Any mismatch (size, magic, version, units, identity, checksum) fails
  * ss_open. Host memory: 4 x units^2 bytes per gated layer (twice that with a profile: its counts are kept for
- * reset), pageable, outside the pinned admission. Device-gated ss_open refuses a policy other than LRU / SCORED with
+ * reset), pageable, outside the pinned admission. Device-gated ss_open refuses a policy other than LRU / SCORED / AUTO with
  * SS_E_INVALID (before scored eviction, SCORED itself was SS_E_UNSUPPORTED). */
 #define SS_DG_SCORED 1
 /* Counters since open (or the last ss_stats_reset), folded at each ss_end. */
@@ -604,7 +605,8 @@ typedef struct ss_dg_stats {
   /* appended, scored eviction (0 under LRU): score_fallbacks = boundaries that used the recency order because the
    * score lists were not this token's (an internal consistency guard: should stay 0); scored_victims = victims taken
    * in score order; score_layers / score_candidates = layers ranked and the units they ranked; score_saturated =
-   * transition increments refused by a saturated (2^32 - 1) cell; score_ns = the service thread's ranking time */
+   * transition increments refused by a saturated (2^32 - 1) cell; score_ns = ranking / selection time (the bounded
+   * selector runs at the boundary, scores only eligible keys, and skips ranking on AUTO R1 or when no victims are needed) */
   uint64_t score_fallbacks, scored_victims, score_layers, score_candidates, score_saturated, score_ns;
   /* appended, scored eviction: score_deferred = layers whose ranking waited behind a later layer because the device
    * had already exported it; score_last_ns = ranking time after the last gated layer was served (the terminal path,
@@ -746,6 +748,19 @@ SS_API ss_status ss_recipe_plan(const ss_recipe* r, const char* route, const cha
 /* feature macro: engines built against older trees compile the reset out */
 #define SS_DG_RESET_OPEN 1
 SS_API ss_status ss_dg_reset_open(ss_ctx* c);
+
+/* Additive row-aware boundary. rows must be positive and describes the completed window, including uncommitted
+   verify rows. ss_end / ts_end is exactly one row. AUTO learns as SCORED on every cycle, but R1 uses the unchanged
+   LRU walk without ranking. The public integer score, weights and optional TSSCPRF1 profile are shared by both. */
+#define SS_DG_AUTO_EVICT 1
+SS_API ss_status ss_dg_end_rows(ss_ctx* c, uint32_t rows);
+/* Engine thread, between tokens after the device and service have returned ownership (as after ss_end).
+   Drains/collects write-backs, switches LRU / SCORED / SCORED_AUTO, and resets learning to the open profile (or zero)
+   and demand epochs, retaining placement and recency. Counters remain lifetime counters. To switch to scoring the
+   context must have been opened with SCORED or SCORED_AUTO (tables provisioned at open); an LRU-only open refuses
+   that switch with SS_E_INVALID. reset_open restores the open policy as well as its learning and placement. */
+#define SS_DG_SET_POLICY 1
+SS_API ss_status ss_dg_set_policy(ss_ctx* c, ss_policy policy);
 
 #ifdef __cplusplus
 }
