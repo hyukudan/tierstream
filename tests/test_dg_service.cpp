@@ -1465,3 +1465,53 @@ TEST(dg_service_capture_routes_and_overflow) {
   }
   CHECK(ss_dg_capture_reserve(nullptr) == nullptr);
 }
+
+// Mirror replica ownership: capture owner precedes the context that joins service.
+// A step throws with an open token; terminal detach is deliberately unavailable.
+TEST(dg_service_capture_exception_lifetime) {
+  bool stopped = false, destroyed = false;
+  struct GuardedCapture {
+    bool& stopped;
+    bool& destroyed;
+    std::vector<ss_dg_capture_event> records{256};
+    ss_dg_capture_sink sink{};
+    GuardedCapture(bool& s, bool& d) : stopped(s), destroyed(d) {
+      sink.records = records.data(); sink.capacity = records.size();
+      sink.struct_size = sizeof(sink); sink.event_size = sizeof(ss_dg_capture_event);
+    }
+    ~GuardedCapture() {
+      CHECK(stopped);  // fail before releasing/poisoning any capture storage
+      std::memset(records.data(), 0xdd, records.size() * sizeof(records[0]));
+      destroyed = true;
+    }
+  };
+  struct Context {
+    GuardedCapture& capture;
+    Rig rig{std::chrono::milliseconds(60000)};
+    explicit Context(GuardedCapture& c) : capture(c) { rig.core->capture_bind(&c.sink); }
+    ~Context() {
+      CHECK(!capture.destroyed);
+      CHECK(rig.core->capture_sink() == &capture.sink);
+      rig.svc->stop_join();
+      CHECK(!rig.svc->running());
+      CHECK(capture.sink.count > 0);
+      CHECK_EQ(capture.sink.incomplete, 0u);
+      capture.stopped = true;
+      rig.core->capture_bind(nullptr);  // only after service shutdown
+    }
+  };
+  try {
+    GuardedCapture capture(stopped, destroyed);
+    Context tier(capture);
+    auto& r = tier.rig;
+    uint32_t miss = 0;
+    while (r.core->table()[r.core->key(0, miss)] >= 0) ++miss;
+    r.seq = 1; r.svc->begin(1);
+    r.do_export(0, {miss, miss}, 1, 1);  // leave service waiting for prediction
+    // Acquire ready guarantees the raw export was written; service may still
+    // be finishing decision capture when the exceptional step begins unwinding.
+    CHECK(r.do_wait(0));
+    throw std::runtime_error("exceptional step");
+  } catch (const std::runtime_error&) {}
+  CHECK(stopped); CHECK(destroyed);
+}
