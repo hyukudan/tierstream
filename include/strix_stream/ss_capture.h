@@ -13,6 +13,8 @@
  * decision flags: 1 export miss, 2 fetched, 4 resurrected, 8 bank,
  * 16 covered, 32 prefetch. homes follow DgCore::Home (Host=0).
  * Host timeline stamps[0..2] are existing seen/demand/end steady-clock ns.
+ * Host timeline n_ids = covered_waits, mask = predicted_true counts; device
+ * times[3..4] retain gpu_wait_us and gpu_export_ready_us (including sentinels).
  * Decision valid=1 means its first masked occurrence was processed.
  * Timeline validity: bit 0 host timeline, 1 export stamp, 2 wait entry,
  * 3 ready observed, 4 existing device durations. GPU stamps are globaltimer ns;

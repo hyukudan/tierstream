@@ -374,6 +374,8 @@ void DgService::serve_token(uint32_t seq) {
       e->times[0] = t.seen_us; e->times[1] = t.demand_us;
       e->times[2] = t.pred_wait_us; e->times[3] = t.prefetch_us; e->times[4] = t.serve_us;
       const auto& a = core_->stats();
+      e->n_ids = uint32_t(a.covered_waits - before.covered_waits);
+      e->mask = a.predicted_true - before.predicted_true;
       e->counts[0] = a.lookups - before.lookups; e->counts[1] = a.misses - before.misses;
       e->counts[2] = a.covered - before.covered; e->counts[3] = a.fetched - before.fetched;
       e->counts[4] = a.prefetched - before.prefetched;
