@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include "strix_stream/ss_capture.h"
 #include <deque>
 #include <functional>
 #include <string>
@@ -361,6 +362,8 @@ class DgCore {
   // order of `residents` (the priority list, which names every key), the rest stay file-homed; block numbers follow key
   // order as in the two-tier rule, and the pinned units' recency order is the priority order.
   void place(const std::vector<uint32_t>& residents, const std::vector<uint8_t>* disk = nullptr);
+  void capture_bind(ss_dg_capture_sink* s) { capture_ = s; }
+  ss_dg_capture_sink* capture_sink() const { return capture_; }
   uint32_t keys() const { return keys_; }
   uint32_t key(uint32_t g, uint32_t unit) const { return base_[g] + unit; }
   uint32_t gated() const { return uint32_t(base_.size() - 1); }
@@ -640,6 +643,7 @@ class DgCore {
 
  private:
   static constexpr uint32_t kNone = 0xffffffffu;
+  ss_dg_capture_sink* capture_ = nullptr;
   struct Entry {
     Home home = Home::Host;
     int32_t slot = -1;   // Device / Coming / Bank / Evicting

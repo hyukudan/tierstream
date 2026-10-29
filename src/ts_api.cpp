@@ -64,6 +64,7 @@ ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) { return ss_dg
 ss_status ts_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total) { return ss_dg_residency(c, out, cap, total); }
 ss_status ts_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready) { return ss_dg_set_sched(c, wb_defer, flush_ready); }
 ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token) { return ss_dg_set_budgets(c, spare_target, prefetch_per_layer, prefetch_per_token); }
+ss_status ts_dg_capture_bind(ss_ctx* c, ss_dg_capture_sink* sink, uint32_t size, void* user) { return ss_dg_capture_bind(c, sink, size, user); }
 ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) { return ss_dg_timeline_sized(c, g, out, size); }
 ss_status ts_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size) { return ss_dg_boundary_timeline_sized(c, out, size); }
 ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) { return ss_stats_dg_sized(c, out, size); }

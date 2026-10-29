@@ -718,6 +718,10 @@ typedef struct ss_dg_layer_timeline {
   uint32_t predicted_true, covered_waits;
   double gpu_wait_us, gpu_export_ready_us, wb_left_ms, dma_first_ms;
 } ss_dg_layer_timeline;
+#include "ss_capture.h"
+/* Between tokens only. NULL unbinds; size and event_size must match v1.
+ * user is reserved (ignored); no callbacks on the service path. */
+SS_API ss_status ss_dg_capture_bind(ss_ctx* c, ss_dg_capture_sink* sink, uint32_t size, void* user);
 SS_API ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
 /* The last successful boundary (ss_end) of a dg_diag context, host microseconds: sync = the demand and prefetch
  * streams' synchronize, select = admissions, completed write-backs and victim selection, upload = the table upload

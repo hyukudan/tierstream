@@ -232,6 +232,7 @@ TS_API ss_status ts_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
 TS_API ss_status ts_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total);
 TS_API ss_status ts_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready);
 TS_API ss_status ts_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer, uint32_t prefetch_per_token);
+TS_API ss_status ts_dg_capture_bind(ss_ctx* c, ss_dg_capture_sink* sink, uint32_t size, void* user);
 TS_API ss_status ts_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size);
 TS_API ss_status ts_dg_boundary_timeline_sized(const ss_ctx* c, ss_dg_boundary_timeline* out, uint32_t size);
 TS_API ss_status ts_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);

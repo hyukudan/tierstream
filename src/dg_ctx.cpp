@@ -552,6 +552,13 @@ class CudaDgCtx final : public DgCtx {
         // the device's stamps (the end kernel ran after every wait kernel; done was observed)
         const volatile unsigned long long* t = gts_h_ + 4u * g;
         const unsigned long long ex = t[0], in = t[1], rd = t[2];
+        if (auto* e = ss_dg_capture_reserve(core_->capture_sink())) {
+          *e = ss_dg_capture_event{};
+          e->kind = 5; e->seq = seq_; e->layer = g;
+          e->stamps[0] = ex; e->stamps[1] = in; e->stamps[2] = rd;
+          e->valid = (ex ? 2u : 0u) | (in ? 4u : 0u) | (rd ? 8u : 0u) | 16u;
+          e->times[0] = d.dma_ms; e->times[1] = d.dma_first_ms; e->times[2] = d.wb_left_ms;
+        }
         const bool ok = ex && in && rd && rd >= in && rd >= ex;
         d.gpu_wait_us = ok ? double(rd - in) / 1000.0 : -1;
         d.gpu_export_ready_us = ok ? double(rd - ex) / 1000.0 : -1;
@@ -1160,6 +1167,11 @@ class CudaDgCtx final : public DgCtx {
     timeline_valid_ = true;
   }
 
+  void capture_bind(ss_dg_capture_sink* sink, void* user) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_capture_bind: between tokens only");
+    (void)user;
+    core_->capture_bind(sink);
+  }
   void timeline(int g, ss_dg_layer_timeline* out) const override {
     require(!in_token_, SS_E_INVALID, "ss_dg_timeline: between tokens only");
     require(o_.dg_diag, SS_E_INVALID, "ss_dg_timeline: open with dg_diag = 1");

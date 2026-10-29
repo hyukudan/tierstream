@@ -1033,6 +1033,14 @@ ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_
     dg_ctx(c, "ss_dg_set_budgets").set_budgets(spare_target, prefetch_per_layer, prefetch_per_token);
   });
 }
+ss_status ss_dg_capture_bind(ss_ctx* c, ss_dg_capture_sink* sink, uint32_t size, void* user) {
+  return ctx_guard(c, [&] {
+    need(!sink || (size == sizeof(*sink) && sink->struct_size == size &&
+         sink->event_size == sizeof(ss_dg_capture_event) && (sink->records || !sink->capacity) &&
+         sink->count <= sink->capacity), "ss_dg_capture_bind: incompatible sink");
+    dg_ctx(c, "ss_dg_capture_bind").capture_bind(sink, user);
+  });
+}
 ss_status ss_dg_timeline_sized(const ss_ctx* c, int g, ss_dg_layer_timeline* out, uint32_t size) {
   return guard([&] {
     need(c && out && size >= sizeof(uint32_t), "ss_dg_timeline: bad argument");

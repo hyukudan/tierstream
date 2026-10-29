@@ -990,6 +990,12 @@ uint32_t DgCore::collect() {
 void DgCore::submit_part(Deferred& d) {
   const uint32_t p = d.parts_done;
   t_->d2h_part(wb_stream_, d.slot, d.block, p);
+  if (auto* e = ss_dg_capture_reserve(capture_)) {
+    *e = ss_dg_capture_event{};
+    e->kind = 3; e->seq = seq_; e->layer = gated_of(d.key); e->n_ids = 1;
+    e->ids[0] = d.key - base_[e->layer]; e->slot = d.slot; e->block = d.block;
+    e->flags = p; e->counts[0] = t_->part_bytes(p);
+  }
   ++d.parts_done;
   const uint64_t b = t_->part_bytes(p);
   d.bytes += b;
@@ -1423,6 +1429,22 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
     fail(SS_E_BACKEND, "winpf: gated layer " + std::to_string(g) + " exported " + std::to_string(n) +
                            " ids: not rows x top_k (" + std::to_string(wp_.top_k) + ")");
   shadow_demand(g, ids, n);  // (the homes before this layer's fetches)
+  ss_dg_capture_event* decisions[64];
+  if (capture_) for (uint32_t i = 0; i < n; ++i) {
+    decisions[i] = nullptr;
+    for (uint32_t j = 0; j < i; ++j) if (ids[j] == ids[i]) { decisions[i] = decisions[j]; break; }
+    bool first = true;
+    for (uint32_t j = 0; j < i; ++j) if (ids[j] == ids[i]) first = false;
+    if (!first) continue;
+    if (auto* e = ss_dg_capture_reserve(capture_)) {
+      *e = ss_dg_capture_event{}; decisions[i] = e;
+      const uint32_t k = key(g, ids[i]);
+      e->kind = 2; e->seq = seq_; e->layer = g; e->n_ids = 1; e->ids[0] = ids[i];
+      e->home_before = uint32_t(home(k));
+      e->home_after = uint32_t(home(k)); e->slot = slot_of(k); e->block = block_of(k);
+      for (uint32_t j = i; j < n; ++j) if (ids[j] == ids[i] && (mask >> j & 1u)) e->flags |= 1u;
+    }
+  }
   if (diag_ && mask) t_->diag_mark(g, 0);
   bool first_marked = false;
   uint32_t first_read = kNone;  // dg_diag: the first fetched key while its read is in flight
@@ -1443,6 +1465,14 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
   poll_landings();  // (a completed landing read is landed: only a read still running is late)
   for (uint32_t i = 0; i < n; ++i) {
     if (!(mask >> i & 1u)) continue;
+    uint64_t cap_fetch = 0, cap_res = 0, cap_bank = 0;
+    if (capture_) {
+      cap_fetch = st_.fetched; cap_res = st_.resurrected; cap_bank = st_.bank_serves;
+      if (decisions[i] && !decisions[i]->valid) {
+        decisions[i]->home_before = uint32_t(home(key(g, ids[i])));
+        decisions[i]->valid = 1;  // this decision has reached its first masked occurrence
+      }
+    }
     if (on_device_or_coming(g, ids[i])) {
       cover(g, ids[i]);
       ++st_.covered;
@@ -1451,6 +1481,14 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
       else late_.push_back(ids[i]);
     } else {
       miss(ids[i]);
+    }
+    if (capture_ && decisions[i]) {
+      auto& e = *decisions[i]; const uint32_t k = key(g, ids[i]);
+      e.home_after = uint32_t(home(k)); e.slot = slot_of(k); e.block = block_of(k);
+      if (st_.fetched != cap_fetch) e.flags |= 2u;
+      if (st_.resurrected != cap_res) e.flags |= 4u;
+      if (st_.bank_serves != cap_bank) e.flags |= 8u;
+      if (!(e.flags & 6u)) e.flags |= 16u;
     }
   }
   for (uint32_t id : late_) miss(id);
@@ -1901,6 +1939,12 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     const uint32_t k = victims_[i];
     Entry& x = e_[k];
     t_->d2h(x.slot, x.block);
+    if (auto* e = ss_dg_capture_reserve(capture_)) {
+      *e = ss_dg_capture_event{};
+      e->kind = 3; e->seq = seq_; e->layer = gated_of(k); e->n_ids = 1;
+      e->ids[0] = k - base_[e->layer]; e->slot = x.slot; e->block = x.block;
+      e->flags = UINT32_MAX; e->counts[0] = unit_bytes_;  // whole expert
+    }
     if (mut_ == kEarlyWritebackBlock) free_blocks_.push_back(x.block);
     void* ev = event();
     t_->record(ev, DgTransport::kD2h);

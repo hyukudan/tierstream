@@ -305,6 +305,11 @@ void DgService::serve_token(uint32_t seq) {
             "device-gated: gated layer " + std::to_string(g) + " promised " + std::to_string(n_pred) +
                 " predicted ids");
     const uint64_t mask = uint64_t(r.mask_lo) | uint64_t(r.mask_hi) << 32;
+    if (auto* e = ss_dg_capture_reserve(core_->capture_sink())) {
+      *e = ss_dg_capture_event{};
+      e->kind = 1; e->seq = seq; e->layer = g; e->n_ids = n; e->mask = mask;
+      std::copy(r.ids, r.ids + n, e->ids);  // raw occurrences, before serve_demand
+    }
     ids_.assign(r.ids, r.ids + n);
     const DgStats before = core_->stats();
     core_->serve_demand(g, ids_.data(), n, mask);  // throws on an id outside the layer
@@ -359,6 +364,21 @@ void DgService::serve_token(uint32_t seq) {
       t.prefetched = uint32_t(after.prefetched - before.prefetched);
       t.predicted_true = uint32_t(after.predicted_true - before.predicted_true);
       tl_[g] = t;
+    }
+    if (auto* e = ss_dg_capture_reserve(core_->capture_sink())) {
+      *e = ss_dg_capture_event{};
+      e->kind = 4; e->seq = seq; e->layer = g; e->valid = 1;
+      e->stamps[0] = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_seen.time_since_epoch()).count());
+      e->stamps[1] = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_demand.time_since_epoch()).count());
+      e->stamps[2] = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t_end.time_since_epoch()).count());
+      e->times[0] = t.seen_us; e->times[1] = t.demand_us;
+      e->times[2] = t.pred_wait_us; e->times[3] = t.prefetch_us; e->times[4] = t.serve_us;
+      const auto& a = core_->stats();
+      e->counts[0] = a.lookups - before.lookups; e->counts[1] = a.misses - before.misses;
+      e->counts[2] = a.covered - before.covered; e->counts[3] = a.fetched - before.fetched;
+      e->counts[4] = a.prefetched - before.prefetched;
+      e->counts[5] = a.resurrected - before.resurrected;
+      e->counts[6] = a.bank_serves - before.bank_serves;
     }
     t_prev = t_end;
   }

@@ -65,6 +65,7 @@ class DgCtx {
   virtual Json stats_json() const = 0;
   virtual bool snapshot(ss_layer_stats* total, ss_snapshot_info* info) const = 0;
   virtual bool snapshot_json(Json* out) const = 0;
+  virtual void capture_bind(ss_dg_capture_sink* sink, void* user) = 0;
   virtual void timeline(int g, ss_dg_layer_timeline* out) const = 0;
   virtual void boundary_timeline(ss_dg_boundary_timeline* out) const = 0;
 
