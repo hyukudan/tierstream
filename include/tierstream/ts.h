@@ -29,6 +29,11 @@ typedef ss_forward_mode ts_forward_mode;
 typedef ss_group ts_group;
 typedef ss_layer_stats ts_layer_stats;
 typedef ss_layer_view ts_layer_view;
+typedef ss_mfile ts_mfile;
+typedef ss_mfile_counters ts_mfile_counters;
+typedef ss_mfile_io ts_mfile_io;
+typedef ss_mfile_options ts_mfile_options;
+typedef ss_mfile_verify ts_mfile_verify;
 typedef ss_options ts_options;
 typedef ss_plan ts_plan;
 typedef ss_plan_totals ts_plan_totals;
@@ -56,6 +61,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_E_UNSUPPORTED SS_E_UNSUPPORTED
 #define TS_FORWARD_DEVICE_GATED SS_FORWARD_DEVICE_GATED
 #define TS_FORWARD_HOST SS_FORWARD_HOST
+#define TS_MFILE_VERIFY_ALWAYS SS_MFILE_VERIFY_ALWAYS
+#define TS_MFILE_VERIFY_CACHED SS_MFILE_VERIFY_CACHED
+#define TS_MFILE_VERIFY_OFF SS_MFILE_VERIFY_OFF
 #define TS_OK SS_OK
 #define TS_POLICY_LRU SS_POLICY_LRU
 #define TS_POLICY_SCORED SS_POLICY_SCORED
@@ -80,6 +88,8 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DG_SET_POLICY SS_DG_SET_POLICY
 #define TS_DG_SET_SCHED SS_DG_SET_SCHED
 #define TS_HAVE_STATS_SNAPSHOT SS_HAVE_STATS_SNAPSHOT
+#define TS_MFILE SS_MFILE
+#define TS_MFILE_MAX_LOCATIONS SS_MFILE_MAX_LOCATIONS
 #define TS_SNAPSHOT_EXCLUSIVE SS_SNAPSHOT_EXCLUSIVE
 #define TS_SNAPSHOT_READAHEAD SS_SNAPSHOT_READAHEAD
 
@@ -168,6 +178,17 @@ TS_API ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const cha
 TS_API ss_status ts_dg_reset_open(ss_ctx* c);
 TS_API ss_status ts_dg_end_rows(ss_ctx* c, uint32_t rows);
 TS_API ss_status ts_dg_set_policy(ss_ctx* c, ss_policy policy);
+TS_API void ts_mfile_options_defaults_sized(ss_mfile_options* o, uint32_t size);
+TS_API ss_status ts_mfile_open(const char* primary, const char* weight_dirs, const ss_mfile_options* opt, ss_mfile** out);
+TS_API void ts_mfile_close(ss_mfile* f);
+TS_API uint64_t ts_mfile_size(const ss_mfile* f);
+TS_API uint32_t ts_mfile_alignment(const ss_mfile* f);
+TS_API int ts_mfile_multi(const ss_mfile* f);
+TS_API ss_status ts_mfile_pread(ss_mfile* f, void* dst, uint64_t bytes, uint64_t offset, uint64_t* got);
+TS_API ss_status ts_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n);
+TS_API ss_status ts_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out);
+TS_API const char* ts_mfile_location_path(const ss_mfile* f, int loc);
+TS_API const char* ts_mfile_open_report(const ss_mfile* f);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }
@@ -180,6 +201,7 @@ static inline void ts_dg_winpf_defaults(ss_dg_winpf_params* p) { ss_dg_winpf_def
 static __device__ __forceinline__ int32_t ts_dg_slot(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot(v, g, id); }
 static __device__ __forceinline__ int32_t ts_dg_slot_if_ready(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot_if_ready(v, g, id); }
 #endif
+static inline void ts_mfile_options_defaults(ss_mfile_options* o) { ss_mfile_options_defaults(o); }
 
 #ifdef __cplusplus
 }

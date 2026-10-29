@@ -53,6 +53,8 @@ void add(ss_layer_stats& a, const ss_layer_stats& b) {
 
 Ctx::Ctx(const Desc& d, const ss_budget& b, const Plan& p, const ss_options& o) : d_(d), plan_(p), o_(o) {
   (void)b;
+  weight_dirs_ = o.weight_dirs ? o.weight_dirs : "";
+  o_.weight_dirs = weight_dirs_.c_str();
   try {
     init();
   } catch (...) {
@@ -89,7 +91,7 @@ void Ctx::init() {
   require(o_.staging_bytes >= 4 * max_align, SS_E_INVALID, "open: staging_bytes must be >= 4 x the source alignment");
   o_.staging_bytes = round_up(o_.staging_bytes, max_align);
 
-  for (const auto& s : d_.sources) files_.push_back(std::make_unique<File>(s.path, o_.direct_io != 0));
+  for (const auto& s : d_.sources) files_.push_back(open_source(s.path, o_));
 
   // Staging ring (pinned host): file reads land here, then go to the device (non-unified) or to the slot.
   for (uint32_t i = 0; i < o_.staging_buffers; ++i) {
@@ -579,8 +581,8 @@ void Ctx::read_unit_host(int layer, int unit, void* dst, bool hash, uint64_t* di
   Xxh64 h;
   uint64_t pos = 0;
   for (const Part& part : l.parts) {
-    const File& f = *files_[size_t(part.source)];
-    const uint64_t al = d_.sources[size_t(part.source)].align;
+    const SourceFile& f = *files_[size_t(part.source)];
+    const uint64_t al = f.alignment(d_.sources[size_t(part.source)].align);
     const uint64_t F = part.offset + uint64_t(unit) * part.stride;
     char* out = at(dst, pos);
     require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
@@ -619,8 +621,8 @@ void Ctx::read_unit_device(Job& j) {
   uint64_t pos = 0;
   bool waited = false;
   for (const Part& part : l.parts) {
-    const File& f = *files_[size_t(part.source)];
-    const uint64_t al = f.direct() ? d_.sources[size_t(part.source)].align : 1;
+    const SourceFile& f = *files_[size_t(part.source)];
+    const uint64_t al = f.direct() ? f.alignment(d_.sources[size_t(part.source)].align) : 1;
     const uint64_t F = part.offset + uint64_t(j.unit) * part.stride;
     require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(j.layer) + ", " + std::to_string(j.unit) +
                                                      ") part " + part.name + " is past the end of its source");
@@ -1839,7 +1841,7 @@ Json Ctx::format_stats(const StatsView& v) const {
   j["backend"] = Json::string(be_->name());
   j["forwards"] = Json::number(v.forwards);
   Json direct = Json::array();
-  for (const auto& f : files_) direct.push(Json::boolean(f->direct()));
+  for (const auto& f : files_) direct.push(Json::boolean(f->physical_direct()));
   j["sources_direct"] = direct;
   const size_t n = d_.layers.size();
   ss_layer_stats t{};

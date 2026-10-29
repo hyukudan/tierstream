@@ -247,6 +247,9 @@ Streaming knobs (`ss_options`; `backend` comes from the set's `kind`; `device` i
 | `policy` | `"lru"` \| `"scored"` | `"lru"` | `policy` |
 | `lookahead_units` | integer 0..64 | 2 | `lookahead_budget` (speculative units per layer) |
 | `reader_threads` | integer 1..64 | 2 | `reader_threads` |
+| `weight_dirs` | string, directories separated by `;` | empty | `weight_dirs` |
+| `drive_readers` | integer 1..32 | 4 | `drive_readers` |
+| `weight_verify` | `"cached"` or `"always"` | `"cached"` | `weight_verify` |
 | `staging_buffers` | integer 2..64 | 4 | `staging_buffers` |
 | `staging_mib` | integer 1..16384 | 256 | `staging_bytes` (≥ 4 × the largest source alignment; rounded up to it by the library; a unit larger than a buffer is read in pieces) |
 | `copy_piece_mib` | integer 1..4096 | 64 | `copy_piece_bytes` |
@@ -259,6 +262,18 @@ Streaming knobs (`ss_options`; `backend` comes from the set's `kind`; `device` i
 | `spec_persistent` | bool | false | `spec_persistent` |
 | `readahead_units` | integer 0..64 | 0 | `readahead_units`: pinned host read-ahead buffers, each the size of the largest unit that can be read from its file; billed in `resources.readahead_bytes` / `host_bytes` / commit |
 | `tier_mode` | `"inclusive"` \| `"exclusive"` | `"inclusive"` | `tier_mode` of the budget. inclusive: a promoted unit keeps its pinned copy. exclusive: each unit lives in exactly one place (a device slot, a pinned block, or only its file); a promotion frees its block and an evicted unit is written back into a free block (design.md §3.4). Exclusive is refused on a `hip` set, with `fill_residents = false` and with `pinned_backing = true`. Pick it for a decode route with dynamic residency (`pin_planned = false`) whose device + host bytes cover the model only when no unit is held twice. |
+
+The multi-disk keys are placement knobs, so profiles and overrides use
+`routes.<route>.placement.<set>.weight_dirs` (and likewise for `drive_readers`
+and `weight_verify`). A source uses a shared stripe session only when a secondary
+directory contains `<source basename>.stripe.json`; other sources retain their
+ordinary file reader. `ss_open` copies the directory list. The `weight_dirs`
+pointer returned by `ss_recipe_plan` belongs to the recipe and is valid until that
+recipe is modified or freed; open the context before then. In multi mode,
+`ss_source_direct` and the stats JSON `sources_direct` mean **all locations are
+physically unbuffered**. The session always requires aligned covering reads,
+even when some locations use buffered I/O.
+
 
 Engine knobs (in the compiled plan's `engine` section; the library does not read them; every value has one concrete
 meaning, and an engine refuses a value outside its legal set rather than substituting its own):

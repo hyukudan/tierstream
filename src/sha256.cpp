@@ -1,7 +1,19 @@
 #include "sha256.hpp"
 
+#include "errors.hpp"
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 namespace ts {
 namespace {
@@ -73,6 +85,91 @@ std::string sha256_hex(const void* data, size_t n) {
     out += buf;
   }
   return out;
+}
+
+namespace {
+std::string hex_of(const uint32_t h[8]) {
+  std::string out;
+  char buf[9];
+  for (int i = 0; i < 8; ++i) {
+    std::snprintf(buf, sizeof buf, "%08x", static_cast<unsigned>(h[i]));
+    out += buf;
+  }
+  return out;
+}
+}  // namespace
+
+Sha256::Sha256() {
+  static const uint32_t init[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  std::memcpy(h_, init, sizeof h_);
+#if defined(_WIN32)
+  BCRYPT_HASH_HANDLE hh = nullptr;
+  if (BCryptCreateHash(BCRYPT_SHA256_ALG_HANDLE, &hh, nullptr, 0, nullptr, 0, 0) == 0) cng_ = hh;
+#endif
+}
+
+Sha256::~Sha256() {
+#if defined(_WIN32)
+  if (cng_) BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(cng_));
+#endif
+}
+
+void Sha256::update(const void* data, size_t n) {
+  const unsigned char* p = static_cast<const unsigned char*>(data);
+#if defined(_WIN32)
+  if (cng_) {
+    while (n) {
+      ULONG part = ULONG(n > (size_t(1) << 30) ? (size_t(1) << 30) : n);
+      require(BCryptHashData(static_cast<BCRYPT_HASH_HANDLE>(cng_), const_cast<PUCHAR>(p), part, 0) == 0, SS_E_IO,
+              "SHA-256: the system provider failed");
+      p += part;
+      n -= part;
+    }
+    return;
+  }
+#endif
+  total_ += n;
+  if (buf_len_) {
+    size_t take = std::min<size_t>(64 - buf_len_, n);
+    std::memcpy(buf_ + buf_len_, p, take);
+    buf_len_ += take;
+    p += take;
+    n -= take;
+    if (buf_len_ < 64) return;
+    block(h_, buf_);
+    buf_len_ = 0;
+  }
+  for (; n >= 64; p += 64, n -= 64) block(h_, p);
+  std::memcpy(buf_, p, n);
+  buf_len_ = n;
+}
+
+std::string Sha256::hex() {
+#if defined(_WIN32)
+  if (cng_) {
+    UCHAR d[32];
+    const long st = BCryptFinishHash(static_cast<BCRYPT_HASH_HANDLE>(cng_), d, 32, 0);
+    BCryptDestroyHash(static_cast<BCRYPT_HASH_HANDLE>(cng_));
+    cng_ = nullptr;
+    require(st == 0, SS_E_IO, "SHA-256: the system provider failed");
+    std::string out;
+    char buf[3];
+    for (UCHAR b : d) {
+      std::snprintf(buf, sizeof buf, "%02x", unsigned(b));
+      out += buf;
+    }
+    return out;
+  }
+#endif
+  unsigned char tail[128] = {};
+  std::memcpy(tail, buf_, buf_len_);
+  tail[buf_len_] = 0x80;
+  size_t len = buf_len_ + 1 + 8 <= 64 ? 64 : 128;
+  uint64_t bits = total_ * 8;
+  for (int i = 0; i < 8; ++i) tail[len - 1 - i] = static_cast<unsigned char>(bits >> (8 * i));
+  for (size_t i = 0; i < len; i += 64) block(h_, tail + i);
+  return hex_of(h_);
 }
 
 }  // namespace ts

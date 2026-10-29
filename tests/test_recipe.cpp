@@ -1085,6 +1085,46 @@ TEST(select_session_and_stale_recipe) {
   CHECK_EQ(lab.route(), std::string("decode_pair"));
 }
 
+TEST(recipe_multidisk_roundtrip_overrides_and_compile) {
+  RecipeStack base(kLab, "lab.toml");
+  const auto original = json_write(base.effective_json());
+  CHECK(!has(original, "weight_dirs"));
+  CHECK(!has(original, "drive_readers"));
+  CHECK(!has(original, "weight_verify"));
+  const std::string prefix = "routes.prefill_long.placement.rtx.";
+  base.set(prefix + "weight_dirs", R"("stripe-a;stripe-b")", "--set");
+  base.set(prefix + "drive_readers", "7", "--set");
+  base.set(prefix + "weight_verify", R"("always")", "--set");
+  const auto canonical = json_write(base.effective_json());
+  CHECK_EQ(json_write(recipe_to_json(parse_recipe(canonical))), canonical);
+  const auto* placement = base.effective().route("prefill_long")->placement("rtx");
+  CHECK_EQ(placement->weight_dirs, std::string("stripe-a;stripe-b"));
+  CHECK_EQ(placement->get("drive_readers"), 7.0);
+  const Desc d = make_desc(blob_desc());
+  const auto plan = recipe_plan(base.effective(), base.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {});
+  CHECK_EQ(std::string(plan.options.weight_dirs), placement->weight_dirs);
+  CHECK_EQ(plan.options.drive_readers, 7u);
+  CHECK_EQ(plan.options.weight_verify, int(SS_MFILE_VERIFY_ALWAYS));
+  const auto* options = plan.doc.find("options");
+  CHECK_EQ(options->find("weight_dirs")->text, placement->weight_dirs);
+  CHECK_EQ(options->find("drive_readers")->text, std::string("7"));
+  CHECK_EQ(options->find("weight_verify")->text, std::string("always"));
+  for (const char* value : {"0", "33", "1.5", "true"})
+    CHECK_REFUSED(base.set(prefix + "drive_readers", value, "--set"), "drive_readers");
+  CHECK_REFUSED(base.set(prefix + "weight_dirs", "12", "--set"), "expected a string");
+  CHECK_REFUSED(base.set(prefix + "weight_dirs", R"("bad\u0000dir")", "--set"), "embedded NUL");
+  CHECK_REFUSED(base.set(prefix + "weight_verify", R"("off")", "--set"), "weight_verify");
+  for (const char* value : {"1", "32"}) base.set(prefix + "drive_readers", value, "--set");
+  base.set(prefix + "weight_dirs", R"("")", "--set");
+  base.set(prefix + "drive_readers", "4", "--set");
+  base.set(prefix + "weight_verify", R"("cached")", "--set");
+  CHECK_EQ(json_write(base.effective_json()), original);
+  const auto defaults = recipe_plan(base.effective(), base.effective_sha256(), "prefill_long", "rtx", 0, "GPU-PRO", d, {}, {});
+  CHECK(defaults.options.weight_dirs == nullptr);
+  CHECK_EQ(defaults.options.drive_readers, 4u);
+  CHECK_EQ(defaults.options.weight_verify, int(SS_MFILE_VERIFY_CACHED));
+}
+
 // ---- C ABI --------------------------------------------------------------------------------------------------------
 TEST(capi_recipe_roundtrip) {
   ss_recipe* r = nullptr;
@@ -1093,6 +1133,9 @@ TEST(capi_recipe_roundtrip) {
   CHECK(r == nullptr);
   CHECK_OK(ss_recipe_from_text(kLab, std::strlen(kLab), "lab.toml", &r));
   CHECK_OK(ss_recipe_set(r, "routes.prefill_long.placement.rtx.chunk_tokens", "8192", nullptr));
+  CHECK_OK(ss_recipe_set(r, "routes.prefill_long.placement.rtx.weight_dirs", R"("stripe-a;stripe-b")", nullptr));
+  CHECK_OK(ss_recipe_set(r, "routes.prefill_long.placement.rtx.drive_readers", "5", nullptr));
+  CHECK_OK(ss_recipe_set(r, "routes.prefill_long.placement.rtx.weight_verify", R"("always")", nullptr));
   char* out = nullptr;
   size_t len = 0;
   CHECK_OK(ss_recipe_to_json(r, &out, &len));
@@ -1119,6 +1162,9 @@ TEST(capi_recipe_roundtrip) {
   CHECK_OK(ss_recipe_plan(r, "prefill_long", "rtx", 0, "GPU-PRO", d, nullptr, 0, nullptr, nullptr, nullptr, 0, &b, &o,
                           &plan, &out, nullptr));
   CHECK_EQ(o.device, 3);
+  CHECK_EQ(std::string(o.weight_dirs), std::string("stripe-a;stripe-b"));
+  CHECK_EQ(o.drive_readers, 5u);
+  CHECK_EQ(o.weight_verify, int(SS_MFILE_VERIFY_ALWAYS));
   CHECK_EQ(int(o.backend), int(SS_BACKEND_CUDA));
   CHECK_EQ(b.device_bytes, 90 * GiB);
   Json doc = json_parse(out);

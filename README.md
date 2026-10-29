@@ -228,6 +228,51 @@ engine's own cache, then receive maintainer approval.
 
 Engine knobs (`prefetch_layers`, `host_prefetch_layers`, …) only take effect in an engine that implements them.
 
+### Several drives (multi-disk streaming)
+
+A model streamed from one NVMe drive is limited by that drive. tierstream can read the same model from several
+drives at once, without a second full copy:
+- `ts-stripe make MODEL.gguf RANGES.json STRIPE_DIR` copies part of the model to another drive as a
+  **stripe**: whole chunks (16 MiB) on a fixed grid, listed in a manifest with the model's SHA-256 and the xxh64 of
+  every chunk. A ranges file says which bytes to place; `interleave` puts every other chunk of a range on the stripe,
+  so a whole-layer expert stream or a batch of random Engram rows is read about half from each drive. For DeepSeek
+  V4.1 Flash Q2 the routed experts and both Engram tables interleaved = 166 GiB on the second drive.
+- Readers pass the stripe directories (`weight_dirs`, engines `--weight-dirs MODEL_DIR;STRIPE_DIR`).
+  Sessions share **one reader pool per volume and reader count** across files (`drive_readers`, 1..32, default 4); unbuffered reads
+  stay unbuffered. Large requests (8 MiB and up) are split between the drives with **adaptive shares** that follow
+  each drive's measured speed (a slow drive gets little or nothing, and every 16th large request reads the original
+  alone as the live baseline); small and latency-bound reads stay on the original drive, as with one drive.
+- **Verification and trust.** A stripe chunk is served only after its xxh64 matched the manifest (`weight_verify`:
+  `always` checks every chunk at open and re-checks whole-chunk reads inline, `cached` checks once per data-file
+  version). Read errors, short reads and mismatches fall back to the original file; missing or stale stripes disable
+  that location. Stripe directories must be as trusted as the primary: xxh64 detects accidental corruption, not
+  deliberate tampering. A supplied `primary_sha256` is trusted without checking and must describe the current primary.
+  Windows holds serving files with `FILE_SHARE_READ` only, excluding writers. Linux has no share-read-only exclusion:
+  stripe data is published mode 0444, but its owner or a privileged process can still change it. Identity, including
+  Linux ctime, is checked at reuse and after verification. Keep primary and stripe files immutable while sessions live.
+  Use `weight_verify=always` on Linux where stripe directories are not exclusively owned; partial reads still rely on
+  open-time verification. Byte identity assumes these trust and immutability requirements.
+- **First open.** Without an admitted `primary_sha256` or an identity cache hit, opening a striped primary hashes the
+  entire primary and scans the stripe. Hundreds of GiB can take minutes; cached subsequent opens avoid these scans.
+  The `ss_mfile` C API permits concurrent reads and queries with separate destination buffers. Close must not race any
+  call using that handle; separate handles to a shared session can be closed independently.
+- With no stripe directory (the default) nothing changes: the original single-file code path runs.
+
+**Measured** (DeepSeek V4.1 Flash Q2 on the RTX PRO 6000 during prompt prefill, exact profile, 32 GiB pinned host tier;
+original on a PCIe 4.0 NVMe, stripe on a second PCIe 4.0 NVMe; the same tokens and states in every arm):
+
+| prompt | one drive | two drives | |
+|---:|---:|---:|---:|
+| 8K | 13.2 s | 10.6 s | -19 % |
+| 32K | 19.2 s | 17.4 s | -9 % |
+| 64K | 29.1 s | 27.8 s | -5 % |
+| 128K | 49.9 s | 48.4 s | -3 % |
+
+The expert stream itself goes from 11.0 to 8.45 s per request (-23 %, 29 % of the bytes from the second drive) and the
+service starts 17 % faster; longer prompts gain less because they are compute bound. A third, slower drive (a
+DRAM-less system disk) added nothing: the shares give it little. Decode reads single experts and Engram rows, which
+stay on the original drive, so decode speed does not change.
+
 ### What never changes
 
 Bytes are copied, never transformed, and engine kernels must not depend on which slot a unit sits in. So every
@@ -308,6 +353,7 @@ A recipe (below) compiles to the library's budget and options. The knobs that sh
 | `readahead_units`, `host_prefetch_layers` | 0, 0 | host read-ahead buffers and distance |
 | `prefetch_layers` | 1 | certain whole-layer prefetch distance |
 | `reader_threads`, `staging_mib`, `direct_io` | 2, 256, true | the disk reader |
+| `weight_dirs`, `drive_readers`, `weight_verify` | none, 4, cached | stripe copies on other drives (several drives) |
 
 The full list, with units and checks, is in [docs/recipes.md](docs/recipes.md).
 
