@@ -91,3 +91,9 @@ ss.h-sha256 26425365314ead3b0383a6927684c0c44df5bbb500f1fc941f63b54141c4ace1
 
 # auto (additive policy value, row-aware boundary and drained policy setter; existing struct layouts unchanged)
 ss.h-sha256 42489510e3c63d99c15cea284c3b7ee04794f2f540719413c923e866862ad187
+
+# multidisk (additive: multi-location C API and appended weight options; existing declarations unchanged)
+ss.h-sha256 eeba12d0c1cf4eec69f89ae4c69b7265b03c99e5d9b9712283fc94f18413d8e9
+
+# auto + multidisk (additive: multi-location C API and appended weight options on top of auto; all existing declarations unchanged)
+ss.h-sha256 f73260fbaa5c8000b3e6f3bc0325c1ef3dd33ba4593d591304ce6095cb986ec9

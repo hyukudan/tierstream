@@ -5,6 +5,7 @@
 #include <functional>
 #include <vector>
 #include "desc.hpp"
+#include "source_file.hpp"
 namespace ts {
 struct DgLoadUnit {
   int layer = 0, unit = 0;
@@ -21,8 +22,10 @@ struct DgLoadStats {
 };
 // Buffers are caller-owned. recycle waits for the previous transfer from this buffer;
 // submit must enqueue all copies before returning. Workers never publish placement.
+// Optional context sources keep one shared MFile session alive across all worker adapters.
 DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& units,
     const std::vector<char*>& buffers, uint64_t buffer_bytes, uint32_t readers,
     bool direct, bool verify, const std::function<void(size_t)>& recycle,
-    const std::function<void(size_t, const std::vector<DgLoadCopy>&)>& submit);
+    const std::function<void(size_t, const std::vector<DgLoadCopy>&)>& submit,
+    const std::vector<std::unique_ptr<SourceFile>>* sources = nullptr);
 }  // namespace ts

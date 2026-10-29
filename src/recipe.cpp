@@ -295,6 +295,9 @@ const std::vector<PlacementField>& placement_fields() {
       {"tier_mode", FieldType::TierMode, 0, 1, kTierInclusive},
       {"lookahead_units", FieldType::Int, 0, 64, 2},
       {"reader_threads", FieldType::Int, 1, 64, 2},
+      {"weight_dirs", FieldType::WeightDirs, 0, 0, 0},
+      {"drive_readers", FieldType::Int, 1, 32, 4},
+      {"weight_verify", FieldType::WeightVerify, 0, 1, SS_MFILE_VERIFY_CACHED},
       {"staging_buffers", FieldType::Int, 2, 64, 4},
       {"staging_mib", FieldType::Int, 1, 16384, 256},
       {"copy_piece_mib", FieldType::Int, 1, 4096, 64},
@@ -568,6 +571,13 @@ Recipe recipe_from_json(const Json& doc, NoteFn note) {
             case FieldType::TierMode:
               p.v[k] = rd.choice(*v, fw, {"inclusive", "exclusive"}) == "inclusive" ? kTierInclusive : kTierExclusive;
               break;
+            case FieldType::WeightDirs:
+              p.weight_dirs = rd.str(*v, fw);
+              if (p.weight_dirs.find('\0') != std::string::npos) rd.bad(fw, "embedded NUL in directory list");
+              break;
+            case FieldType::WeightVerify:
+              p.v[k] = rd.choice(*v, fw, {"cached", "always"}) == "cached" ? SS_MFILE_VERIFY_CACHED : SS_MFILE_VERIFY_ALWAYS;
+              break;
           }
           if (std::string(f.key) == "workspace_gib") p.has_workspace = true;
         }
@@ -765,6 +775,10 @@ Json recipe_to_json(const Recipe& r) {
              std::string(f.key) == "host_prefetch_layers") &&
             p.v[k] == 0)
           continue;
+        if ((std::string(f.key) == "weight_dirs" && p.weight_dirs.empty()) ||
+            (std::string(f.key) == "drive_readers" && p.v[k] == 4) ||
+            (std::string(f.key) == "weight_verify" && p.v[k] == SS_MFILE_VERIFY_CACHED))
+          continue;
         switch (f.type) {
           case FieldType::Gib:
           case FieldType::Float:
@@ -781,6 +795,12 @@ Json recipe_to_json(const Recipe& r) {
             break;
           case FieldType::TierMode:
             pe[f.key] = Json::string(p.v[k] == kTierInclusive ? "inclusive" : "exclusive");
+            break;
+          case FieldType::WeightDirs:
+            pe[f.key] = Json::string(p.weight_dirs);
+            break;
+          case FieldType::WeightVerify:
+            pe[f.key] = Json::string(p.v[k] == SS_MFILE_VERIFY_CACHED ? "cached" : "always");
             break;
         }
       }

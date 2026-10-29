@@ -10,7 +10,7 @@
 #include <new>
 #include <thread>
 #include "errors.hpp"
-#include "file_reader.hpp"
+#include "source_file.hpp"
 #include "xxh64.hpp"
 namespace ts {
 namespace {
@@ -27,9 +27,13 @@ struct Bounce {
 DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input,
     const std::vector<char*>& buffers, uint64_t buffer_bytes, uint32_t readers,
     bool direct, bool verify, const std::function<void(size_t)>& recycle,
-    const std::function<void(size_t, const std::vector<DgLoadCopy>&)>& submit) {
+    const std::function<void(size_t, const std::vector<DgLoadCopy>&)>& submit,
+    const std::vector<std::unique_ptr<SourceFile>>* sources) {
   const auto start = std::chrono::steady_clock::now();
   require(!buffers.empty() && readers > 0, SS_E_INVALID, "startup loader: empty pipeline");
+  require(!sources || sources->size() == d.sources.size(), SS_E_INVALID, "startup loader: source count differs");
+  const bool covering = direct || (sources && std::any_of(sources->begin(), sources->end(),
+      [](const std::unique_ptr<SourceFile>& f) { return f->direct(); }));
   // Reorder I/O only: each unit retains its original slot and host home.
   auto units = input;
   std::stable_sort(units.begin(), units.end(), [](const DgLoadUnit& a, const DgLoadUnit& b) {
@@ -46,7 +50,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
     for (const auto& p : d.layers[size_t(u.layer)].parts) slack += 3*std::max<uint64_t>(4096, d.sources[size_t(p.source)].align);
     // Reserve worst-case covering slack per range; a one-unit tight ring still
     // works via the fallback. Host batching does not consume ring storage.
-    const size_t cap = size_t(std::max<uint64_t>(1, buffer_bytes / (bytes + (direct && u.slot >= 0 ? slack : 0))));
+    const size_t cap = size_t(std::max<uint64_t>(1, buffer_bytes / (bytes + (covering && u.slot >= 0 ? slack : 0))));
     size_t n = 1;
     while (n < cap && i + n < units.size() && units[i+n].layer == u.layer &&
            (units[i+n].slot >= 0) == (u.slot >= 0)) ++n;
@@ -67,10 +71,11 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
   DgLoadStats stats;
   auto worker = [&] {
     try {
-      std::vector<std::unique_ptr<File>> files;
+      std::vector<std::unique_ptr<SourceFile>> files;
       uint64_t alignment = 4096;
-      for (const auto& src : d.sources) {
-        files.push_back(std::make_unique<File>(src.path, direct));
+      for (size_t i = 0; i < d.sources.size(); ++i) {
+        const auto& src = d.sources[i];
+        files.push_back(open_source(src.path, direct, sources ? (*sources)[i]->session() : nullptr));
         alignment = std::max(alignment, src.align);
       }
       const uint64_t bounce_bytes = std::max<uint64_t>(1ull << 20, 4 * alignment);
@@ -125,11 +130,11 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
             ranges.back().bytes += span.bytes;
           else ranges.push_back(span);
         }
-        if (b.resident && direct) {
+        if (b.resident && covering) {
           uint64_t cursor = 0;
           std::vector<char*> destinations;
           for (const auto& a : ranges) {
-            const uint64_t al = std::max<uint64_t>(4096, d.sources[a.source].align);
+            const uint64_t al = files[a.source]->alignment(std::max<uint64_t>(4096, d.sources[a.source].align));
             const uint64_t pad = (al - (uintptr_t(buffers[bi]) + cursor) % al) % al;
             const uint64_t delta = a.offset % al;
             const uint64_t extent = (delta + a.bytes + al - 1) / al * al;
@@ -152,7 +157,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
           spans = std::move(ranges);
           if (!destinations.empty()) {
             for (auto& a : spans) {
-              const uint64_t al = std::max<uint64_t>(4096, d.sources[a.source].align);
+              const uint64_t al = files[a.source]->alignment(std::max<uint64_t>(4096, d.sources[a.source].align));
               const uint64_t delta = a.offset % al;
               a.dst -= delta;
               a.bytes = (delta + a.bytes + al - 1) / al * al;
@@ -169,7 +174,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
                  spans[s].dst == a.dst + a.bytes && a.room == 0 && spans[s].room == 0) a.bytes += spans[s++].bytes;
           const auto& file = *files[a.source];
           require(a.offset < file.size(), SS_E_IO, "startup loader: source range past EOF");
-          const uint64_t al = std::max<uint64_t>(4096, d.sources[a.source].align);
+          const uint64_t al = files[a.source]->alignment(std::max<uint64_t>(4096, d.sources[a.source].align));
           auto read = [&](void* dst, uint64_t n, uint64_t off, uint64_t need) {
             const uint64_t got = file.pread(dst,n,off);
             actual += got; ++calls;

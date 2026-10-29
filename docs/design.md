@@ -408,6 +408,68 @@ lookup tables (Engram) unbuffered (study §6.5).
 | jobs still in flight across forwards | `ss_end` waits until every job of the forward has been *issued* (discrete) or has *landed* (unified), and cancels speculative jobs that never started. On a discrete GPU an issued copy may still be in flight, so for every layer that got persistent copies `ss_end` records a per-layer `ready` event on the copy stream. The next `ss_acquire` of that layer makes the engine stream wait for it once, before any hit is read. |
 | a failed read leaves a unit marked resident | `ss_end` drops every persistent unit whose job did not finish; `ss_seed` drops the seeds that failed and returns the first error. A failed unit is read again at its next use. |
 
+### 4.4 Several drives: multi-location files
+
+- A model file (the **primary**) may have **stripe copies** of some of its chunks in other directories, normally on
+  other NVMe drives. `ss_options.weight_dirs` (recipe `weight_dirs`, engines `--weight-dirs`) lists them, `;`
+  separated; the primary's own directory and duplicates are ignored, so with no other directory nothing changes.
+- A stripe directory holds `<primary basename>.stripe.json` (`tierstream/stripe-v1`) and the data file it names.
+  The manifest gives the chunk size (a power of two, 16 MiB by default) on a grid over the primary's offsets, the
+  placed chunks as runs `[first chunk, count, first slot]`, the xxh64 of every placed chunk's bytes, the primary's
+  SHA-256, and a digest of its own canonical text. Placed chunks are stored whole and back to back (the last one
+  zero-padded), so every read of the data file is aligned. Validation is strict (sorted non-overlapping runs, dense
+  slots, sizes, names, limits checked before allocation) and any failure disables that location only.
+- `ts-stripe make PRIMARY RANGES.json OUT_DIR` builds a stripe: one sequential unbuffered pass over the primary
+  (SHA-256 + copy), unbuffered writes, a full read-back check, an immutable versioned data file, then an atomic
+  manifest switch. A ranges file names byte ranges with a policy: `all` (every chunk on the stripe) or `interleave`
+  (odd chunks on the stripe, so that whole-layer streams and random record reads split about evenly over two
+  drives; a single small unit usually lies in one chunk). `verify`, `gc` and `show` maintain stripes.
+- **Session.** The registry lookup key is (canonical primary, directories, direct flag). Reuse requires matching
+  `drive_readers` (1..32, default 4), unchanged file identities and manifests, matching caller digest when supplied,
+  and verification at least as strict as requested. A directory with no manifest stays reusable while it stays absent.
+  Reader pools are shared process-wide by (volume identity, reader count), including across shard files on that volume.
+  Each call waits for its own jobs on success and error; a shared pool never makes another session's jobs its responsibility.
+  Reads and queries may run concurrently on a live handle with non-overlapping destination buffers. Close must not race
+  any call on that handle; closing a separate handle to the session is safe.
+- **Writer contract.** Windows opens every serving file with `FILE_SHARE_READ` only, excluding writers. Linux has no
+  share-read-only exclusion: stripes are published mode 0444, but owners and privileged processes can still write.
+  Identity, including Linux ctime, is checked at reuse and after verification. Keep files immutable while sessions live;
+  use `weight_verify=always` on Linux where stripe directories are not exclusively owned. Partial reads still rely on
+  open-time verification, even with `always`. Stripe directories must be as trusted as the primary: xxh64 detects
+  accidental corruption, not deliberate tampering.
+- **Reads.** Offset, length and buffer are 4 KiB aligned (a read may run past EOF to the aligned end; that tail is
+  zero-filled on every route). A read is split at chunk boundaries into one piece per chunk. Windows issues concurrent
+  4 MiB parts within each piece; Linux reads those parts sequentially. With a stripe location, reads of 8 MiB and up
+  always go to the shared volume pools; a smaller single-piece read runs on the caller's thread and other multi-piece
+  reads go to the pools, even if all pieces use one location.
+- **Which reads use a stripe.** The primary holds every byte, so a stripe pays only when two drives work on the same
+  request. Requests of at least 8 MiB (whole-layer expert streams, startup loads) are split; smaller requests (one
+  expert's parts, a decode step's 24-48 Engram pages) and scattered batches under 64 reads stay on the primary,
+  exactly as with one drive: a split small request waits for the slower drive. Measured: splitting a
+  24-row Engram job made it slower on a quiet primary (0.29 -> 0.47 ms), so it is not done.
+- **Adaptive shares.** In a split request each chunk with a stripe copy goes to whichever of its two homes has the
+  least of (bytes this request already gave it + the chunk) / its share. Shares follow each location's measured
+  throughput (its bytes of a request over the time until its last piece finished, EWMA). Every 16th large request
+  reads the primary alone, so a current single-drive baseline is always known; while split requests measure slower
+  than that baseline, splitting is off for the next 64 large requests. This bounds a regression rather than excluding
+  it: no controller can know the single-drive time of the request it splits.
+- **Verification.** Every byte served from a stripe belongs to a chunk whose xxh64 matched the manifest, checked
+  through the serving handle at open (`weight_verify = always`) or at the first open of that data-file version
+  (`cached`: the passing-chunk bitmap is kept by file identity; the identity is volume, file index, size, last-write
+  and creation time - not the NTFS change time, which metadata-only events move); with `always` also again on every read covering a
+  whole chunk (that hash sits on the read path: measured, it cost a large prompt-prefill weight stream about a quarter of its
+  throughput, so the default `cached` relies on the open-time check and the platform writer contract).
+- **Admission cost.** Without a caller-supplied digest or a primary identity-cache hit, first open hashes the entire
+  striped primary and verifies the entire stripe; hundreds of GiB can take minutes. `primary_sha256` is trusted without
+  recomputing it and must describe the primary's current bytes. Cached verification results avoid later stripe scans.
+  The C API always validates the reader count and verification mode, even without stripes, and refuses test-only OFF.
+- **Fallback.** A read error, short read or hash mismatch on a stripe re-reads that piece from the primary in the
+  same job and demotes the chunk to the primary for good; three errors disable the location. A missing drive,
+  manifest or data file, or a manifest bound to other primary bytes, disables that location at open. Engines see
+  the primary's bytes in every case.
+- Counters (`ss_mfile_get_counters`): bytes, reads and busy time per location, fallback bytes, demoted chunks,
+  verification failures and time, disabled and unbuffered locations, the effective verification mode.
+
 ## 5. Planner (same rule as vramplan's third tier)
 
 `ss_plan_make(desc, budget, benefit)` places units in four steps.

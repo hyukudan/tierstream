@@ -53,7 +53,7 @@ struct RGroup {
 };
 
 // Scalar knobs of a placement (docs/recipes.md §5.1), table-driven: parse, canonical form and settable paths share it.
-enum class FieldType { Gib, Float, Int, Bool, Policy, TierMode };
+enum class FieldType { Gib, Float, Int, Bool, Policy, TierMode, WeightDirs, WeightVerify };
 constexpr double kTierInclusive = 0, kTierExclusive = 1;
 struct PlacementField {
   const char* key;
@@ -67,6 +67,7 @@ struct RPlacement {
   std::vector<double> v;  // per placement_fields(); bools 0/1, policy = ss_policy
   bool has_workspace = false;
   std::vector<RGroup> groups;
+  std::string weight_dirs;
   double get(const char* key) const;
 };
 
@@ -181,7 +182,7 @@ Json recipe_select(const Recipe& r, const std::string& effective_sha256, const J
 
 struct RecipePlan {
   ss_budget budget{};
-  ss_options options{};
+  ss_options options{};  // weight_dirs borrows the recipe placement string until open copies it
   Plan plan;
   Json doc;  // strix-stream/recipe-plan-v1
 };

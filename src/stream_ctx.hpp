@@ -14,7 +14,7 @@
 
 #include "backend.hpp"
 #include "desc.hpp"
-#include "file_reader.hpp"
+#include "source_file.hpp"
 #include "plan.hpp"
 #include "resident_set.hpp"
 #include "strix_stream/ss.h"
@@ -92,7 +92,7 @@ class Ctx {
   // half-updated (a unit admitted without its read, a job nobody owns): it refuses every further call but close.
   void poison() noexcept { poisoned_ = true; }
   bool poisoned() const { return poisoned_; }
-  bool source_direct(int i) const { return files_[size_t(i)]->direct(); }
+  bool source_direct(int i) const { return files_[size_t(i)]->physical_direct(); }
   int n_sources() const { return int(files_.size()); }
   Json stats_json() const;
   ss_exclusive_stats exclusive_stats() const;
@@ -216,7 +216,8 @@ class Ctx {
   Plan plan_;
   ss_options o_;
   std::unique_ptr<Backend> be_;
-  std::vector<std::unique_ptr<File>> files_;
+  std::string weight_dirs_;
+  std::vector<std::unique_ptr<SourceFile>> files_;
   std::vector<LayerState> L_;
   std::vector<RingSlot> ring_;
   std::vector<void*> ring_owner_ev_;  // release event of the layer that last read each ring slot

@@ -286,6 +286,12 @@ typedef struct ss_options {
    * = an empty table (online learning only). Needs SS_POLICY_SCORED and a descriptor with per-unit hashes. */
   uint64_t dg_score_profile_len;
   const void* dg_score_profile;
+  /* appended, multi-disk weight streaming ("Multi-location files" below): ';'-separated directories holding stripe
+   * copies of the descriptor's sources; the source's own directory and duplicates are ignored, and with no other
+   * directory (NULL, empty) every source is read exactly as before. Copied at open. */
+  const char* weight_dirs;
+  uint32_t drive_readers;         /* reader threads per volume with weight_dirs: 1..32 (default 4), always validated */
+  int weight_verify;              /* CACHED (default) or ALWAYS; always validated, including without weight_dirs */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -761,6 +767,90 @@ SS_API ss_status ss_dg_end_rows(ss_ctx* c, uint32_t rows);
    that switch with SS_E_INVALID. reset_open restores the open policy as well as its learning and placement. */
 #define SS_DG_SET_POLICY 1
 SS_API ss_status ss_dg_set_policy(ss_ctx* c, ss_policy policy);
+
+
+/* Multi-location files (docs/design.md §4.4). A model file (the primary) plus stripe copies of some of its chunks on
+ * other drives: each extra directory holds "<primary basename>.stripe.json" (tierstream/stripe-v1: chunk size, the
+ * primary's SHA-256, the placed chunks and their xxh64) and the data file it names. Reads are split at chunk
+ * boundaries and served by one reader pool per drive. Every byte served from a secondary location belongs to a chunk
+ * whose xxh64 matched the manifest, checked through the serving handle at open (verify_mode ALWAYS) or at the first
+ * open of that data-file version (CACHED, the result kept by file identity); with ALWAYS also again on every read
+ * covering a whole chunk. Any read error, short read or mismatch serves that chunk from the primary from then on. A missing drive,
+ * manifest or data file, or a manifest bound to other primary bytes, disables that location (never an error).
+ * Sessions are looked up by (canonical primary, directories, direct flag), reused only while file identities and
+ * manifests hold, drive_readers matches and verification is at least as strict as requested. Absent manifests stay
+ * reusable while absent. Reader pools are shared process-wide by (volume identity, drive_readers), across files.
+ * Windows opens files with FILE_SHARE_READ only, excluding writers for the session's lifetime. Linux has no such
+ * exclusion: stripe data is published 0444; owners or privileged processes can still modify it. Identity (including
+ * Linux ctime) is checked on reuse and after verification, not on every partial read. Keep files immutable while
+ * sessions live; use ALWAYS on Linux where stripe directories are not exclusively owned (partial reads still rely
+ * on the open-time check). Stripe directories must be as trusted as the primary: xxh64 detects accidental corruption,
+ * not deliberate tampering. First open without a supplied primary_sha256 or identity cache hashes the entire primary
+ * and verifies the stripe; hundreds of GiB can take minutes. CACHED persists the stripe verification by identity.
+ * Concurrent reads, counter queries and accessors on a live handle are supported; read destinations must not overlap
+ * concurrently. Each call waits for all its own jobs, including on error. Close must not race any call on that handle;
+ * closing a separate handle to the same shared session is safe.
+ * Read contract: offset, bytes and dst are multiples of ss_mfile_alignment (4096); a read may extend past the end
+ * of the file up to the aligned end (got = the bytes that exist; bytes past EOF are zero-filled on every route). */
+#define SS_MFILE 1
+typedef struct ss_mfile ss_mfile;
+typedef enum ss_mfile_verify {
+  SS_MFILE_VERIFY_CACHED = 0,     /* verify a data-file version once; reuse the result while its identity holds */
+  SS_MFILE_VERIFY_ALWAYS = 1,     /* verify every placed chunk when a session is created (a reused session is not
+                                    re-verified) and re-check whole-chunk reads inline (qualification) */
+  SS_MFILE_VERIFY_OFF = 2         /* C++ tests only; rejected by ss_open and ss_mfile_open */
+} ss_mfile_verify;
+typedef struct ss_mfile_options {
+  uint32_t struct_size;           /* sizeof(ss_mfile_options), set by ss_mfile_options_defaults */
+  int direct_io;                  /* 1 = unbuffered reads (default) */
+  uint32_t drive_readers;         /* reader threads per volume: 1..32 (default 4), always validated */
+  int verify_mode;                /* ss_mfile_verify */
+  const char* primary_sha256;     /* optional admitted SHA-256 (hex), trusted without checking: MUST describe the
+                                    current primary bytes; NULL = full-file hash computed / cached by identity */
+} ss_mfile_options;
+typedef struct ss_mfile_io {
+  void* dst;
+  uint64_t offset;
+  uint64_t bytes;
+} ss_mfile_io;
+#define SS_MFILE_MAX_LOCATIONS 8  /* the primary + 7 secondary directories */
+typedef struct ss_mfile_counters {
+  uint32_t struct_size;           /* set by the caller */
+  uint32_t locations;             /* location 0 = the primary */
+  uint64_t bytes[SS_MFILE_MAX_LOCATIONS];
+  uint64_t reads[SS_MFILE_MAX_LOCATIONS];
+  uint64_t busy_ns[SS_MFILE_MAX_LOCATIONS];   /* summed read time of that location's reads */
+  uint64_t fallback_bytes;        /* bytes re-read from the primary after a secondary failure */
+  uint64_t demoted_chunks;
+  uint64_t verify_fail;           /* chunks whose xxh64 did not match (open or inline) */
+  uint64_t read_errors;           /* secondary read errors and short reads */
+  uint64_t verified_bytes;        /* bytes hashed by the open-time verification of this process */
+  uint64_t verify_ns;
+  uint32_t disabled_mask;         /* bit i: location i disabled (at open or after errors) */
+  uint32_t direct_mask;           /* bit i: location i is read unbuffered */
+  int verify_mode;                /* the session's effective ss_mfile_verify */
+  uint32_t reserved;
+} ss_mfile_counters;
+SS_API void ss_mfile_options_defaults_sized(ss_mfile_options* o, uint32_t size);
+static inline void ss_mfile_options_defaults(ss_mfile_options* o) {
+  ss_mfile_options_defaults_sized(o, (uint32_t)sizeof *o);
+}
+/* weight_dirs: ';'-separated directories (NULL / empty: the primary only). opt may be NULL (defaults). */
+SS_API ss_status ss_mfile_open(const char* primary, const char* weight_dirs, const ss_mfile_options* opt,
+                               ss_mfile** out);
+SS_API void ss_mfile_close(ss_mfile* f);
+SS_API uint64_t ss_mfile_size(const ss_mfile* f);
+SS_API uint32_t ss_mfile_alignment(const ss_mfile* f);
+/* 1 when at least one secondary location serves chunks */
+SS_API int ss_mfile_multi(const ss_mfile* f);
+SS_API ss_status ss_mfile_pread(ss_mfile* f, void* dst, uint64_t bytes, uint64_t offset, uint64_t* got);
+/* Every io in flight at once (the latency path of small scattered reads); each io follows the read contract. */
+SS_API ss_status ss_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n);
+SS_API ss_status ss_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out);
+/* The location's file path (0 = the primary), NULL past the last; valid until ss_mfile_close. */
+SS_API const char* ss_mfile_location_path(const ss_mfile* f, int loc);
+/* Why secondary locations were disabled at open ("" when none); valid until ss_mfile_close. */
+SS_API const char* ss_mfile_open_report(const ss_mfile* f);
 
 #ifdef __cplusplus
 }

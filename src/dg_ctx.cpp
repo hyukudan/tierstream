@@ -23,7 +23,7 @@
 #include "dg_load.hpp"
 #include "dg_kernels.hpp"
 #include "dg_service.hpp"
-#include "file_reader.hpp"
+#include "source_file.hpp"
 #include "xxh64.hpp"
 #endif
 
@@ -299,6 +299,8 @@ struct LoadRing {
 class CudaDgCtx final : public DgCtx {
  public:
   CudaDgCtx(const Desc& d, const Plan& p, const ss_options& o) : d_(d), o_(o), x_(dg_layout(d, p, o)) {
+    weight_dirs_ = o.weight_dirs ? o.weight_dirs : "";
+    o_.weight_dirs = weight_dirs_.c_str();
     try {
       init();
     } catch (...) {
@@ -312,7 +314,7 @@ class CudaDgCtx final : public DgCtx {
   bool poisoned() const override { return poisoned_; }
   void poison() override { poisoned_ = true; }
   int n_sources() const override { return int(files_.size()); }
-  bool source_direct(int i) const override { return files_[size_t(i)]->direct(); }
+  bool source_direct(int i) const override { return files_[size_t(i)]->physical_direct(); }
 
   void begin(const uint32_t* rows, int n_layers) override {
     require(!in_token_, SS_E_INVALID, "ss_begin: a gated token is already open (call ss_end)");
@@ -954,7 +956,7 @@ class CudaDgCtx final : public DgCtx {
     j["backend"] = Json::string("cuda");
     j["forwards"] = Json::number(s.tokens);
     Json direct = Json::array();
-    for (const auto& f : files_) direct.push(Json::boolean(f->direct()));
+    for (const auto& f : files_) direct.push(Json::boolean(f->physical_direct()));
     j["sources_direct"] = direct;
     ss_layer_stats t{};
     Json ls = Json::array();
@@ -1073,7 +1075,7 @@ class CudaDgCtx final : public DgCtx {
   // when the direct-I/O alignment rules are not met.
   void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest, DgLoadStats* stats = nullptr) {
     const Layer& l = d_.layers[size_t(layer)];
-    auto read = [&](const File& file, void* out, uint64_t n, uint64_t off) {
+    auto read = [&](const SourceFile& file, void* out, uint64_t n, uint64_t off) {
       const uint64_t got = file.pread(out, n, off);
       if (stats) { stats->read_bytes += got; ++stats->read_calls; }
       return got;
@@ -1081,8 +1083,8 @@ class CudaDgCtx final : public DgCtx {
     Xxh64 h;
     uint64_t pos = 0;
     for (const Part& part : l.parts) {
-      const File& f = *files_[size_t(part.source)];
-      const uint64_t al = d_.sources[size_t(part.source)].align;
+      const SourceFile& f = *files_[size_t(part.source)];
+      const uint64_t al = f.alignment(d_.sources[size_t(part.source)].align);
       const uint64_t F = part.offset + uint64_t(unit) * part.stride;
       char* out = at(dst, pos);
       require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
@@ -1138,7 +1140,7 @@ class CudaDgCtx final : public DgCtx {
     device_ = o_.device;
     ck(cudaSetDevice(device_), "cudaSetDevice");
     ck_launch(dgk::preload(), "loading the kernels");
-    for (const auto& s : d_.sources) files_.push_back(std::make_unique<File>(s.path, o_.direct_io != 0));
+    for (const auto& s : d_.sources) files_.push_back(open_source(s.path, o_));
     bounce_bytes_ = x_.bounce_bytes;  // the sizes admission billed (dg_layout)
     pin(&bounce_, size_t(bounce_bytes_), cudaHostAllocPortable, "cudaHostAlloc (bounce)");
     pin(reinterpret_cast<void**>(&staging_), size_t(x_.staging_bytes), cudaHostAllocPortable,  // also the reset spare
@@ -1353,7 +1355,7 @@ class CudaDgCtx final : public DgCtx {
               pipeline_h2d_bytes += cpy.bytes;
             }
             ck(cudaEventRecord(ring.events[i], ring.stream), "startup buffer event");
-          });
+          }, &files_);
       load.h2d_bytes = pipeline_h2d_bytes;
       ck(cudaStreamSynchronize(ring.stream), "startup H2D done");
     }
@@ -1366,7 +1368,7 @@ class CudaDgCtx final : public DgCtx {
                  (unsigned long long)load.h2d_bytes, elapsed(),
                  (unsigned long long)load.bounce_bytes, load.hash_seconds);
     for (size_t i = 0; i < files_.size(); ++i)
-      std::fprintf(stderr, "dg_load source=%llu direct=%d\n", (unsigned long long)i, files_[i]->direct() ? 1 : 0);
+      std::fprintf(stderr, "dg_load source=%llu direct=%d\n", (unsigned long long)i, files_[i]->physical_direct() ? 1 : 0);
     ring.release();
     transport_->upload_table(core_->table().data(), x_.keys);
     core_->check();
@@ -1457,7 +1459,8 @@ class CudaDgCtx final : public DgCtx {
   ss_options o_;
   DgLayout x_;
   int device_ = 0;
-  std::vector<std::unique_ptr<File>> files_;
+  std::string weight_dirs_;
+  std::vector<std::unique_ptr<SourceFile>> files_;
   void* bounce_ = nullptr;
   uint64_t bounce_bytes_ = 0;
   char* staging_ = nullptr;

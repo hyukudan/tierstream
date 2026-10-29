@@ -84,5 +84,16 @@ ss_status ts_recipe_plan(const ss_recipe* r, const char* route, const char* set,
 ss_status ts_dg_reset_open(ss_ctx* c) { return ss_dg_reset_open(c); }
 ss_status ts_dg_end_rows(ss_ctx* c, uint32_t rows) { return ss_dg_end_rows(c, rows); }
 ss_status ts_dg_set_policy(ss_ctx* c, ss_policy policy) { return ss_dg_set_policy(c, policy); }
+void ts_mfile_options_defaults_sized(ss_mfile_options* o, uint32_t size) { ss_mfile_options_defaults_sized(o, size); }
+ss_status ts_mfile_open(const char* primary, const char* weight_dirs, const ss_mfile_options* opt, ss_mfile** out) { return ss_mfile_open(primary, weight_dirs, opt, out); }
+void ts_mfile_close(ss_mfile* f) { ss_mfile_close(f); }
+uint64_t ts_mfile_size(const ss_mfile* f) { return ss_mfile_size(f); }
+uint32_t ts_mfile_alignment(const ss_mfile* f) { return ss_mfile_alignment(f); }
+int ts_mfile_multi(const ss_mfile* f) { return ss_mfile_multi(f); }
+ss_status ts_mfile_pread(ss_mfile* f, void* dst, uint64_t bytes, uint64_t offset, uint64_t* got) { return ss_mfile_pread(f, dst, bytes, offset, got); }
+ss_status ts_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n) { return ss_mfile_preadv(f, ios, n); }
+ss_status ts_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out) { return ss_mfile_get_counters(f, out); }
+const char* ts_mfile_location_path(const ss_mfile* f, int loc) { return ss_mfile_location_path(f, loc); }
+const char* ts_mfile_open_report(const ss_mfile* f) { return ss_mfile_open_report(f); }
 
 }  // extern "C"

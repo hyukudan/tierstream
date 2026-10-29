@@ -8,6 +8,7 @@
 
 #include "desc.hpp"
 #include "errors.hpp"
+#include "mfile.hpp"
 #include "plan.hpp"
 #include "recipe.hpp"
 #include "dg_ctx.hpp"
@@ -28,6 +29,11 @@ struct ss_ctx {
 };
 struct ss_recipe {
   ts::RecipeStack s;
+};
+struct ss_mfile {
+  std::shared_ptr<ts::MFile> file;
+  std::vector<std::string> paths;
+  std::string report;
 };
 
 namespace {
@@ -115,6 +121,9 @@ void options_defaults(ss_options* o) {
   o->dg_score_w_trans = 700;
   o->dg_score_w_freq = 200;
   o->dg_score_w_recency = 100;
+  o->weight_dirs = nullptr;
+  o->drive_readers = 4;
+  o->weight_verify = SS_MFILE_VERIFY_CACHED;
 #if defined(_WIN32)
   o->dg_service_boost = 1;
 #endif
@@ -143,6 +152,14 @@ void clear_reserved(ss_options& o) {
   o.reserved1 = 0;
   o.reserved2 = 0;
   o.reserved3 = 0;
+}
+void clear_reserved(ss_mfile_options&) {}
+void mfile_defaults(ss_mfile_options* o) {
+  *o = ss_mfile_options{};
+  o->struct_size = uint32_t(sizeof *o);
+  o->direct_io = 1;
+  o->drive_readers = 4;
+  o->verify_mode = SS_MFILE_VERIFY_CACHED;
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
@@ -177,6 +194,52 @@ extern "C" {
 const char* ss_last_error(void) { return g_err.c_str(); }
 int ss_abi_version(void) { return SS_ABI_VERSION; }
 void ss_free(void* p) { std::free(p); }
+
+void ss_mfile_options_defaults_sized(ss_mfile_options* o, uint32_t size) {
+  sized_defaults(o, size, mfile_defaults);
+}
+ss_status ss_mfile_open(const char* primary, const char* dirs, const ss_mfile_options* opt, ss_mfile** out) {
+  if (out) *out = nullptr;
+  return guard([&] {
+    need(primary && out, "ss_mfile_open: null argument");
+    auto o = versioned(opt, mfile_defaults, "ss_mfile_options");
+    need(o.drive_readers >= 1 && o.drive_readers <= 32, "drive_readers must be in 1..32");
+    need(o.verify_mode == SS_MFILE_VERIFY_CACHED || o.verify_mode == SS_MFILE_VERIFY_ALWAYS,
+         "verify_mode must be cached or always");
+    ts::MFile::Options options;
+    options.direct = o.direct_io != 0;
+    options.drive_readers = o.drive_readers;
+    options.verify_mode = o.verify_mode;
+    if (o.primary_sha256) options.primary_sha256 = o.primary_sha256;
+    auto f = std::make_unique<ss_mfile>();
+    f->file = ts::MFile::open(primary, dirs ? dirs : "", options);
+    for (int i = 0; i < f->file->locations(); ++i) f->paths.push_back(f->file->location_path(i));
+    f->report = f->file->reasons();
+    *out = f.release();
+  });
+}
+void ss_mfile_close(ss_mfile* f) { delete f; }
+uint64_t ss_mfile_size(const ss_mfile* f) { return f ? f->file->size() : 0; }
+uint32_t ss_mfile_alignment(const ss_mfile* f) { return f ? ts::MFile::kAlign : 0; }
+int ss_mfile_multi(const ss_mfile* f) { return f && f->file->multi() ? 1 : 0; }
+ss_status ss_mfile_pread(ss_mfile* f, void* dst, uint64_t bytes, uint64_t offset, uint64_t* got) {
+  if (got) *got = 0;
+  return guard([&] {
+    need(f != nullptr, "ss_mfile_pread: null file");
+    uint64_t n = f->file->pread(dst, bytes, offset);
+    if (got) *got = n;
+  });
+}
+ss_status ss_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n) {
+  return guard([&] { need(f != nullptr, "ss_mfile_preadv: null file"); f->file->preadv(ios, n); });
+}
+ss_status ss_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out) {
+  return guard([&] { need(f != nullptr, "ss_mfile_get_counters: null file"); f->file->counters(out); });
+}
+const char* ss_mfile_location_path(const ss_mfile* f, int loc) {
+  return !f || loc < 0 || size_t(loc) >= f->paths.size() ? nullptr : f->paths[size_t(loc)].c_str();
+}
+const char* ss_mfile_open_report(const ss_mfile* f) { return f ? f->report.c_str() : nullptr; }
 
 ss_status ss_desc_from_json(const char* json_text, size_t len, ss_desc** out) {
   return guard([&] {
@@ -298,6 +361,9 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
     need(d && budget && out, "ss_open: null argument");
     need(!plan || plan->desc == d, "ss_open: plan was made from another descriptor");
     ss_options o = versioned(opt, options_defaults, "ss_open options");
+    need(o.drive_readers >= 1 && o.drive_readers <= 32, "drive_readers must be in 1..32");
+    need(o.weight_verify == SS_MFILE_VERIFY_CACHED || o.weight_verify == SS_MFILE_VERIFY_ALWAYS,
+         "weight_verify must be cached or always");
     ss_budget bb = versioned(budget, budget_defaults, "ss_open budget");
     need(!plan || ts::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
     ts::Plan p = plan ? plan->p : ts::plan_make(d->d, bb, {});

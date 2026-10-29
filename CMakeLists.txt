@@ -43,6 +43,9 @@ add_library(tierstream STATIC
   src/recipe_run.cpp
   src/resident_set.cpp
   src/file_reader.cpp
+  src/raw_file.cpp
+  src/stripe_manifest.cpp
+  src/mfile.cpp
   src/backend_cpu.cpp
   src/dg_core.cpp
   src/dg_prior.cpp
@@ -57,7 +60,7 @@ add_library(tierstream STATIC
 target_include_directories(tierstream PUBLIC include PRIVATE src)
 target_link_libraries(tierstream PUBLIC Threads::Threads)
 if(WIN32)
-  target_link_libraries(tierstream PUBLIC avrt winmm)  # the device-gated service thread boost
+  target_link_libraries(tierstream PUBLIC avrt winmm bcrypt)  # service thread boost and incremental SHA-256
 endif()
 # One release of the rename: the old CMake target name, and the old archive file next to the new one (engine build
 # scripts link strix_stream.lib / libstrix_stream.a by path).
@@ -165,13 +168,23 @@ foreach(name ts-recipe ss-recipe)
   target_link_libraries(${name} PRIVATE tierstream)
 endforeach()
 
+add_executable(ts-stripe tools/ts_stripe.cpp)
+target_include_directories(ts-stripe PRIVATE src)
+target_link_libraries(ts-stripe PRIVATE tierstream)
+
 if(TS_TESTS)
   enable_testing()
   add_executable(ts-bench-dg-scored tests/bench_dg_scored.cpp)
   target_include_directories(ts-bench-dg-scored PRIVATE src)
   target_link_libraries(ts-bench-dg-scored PRIVATE tierstream)
-  foreach(t core runtime recipe exclusive readahead snapshot)
-    add_executable(ts-test-${t} tests/test_${t}.cpp)
+  add_executable(ts-test-stripe tests/test_ts_stripe.cpp)
+  target_include_directories(ts-test-stripe PRIVATE src)
+  target_link_libraries(ts-test-stripe PRIVATE tierstream)
+  add_test(NAME stripe-tool COMMAND ts-test-stripe ${CMAKE_CURRENT_BINARY_DIR}/stripe-tool-test $<TARGET_FILE:ts-stripe>)
+  set_tests_properties(stripe-tool PROPERTIES TIMEOUT 30)
+  foreach(t core runtime recipe exclusive readahead snapshot mfile source-file)
+    string(REPLACE "-" "_" f ${t})
+    add_executable(ts-test-${t} tests/test_${f}.cpp)
     target_include_directories(ts-test-${t} PRIVATE src)
     target_link_libraries(ts-test-${t} PRIVATE tierstream)
   endforeach()
@@ -181,6 +194,9 @@ if(TS_TESTS)
   add_test(NAME exclusive COMMAND ts-test-exclusive)
   add_test(NAME readahead COMMAND ts-test-readahead)
   add_test(NAME snapshot COMMAND ts-test-snapshot)
+  add_test(NAME mfile COMMAND ts-test-mfile)
+  add_test(NAME source-file COMMAND ts-test-source-file)
+  set_tests_properties(source-file PROPERTIES TIMEOUT 30)
   foreach(t dg dg-service dg-open dg-load)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
@@ -210,7 +226,7 @@ if(TS_TESTS)
   target_include_directories(ts-test-old-abi PRIVATE include)
   set(ts_old_abi_deps Threads::Threads)  # what an engine linking the file links itself
   if(WIN32)
-    list(APPEND ts_old_abi_deps avrt winmm)
+    list(APPEND ts_old_abi_deps avrt winmm bcrypt)
   endif()
   if(TS_CUDA)
     list(APPEND ts_old_abi_deps CUDA::cudart CUDA::cuda_driver)

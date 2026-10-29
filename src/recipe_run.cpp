@@ -993,6 +993,9 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   o.policy = ss_policy(int(p.get("policy")));
   o.lookahead_budget = uint32_t(p.get("lookahead_units"));
   o.reader_threads = uint32_t(p.get("reader_threads"));
+  o.weight_dirs = p.weight_dirs.empty() ? nullptr : p.weight_dirs.c_str();
+  o.drive_readers = uint32_t(p.get("drive_readers"));
+  o.weight_verify = int(p.get("weight_verify"));
   o.staging_buffers = uint32_t(p.get("staging_buffers"));
   o.staging_bytes = uint64_t(p.get("staging_mib")) << 20;
   o.copy_piece_bytes = uint64_t(p.get("copy_piece_mib")) << 20;
@@ -1177,6 +1180,10 @@ RecipePlan recipe_plan(const Recipe& r, const std::string& eff_sha, const std::s
   oj["policy"] = Json::string(o.policy == SS_POLICY_LRU ? "lru" : "scored");
   oj["lookahead_budget"] = Json::number(uint64_t(o.lookahead_budget));
   oj["reader_threads"] = Json::number(uint64_t(o.reader_threads));
+  if (o.weight_dirs) oj["weight_dirs"] = Json::string(o.weight_dirs);
+  if (o.drive_readers != 4) oj["drive_readers"] = Json::number(uint64_t(o.drive_readers));
+  if (o.weight_verify != SS_MFILE_VERIFY_CACHED)
+    oj["weight_verify"] = Json::string("always");
   oj["staging_buffers"] = Json::number(uint64_t(o.staging_buffers));
   oj["staging_bytes"] = Json::number(o.staging_bytes);
   oj["copy_piece_bytes"] = Json::number(o.copy_piece_bytes);
