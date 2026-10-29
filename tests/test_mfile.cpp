@@ -721,6 +721,29 @@ TEST(mfile_pools_shared_across_shards_and_absent_manifests_reused) {
   CHECK_EQ(MFile::test_sessions_created(), sessions + 1);
 }
 
+TEST(mfile_primary_hashed_only_for_a_matching_manifest) {
+  // a directory list without a stripe for this primary (e.g. a leftover setting) costs no full-file hash
+  Fixture t;
+  const auto hashes = [&] {
+    size_t n = 0;
+    for (const auto& e : fs::recursive_directory_iterator(t.cache))
+      if (e.path().filename().u8string().rfind("file-sha256-", 0) == 0) ++n;
+    return n;
+  };
+  auto o = t.options();
+  o.primary_sha256.clear();
+  const auto empty = t.root / "empty";
+  fs::create_directory(empty);
+  auto none = MFile::open(t.primary.u8string(), empty.u8string(), o);
+  CHECK_EQ(hashes(), size_t(0));
+  CHECK(t.equal(*none, 0, 8 * C));
+  auto striped = MFile::open(t.primary.u8string(), t.secondary.u8string(), o);
+  CHECK_EQ(hashes(), size_t(1));
+  const auto c = counters(*striped);
+  CHECK_EQ(c.locations, 2u);
+  CHECK_EQ(c.disabled_mask, 0u);  // the manifest matched the hashed primary
+}
+
 TEST(mfile_tail_zero_and_fallback_learning) {
   Fixture t;
   // Physical padding is excluded from the logical hash, but must never change the caller's EOF tail.
