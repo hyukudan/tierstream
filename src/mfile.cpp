@@ -626,11 +626,9 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
   first->pool = drive_pool(first->id.volume, o.drive_readers);
   f.size = first->file->size();
   f.locs.push_back(std::move(first));
-  // The primary-only session has no verification or chunk-map cost. Existing source readers never create it.
-  if (!dirs.empty()) f.bound_digest = o.primary_sha256.empty() ? file_sha256_cached(path) : o.primary_sha256;
-  else f.bound_digest = o.primary_sha256;
-  require(f.locs[0]->file->identity() == f.locs[0]->id && identity_of(path) == f.locs[0]->id,
-          SS_E_IO, "primary changed during open");
+  // The primary-only session has no verification or chunk-map cost. Existing source readers never create it. The
+  // primary is hashed (identity-cached) only once a manifest naming it with its size is found.
+  f.bound_digest = o.primary_sha256;
   bool grid_set = false;
   for (const std::string& dir : dirs) {
     auto loc = std::make_unique<Impl::Loc>();
@@ -649,6 +647,7 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
       const auto& m = l.manifest;
       require(m.primary_size == f.size && canonical(joined(fs::u8path(path).parent_path().u8string(), m.primary_basename)) == path,
               SS_E_DESC, "primary basename or size mismatch");
+      if (f.bound_digest.empty()) f.bound_digest = file_sha256_cached(path);
       require(m.primary_sha256 == f.bound_digest, SS_E_DESC, "primary SHA-256 mismatch");
       require(!grid_set || f.chunk == m.chunk_bytes, SS_E_DESC, "secondary chunk grid mismatch");
       if (grid_set) for (const auto& r : m.runs)
@@ -690,6 +689,8 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
       f.report += "location " + std::to_string(index) + ": " + e.what() + "\n";
     }
   }
+  require(f.locs[0]->file->identity() == f.locs[0]->id && identity_of(path) == f.locs[0]->id,
+          SS_E_IO, "primary changed during open");
   std::vector<std::future<void>> scans;
   // One coordinator per enabled location; each submits bounded scan jobs to its shared volume pool.
   try {
