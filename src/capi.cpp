@@ -118,6 +118,10 @@ void options_defaults(ss_options* o) {
   o->dg_wait_timeout_ms = 10000;
   o->dg_spare_target = 0xFFFFFFFFu;
   o->dg_wb_defer = 1;  // adopted on the RTX PRO (exact; 0 keeps the boundary write-backs)
+  // deferred write-backs on their own D2H stream (behind the layer's ready by an event), so they overlap the next
+  // layer's demand H2D instead of queuing ahead of it on the demand stream: the same parts, bytes, destinations,
+  // credit, cap and completion events; 0 = the demand stream
+  o->dg_wb_stream = 1;
   o->dg_score_w_trans = 700;
   o->dg_score_w_freq = 200;
   o->dg_score_w_recency = 100;

@@ -252,8 +252,10 @@ typedef struct ss_options {
    * is enqueued at the boundary, right after the table upload. (The timeline's wb_left_ms measures the boundary's
    * write-backs: meaningful with 0 only.) */
   uint32_t dg_wb_defer;
-  /* dg_wb_defer = 1: 0 (default) = the parts go on the demand stream right after the layer's ready (stream order
-   * keeps them behind it); 1 = on the write-back stream, made to wait for the ready by an event */
+  /* dg_wb_defer = 1: 1 (ss_options_defaults) = the parts go on the write-back stream, made to wait for the layer's
+   * ready by an event, so they overlap the next layer's demand copies; 0 (also a zeroed struct) = on the demand stream
+   * right after the layer's ready (stream order keeps them behind it, and the next layer's demand copies behind them).
+   * Transport only: the same parts, bytes, destinations, credit, cap and completion events either way. */
   uint32_t dg_wb_stream;
   /* dg_wb_defer = 1: write-back bytes submitted per served layer (no more parts once the next layer has exported);
    * a part larger than what is left still goes and the excess is repaid by the next layers. 0 (default) = the bytes

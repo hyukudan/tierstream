@@ -80,7 +80,7 @@ struct Rig {
   // with_began: the service waits for the begin kernel's word before any flag (design rev 3.4 §11.2).
   // wb_defer: the boundary's write-backs are issued by the service after each served layer.
   explicit Rig(std::chrono::milliseconds timeout = std::chrono::milliseconds(2000), uint32_t max_ids = 8,
-               bool with_began = false, bool wb_defer = false, bool scored = false) {
+               bool with_began = false, bool wb_defer = false, bool scored = false, bool wb_on_d2h = false) {
     ts::DgConfig c;
     c.n_units.assign(G, U);
     c.persistent_slots = 48 + 12;
@@ -89,6 +89,7 @@ struct Rig {
     c.spare_target = 12;
     c.prefetch_reserve = 3;
     c.wb_defer = wb_defer;
+    c.wb_on_d2h = wb_on_d2h;  // dg_wb_stream
     c.scored = scored;
     c.max_ids = max_ids;
     t = std::make_unique<Immediate>(G * U, c.persistent_slots + 2 * c.bank_slots, c.blocks, ready.data());
@@ -205,9 +206,11 @@ TEST(dg_service_tokens) {
 }
 
 // dg_wb_defer: the service issues the deferred write-backs after the layers it serves; every read stays exact, and
-// a boundary issues what the token left (the engine thread then owns the deferred queue).
-TEST(dg_service_tokens_wb_defer) {
-  Rig r(std::chrono::milliseconds(2000), 8, false, true);
+// a boundary issues what the token left (the engine thread then owns the deferred queue). On the demand stream
+// (dg_wb_stream = 0) and on the write-back stream (1, the default).
+namespace {
+ts::DgStats service_wb_defer_run(bool on_d2h) {
+  Rig r(std::chrono::milliseconds(2000), 8, false, true, false, on_d2h);
   std::mt19937 rng(6);
   int bad_reads = 0;
   for (int tok = 0; tok < 200; ++tok) {
@@ -235,6 +238,16 @@ TEST(dg_service_tokens_wb_defer) {
   CHECK(st.evicted > 0);
   CHECK_EQ(st.wb_deferred, st.evicted);
   CHECK(st.wb_deferred > st.wb_boundary_flushed);  // most write-backs went out inside a token
+  return st;
+}
+}  // namespace
+
+TEST(dg_service_tokens_wb_defer) {
+  // the service thread races the exports (the "device ahead" stop), so the counts are per run; the scripted
+  // dg_defer_wb_stream_same_parts (test_dg) compares the two streams decision for decision
+  const ts::DgStats dem = service_wb_defer_run(false);
+  const ts::DgStats d2h = service_wb_defer_run(true);
+  CHECK(dem.wb_issued_bytes > 0 && d2h.wb_issued_bytes > 0);
 }
 
 // Scored eviction: a layer whose next layer already exported (the device ran ahead) is ranked after that layer's

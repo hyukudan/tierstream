@@ -6,6 +6,7 @@
 // mutation of the core must be caught.
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1205,8 +1206,8 @@ const std::function<bool()> kAhead = [] { return true; };  // the device already
 
 // R = 8 residents (keys 0..7, slots 0..7, key 7 least recent), D = 12 spares, target 8. Token 1 misses 8 units of
 // layer 1: 4 spares stay free, and the boundary defers 4 victims, 7, 6, 5, 4 (slots 7..4), nothing copied.
-std::unique_ptr<Mini> deferred_four(uint64_t wb_bytes = 0, uint64_t wb_out = 0) {
-  auto m = std::make_unique<Mini>(8, 12, 8, keys_in_order(8), 4, false, -1, true, wb_bytes, wb_out);
+std::unique_ptr<Mini> deferred_four(uint64_t wb_bytes = 0, uint64_t wb_out = 0, bool on_d2h = false) {
+  auto m = std::make_unique<Mini>(8, 12, 8, keys_in_order(8), 4, false, -1, true, wb_bytes, wb_out, on_d2h);
   m->core->begin_token(1);
   m->serve_w(1, {0, 1, 2, 3, 4, 5, 6, 7});
   m->t->clear_issued();
@@ -1710,6 +1711,142 @@ TEST(dg_defer_failure_at_every_stage) {
   }
   std::printf("  %d failure points\n", failed);
   CHECK(failed >= 10);
+}
+
+// dg_wb_stream (default 1): the same scripted tokens with the deferred write-backs on kDem and on
+// kD2h. Pure transport: the same copies (H2D, D2H parts: slot, block, part; table entries; readies) in the same issue
+// order, the same credit / debt / outstanding-cap decisions, cancellations, partial resurrections, boundary flushes and
+// completed bytes, the same homes; only the stream of the parts and their completion events differs, and on kD2h every
+// layer's first part sits behind a wait on an event recorded on kDem after that layer's ready (nothing before it).
+// Copies run only at fixed drain points, so completion (collect, the cap) is identical in both runs.
+namespace {
+struct StreamRun {
+  std::vector<std::vector<int64_t>> trace;
+  ts::DgStats st;
+  std::vector<int> home;
+  std::vector<int32_t> slot, block;
+  uint64_t outstanding_mid = 0, deferred_mid = 0, parts_mid = 0, outstanding_end = 0;
+  bool ok = false;
+};
+StreamRun wb_stream_script(bool on_d2h, uint64_t wb_bytes, uint64_t wb_out) {
+  StreamRun r;
+  auto m = deferred_four(wb_bytes, wb_out, on_d2h);
+  m->core->begin_token(2);
+  m->serve_w(1, {0});     // a hit: credit, victim 7's first part(s)
+  m->serve_w(1, {8});     // a miss into a free spare
+  m->serve_w(0, {5});     // victim 5 cancelled before any part (no copy, its block returns)
+  m->serve_w(0, {1, 2});  // more parts (debt / cap)
+  r.outstanding_mid = m->core->wb_outstanding_bytes();
+  r.deferred_mid = m->core->deferred();
+  r.parts_mid = m->core->deferred_parts_issued();
+  m->serve_w(0, {6});     // victim 6: partly submitted or untouched, resurrected
+  m->t->drain_all();
+  m->serve_w(1, {9, 10});  // collected mid-token, the cap frees up
+  m->serve_w(2, {0});      // the last gated layer: no write-back
+  m->t->drain_all();
+  m->core->end_token({});  // carries / selects victims
+  m->core->check();
+  m->t->drain_all();
+  m->core->begin_token(3);
+  m->serve_w(0, {3, 11});
+  m->serve_w(1, {12});
+  m->t->drain_all();
+  m->core->end_token({});  // the older excess flushed after the upload
+  m->core->check();
+  m->t->drain_all();
+  m->core->begin_token(4);
+  m->core->end_token({});
+  m->t->drain_all();
+  m->core->begin_token(5);
+  m->core->end_token({});
+  m->core->check();
+  m->t->drain_all();
+  r.trace = m->t->trace();
+  r.st = m->core->stats();
+  r.outstanding_end = m->core->wb_outstanding_bytes();
+  for (uint32_t k = 0; k < Mini::K; ++k) {
+    r.home.push_back(int(m->core->home(k)));
+    r.slot.push_back(m->core->slot_of(k));
+    r.block.push_back(m->core->block_of(k));
+  }
+  r.ok = m->homes_ok() && m->v.what.empty();
+  return r;
+}
+// The copies and publications of a trace without their stream: {kind, a, b, key}.
+std::vector<std::vector<int64_t>> copies_of(const std::vector<std::vector<int64_t>>& tr) {
+  std::vector<std::vector<int64_t>> v;
+  for (const auto& op : tr) {
+    const auto k = Scripted::Kind(op[1]);
+    if (k == kH2D || k == kPart || k == Scripted::D2H || k == kEntry || k == kReady || k == kUpload)
+      v.push_back({op[1], op[2], op[3], op[4]});
+  }
+  return v;
+}
+}  // namespace
+
+TEST(dg_defer_wb_stream_same_parts) {
+  const struct {
+    uint64_t bytes, out;
+  } budgets[] = {{0, 0}, {3000, 1u << 20}, {1, 4096}, {0, 8192}, {12288, 2 * 8192 - 4096 + 1}};
+  for (const auto& b : budgets) {
+    const StreamRun dem = wb_stream_script(false, b.bytes, b.out);
+    const StreamRun d2h = wb_stream_script(true, b.bytes, b.out);
+    CHECK(dem.ok);
+    CHECK(d2h.ok);
+    CHECK(copies_of(dem.trace) == copies_of(d2h.trace));
+    CHECK(dem.home == d2h.home);
+    CHECK(dem.slot == d2h.slot);
+    CHECK(dem.block == d2h.block);
+    CHECK_EQ(dem.outstanding_mid, d2h.outstanding_mid);
+    CHECK_EQ(dem.deferred_mid, d2h.deferred_mid);
+    CHECK_EQ(dem.parts_mid, d2h.parts_mid);
+    CHECK_EQ(dem.outstanding_end, d2h.outstanding_end);
+    {  // every counter (all uint64_t) but the host's measured wait times
+      static_assert(sizeof(ts::DgStats) % sizeof(uint64_t) == 0, "DgStats: uint64_t counters only");
+      uint64_t a[sizeof(ts::DgStats) / 8], c[sizeof(ts::DgStats) / 8];
+      std::memcpy(a, &dem.st, sizeof a);
+      std::memcpy(c, &d2h.st, sizeof c);
+      const size_t skip0 = offsetof(ts::DgStats, wb_forced_wait_ns) / 8, skip1 = offsetof(ts::DgStats, score_ns) / 8,
+                   skip2 = offsetof(ts::DgStats, score_last_ns) / 8;
+      for (size_t i = 0; i < sizeof a / 8; ++i) {
+        if (i == skip0 || i == skip1 || i == skip2) continue;
+        if (a[i] != c[i]) std::printf("  budget %llu/%llu: DgStats word %zu: %llu vs %llu\n", (unsigned long long)b.bytes,
+                                      (unsigned long long)b.out, i, (unsigned long long)a[i], (unsigned long long)c[i]);
+        CHECK_EQ(a[i], c[i]);
+      }
+    }
+    CHECK(dem.st.wb_issued_bytes > 0);
+    CHECK(dem.st.wb_cancelled > 0);
+    CHECK_EQ(dem.st.wb_issued_bytes - dem.st.wb_completed_bytes, dem.outstanding_end);  // collected at boundaries
+    // streams: kDem mode issues no wait and every part on kDem; kD2h mode every part on kD2h, an in-token layer's
+    // first part right after {Record on kDem (behind everything the layer queued there, its ready included), Wait on
+    // kD2h}, a boundary's flushed parts after the table upload (which synchronizes kDem)
+    int waits = 0, d2h_parts = 0;
+    for (const auto& op : dem.trace) {
+      CHECK(Scripted::Kind(op[1]) != Scripted::Wait);
+      if (Scripted::Kind(op[1]) == kPart) CHECK_EQ(op[0], int64_t(DgTransport::kDem));
+    }
+    bool behind_ready = false;  // since the last post-ready wait on kD2h
+    for (size_t i = 0; i < d2h.trace.size(); ++i) {
+      const auto& op = d2h.trace[i];
+      const auto k = Scripted::Kind(op[1]);
+      if (k == kRecord && op[0] == int64_t(DgTransport::kDem)) behind_ready = false;  // a new layer ready: wait again
+      if (k == Scripted::Wait) {
+        CHECK_EQ(op[0], int64_t(DgTransport::kD2h));
+        CHECK(i >= 1 && Scripted::Kind(d2h.trace[i - 1][1]) == kRecord && d2h.trace[i - 1][0] == int64_t(DgTransport::kDem));
+        behind_ready = true;
+        ++waits;
+      }
+      if (k == kPart) {
+        CHECK_EQ(op[0], int64_t(DgTransport::kD2h));
+        CHECK(behind_ready);
+        ++d2h_parts;
+      }
+      if (k == kUpload) behind_ready = true;  // a boundary's flush: the demand stream synced at the upload
+    }
+    CHECK(waits > 0);
+    CHECK(d2h_parts > 0);
+  }
 }
 
 // check_unit's drain between tokens: every deferred write-back submitted and synchronized; bookkeeping stays coherent.
