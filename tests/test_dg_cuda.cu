@@ -704,8 +704,9 @@ ss_dg_stats wb_defer_cases(const char* tag, const std::function<void(ss_options&
   return sum;
 }
 
+// The demand stream (dg_wb_stream = 0, the OFF switch of the default write-back stream).
 TEST(dg_cuda_wb_defer) {
-  const ss_dg_stats s = wb_defer_cases("wbd", [](ss_options&) {});
+  const ss_dg_stats s = wb_defer_cases("wbd", [](ss_options& o) { o.dg_wb_stream = 0; });
   CHECK(s.wb_cancelled > 0);  // MRU victims come back before their first part
 }
 
@@ -715,7 +716,7 @@ TEST(dg_cuda_wb_defer_layer_bytes) {
   CHECK(s.wb_cancelled > 0);
 }
 
-// The write-back stream behind a post-ready event instead of the demand stream.
+// The write-back stream behind a post-ready event (the default, set explicitly).
 TEST(dg_cuda_wb_defer_d2h_stream) {
   const ss_dg_stats s = wb_defer_cases("wbds", [](ss_options& o) { o.dg_wb_stream = 1; });
   CHECK(s.wb_cancelled > 0);

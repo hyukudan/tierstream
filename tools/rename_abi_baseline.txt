@@ -97,3 +97,6 @@ ss.h-sha256 eeba12d0c1cf4eec69f89ae4c69b7265b03c99e5d9b9712283fc94f18413d8e9
 
 # auto + multidisk (additive: multi-location C API and appended weight options on top of auto; all existing declarations unchanged)
 ss.h-sha256 f73260fbaa5c8000b3e6f3bc0325c1ef3dd33ba4593d591304ce6095cb986ec9
+
+# auto + multidisk + wb-stream default (comment only: dg_wb_stream documents its new ss_options_defaults value 1; no declaration or layout changed)
+ss.h-sha256 640047bfdae32083a49d12b010166e4133add6ad25a96a3e007b313c4525f037

@@ -151,8 +151,9 @@ layer, but a layer whose weights are already available needs no host reply.
   them back part by part during the next token, right after a layer's ready signal and prefetches, when the copy
   engine is otherwise idle. It never copies after the last gated layer, and stops as soon as the device has
   exported the next layer. `dg_wb_layer_bytes` sets the budget per layer (default: one part).
-  `dg_wb_max_outstanding` caps the bytes in flight (default: two experts). `dg_wb_stream` picks the demand stream
-  (default) or the write-back stream. A victim that is routed or predicted again before any of its bytes were copied
+  `dg_wb_max_outstanding` caps the bytes in flight (default: two experts). `dg_wb_stream` picks the write-back stream
+  (default: the copies overlap the next layer's demand copies) or the demand stream (0: they queue ahead of them). A
+  victim that is routed or predicted again before any of its bytes were copied
   costs no copy. A demand that finds no free slot waits for a write-back already in flight, or else finishes the
   oldest deferred one. Unfinished write-backs carry into the next token, up to about one boundary's worth of victims,
   and the next boundary copies the older excess. Results are bit-for-bit identical. `ss_stats_dg` reports the deferred, cancelled, forced and

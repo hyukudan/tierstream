@@ -172,6 +172,32 @@ TEST(dg_open_wb_defer_options) {
          SS_E_UNSUPPORTED, "needs the CUDA backend");
 }
 
+// The transport defaults: ss_options_defaults puts the deferred write-backs on the write-back stream
+// (dg_wb_stream = 1) with dg_wb_defer = 1; a zeroed struct keeps 0 / 0 (the demand stream, boundary write-backs); 0 is
+// accepted with deferral (the OFF switch), and sized defaults of an older struct that ends before dg_wb_stream write
+// only its bytes.
+TEST(dg_open_wb_stream_default) {
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_wb_defer, 1u);
+  CHECK_EQ(o.dg_wb_stream, 1u);
+  CHECK_EQ(o.dg_wb_layer_bytes, 0u);
+  CHECK_EQ(o.dg_wb_max_outstanding, 0u);
+  ss_options z;
+  std::memset(&z, 0, sizeof z);
+  CHECK_EQ(z.dg_wb_stream, 0u);
+  std::vector<uint8_t> ob(sizeof(ss_options) + 16, 0x5A);
+  const uint32_t old = uint32_t(offsetof(ss_options, dg_wb_stream));
+  ss_options_defaults_sized(reinterpret_cast<ss_options*>(ob.data()), old);
+  bool canary = true;
+  for (size_t i = old; i < ob.size(); ++i) canary = canary && ob[i] == 0x5A;
+  CHECK(canary);
+  CHECK_EQ(reinterpret_cast<ss_options*>(ob.data())->dg_wb_defer, 1u);
+  DgModel m("open-wbs");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_wb_stream = 0; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_wb_stream = 1; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
 // ---- winpf: the tierstream/hint-prior-v1 file (ss.h: Window prefetch), parsed with every refusal ----
 #include "dg_ctx.hpp"
 #include "errors.hpp"
