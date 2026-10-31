@@ -8,6 +8,7 @@
 // wdsrtx's StreamCache (ds41/rtx-replica a8cccdc7, src/cuda/ds41_stream_cache.cpp).
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -59,6 +60,27 @@ class DgTransport {
   // winpf: push the stream's queued work to the GPU now (under WDDM a copy can otherwise sit in the driver's batch until
   // a later submission, i.e. until after the demand it was meant to precede). Never waits. Default: nothing.
   virtual void flush(Stream s) { (void)s; }
+  // Three-tier (disk_tier): the unit's bytes from its file into host block `block` (every part, the block layout),
+  // synchronously. Blocks [blocks, blocks + disk_staging) are the staging buffers, -1 the reset staging buffer. The
+  // core guarantees no copy reads the block meanwhile. Default: unsupported.
+  virtual void read_unit(uint32_t key, int32_t block);
+  // The same read, asynchronous (disk_queue > 1): begin starts it and returns a handle; end waits for it, rethrows its
+  // error and returns its own read time in ns (0: begin's host time was the read). Several reads may be in flight, each
+  // into its own block; the core ends every begun read exactly once, oldest first, before any copy reads its block.
+  // Default: begin is the synchronous read_unit, end does nothing.
+  virtual void* read_unit_begin(uint32_t key, int32_t block) {
+    read_unit(key, block);
+    return nullptr;
+  }
+  virtual uint64_t read_unit_end(void* handle) {
+    (void)handle;
+    return 0;
+  }
+  // A host query: true once the read finished (its end does not block). Default: true (begin read synchronously).
+  virtual bool read_unit_done(void* handle) {
+    (void)handle;
+    return true;
+  }
 };
 
 // dg_diag: the host time of the last boundary's phases (end_token), microseconds.
@@ -95,6 +117,23 @@ struct DgConfig {
   bool boundary_score = false;  // context: bounded selection of eligible keys; false keeps the public reference
   uint32_t w_trans = 700, w_freq = 200, w_rec = 100;
   uint32_t max_ids = 64;
+  // Three-tier placement (ss.h SS_DG_DISK_TIER). disk_tier: place() may leave keys file-homed (Home::File) and a
+  // boundary drops pinned units to their files (their recency order) to free blocks for write-backs. home_blocks: the
+  // blocks place() gives to non-device keys (the plan's pinned units; the rest of `blocks` are spares); exact (0 = no
+  // pinned home; ignored without disk_tier, where every non-device key takes a block). disk_staging: staging buffers
+  // (block indices blocks..blocks + n - 1). disk_prefetch: prefetches may read file-homed keys. inclusive: device keys that may keep their block as a clean
+  // copy after a promotion (0 = exclusive). disk_queue: file reads in flight at once (bounded by disk_staging too);
+  // 0 or 1 = each read finishes inside its fetch, before its copy is enqueued (the synchronous reads).
+  bool disk_tier = false;
+  bool disk_prefetch = false;
+  uint32_t home_blocks = 0;
+  uint32_t disk_staging = 0;
+  uint32_t inclusive = 0;
+  uint32_t disk_queue = 16;
+  // dg_no_admit: a demand miss is served through a bank slot (pinned block or file -> bank) and released at the
+  // boundary, its home unchanged; no prefetch is issued and no boundary evicts. Placement changes only through rounds,
+  // make_resident and seed. Needs bank_slots >= max_ids (a layer's distinct misses).
+  bool no_admit = false;
 };
 
 struct DgStats {
@@ -128,6 +167,38 @@ struct DgStats {
   // the service: layers whose ranking waited for a later layer (the device was ahead), and the ranking time spent
   // after the last gated layer was served (on the terminal path)
   uint64_t score_deferred = 0, score_last_ns = 0;
+  // three-tier (ss_dg_stats): file reads (and their bytes / host time), reads that waited for a staging buffer, pinned
+  // units dropped to their file for a write-back block, device victims dropped to their file, clean copies kept at a
+  // promotion, evictions of clean-copy units (no write-back). disk_read_ns sums the reads' own times; disk_wait_ns is
+  // the host's wall time waiting for reads to finish (overlapped reads: below the sum); disk_overlapped = reads begun
+  // while another one was still in flight; disk_carried (bytes) = reads ended in a later call than their fetch's (a
+  // prefetch read that overlapped the rest of the layer's service, or a window's prior read the start of the token).
+  uint64_t disk_reads = 0, disk_read_bytes = 0, disk_read_ns = 0, disk_stage_waits = 0, disk_drops = 0;
+  uint64_t disk_discards = 0, inclusive_kept = 0, inclusive_drops = 0;
+  uint64_t disk_wait_ns = 0, disk_overlapped = 0, disk_carried = 0, disk_carried_bytes = 0;
+  uint64_t disk_max_in_flight = 0;  // the most file reads in flight at once since open (a gauge)
+  // make_resident (ss_dg_make_resident): units copied in (from a pinned block or a file), device units it evicted, the
+  // bytes it copied in, its host time. Its copies, reads and evictions count nowhere else (not misses, fetches,
+  // prefetches, evictions, write-backs or file reads).
+  uint64_t resident_units = 0, resident_evicted = 0, resident_bytes = 0, resident_ns = 0;
+  // placement rounds (ss_dg_round): rounds run, units whose home they changed (promoted, demoted, dropped), the bytes
+  // they moved (file reads + H2D + write-backs), their host time, rounds that stopped at a cancellation. Their copies,
+  // reads and write-backs count nowhere else.
+  uint64_t round_count = 0, round_units = 0, round_bytes = 0, round_ns = 0, round_cancelled = 0;
+};
+
+// A placement round (ss_dg_round), docs/design.md §3.10.
+struct DgRoundIn {
+  uint64_t budget_bytes = 0;  // file reads + H2D + write-back bytes the round may move (0 = no limit)
+  uint32_t max_units = 96;    // promotions (to the device or to the pinned tier) at most
+  double hysteresis = 1.25;   // a candidate replaces a unit only when its count is above hysteresis x that unit's
+  double decay = 0.85;        // s = decay x s + hits since the last round
+  uint32_t flags = 0;         // none defined (0)
+};
+struct DgRoundOut {
+  uint32_t promoted_to_device = 0, promoted_to_pinned = 0, demoted_from_device = 0, dropped_to_file = 0;
+  uint32_t cancelled = 0;
+  uint64_t bytes_read = 0, bytes_h2d = 0, bytes_written_back = 0, ns = 0;
 };
 
 // Window prefetch (winpf, opt-in). Off = today's behaviour byte for byte.
@@ -159,7 +230,9 @@ struct DgLayerCounts {
 
 class DgCore {
  public:
-  enum class Home : uint8_t { Host, Device, Coming, Bank, Evicting };
+  // File (three-tier only): no slot, no block; its bytes are read from its file when fetched. A Device key may also
+  // hold a block (backed: a clean copy, inclusive share); a Coming / Bank key fetched from its file holds none.
+  enum class Home : uint8_t { Host, Device, Coming, Bank, Evicting, File };
 
   DgCore(const DgConfig& cfg, DgTransport* t);
   ~DgCore();
@@ -167,8 +240,11 @@ class DgCore {
   DgCore& operator=(const DgCore&) = delete;
 
   // Open: `residents` (keys, by priority) take slots 0.., every other key a block. The caller fills the bytes
-  // (slot_of / block_of) and uploads table() before the first token.
-  void place(const std::vector<uint32_t>& residents);
+  // (slot_of / block_of) and uploads table() before the first token. Three-tier (disk_tier, `disk` = one flag per key,
+  // 1 = the plan's file tier): the non-device keys take home_blocks blocks, plan-pinned keys first, each group in the
+  // order of `residents` (the priority list, which names every key), the rest stay file-homed; block numbers follow key
+  // order as in the two-tier rule, and the pinned units' recency order is the priority order.
+  void place(const std::vector<uint32_t>& residents, const std::vector<uint8_t>* disk = nullptr);
   uint32_t keys() const { return keys_; }
   uint32_t key(uint32_t g, uint32_t unit) const { return base_[g] + unit; }
   uint32_t gated() const { return uint32_t(base_.size() - 1); }
@@ -183,13 +259,25 @@ class DgCore {
   const DgStats& stats() const { return st_; }
   const std::vector<DgLayerCounts>& layer_counts() const { return lc_; }
   uint32_t free_blocks() const { return uint32_t(free_blocks_.size()); }
+  bool backed(uint32_t k) const { return e_[k].backed; }      // a device key holding a clean copy in its block
+  uint32_t backed_units() const { return backed_; }
+  uint32_t file_units() const { return on_file_; }             // file-homed keys (three-tier)
+  uint32_t host_units() const { return on_host_; }             // pinned homes (three-tier: the recency list's length)
+  std::vector<uint32_t> host_order() const;                    // three-tier: pinned homes, most recently homed first
   uint32_t deferred() const { return uint32_t(deferred_.size()); }  // victims whose write-back is not recorded yet
   uint32_t deferred_parts_issued() const { return deferred_.empty() ? 0u : deferred_.front().parts_done; }
   uint64_t wb_outstanding_bytes() const { return outstanding_; }  // submitted write-back bytes not collected yet
   uint32_t gated_of(uint32_t k) const;  // the gated layer of a key
+  uint32_t reads_in_flight() const { return uint32_t(pending_.size()); }  // file reads begun, copies not enqueued yet
+  // The service between exports (inside a token, any time): the oldest reads that already finished get their copies
+  // and entries enqueued now (never waits), so a prefetch read carried across calls is copied while the layer computes.
+  void poll_reads();
 
   // ---- inside a token (the service thread) ----
-  void begin_token(uint32_t seq);
+  // run (G flags, NULL = every gated layer): the gated layers this token exports. A layer not exported is not served:
+  // no demand, use, recency, score history or prediction of it this token; its units age as unrouted ones (the token's
+  // epoch still advances) and the boundary ranks it from its unchanged history.
+  void begin_token(uint32_t seq, const std::vector<uint8_t>* run = nullptr);
   bool on_device_or_coming(uint32_t g, uint32_t unit) const;
   // Makes (g, unit) arrive: a copy into a free slot (or a bank slot for a demand), or a resurrection. A prefetch over
   // budget does nothing. Returns true if something was enqueued.
@@ -198,7 +286,7 @@ class DgCore {
   void cover(uint32_t g, uint32_t unit);
   // A true use (recency + stats); was_miss = its export saw -1.
   void use(uint32_t g, uint32_t unit, bool was_miss);
-  void signal(uint32_t g) { t_->signal_ready(g, seq_); }
+  void signal(uint32_t g);  // ready[g] = seq, after the file reads in flight landed their copies
   // wb_defer: after gated layer g was served (its ready and its prefetches already enqueued), the next deferred
   // write-back parts under the layer's byte credit (a part larger than the credit left still goes: the excess is a
   // debt the next layers repay) and the outstanding cap (finished write-backs are collected first). Nothing after the
@@ -224,8 +312,11 @@ class DgCore {
   enum Mutation { kNoMutation = 0, kEntryBeforeCopy, kNoCover, kEarlyEventRecycle, kNoBankUnpublish,
                   kEarlySourceFree, kFreeResurrectedSlot, kEarlyWritebackBlock, kReevictPending,
                   kEarlyDeferredSlot, kRecordBeforeLastPart, kRevertKeepsEntry, kSeedNoPfSync,
-                  kIgnoreKeep, kStaleList, kNoUnionSave, kSkipRank };
-  void set_mutation(int m) { mut_ = m; }
+                  kIgnoreKeep, kStaleList, kNoUnionSave, kSkipRank, kStageNoWait };
+  void set_mutation(int m) {
+    drain_pending();
+    mut_ = m;
+  }
 
   // ---- boundary (the engine thread, the device done with the token) ----
   // Drains the token's copies, returns bank units to their blocks, collects write-backs, evicts LRU victims (never a
@@ -236,6 +327,51 @@ class DgCore {
   uint32_t policy() const { return c_.scored ? (c_.scored_auto ? 2u : 1u) : 0u; }
   // Between tokens: HOST keys into free slots (no eviction, no bank), synchronously. Returns how many moved.
   uint32_t seed(const std::vector<uint32_t>& keys);
+  // Between tokens (ss_dg_make_resident): every unit of gated layer g in `units` (distinct, in range) on the device
+  // when it returns, its entry uploaded. `other_kept` = the keys every layer keeps, g's current set included (never
+  // victims; keys in `units` are not counted). Refused with SS_E_CAPACITY before anything changes when units + distinct
+  // other_kept + spare_target > persistent_slots, when the persistent slots that are free or hold an eligible victim
+  // cannot take the missing units, or (two-tier) when there is neither a free slot nor a free block to start with.
+  // Then: drain (every read, copy and write-back finished and collected), units of g already on the device (or coming)
+  // stay, the others take free slots, else evict eligible device units (not in `units`, not in other_kept) in the
+  // policy's order (LRU: the recency tail; scored / auto: the boundary's score order) with the boundary's lower-tier
+  // rules (a clean copy back to its block, a write-back into a free block, three-tier: a pinned unit dropped to its
+  // file for that block, else the victim to its file), then copy in from the pinned block or the file (a staging
+  // buffer), new units most recent. No clean copy is kept. Counted only in the resident_* stats. Transactional per
+  // copy: a home changes only after its copy and entry were accepted, a source block / victim slot is freed only after
+  // its stream was synced. A read failure (the device fine) re-establishes the cache (the units moved so far stay, the
+  // table uploaded); any device failure poisons the core (poisoned(): every token, reset and make_resident refused)
+  // with its host records still one consistent ownership.
+  struct ResidentResult {
+    uint32_t copied = 0, evicted = 0;
+  };
+  ResidentResult make_resident(uint32_t g, const std::vector<uint32_t>& units, const std::vector<uint32_t>& other_kept);
+  const std::vector<uint32_t>& resident_victims() const { return res_victims_; }  // test hook: the last call's victims
+  // ---- placement rounds (ss_dg_round, docs/design.md §3.10), the engine thread between tokens ----
+  // The decayed counts first (s = decay x s + the unit's exports since the last round, counted by serve_use from the
+  // unique ids of every exported layer: the ids the scored tables see; no device work), then the moves in rank order:
+  // (a) a pinned unit to the device, into a free slot while the device holds fewer than persistent_slots - spare_target
+  // - kept (distinct `kept` keys) - coming units, else in place of the coldest device unit when its count is above
+  // hysteresis x that unit's; the demoted unit goes back to its block (a clean copy) or is written back into a free
+  // block (on kD2h with wb_on_d2h, else on kDem; three-tier without a free block: the coldest pinned unit is dropped to
+  // its file for it); (b) three-tier: a file unit read (up to disk_queue reads in flight) into the block of the coldest
+  // pinned unit, which is dropped to its file, when its count is above hysteresis x that unit's. Never a kept unit, a
+  // unit coming, or one with a write-back pending; a unit with a zero count is never promoted. max_units bounds the
+  // promotions, budget_bytes the bytes (a move that does not fit stops its phase). Transactional as make_resident: a
+  // home changes only after its copy (and entry) was accepted and its stream synced; a cancellation seen after a copy
+  // drops it (its slot / block freed, its source keeps its home). Entries uploaded before it returns. A read failure
+  // (SS_E_IO) leaves the cache consistent (the moves committed so far stay, the table uploaded); any device failure
+  // poisons the core. Counted only in the round_* stats.
+  DgRoundOut round(const DgRoundIn& in, const std::vector<uint32_t>& kept);
+  // Any thread: the round in progress stops at its next unit boundary (cancelled = 1). No effect between rounds.
+  void cancel_round() { round_cancel_.store(true, std::memory_order_release); }
+  // Between tokens: the decayed counts of `keys` (finite, >= 0), e.g. from a routing profile; every key checked first.
+  void seed_round_counts(const std::vector<uint32_t>& keys, const std::vector<float>& counts);
+  const DgRoundOut& last_round() const { return last_round_; }  // also after a failure (zero after a refusal)
+  double round_count(uint32_t k) const { return rs_[k]; }
+  uint32_t round_hits(uint32_t k) const { return rhits_[k]; }  // exports since the last round
+  // Test hook: called at every unit boundary of a round (after its cancellation check), with the moves so far.
+  void set_round_probe(std::function<void(uint32_t)> f) { round_probe_ = std::move(f); }
   // Between tokens: every deferred write-back submitted, then every stream synchronized.
   void drain();
   // Between tokens, with exclusive ownership. Restore the immutable place() blueprint; copies only misplaced units.
@@ -248,6 +384,8 @@ class DgCore {
   std::vector<uint32_t> residency() const;
   bool wb_defer() const { return c_.wb_defer; }
   bool reset_failed() const { return reset_failed_; }
+  // A reset or a make_resident failed on the device: the core refuses every token, reset and make_resident.
+  bool poisoned() const { return reset_failed_; }
   // Test-only semantic comparison: excludes sequence domain, event handles, dead scratch and lifetime counters.
   bool same_open_state(const DgCore& other) const;
   // Teardown only (noexcept, no device call): drops the deferred write-backs nothing was submitted for yet. A partly
@@ -269,7 +407,10 @@ class DgCore {
   // ---- window prefetch (winpf), between tokens ----
   void set_winpf(const DgWinpf& w);
   const DgWinpf& winpf() const { return wp_; }
-  void set_prior(DgPrior&& p) { prior_ = std::move(p); }
+  void set_prior(DgPrior&& p) {
+    drain_pending();
+    prior_ = std::move(p);
+  }
   const DgPrior& prior() const { return prior_; }
   // The next window's rows (symbol = token id, weight in [0, 1]): appended to the rows hinted since the last boundary;
   // issues the prior prefetches of gated layers 0..P-1 now.
@@ -287,7 +428,10 @@ class DgCore {
   // The l+1 buckets' learning state lives as long as the context (ss_stats_reset does not touch it), as scored
   // eviction's tables (scored.md 8.4).
   uint32_t prefetch_reserve() const { return c_.prefetch_reserve; }
-  void set_diag(bool on) { diag_ = on; }
+  void set_diag(bool on) {
+    drain_pending();
+    diag_ = on;
+  }
   const DgBoundaryTimes& boundary_times() const { return bt_; }
 
   // ---- scored eviction (c_.scored; docs/design.md §3.8) ----
@@ -340,6 +484,9 @@ class DgCore {
     uint64_t demand_epoch = 0;  // scored: the epoch of its last demand use (0 = never; place / seed / prefetch: 0)
     uint64_t lru_stamp = 0;     // scored: the recency list position (unique; larger = nearer the head)
     void* pf_done = nullptr;
+    bool backed = false;        // Device with a clean copy in `block` (inclusive share)
+    bool in_hlist = false;      // three-tier: in the pinned homes' recency list (exactly the Host keys)
+    uint32_t hprev = kNone, hnext = kNone;
   };
   struct Writeback {
     uint32_t key;
@@ -369,10 +516,44 @@ class DgCore {
   int32_t take_bank_slot(uint32_t g);
   void write_entry(DgTransport::Stream s, uint32_t k, int32_t v);
   bool fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted);
+  void serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead);
+  void copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t src);  // h2d + entry (kEntryBeforeCopy order)
+  // three-tier, overlapped file misses: the reads begun and not ended, oldest first. drain_pending(n) ends the n oldest
+  // (all by default) and enqueues what their fetch would have enqueued after the read: the copy, the entry, the
+  // staging buffer's event, a prefetch's event. A failed read returns its key to its file (fetch undone); the first
+  // error is rethrown after every record was ended.
+  struct Pending {
+    uint32_t key;
+    int32_t slot, stage;
+    DgTransport::Stream s;
+    bool prefetch, bank, free_counted;  // free_counted: a demand that took a free slot (demand_free_used_)
+    void* handle;
+    uint64_t entry;  // the public call that began it (entries_)
+  };
+  void drain_pending(size_t n = SIZE_MAX);
+  void drain_through(const std::function<bool(const Pending&)>& f);  // up to the last record f accepts
+  void drain_demand();               // up to the last demand record
+  void drain_key(uint32_t k);        // up to k's record
+  void drain_layer(uint32_t g);      // up to the last demand record or record of gated layer g
+  void enter();                      // a public entry point: counted, the demand records drained
+  void undo_pending(const Pending& p);
+  void finish_pending(const Pending& p);
   void apply_wb_defer();
   void issue_prior();  // window_hint's prior prefetches
   void stamp_room(const char* what) const;  // scored: the stamp counter may take one more phase of pushes
+  // three-tier: the pinned homes' recency list (disk_tier only), a key leaving the device for its lower home (its
+  // block if it holds one, else its file), a block freed by dropping the least recently homed pinned key to its file,
+  // the next staging buffer (waits for its last copy)
+  void hpush(uint32_t k);
+  void hunlink(uint32_t k);
+  void to_lower(uint32_t k);
+  // skip (make_resident): keys never dropped; count = false: not counted in disk_drops
+  bool drop_host_lru(const std::vector<uint8_t>* skip = nullptr, bool count = true);
+  int32_t take_stage();
   void score_history(uint32_t g);           // scored: serve_use's history update of layer g (union saved first)
+  void rank_layer(uint32_t g);              // scored: score_layer's ranking (the public reference lists)
+  // scored: the bounded selection of the `need` smallest eligible candidates of every layer, ascending, in select_heap_
+  void select_scored(size_t need, const std::function<bool(uint32_t)>& eligible, bool count);
   void reset_score();                       // scored: the open state of every table (reset_open)
   ScoreCand score_candidate(uint32_t g, uint32_t u, uint64_t denominator, const ScoreCand* cutoff = nullptr) const;
   std::vector<uint32_t> score_window(uint32_t g) const;  // the ring's unions in order, each closed by kNone
@@ -387,6 +568,7 @@ class DgCore {
   std::vector<Entry> open_e_;
   std::vector<int32_t> open_table_, open_free_slots_, open_free_blocks_;
   uint32_t open_head_ = kNone, open_tail_ = kNone, open_on_device_ = 0;
+  uint32_t open_hhead_ = kNone, open_htail_ = kNone, open_on_host_ = 0, open_on_file_ = 0;
   DgWinpf open_wp_;
   double open_rate_gbps_ = 30;
   bool open_rate_set_ = false, reset_failed_ = false;
@@ -413,10 +595,24 @@ class DgCore {
   bool pressure_ = false;
   uint32_t pressure_free_ = 0, pressure_recent_ = 0, demand_free_used_ = 0;
   uint32_t head_ = kNone, tail_ = kNone, on_device_ = 0;
+  // three-tier: the pinned homes' recency list (head = most recently homed), counts, the staging ring
+  uint32_t hhead_ = kNone, htail_ = kNone, on_host_ = 0, on_file_ = 0, backed_ = 0;
+  std::vector<void*> stage_ev_;  // per staging buffer: its last copy's event (nullptr = unused yet)
+  uint32_t stage_next_ = 0;
+  std::deque<Pending> pending_;
+  uint64_t entries_ = 0;  // public calls that drained the demand reads (enter)
   std::vector<uint32_t> coming_, banked_;
   std::vector<uint32_t> pred_;     // the deduplicated valid prediction for gated layer pred_layer_
   uint32_t pred_layer_ = kNone;
   std::vector<uint8_t> layer_missed_;  // per gated layer, this token
+  std::vector<uint8_t> run_;           // per gated layer: exported this token (begin_token)
+  std::vector<uint32_t> res_victims_;  // make_resident's last victims (test hook)
+  // placement rounds: the decayed counts, the exports since the last round, the cancellation flag
+  std::vector<double> rs_;
+  std::vector<uint32_t> rhits_;
+  std::atomic<bool> round_cancel_{false};
+  DgRoundOut last_round_;
+  std::function<void(uint32_t)> round_probe_;
   bool diag_ = false;
   DgBoundaryTimes bt_;
   uint32_t seq_ = 0;

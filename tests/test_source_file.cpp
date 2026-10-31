@@ -4,11 +4,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <new>
 #include <vector>
 
 #include "check.hpp"
 #include "dg_fixture.hpp"
 #include "dg_load.hpp"
+#include "errors.hpp"
 #include "fixture.hpp"
 #include "mfile.hpp"
 #include "source_file.hpp"
@@ -40,7 +43,8 @@ struct Run {
   ss_plan* p = nullptr;
   ss_ctx* c = nullptr;
   ~Run() { ss_close(c); ss_plan_free(p); ss_desc_free(d); }
-  void open(const std::string& json, const char* dirs, bool direct, uint32_t drive_readers = 3, bool old_options = false) {
+  void open(const std::string& json, const char* dirs, bool direct, uint32_t drive_readers = 3, bool old_options = false,
+            const ss_file_identity* ids = nullptr, uint32_t n_ids = 0, ss_status want = SS_OK) {
     CHECK_OK(ss_desc_from_json(json.data(), json.size(), &d));
     ss_budget b;
     ss_budget_defaults(&b);
@@ -62,7 +66,10 @@ struct Run {
     o.drive_readers = drive_readers;
     o.weight_verify = SS_MFILE_VERIFY_ALWAYS;
     if (old_options) o.struct_size = uint32_t(offsetof(ss_options, weight_dirs));
-    CHECK_OK(ss_open(d, &b, p, &o, &c));
+    o.source_identities = ids;
+    o.source_identity_n = n_ids;
+    if (want == SS_OK) CHECK_OK(ss_open(d, &b, p, &o, &c));
+    else CHECK(ss_open(d, &b, p, &o, &c) == want && !c);
   }
 };
 
@@ -421,4 +428,261 @@ TEST(source_open_validates_weight_options_without_manifests) {
   ss_desc_free(d);
 }
 
+// Expected source identities (ss_options.source_identities): the bound open of each source must name that file, or
+// ss_open fails with SS_E_DESC naming the source; an all-zero entry is not checked. Plain and multi-location sources.
+TEST(source_expected_identity) {
+  SourceFixture fx("source-identity");
+  const std::string experts = (fx.dir / "experts.bin").u8string(), blob = (fx.dir / "blob.bin").u8string();
+  auto id = [](const std::string& path) {
+    const ts::FileIdentity f = ts::identity_of(path);
+    return ss_file_identity{f.volume, f.index, f.size};
+  };
+  StripeDir stripe(fx.dir);
+  stripe.manifest("experts.bin");
+  const auto dirs = stripe.path.u8string();
+  for (const char* list : {static_cast<const char*>(nullptr), dirs.c_str()}) {
+    const ss_file_identity right[2] = {id(experts), id(blob)};
+    {
+      Run r;
+      r.open(fx.json, list, false, 3, false, right, 2);
+      CHECK(r.c);
+      if (r.c) CHECK(read_all(r.c, fx) == fx.expected);
+    }
+    for (int k = 0; k < 3; ++k) {
+      ss_file_identity wrong[2] = {right[0], right[1]};
+      if (k == 0) wrong[1].index ^= 1;
+      if (k == 1) wrong[1].size += 1;
+      if (k == 2) wrong[1] = right[0];  // another source's identity
+      Run r;
+      r.open(fx.json, list, false, 3, false, wrong, 2, SS_E_DESC);
+      CHECK(std::string(ss_last_error()).find("blob.bin") != std::string::npos);
+    }
+    {
+      ss_file_identity wrong = right[1];
+      Run r;  // the multi-location source (experts, with list) is checked against its primary
+      r.open(fx.json, list, false, 3, false, &wrong, 1, SS_E_DESC);
+      CHECK(std::string(ss_last_error()).find("experts.bin") != std::string::npos);
+    }
+    {
+      const ss_file_identity unchecked[2] = {{0, 0, 0}, right[1]};
+      Run r;
+      r.open(fx.json, list, false, 3, false, unchecked, 2);
+      CHECK(r.c);
+    }
+  }
+  const ss_file_identity three[3] = {};
+  { Run r; r.open(fx.json, nullptr, false, 3, false, three, 3, SS_E_INVALID); }
+  { Run r; r.open(fx.json, nullptr, false, 3, false, nullptr, 1, SS_E_INVALID); }
+  // The loaders' own opens (dg_load_pipeline workers, three-tier reads): bound, and the identity of the context's
+  // open source when given.
+  const ts::FileIdentity e = ts::identity_of(experts);
+  ts::FileIdentity other = e;
+  other.index ^= 1;
+  CHECK(ts::open_source(experts, false, nullptr, e)->identity() == ts::open_source(experts, false, nullptr)->identity());
+  bool refused = false;
+  try {
+    ts::open_source(experts, false, nullptr, other);
+  } catch (const ts::Error& err) {
+    refused = err.status() == SS_E_DESC && std::string(err.what()).find("experts.bin") != std::string::npos;
+  }
+  CHECK(refused);
+}
+
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }
+
+// dg_read_unit (the three-tier file reads): the in-place parts of a multi-location session go out as one preadv
+// (parallel) and land the same bytes, with the same digest, as one read per part; a part that needs the bounce buffer
+// keeps it (mixed: the first part unaligned).
+TEST(source_dg_read_unit_parts_in_parallel) {
+  const auto dir = sstest::Fixture::temp_root() / "ss-test-dg-read-unit";
+  std::filesystem::create_directories(dir);
+  const auto file = dir / "experts.bin";
+  const int U = 16;
+  const uint64_t pb[3] = {64 << 10, 64 << 10, 128 << 10}, base = 4096;
+  const uint64_t size = base + uint64_t(U) * (pb[0] + pb[1] + pb[2]) + 8192;
+  {
+    std::vector<char> buf(static_cast<size_t>(size));
+    for (uint64_t i = 0; i < size; ++i) buf[size_t(i)] = char(sstest::byte_at(5, i));
+    std::ofstream f(file, std::ios::binary);
+    f.write(buf.data(), std::streamsize(size));
+  }
+  StripeDir stripe(dir);
+  stripe.manifest("experts.bin");
+  for (bool mixed : {false, true}) {
+    uint64_t off[3];
+    off[0] = base + (mixed ? 1000 : 0);
+    off[1] = base + uint64_t(U) * pb[0] + 4096;
+    off[2] = off[1] + uint64_t(U) * pb[1];
+    std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                       file.generic_string() + R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":)" +
+                       std::to_string(U) + R"(,"top_k":4,"parts":[)";
+    const char* names[3] = {"gate", "up", "down"};
+    for (int p = 0; p < 3; ++p)
+      json += std::string(p ? "," : "") + R"({"name":")" + names[p] + R"(","format":"Q4_K","offset":)" +
+              std::to_string(off[p]) + R"(,"stride":)" + std::to_string(pb[p]) + R"(,"bytes":)" +
+              std::to_string(pb[p]) + "}";
+    json += "]}]}";
+    const auto d = ts::desc_from_json(ts::json_parse(json));
+    for (bool direct : {false, true}) {
+      const auto dirs = stripe.path.u8string();
+      ss_options o;
+      ss_options_defaults(&o);
+      o.weight_dirs = dirs.c_str();
+      o.direct_io = direct;
+      o.weight_verify = SS_MFILE_VERIFY_ALWAYS;
+      std::vector<std::unique_ptr<ts::SourceFile>> files;
+      files.push_back(ts::open_source(d.sources[0].path, o));
+      CHECK(files[0]->session() != nullptr);
+      if (!files[0]->session()) continue;
+      files[0]->session()->test_prefer_stripe(true);  // the odd chunks from the stripe: the parts span both drives
+      const uint64_t unit = pb[0] + pb[1] + pb[2], bounce_bytes = 1 << 20;
+      auto* a = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
+      auto* b = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
+      auto* bounce = static_cast<char*>(::operator new(size_t(bounce_bytes), std::align_val_t(4096)));
+      std::mutex mu;
+      for (int u : {0, 3, 7, U - 1}) {
+        std::vector<uint8_t> expected;
+        for (int p = 0; p < 3; ++p)
+          for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(5, off[p] + uint64_t(u) * pb[p] + i));
+        std::memset(a, 0x11, size_t(unit));
+        std::memset(b, 0x22, size_t(unit));
+        ts::DgLoadStats sa, sb;
+        uint64_t da = 0, db = 1;
+        ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, &mu, true);
+        ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, &mu, false);
+        CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
+        CHECK(std::memcmp(b, expected.data(), expected.size()) == 0);
+        CHECK_EQ(da, ts::xxh64(expected.data(), expected.size()));
+        CHECK_EQ(da, db);
+        CHECK_EQ(sb.read_calls, uint64_t(mixed ? 2 + (pb[0] + bounce_bytes - 1) / bounce_bytes : 3));
+        CHECK_EQ(sa.read_calls, uint64_t(mixed ? 1 + (pb[0] + bounce_bytes - 1) / bounce_bytes : 1));  // one preadv
+        CHECK_EQ(sa.bounce_bytes, mixed ? pb[0] : uint64_t(0));
+        CHECK_EQ(sa.bounce_bytes, sb.bounce_bytes);
+      }
+      const auto c = counters(*files[0]->session());
+      CHECK(c.bytes[0] > 0 && c.bytes[1] > 0);
+      CHECK_EQ(c.verify_fail, uint64_t(0));
+      CHECK_EQ(c.read_errors, uint64_t(0));
+      ::operator delete(a, std::align_val_t(4096));
+      ::operator delete(b, std::align_val_t(4096));
+      ::operator delete(bounce, std::align_val_t(4096));
+    }
+  }
+}
+
+// dg_read_unit with sub-reads (DG_UNIT_SUBREAD_KIB): every in-place part of the unit is cut into pieces that are all in
+// flight together, on a plain file (overlapped reads on a second handle) and on a stripe session (one preadv, pieces
+// never across a chunk), direct and buffered; the bytes and digest are those of one request per part, the bounce path
+// is unchanged, and an injected piece failure fails the unit read (every other piece completed) and leaves the source
+// usable; a failing stripe location falls back to the primary with the same bytes.
+TEST(source_dg_read_unit_subreads) {
+  const auto dir = sstest::Fixture::temp_root() / "ss-test-dg-read-subreads";
+  std::filesystem::create_directories(dir);
+  const auto file = dir / "experts.bin";
+  const int U = 16;
+  const uint64_t pb[3] = {64 << 10, 64 << 10, 128 << 10}, base = 4096, sub = 16 << 10;
+  const uint64_t size = base + uint64_t(U) * (pb[0] + pb[1] + pb[2]) + 8192;
+  {
+    std::vector<char> buf(static_cast<size_t>(size));
+    for (uint64_t i = 0; i < size; ++i) buf[size_t(i)] = char(sstest::byte_at(7, i));
+    std::ofstream f(file, std::ios::binary);
+    f.write(buf.data(), std::streamsize(size));
+  }
+  StripeDir stripe(dir);
+  stripe.manifest("experts.bin");
+  const auto dirs = stripe.path.u8string();
+  for (bool mixed : {false, true}) {
+    uint64_t off[3];
+    off[0] = base + (mixed ? 1000 : 0);
+    off[1] = base + uint64_t(U) * pb[0] + 4096;
+    off[2] = off[1] + uint64_t(U) * pb[1];
+    std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                       file.generic_string() + R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":)" +
+                       std::to_string(U) + R"(,"top_k":4,"parts":[)";
+    const char* names[3] = {"gate", "up", "down"};
+    for (int p = 0; p < 3; ++p)
+      json += std::string(p ? "," : "") + R"({"name":")" + names[p] + R"(","format":"Q4_K","offset":)" +
+              std::to_string(off[p]) + R"(,"stride":)" + std::to_string(pb[p]) + R"(,"bytes":)" +
+              std::to_string(pb[p]) + "}";
+    json += "]}]}";
+    const auto d = ts::desc_from_json(ts::json_parse(json));
+    for (bool multi : {false, true})
+      for (bool direct : {false, true}) {
+        ss_options o;
+        ss_options_defaults(&o);
+        o.weight_dirs = multi ? dirs.c_str() : nullptr;
+        o.direct_io = direct;
+        o.weight_verify = SS_MFILE_VERIFY_ALWAYS;
+        std::vector<std::unique_ptr<ts::SourceFile>> files;
+        files.push_back(ts::open_source(d.sources[0].path, o));
+        CHECK_EQ(files[0]->session() != nullptr, multi);
+        if (multi) files[0]->session()->test_prefer_stripe(true);
+        const uint64_t unit = pb[0] + pb[1] + pb[2], bounce_bytes = 1 << 20;
+        auto* a = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
+        auto* b = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
+        auto* bounce = static_cast<char*>(::operator new(size_t(bounce_bytes), std::align_val_t(4096)));
+        std::mutex mu;
+        for (int u : {0, 5, 15}) {
+          std::vector<uint8_t> expected;
+          for (int p = 0; p < 3; ++p)
+            for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(7, off[p] + uint64_t(u) * pb[p] + i));
+          std::memset(a, 0x11, size_t(unit));
+          std::memset(b, 0x22, size_t(unit));
+          ts::DgLoadStats sa, sb;
+          uint64_t da = 0, db = 1;
+          ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, &mu, true, sub);
+          ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, &mu, true, 0);
+          CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
+          CHECK(std::memcmp(b, expected.data(), expected.size()) == 0);
+          CHECK_EQ(da, ts::xxh64(expected.data(), expected.size()));
+          CHECK_EQ(da, db);
+          const bool bounced = mixed && files[0]->direct();  // (a buffered file reads the unaligned part in place)
+          CHECK_EQ(sa.bounce_bytes, bounced ? pb[0] : uint64_t(0));
+          CHECK_EQ(sa.bounce_bytes, sb.bounce_bytes);
+          // the in-place parts as sub-reads: 4 + 8 pieces (plus the first part's 4 when in place), more on a stripe
+          // where a piece meets a chunk boundary
+          const uint64_t want = (bounced ? 0 : pb[0] / sub) + pb[1] / sub + pb[2] / sub;
+          if (multi) CHECK(sa.pieces >= want);
+          else CHECK_EQ(sa.pieces, want);
+          CHECK_EQ(sb.pieces, uint64_t(0));
+        }
+#if defined(_WIN32)
+        if (!multi) CHECK(ts::RawFile::test_max_in_flight() >= 12u);  // a unit's pieces all in flight together
+#endif
+        if (!multi) {  // an injected piece failure: the unit read fails; the next one is whole
+          ts::RawFile::test_fail_piece(3);
+          bool threw = false;
+          try {
+            ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, nullptr, nullptr, &mu, true, sub);
+          } catch (const ts::Error& e) {
+            threw = e.status() == SS_E_IO;
+          }
+          CHECK(threw);
+          ts::RawFile::test_fail_piece(0);
+          uint64_t dg = 0;
+          ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, &dg, nullptr, &mu, true, sub);
+          std::vector<uint8_t> expected;
+          for (int p = 0; p < 3; ++p)
+            for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(7, off[p] + 2ull * pb[p] + i));
+          CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
+          CHECK_EQ(dg, ts::xxh64(expected.data(), expected.size()));
+        } else {  // a failing stripe location: its pieces fall back to the primary, the same bytes
+          files[0]->session()->test_inject(1, 1, 0);
+          uint64_t dg = 0;
+          ts::dg_read_unit(d, files, 0, 9, a, bounce, bounce_bytes, true, &dg, nullptr, &mu, true, sub);
+          std::vector<uint8_t> expected;
+          for (int p = 0; p < 3; ++p)
+            for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(7, off[p] + 9ull * pb[p] + i));
+          CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
+          CHECK_EQ(dg, ts::xxh64(expected.data(), expected.size()));
+          files[0]->session()->test_inject(1, 0, 0);
+          const auto c = counters(*files[0]->session());
+          CHECK(c.bytes[1] > 0);
+          CHECK(c.fallback_bytes > 0);
+        }
+        ::operator delete(a, std::align_val_t(4096));
+        ::operator delete(b, std::align_val_t(4096));
+        ::operator delete(bounce, std::align_val_t(4096));
+      }
+  }
+}

@@ -52,6 +52,12 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_wait_timeout_ms < 1) refuse(SS_E_INVALID, "dg_wait_timeout_ms must be >= 1");
   if (o.dg_wb_defer > 1) refuse(SS_E_INVALID, "dg_wb_defer must be 0 or 1");
   if (o.dg_wb_stream > 1) refuse(SS_E_INVALID, "dg_wb_stream must be 0 or 1");
+  if (o.dg_disk_tier > 1 || o.dg_disk_prefetch > 1) refuse(SS_E_INVALID, "dg_disk_tier / dg_disk_prefetch must be 0 or 1");
+  if (!o.dg_disk_tier && (o.dg_disk_prefetch || o.dg_disk_staging || o.dg_disk_queue))
+    refuse(SS_E_INVALID, "dg_disk_prefetch / dg_disk_staging / dg_disk_queue need dg_disk_tier = 1");
+  if (o.dg_disk_staging > 256) refuse(SS_E_INVALID, "dg_disk_staging must be 0..256");
+  if (o.dg_disk_queue > 64) refuse(SS_E_INVALID, "dg_disk_queue must be 0..64");
+  if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
 
   DgLayout x;
   x.B = o.dg_max_ids;
@@ -102,6 +108,8 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
         ++planned;
       } else if (t == SS_TIER_PINNED) {
         ++x.P;
+      } else if (t == SS_TIER_DISK && o.dg_disk_tier) {
+        ++x.F;
       } else {
         refuse(SS_E_CAPACITY, "unit (" + std::to_string(l.index) + ", " + std::to_string(u) +
                                   ") is not resident or pinned (no gated unit is read from its file)");
@@ -109,16 +117,21 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     }
     // the planner's billed dynamic slots: never more than the layer's non-resident units
     x.D += std::min<uint32_t>(b.dynamic_slots_per_layer, uint32_t(l.n_units) - planned);
+    if (o.dg_disk_tier)
+      for (int u = 0; u < l.n_units; ++u)
+        x.disk.push_back(p.tier[size_t(d.unit_base[size_t(L)] + u)] == SS_TIER_DISK ? 1 : 0);
     keys += uint64_t(l.n_units);
     require(keys < 0x7fffffffull, SS_E_INVALID, "device-gated: more than 2^31 - 1 gated units");
     x.unit_base.push_back(uint32_t(keys));
   }
   x.keys = uint32_t(keys);
   x.R = uint32_t(x.residents.size());
+  x.disk_tier = o.dg_disk_tier != 0;
+  x.disk_prefetch = o.dg_disk_prefetch != 0;
   if (o.dg_spare_slots) {  // one global count, as the engine caches (the plan bills per layer)
-    if (o.dg_spare_slots > x.P)
+    if (o.dg_spare_slots > x.P + x.F)
       refuse(SS_E_INVALID, "dg_spare_slots " + std::to_string(o.dg_spare_slots) + " above the non-resident units (" +
-                               std::to_string(x.P) + ")");
+                               std::to_string(x.P + x.F) + ")");
     x.D = o.dg_spare_slots;
   }
   if (x.D < 1)
@@ -130,6 +143,10 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   uint32_t ring_slots = 0;
   for (const RingClass& rc : p.rings)
     if (rc.stride == stride) ring_slots = rc.slots;
+  if (o.dg_no_admit && uint64_t(ring_slots) < 2ull * x.B + 1)  // (the same slots: named for the miss path)
+    refuse(SS_E_CAPACITY, "dg_no_admit serves every miss through a bank slot: it needs " + std::to_string(2 * x.B) +
+                              " bank slots (2 banks x dg_max_ids " + std::to_string(x.B) + ") + the guard, the plan "
+                              "bills " + std::to_string(ring_slots) + " ring slots (set ring_slots = 2 x dg_max_ids + 1)");
   if (uint64_t(ring_slots) < 2ull * x.B + 1)
     refuse(SS_E_CAPACITY, "the plan bills " + std::to_string(ring_slots) + " ring slots, the banks and the guard need " +
                               std::to_string(2 * x.B + 1) + " (set ring_slots = 2 x dg_max_ids + 1)");
@@ -145,6 +162,13 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               "host_spare_units or the host budget)");
   require(uint64_t(x.P) + x.Q < 0x7fffffffull, SS_E_INVALID, "device-gated: more than 2^31 - 1 host blocks");
   x.blocks = x.P + x.Q;
+  // the inclusive share comes out of the spare blocks: at least one stays for write-backs
+  x.I = o.dg_inclusive_blocks;
+  if (x.I && x.I >= x.Q)
+    refuse(SS_E_CAPACITY, "dg_inclusive_blocks " + std::to_string(x.I) + " must stay below the spare blocks (" +
+                              std::to_string(x.Q) + "): raise host_spare_units by the inclusive share");
+  x.S = x.disk_tier ? (o.dg_disk_staging ? o.dg_disk_staging : 8u) : 0u;
+  x.disk_queue = x.disk_tier ? (o.dg_disk_queue ? o.dg_disk_queue : 1u) : 0u;  // off until it measures faster
 
   // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
   // format; the context loads it before the service starts).
@@ -207,13 +231,27 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   // kept in pipeline mode too: ss_dg_reset_open's one-unit spare for placement cycles (persist)
   x.mapped_bytes = dg_mapped_bytes(G);
   const uint64_t host_extra =
-      add_ck(add_ck(x.mapped_bytes, x.bounce_bytes, "the host extras"), x.staging_bytes, "the host extras");
+      add_ck(add_ck(add_ck(x.mapped_bytes, x.bounce_bytes, "the host extras"), x.staging_bytes, "the host extras"),
+             mul_ck(x.S, x.host_stride, "the disk staging buffers"), "the host extras");
   if (add_ck(p.pinned, host_extra, "the host total") > b.host_pinned_bytes)
     refuse(SS_E_CAPACITY, "the plan's pinned bytes (" + std::to_string(p.pinned) + ") plus the mapped control area (" +
                               std::to_string(x.mapped_bytes) + "), the bounce buffer (" +
                               std::to_string(x.bounce_bytes) + ") and the staging buffer (" +
-                              std::to_string(x.staging_bytes) + ") exceed the host budget (" +
+                              std::to_string(x.staging_bytes) + "), the disk staging buffers (" +
+                              std::to_string(uint64_t(x.S) * x.host_stride) + ") exceed the host budget (" +
                               std::to_string(b.host_pinned_bytes) + ")");
+  // A unit's in-place parts as concurrent sub-reads (the file misses, the prefetch reads, the serial loader), e.g.
+  // 1024 = 1 MiB pieces (a medium request: a multi-location session balances each across the homes of its chunk); a
+  // multiple of 4 KiB keeps every piece aligned; 0 (default, until it measures faster) = one request per part.
+  if (const char* v = std::getenv("DG_UNIT_SUBREAD_KIB")) {
+    char* end = nullptr;
+    const unsigned long n = std::strtoul(v, &end, 10);
+    require(*v && end && !*end && n <= 65536 && n % 4 == 0, SS_E_INVALID,
+            "device-gated: invalid DG_UNIT_SUBREAD_KIB (0..65536, a multiple of 4)");
+    x.unit_subread = uint64_t(n) << 10;
+  } else {
+    x.unit_subread = 0;
+  }
   if (!x.load_serial) {
     auto option = [](const char* name, uint32_t def, uint32_t max) {
       const char* v = std::getenv(name);
@@ -235,6 +273,12 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     require(x.load_buffer_bytes >= x.unit_bytes &&
             x.load_buffer_bytes <= available / x.load_buffers, SS_E_CAPACITY,
             "device-gated: startup ring exceeds the host budget (reduce DG_LOAD_BUFFERS or DG_LOAD_BUFFER_MIB)");
+    const char* overlap = std::getenv("DG_LOAD_OVERLAP_ALLOC");
+    const std::string overlap_value = overlap ? overlap : "";
+    x.load_overlap_alloc = overlap_value != "0";
+    require(overlap_value.empty() || overlap_value == "0" || overlap_value == "1" || overlap_value == "true" ||
+                overlap_value == "on",
+            SS_E_INVALID, "device-gated: invalid DG_LOAD_OVERLAP_ALLOC (use 0, 1, true, or on)");
   }
   return x;
 }

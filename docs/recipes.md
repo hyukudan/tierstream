@@ -385,7 +385,7 @@ at most one; ignored at pinned paths) > **recipe** > **default** (this document)
 schema = "strix-stream/recipe-profile-v1"
 recipe = "minimax-m3.1-flash-lab"
 recipe_sha256 = "<sha256 of the recipe file bytes>"
-source = "hyperloom tune, PRO, prefill-8k, 2026-10-24"
+source = "hyperloom tune, PRO, prefill-8k"
 workload = "prefill-8k"
 
 [key]

@@ -353,6 +353,132 @@ switch to scoring. `ss_dg_reset_open` restores the open policy as well as its le
   route trace (8,576 residents, 96 spares, 49,430 tokens, five folds) both read 8.140 misses per token for LRU and 7.652
   for scored with an empty starting table. Profile-seeded counts reach 7.18 in the simulator.
 
+### 3.9 Device-gated kept-resident layers and unexported layers
+
+Layer-wide prefill (a grouped MoE kernel over every expert of one layer at once) runs through the same device-gated
+cache as decode: one copy of each expert, arena slot <- pinned block <- file. Per layer g, between tokens:
+`ss_dg_make_resident(c, g, ids, n)` (every unit of g), then one step that exports no other layer
+(`rows_per_layer[h] = 0` for h != g) and reads g's units through `ss_dg_slot`, then `ss_dg_keep(c, g, NULL, 0)`.
+Several layers may be held at once when the arena has room. Normal decode tokens follow.
+
+- **The call.** Engine thread, between tokens, under the state rules of `ss_dg_set_policy` (the device and the service
+  handed the core back). It validates g and the ids (distinct, in range), then refuses with `SS_E_CAPACITY` before any
+  action when n + the distinct kept units outside the ids (every layer's keep, g's current one included: it stays
+  protected until the call succeeds) + the spare target exceed the persistent slots (residents
+  + billed spares; bank slots and the guard slot are never kept), when the free slots, the slots write-backs in flight
+  will free and the evictable units cannot take the missing units, or (two-tier) when there is neither a free slot nor
+  a free pinned block to begin with. Then it drains every read, copy and write-back (and collects them). Units of g on
+  the device stay where they are (a prior prefetch still coming is admitted), the others take free slots, else evict
+  device units no layer keeps, in the policy's order: the recency tail under LRU, the boundary's bounded score order
+  (score, demand epoch, stamp) under SCORED and SCORED_AUTO. A victim goes down one tier with the boundary's rules: a
+  clean copy back to its block; a write-back into a free block (synchronous, before its slot is reused), a block of a
+  copy already made from a pinned home once the demand stream is synced, three-tier a pinned unit dropped to its file
+  for that block, else the victim itself dropped to its file. The units are copied in from their pinned blocks, or read
+  from their files into the staging buffers (up to `dg_disk_queue` reads in flight) and copied from there; new units are
+  the most recent; no clean copy is kept. The table is uploaded before the call returns. Placement only: every slot
+  receives its unit's file bytes, so outputs are those of any other placement.
+- **Failures.** Each transfer is a transaction: a unit's home changes only after its copy and its entry were
+  accepted (else its slot goes back to the free list and its mirror entry to -1; its source keeps its home and block),
+  a source block is freed and a written-back victim's slot reused only after the stream that reads it was synced, a
+  victim leaves the device only after its write-back was accepted. A file read failure (`SS_E_IO`, the device fine)
+  re-establishes the cache: the reads in flight are ended, what was enqueued is synced, the table uploaded; every keep
+  is unchanged (g's current set was protected, so its units are where they were) and the units moved so far stay. Any
+  device failure (a copy, a publication, an event record, a synchronize, the upload) poisons the core and the context
+  (`SS_E_BACKEND`); the host records stay one consistent ownership, but what the device holds is unknown.
+- **The kept set.** g's keep becomes exactly the ids; `ss_dg_keep` for g (n = 0 releases) or a later make_resident
+  replaces it, `ss_dg_reset_open` drops every keep. While held, g is never exported (its rows are ignored): readers
+  resolve its kept ids through `ss_dg_slot` / `ss_dg_slot_if_ready`, any other id is absent (the guard slot, and the
+  token fails). A kept unit on the device keeps its slot: inside a token entries only change from -1 to a slot, and no
+  boundary evicts or reverts a kept unit (a kept unused prefetch is admitted rather than reverted).
+- **Unexported layers.** `rows_per_layer[h] == 0` for a gated layer (or a held set) means the step has no
+  `ss_dg_enqueue_export` / `predict` / `wait` for h. The service waits for and serves only the exported layers, in
+  order; a prediction an export promised for an unexported next layer is ignored; the "device ran ahead" checks and
+  the write-back slices look at the next exported layer. The core's token has no demand, use, recency or score history
+  for h (its units age as unrouted ones: the token's epoch still advances), and the boundary ranks h from its
+  unchanged history, so every score list is the token's and no fallback is counted. h's export flag keeps the sequence
+  of the last step that exported it; the service checks a later export against that value and `ss_begin` checks every
+  flag against it, so a stray export of an unannounced layer is a desync (the context is poisoned).
+- **Counters.** The call's copies count only in `ss_dg_stats.resident_units`, `resident_evicted`, `resident_bytes` and
+  `resident_ns` (also in the stats JSON); misses, fetches, prefetches, evictions, write-backs and file reads are
+  decode's. Work it completes at its drain (write-backs and reads already in flight) is counted as before.
+- **Gates (CPU).** The randomized core runs (every LRU, scored, deferred, window-prefetch and three-tier shape) add
+  make_resident episodes, held layers read in every layer of every step, and randomly unexported layers; the device
+  model checks every read's bytes and that no copy lands in a slot under a read, the oracles check every boundary's
+  victims, held units never move, refusals change nothing. Deterministic tests check a full layer, several layers and
+  the capacity refusals, the victims against the LRU order and the scored oracle, the three-tier write-back / drop
+  paths and a failed read, clean-copy victims, and that an unexported layer's counters and score history stay put.
+  Device failures are injected at every H2D, D2H, entry write, event record, event / stream synchronize and upload of
+  the call in turn: each must fire (observed), poison the core and leave consistent ownership. A failed replacement
+  (a read failing after evictions) is followed at once by a step reading the old set unexported. The context's
+  bookkeeping (`DgSteps`: keeps, held sets, the exported layers, the flag values) runs with the service and the core
+  in the GLM sequence on 4 x 288 units (per-layer make_resident, a step exporting nothing, release, decode; two whole
+  layers held for 40 decode steps). The same sequence through the real context and `ss_dg_slot` is the GPU test
+  `ts-test-dg-cuda --only dg_cuda_make_resident_prefill`.
+
+### 3.10 Device-gated placement rounds and no-admission misses
+
+Placement in the device-gated cache otherwise changes only through demand: a miss is admitted, the boundary evicts
+by LRU / SCORED / AUTO. A placement round moves units toward a target computed from their export history instead,
+between tokens, within a budget the engine chooses.
+
+- **Counts.** Every gated unit has a decayed count `s` (zero at open). `serve_use` counts, for every exported layer,
+  each unique routed id once per step (the ids the SCORED tables see; host only, no device work; an unexported or held
+  layer counts nothing). A round first applies `s = decay x s + hits` to every unit and clears the hits.
+  `ss_dg_round_seed_counts` sets `s` directly (finite, >= 0; every entry checked before any is set), e.g. from a
+  shipped routing profile. `ss_dg_reset_open` zeroes counts and hits.
+- **Target.** The rank by `s` (ties by key): the top `persistent slots - spare target - kept units` on the device
+  (kept = every layer's `ss_dg_keep` / make_resident keys, distinct; prefetches still coming also hold slots), the
+  next in the pinned tier, the rest in their files.
+- **The call.** `ss_dg_round(c, params, result)`: engine thread, between tokens, the state rules of
+  `ss_dg_make_resident`. Params: `budget_bytes` (file reads + H2D + write-backs; 0 = no limit), `max_units`
+  (promotions, default 96; 0 = only the counts decay), `hysteresis` (>= 1, default 1.25), `decay` (0..1, default
+  0.85), `flags` (0). It drains every read, copy and write-back first (a device failure there poisons), then:
+  - (a) pinned -> device, hottest first: into a free slot while the device holds less than its share and more than
+    the spare target is free; else in place of the coldest movable device unit (ties: least recent) when the
+    candidate's `s > hysteresis x` its `s`. The demoted unit goes back to its block when it holds a clean copy (no
+    write); else it is written back into a free pinned block on the write-back stream (`dg_wb_stream = 1`) or the
+    demand stream, synchronously, its bytes charged; three-tier with no free block, the coldest pinned unit is
+    dropped to its file to free one. The promoted unit's block is freed once its copy was synced (no clean copy kept).
+  - (b) three-tier: file -> pinned, hottest first, in place of the coldest pinned unit (ties: least recently homed)
+    when `s > hysteresis x` its `s`: that unit is dropped to its file (no copy), and the candidate is read straight
+    into its block by the reader pool, up to `dg_disk_queue` reads in flight.
+  - A unit with `s = 0` is never promoted. Kept or held units, units with a write-back in flight and coming
+    prefetches never move. A move whose bytes do not fit the remaining budget, or `max_units` promotions, ends its
+    phase. Decay alone never churns: equal decay keeps every ratio.
+- **Transactions and failures.** Each move is synchronous: a unit's home changes only after its copy and its entry
+  were accepted and the stream that copied it was synced; a demoted unit leaves its slot only after its write-back was
+  synced; a source block or slot is freed only then. A file read failure (`SS_E_IO`) ends the reads in flight (their
+  blocks freed, their units still in their files), uploads the table and returns with the moves made so far; not
+  poisoned. Any device failure (a copy, a write-back, an entry, an event record, a synchronize, the upload) poisons
+  the core and the context, the host records one consistent ownership. The table is uploaded (and synced) before the
+  call returns.
+- **Cancellation.** `ss_dg_round_cancel` (any thread: one atomic store) makes the round in progress stop at its next
+  unit boundary. A copy made but not committed when the flag is seen (a promotion's H2D synced, a file read ended) is
+  dropped: its slot or block is freed, its entry goes back to -1, its source keeps its home. The round returns
+  `SS_OK` with `cancelled = 1`. A cancellation with no round running has no effect (each round clears the flag when
+  it starts).
+- **Result and counters.** `promoted_to_device`, `promoted_to_pinned`, `demoted_from_device`, `dropped_to_file`,
+  `bytes_read`, `bytes_h2d`, `bytes_written_back`, `ns`, `cancelled` (also filled after a failure), and the lifetime
+  counters `ss_dg_stats.round_count / round_units / round_bytes / round_ns / round_cancelled` (also in the stats JSON).
+  A round's copies, reads and write-backs count nowhere else.
+- **No-admission misses** (`ss_options.dg_no_admit = 1`, default 0). A demand miss takes a bank slot (pinned block ->
+  bank, or file -> staging buffer -> bank, the existing bank fallback) and is released at the boundary: its home
+  (block or file) is unchanged and no resident is evicted. No prefetch (prediction, window prior, l+1) is issued and
+  the boundary selects no victims, so placement changes only through rounds, `ss_dg_make_resident` and `ss_seed`. A
+  bank holds `dg_max_ids` slots and a layer has at most that many distinct misses, so both banks and the guard (the
+  existing ring rule) always suffice; `ss_open` names that count when the ring is short (`SS_E_CAPACITY`), and the
+  core refuses a configuration with fewer bank slots than `max_ids`.
+- **Gates (CPU).** Seeded rankings check the exact moves, hysteresis (9 against 10 does not move), decay without
+  exports (no churn), `max_units`, `budget_bytes`, kept units, a device below its share, clean-copy demotions, and the
+  three-tier write-back / drop / read paths with synchronous and overlapped reads. A randomized oracle runs a cache
+  with rounds (random counts, limits, keeps; deferred and immediate write-backs on both streams; clean copies;
+  three-tier) against one without: every token reads the same bytes. Device failures are injected at every H2D, D2H,
+  entry, record, event / stream synchronize and upload of a round in turn (each observed, poisons, consistent
+  ownership); file read failures at the first and later reads (`SS_E_IO`, consistent, the next round completes).
+  Cancellation from another thread at a unit boundary, during a copy and during the file reads. `dg_no_admit`: misses
+  served with the exact bytes through bank slots, homes unchanged after every boundary, the refusal, and with rounds
+  the hot set converging onto the device (no misses on hot-only tokens).
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier
@@ -437,6 +563,22 @@ lookup tables (Engram) unbuffered (study §6.5).
   use `weight_verify=always` on Linux where stripe directories are not exclusively owned. Partial reads still rely on
   open-time verification, even with `always`. Stripe directories must be as trusted as the primary: xxh64 detects
   accidental corruption, not deliberate tampering.
+- **Bound opens (resolve, then bind).** Every file a session or a descriptor source reads (the primary, each stripe
+  directory's manifest and data file, each `desc.sources` file) is first resolved once to its real final path
+  (Windows: opened normally and `GetFinalPathNameByHandleW`, which also expands 8.3 short names; Linux: `realpath`),
+  so symlinked or junctioned model and stripe directories keep working: a link that exists then is followed once.
+  That real path is then opened through held handles of its directory and of every ancestor from the volume root,
+  and a directory or file found to be a symlink, junction or other reparse point during that walk (one swapped in
+  after the resolve) is refused (a stripe location is disabled, a primary or source fails to open). Windows holds
+  each directory with `FILE_FLAG_OPEN_REPARSE_POINT` and without `FILE_SHARE_DELETE` (none can be renamed or deleted
+  while held), and checks that the file's final path is its held directory's plus its name; Linux walks
+  `openat(O_PATH | O_DIRECTORY | O_NOFOLLOW)` from `/` and opens the file `O_NOFOLLOW` relative to the held directory
+  (renames cannot be denied there). The manifest stays open for the session's lifetime and is read through its
+  handle. Resolving follows whatever the path names at open time, so a caller binds to what it authenticated by
+  identity: `ss_mfile_location_info` reports, per location, the manifest's digest field and the identities (volume +
+  file index, or dev + inode, and size) of the held manifest, data file and primary; `ss_options.source_identities`
+  makes `ss_open` require an identity per descriptor source (`SS_E_DESC` naming the source otherwise). The loaders'
+  per-worker handles are checked against the identity of the context's open source.
 - **Reads.** Offset, length and buffer are 4 KiB aligned (a read may run past EOF to the aligned end; that tail is
   zero-filled on every route). A read is split at chunk boundaries into one piece per chunk. Windows issues concurrent
   4 MiB parts within each piece; Linux reads those parts sequentially. With a stripe location, reads of 8 MiB and up
@@ -517,6 +659,115 @@ split, where the device keeps hot units and the peer computes the rest).
 tiers that go through `ss_plan_from_tiers`. A recipe placement with one unit group `{rank = "frequency", resident =
 "fill", pinned = "fill", rest = "disk"}` gives exactly `ss_plan_make`'s plan.
 
+### 5.1 Whole-device budgets
+
+An engine's budget is the whole device, as if the card had N GiB (`--vram-total-gib N`), and the whole host, pinned
+included (`--ram-total-gib M`). `ss_budget_plan(in, out)` (sized structs, pure integer arithmetic on bytes,
+saturating; no device call) is the one implementation every engine uses for it:
+
+- **Inputs.** The caps (0 = uncapped); the measured device context; named fixed components for the device (trunk /
+  dense weights, KV for the requested context, workspaces, drafter), for pinned host buffers and for pageable host
+  memory; the load staging; the expert geometry (keys, device slot bytes, host stride, arena spares, host spare
+  blocks, file-tier staging, inclusive request, whether the file tier is allowed); and the uncapped knobs of the
+  engines' three-tier placement (explicit arena and RAM expert budgets, host memory available now, its margin, the
+  pinned ceiling).
+- **Device.** `arena = ⌊(cap − context − Σ device components − VRAM margin) / slot⌋ − spares`, never more than an
+  explicit arena request (uncapped: the request, or every expert). The margins (`vram_margin_bytes`,
+  `ram_margin_bytes`, default 0) keep room under each cap for what is allocated after the plan (graph capture, warmup,
+  per-request buffers, allocator slack); the minimum caps include them.
+- **Host.** The pinned room is the smallest of (available − margin − load staging), (pinned ceiling − engine pinned −
+  load staging) and, with a RAM cap, (cap − pinned − pageable components − load staging − RAM margin). Experts that
+  do not fit their pinned share go to the file tier (refused without it). Inclusive clean copies only take RAM left
+  over.
+- **Refusals.** A cap that cannot hold `context + device components + VRAM margin + (spares + min_resident) slots`
+  (device) or `host components + RAM margin + spare blocks + staging + one block` (host; every non-resident expert
+  without a file tier) is refused with `SS_E_CAPACITY` and a message naming each component and the smallest cap that
+  would do (`min_vram_total_bytes`, `min_ram_total_bytes`, the flag value rounded up to whole GiB).
+- **Uncapped = today.** With both caps 0 the outputs (counts per tier, inclusive, spare blocks, staging, room, the
+  host need and the pinned peak) are those of DeepSeek's `rtx::tier_plan`; `tests/test_budget.cpp` carries that
+  function unchanged as an oracle and compares its cases and a 16,200-case grid.
+- **Receipt.** `ss_budget_plan_json(in, out, buf, len)` writes the plan as JSON members (no braces): caps, margins,
+  the fixed components by name, the expert geometry and requests, the placement, planned bytes, `device_room_bytes`,
+  `host_cap_units` (the pinned ceiling used), `device_capped` / `host_capped` (the cap, not the request, sized that
+  tier), and the minimum caps in bytes, in GiB rounded up to 0.01 and as the whole-GiB flag value.
+
+The ledger (`ss_budget_ledger`) tracks what is really allocated against the same caps: `add` / `sub` per kind
+(DEVICE, PINNED, PAGEABLE; PINNED and PAGEABLE share the RAM cap) and component name, thread-safe, an add over the
+cap refused with `SS_E_CAPACITY` naming the component; the stats give current and peak per kind, the 16 largest
+components at that kind's peak, and the peak of externally measured device use (`observe_device`: cudaMemGetInfo or
+NVML samples), so the receipt shows the ledger's peak beside the measured one. `observe(stage, device, host)` records one measured
+sample per side (the engine's cudaMemGetInfo / NVML device use, its process commit with pinned memory; either side
+may be absent): the last value, the peak with the stage it happened at, and the samples above each cap;
+`within_caps` is 1 when every measured peak stayed at or below its cap (the receipt's "peak <= cap"). Passed as `ss_options.budget`, the
+context charges its own allocations before making them: in device-gated mode the arena, slot table, controls, mapped
+area, pinned blocks, disk staging, staging, bounce, table staging, diagnostics and (until the open ends) the load
+ring; in host mode every allocation of its backend. A cap overrun fails `ss_open` naming the allocation; closing
+releases the charges.
+
+### 5.2 Device profiles
+
+The caps of §5.1 can come from the machine instead of flags. A device profile (`strix/device-profile-v1`, canonical
+JSON) describes ONE machine as the engine sees it: host RAM (total, available now, unified with the GPU or not), CPU
+cores, NVMe drives, every GPU (api `hip` / `cuda`, name, arch such as `gfx1151` / `sm_120`, compute units, wave, LDS,
+memory / GTT / visible bytes, memory and host-to-device bandwidth, PCIe link), the inter-host links (kind, count,
+measured Gbps), the margins (host floor, device reserve), class limits, evidence ids, the merged override paths and
+notices.
+
+- **Detection** (`ss_devprof_detect`, < 1 s, never fails): Linux `/proc/meminfo`, `/proc/cpuinfo`, the KFD topology
+  (arch from `gfx_target_version`, CUs from `simd_count / simd_per_cu`, wave, LDS), the amdgpu DRM `mem_info_*`
+  totals (the APU's memory = GTT + carve-out), Thunderbolt / USB4 XDomain peers and `/sys/class/nvme`; then the HIP
+  runtime (flat `hipDeviceGetAttribute` / `hipMemGetInfo`, loaded at run time) and on NVIDIA the CUDA driver API +
+  NVML (loaded at run time; no context, no allocation, no probe: name, UUID, SMs, compute capability, total memory,
+  PCIe gen / width, driver). The H2D rate is the engine's measured one from its per-GPU cache file
+  (`strix-gpu-<uuid>.json`); NVMe rates come from an override (or a recipe's evidence) until measured. tierstream builds
+  and runs without either runtime.
+- **Class** (`profiles/<class>.json`, the compiled table written out; CTest `devprof` compares them byte for byte):
+  picked by api + arch + name substring + memory range (`strix-halo-395`: gfx1151 with 96-128 GiB of GTT +
+  carve-out, the size it was qualified on; any other gfx1151 is `generic-hip`); gives the margins (today: host floor 8 GiB = the recipes'
+  `host_free_ram_floor_gib`, device reserve 2 GiB = `ss_budget.margin_gib`), a measured memory bandwidth with its
+  evidence, `unified`, and **limits** engines read instead of literals (`ss_devprof_limit`): `strix-halo-395`
+  max_piece_rows 16384, uma_ceiling_bytes 120 GiB, persist_blocks 40; `rtx-pro-6000-blackwell` long_vram_cap 38 GiB,
+  vram_reserve 1 GiB, replica host margin 6 GiB, max_pinned 68 GiB, service commit floor 20 GiB. An unknown machine
+  (a new gfx, another card) gets `generic-hip` / `generic-cuda` / `generic-cpu`: detected values and today's margins,
+  no limits (the engine keeps its own rule) and a notice - never another arch's or size's qualified numbers. What a
+  class fills is marked `class:<name>` in `evidence`; an override that changes `class` or device 0's api / arch / name
+  / memory takes all of it back (except values the override sets itself) and picks the class again.
+- **Override**: `--device-profile FILE` (`ss_devprof_detect_opts.override_path`) or `STRIX_DEVICE_PROFILE`, a full or
+  partial profile merged over the detected one (objects by key, `devices` / `links` / `host.nvme` by index, `limits`
+  and `evidence` by key; the text's own `overrides` / `notices` / `sources` are ignored, so a saved `ts-devprof` output
+  works as a full override; atomic; every merged path recorded as `FILE:path` in `overrides`). Detection drops GPUs
+  the HIP runtime hides (visibility variables) and joins runtime and sysfs devices by PCI address, never by order.
+  `STRIX_DEVICE_PROFILE_ROOT` (or `opts.root`) reads `/proc` and `/sys` under another root (tests, replay).
+- **Receipts**: `ss_devprof_hash` (xxh64 of the canonical text) names the profile; `ss_devprof_probe_report` gives
+  the recipes' probe report (§8.2 of recipes.md, plus `class` and `arch`).
+
+Planner hooks (all pure arithmetic):
+
+- `ss_devprof_budget(p, device, in)` writes only the caps still at their defaults (explicit flags win): discrete
+  `vram_total_bytes = memory - device_reserve`, `ram_total_bytes = available - host_floor`; unified (Strix Halo and
+  successors) one pool `min(available - host_floor, memory - device_reserve)` as `ram_total_bytes` with
+  `in.unified = 1`. A profile whose margins eat a known size is refused (`SS_E_CAPACITY`), never turned into 0
+  (= uncapped); an unknown size stays uncapped. A caller whose `ss_budget_in` predates the `unified` field gets
+  `SS_E_INVALID` for a unified profile (two independent caps of the pool could each take all of it).
+- `ss_budget_in.unified = 1` (`SS_BUDGET_UNIFIED`): one joint placement - the most residents `r` (up to the arena
+  request, at least `min_resident`) such that the device part (context, components, VRAM margin, `r` + spare slots) and
+  the host part (components, load staging, RAM margin and the smallest host placement for the `keys - r`
+  non-residents: spare blocks, plus the file tier's staging and one block, or every non-resident without a file tier)
+  fit the pool together (closed form: the sum is linear in `r` below `keys`). The pinned tier and the clean copies then
+  get what the device leaves; the final sum is checked against the pool. Both minimum caps are the smallest such sum
+  (a plan at exactly that pool succeeds). With no cap, or `unified = 0`, plans and their JSON are unchanged.
+- `ss_devprof_topology(profiles, n, in, out)`: single box when this box's budget holds the fixed parts + the smallest
+  expert tier at the context, else the fewest boxes whose budgets do, provided a link with a measured rate exists
+  (`gbps_measured > 0`: discovering USB4 peers does not qualify a pair - the engine's link measurement or an override
+  supplies it); the layers split by exact byte budget share (equal boxes: `ceil(layers / 2)` on box 0);
+  `pinned_world` keeps a qualified recipe's choice.
+- `ss_devprof_piece_rows(p, in, &rows)`: the prefill piece from the budget left after the plan, at most the largest
+  multiple of `row_align` within the caller's bounds (on the class a rule was tuned on its bound binds, so its output
+  is today's); an unknown device size gives that maximum, a known size the margins exhaust is refused.
+
+`ts-devprof` prints the effective profile (`--budget`: the caps it gives device 0; `--probe-report HOST`;
+`--expect-class NAME` for node checks).
+
 ## 6. Engine contract
 
 ### 6.1 Calls
@@ -526,7 +777,7 @@ tiers that go through `ss_plan_from_tiers`. A recipe placement with one unit gro
 | `ss_desc_from_model(manifest)` / `ss_desc_from_json` | load |
 | `ss_plan_make` or `ss_plan_from_json` | load (or once per request class: P bucket, cap) |
 | `ss_open(desc, budget, plan, options)` | load: allocates the pool, rings, pinned tier and staging; fills residents and the pinned tier |
-| `ss_begin(rows_per_layer)` | per forward. `rows_per_layer[L] == 0` marks a layer the forward skips (DS cone). |
+| `ss_begin(rows_per_layer)` | per forward. `rows_per_layer[L] == 0` marks a layer the forward skips (DS cone; device-gated: a gated layer not exported, §3.9). |
 | `ss_layer_routes(L, ids, n)` / `ss_layer_routes_dev(L, ids_dev, n, stream)` / `ss_layer_all(L)` | after router(L), or for a layer the forward needs whole |
 | `ss_prefetch(L, ids, n, kind)` / `ss_prefetch_layer(L)` | lookahead / layer-major prefetch |
 | `ss_acquire(L, stream, &view)` or `ss_acquire_groups` + `ss_group_wait` | before MoE(L). `view.table_dev[u]` is the device address of unit u. |
@@ -642,6 +893,10 @@ carry across token boundaries and background submissions are bounded to limit co
 outputs are bitwise identical. See [results and conditions](../README.md#status).
 
 The pipelined startup loader is merged and on by default; `DG_LOAD_SERIAL=1` restores serial loading.
+In pipeline mode the pinned blocks are allocated on a helper thread, chunk by chunk, while the loader already reads
+the device-resident units; a host unit is read once its chunk exists, and the helper is joined right after the loader
+(on by default; `DG_LOAD_OVERLAP_ALLOC=0` restores the serial allocation order). The `dg_load` lines report
+`pinned_alloc_s` (total allocation time), `pinned_alloc_wait_s` (time readers waited for blocks) and `resident_done_s`.
 `ss_dg_reset_open` restores the resolved open-time cache state. `ss_dg_residency` snapshots device-resident units in
 recency order for a later load's `dg_seed`. Measured startup, reset and seed results are in the
 [README](../README.md#status). Window prefetch (`winpf`) is merged, exact and off by default; evaluation is closed

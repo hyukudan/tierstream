@@ -1,5 +1,7 @@
 # tierstream
 
+[English](README.md) · [Español](README.es.md)
+
 *Formerly strix-stream.* All-in-one weight streaming across memory tiers, for MoE and dense models, on CUDA and HIP.
 
 A weight cache for inference engines whose model does not fit in GPU memory. It keeps the weights that matter now
@@ -164,6 +166,25 @@ layer, but a layer whose weights are already available needs no host reply.
   `dg_seed`. These APIs and the pipelined startup loader are merged in [PR #1](https://github.com/hyukudan/tierstream/pull/1).
   Write-back deferral is on by default through `ss_options_defaults` since
   [PR #2](https://github.com/hyukudan/tierstream/pull/2); a zero-initialized options struct still selects immediate copies.
+- **Layer-wide prefill (kept-resident layers):** `ss_dg_make_resident(c, g, ids, n)` makes units of gated layer g
+  resident and kept in the same cache decode uses (one copy of each expert: arena slot, pinned RAM, file), between
+  tokens and synchronously, evicting unkept experts by the policy with the usual write-back rules; `SS_E_CAPACITY`
+  with nothing changed when the kept units of every layer plus the spare target do not fit the persistent slots. A
+  held layer is never exported: one step with `rows_per_layer[h] = 0` for every other layer reads g's experts through
+  `ss_dg_slot`, then `ss_dg_keep(c, g, NULL, 0)` releases it. A gated layer with 0 rows is simply not exported in that
+  step (no export, prediction or wait for it); the service skips it and its counters and score history stay as they
+  were. Its copies count only in `ss_dg_stats.resident_*`. See docs/design.md §3.9.
+- **Placement rounds and no-admission misses:** `ss_dg_round(c, &params, &result)`, between tokens, moves experts
+  toward the rank of a decayed export count (`s = decay x s + exports since the last round`, counted on the host): the
+  hottest pinned experts replace the coldest GPU ones and, three-tier, the hottest file experts replace the coldest
+  pinned ones, only when the newcomer's count is above `hysteresis` (default 1.25) x the replaced one's, at most
+  `max_units` (default 96) promotions and `budget_bytes` bytes per round. Kept and held experts never move. Each move
+  is transactional like `ss_dg_make_resident` (a read failure is `SS_E_IO` with the cache consistent, a device failure
+  poisons); `ss_dg_round_cancel` (any thread) stops a round at the next expert, and `ss_dg_round_seed_counts` starts
+  the counts from a routing profile. With `dg_no_admit = 1` a miss is served from a bank slot and released at the
+  boundary without evicting anything or changing the expert's home, so placement changes only through rounds (and
+  `ss_dg_make_resident` / `ss_seed`). Results are bit-for-bit identical; `ss_dg_stats.round_*` counts the rounds. See
+  docs/design.md §3.10.
 - **Scored eviction (opt-in):** with `policy = SS_POLICY_SCORED` the boundary still keeps the same number of slots
   free, but it picks the experts least likely to be needed soon instead of the least recently used ones. Each expert
   gets an integer score from three parts: how often, in this context, the experts routed in the previous token were
@@ -274,6 +295,39 @@ service starts 17 % faster; longer prompts gain less because they are compute bo
 DRAM-less system disk) added nothing: the shares give it little. Decode reads single experts and Engram rows, which
 stay on the original drive, so decode speed does not change.
 
+### Prepared packs (one pack per model, every layout)
+
+Engines convert some weights at load time (a tensor-parallel rank keeps its half of each expert's rows, a split
+quantized block, a repacked layout). A **pack** stores those bytes once, in each engine's final device format, so a
+load is a plain read straight into place. One pack per model serves every layout:
+- an expert-parallel rank reads the whole experts of its group;
+- a tensor-parallel rank reads its row range of each expert in one read (or its own per-rank record when a format
+  cannot be split by rows);
+- the device-gated cache reads units by key: `ss_pack_dg_descriptor` turns the engine's descriptor into one whose
+  expert parts point into the pack.
+
+A pack is a directory: `pack.json` (model, the SHA-256 of every source file, how each format was produced, the
+SHA-256 of every data file and of the index), `pack.index` (one record per tensor or expert part: key, format,
+offset, bytes, rows, xxh64) and `pack-NNNN.data` (records 4 KiB aligned, the parts of one expert next to each other).
+Pin the SHA-256 of `pack.json` and it pins everything else; records are checked against their xxh64 the first time
+they are read (`cached`, default), on every read (`always`) or not at all after `ts-pack verify --full` (`off`). A pack
+built from other source files than the ones the app loads is refused. Pack data files are ordinary files for
+`ts-stripe`, so a pack can be spread over several drives like a model file.
+
+```sh
+# The engine describes where its device bytes come from (tierstream/pack-layout-v1: byte ranges of the model file,
+# optionally row selections and byte rearrangements inside rows); the tool prints the sizes first.
+ts-pack build LAYOUT.json /models/x.pack --dry-run
+ts-pack build LAYOUT.json /models/x.pack            # prints the pin: the SHA-256 of pack.json
+ts-pack verify /models/x.pack --pin SHA256 --full   # every file's SHA-256 and every record's xxh64
+ts-pack show /models/x.pack                         # sizes per format, files, sources
+```
+
+An engine whose device format is not a byte rearrangement of the model file writes the pack itself through the writer
+API (`ss_pack_writer_begin` / `ss_pack_writer_add` / `ss_pack_writer_finish`: the pack becomes visible only when it is
+complete). Engines open a pack with `ss_pack_open` and read with `ss_pack_find` + `ss_pack_readv`; without a matching
+pack (or with the engine's switch off) they keep their original loader. Format and API: [docs/pack.md](docs/pack.md).
+
 ### What never changes
 
 Bytes are copied, never transformed, and engine kernels must not depend on which slot a unit sits in. So every
@@ -288,6 +342,49 @@ write-back logic lives here once:
 - engines describe their units in a descriptor;
 - recipes choose the budgets;
 - the engine-side code shrinks to an adapter that names the units it needs and reads them through the tables.
+
+### Whole-device budgets
+
+`--vram-total-gib 24` means "run as if this were a 24 GB card": one cap for everything on the device, one for the
+host (`--ram-total-gib`, pinned included). `ss_budget_plan` subtracts the measured CUDA context and the engine's
+named fixed parts (trunk, KV for the requested context, workspaces, drafter, pinned and pageable host buffers, load
+staging); the expert arena gets what is left of the device, the pinned tier what is left of the host, the file tier
+the rest. When the fixed parts alone do not fit, it refuses at startup naming them and the smallest cap that would
+work. With no cap it gives exactly today's three-tier placement. `ss_budget_ledger` (passed as `ss_options.budget`)
+charges every allocation tierstream makes against the same caps and keeps the peak per kind with the components at
+that peak, next to the peak the engine measured (cudaMemGetInfo / NVML). Details: [design §5.1](docs/design.md).
+
+### Running on your hardware (device profiles)
+
+At startup tierstream can describe the machine it runs on as a device profile (`strix/device-profile-v1`): host RAM,
+whether the GPU shares it (Strix Halo and its successors: one memory pool), each GPU's arch, compute units and memory,
+the USB4 links to a second box, the NVMe drives. It reads Linux sysfs (KFD topology, amdgpu memory totals,
+Thunderbolt peers), the HIP runtime, or on NVIDIA the CUDA driver and NVML (read-only queries, no allocation). A
+device class (`profiles/*.json`: `strix-halo-395`, `rtx-pro-6000-blackwell`, `rtx-4090`, generic) adds the safety
+margins and the measured numbers detection cannot know; a machine with no class (a new gfx, another card) runs on its
+detected values and today's margins, with a notice, and is never given another arch's tuned values.
+
+What the profile drives, when no explicit flag is given:
+- **GPU / RAM / disk split**: `ss_devprof_budget` sets the whole-device caps (discrete card: VRAM - reserve and
+  available RAM - floor; unified: one pool shared by the expert arena and the pinned tier); `ss_budget_plan` then
+  places experts on the device, in pinned RAM and on disk as before.
+- **One box or two**: `ss_devprof_topology` runs single-box when the model's fixed parts and a minimal expert tier fit
+  this box's budget at the requested context, else across the boxes with a measured link, splitting the layers by
+  budget share. A qualified recipe can pin its choice.
+- **Prefill piece size**: `ss_devprof_piece_rows` sizes the piece from the memory left after the plan, within the
+  engine's own bounds.
+
+```
+ts-devprof                                  # the effective profile (JSON) of this machine
+ts-devprof --budget                         # the caps it gives the planner
+ts-devprof --device-profile my-box.json     # override: a full or partial profile merged over the detected one
+STRIX_DEVICE_PROFILE=my-box.json <engine>   # the same override for any engine that reads profiles
+```
+
+Explicit `--vram-total-gib` / `--ram-total-gib` (or a recipe's numbers) always win over the profile. A partial
+override is enough to correct one value, e.g. `{"margins": {"host_floor_bytes": 17179869184}}` keeps 16 GiB free on
+the host. Every receipt can carry the profile's hash (`ss_devprof_hash`) and the merged override paths, so a result
+says which machine numbers drove it. Details: [design §5.2](docs/design.md).
 
 ## When it pays (and when it does not)
 
@@ -541,7 +638,7 @@ exception and required gates are documented in [docs/reproduce.md](docs/reproduc
 comparison against the replica's own cache passed, and so did speed parity against that cache (no slower chat,
 A/B/A); tierstream is now that replica's only cache.
 
-Measured 2026-10-25/26: DeepSeek V4.1 Flash on one RTX PRO 6000 (96 GB), Windows WDDM, device-gated mode,
+Measured with DeepSeek V4.1 Flash on one RTX PRO 6000 (96 GB), Windows WDDM, device-gated mode,
 Q2 GGUF experts (IQ2_XXS gate/up, Q2_K down; dense Q8_0), exclusive VRAM + pinned-host cache.
 
 | Merged feature | Measured comparison | Exactness / conditions |

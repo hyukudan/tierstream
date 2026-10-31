@@ -259,27 +259,52 @@ std::vector<uint64_t> placement(const fs::path& ranges, const std::string& base,
   const auto& a = field(j, "ranges");
   require(a.is_array(), SS_E_DESC, "ranges: expected array");
   // Difference arrays make overlapping ranges linear in the number of chunks and ranges.
-  // interleave: odd chunks; interleave-even: even chunks (a second stripe drive takes the chunks the first does not)
-  std::vector<int64_t> all(size_t(count + 1)), interleave(size_t(count + 1)), interleave_even(size_t(count + 1));
+  // interleave: odd chunks; interleave-even: even chunks (a second stripe drive takes the chunks the first does not);
+  // blocks:K / blocks-even:K: odd / even runs of K chunks, so that a read of a few chunks mostly has one stripe home
+  struct Rule {
+    uint64_t run;
+    uint64_t parity;
+    std::vector<int64_t> diff;
+  };
+  std::vector<int64_t> all(size_t(count + 1));
+  std::vector<Rule> rules;
+  auto rule = [&](uint64_t run, uint64_t parity) -> std::vector<int64_t>& {
+    for (auto& r : rules) if (r.run == run && r.parity == parity) return r.diff;
+    rules.push_back(Rule{run, parity, std::vector<int64_t>(size_t(count + 1))});
+    return rules.back().diff;
+  };
   for (const auto& r : a.arr) {
     ts::json_str(field(r, "name"), "range.name");
     const uint64_t offset = ts::json_u64(field(r, "offset"), "range.offset");
     const uint64_t bytes = ts::json_u64(field(r, "bytes"), "range.bytes");
     const auto policy = ts::json_str(field(r, "policy"), "range.policy");
-    require(policy == "all" || policy == "interleave" || policy == "interleave-even", SS_E_DESC, "unknown range policy");
+    uint64_t run = 1, parity = 1;
+    if (policy == "interleave-even") parity = 0;
+    else if (policy.rfind("blocks:", 0) == 0 || policy.rfind("blocks-even:", 0) == 0) {
+      const std::string k = policy.substr(policy.find(':') + 1);
+      require(!k.empty() && k.size() <= 6 && k.find_first_not_of("0123456789") == std::string::npos, SS_E_DESC,
+              "range policy blocks:K needs a run length K of 1..999999 chunks");
+      run = std::stoull(k);
+      require(run >= 1, SS_E_DESC, "range policy blocks:K needs a run length K of 1..999999 chunks");
+      parity = policy[6] == ':' ? 1 : 0;
+    } else require(policy == "all" || policy == "interleave", SS_E_DESC, "unknown range policy");
     require(offset <= size && bytes <= size - offset, SS_E_DESC, "range exceeds primary");
     if (!bytes) continue;
-    auto& diff = policy == "all" ? all : policy == "interleave" ? interleave : interleave_even;
+    auto& diff = policy == "all" ? all : rule(run, parity);
     ++diff[size_t(offset / chunk)];
     --diff[size_t((offset + bytes - 1) / chunk + 1)];
   }
   std::vector<uint64_t> chunks;
-  int64_t na = 0, ni = 0, ne = 0;
+  int64_t na = 0;
+  std::vector<int64_t> n(rules.size(), 0);
   for (uint64_t c = 0; c < count; ++c) {
     na += all[size_t(c)];
-    ni += interleave[size_t(c)];
-    ne += interleave_even[size_t(c)];
-    if (na || (ni && (c & 1)) || (ne && !(c & 1))) chunks.push_back(c);
+    bool placed = na != 0;
+    for (size_t i = 0; i < rules.size(); ++i) {
+      n[i] += rules[i].diff[size_t(c)];
+      if (n[i] && (c / rules[i].run) % 2 == rules[i].parity) placed = true;
+    }
+    if (placed) chunks.push_back(c);
   }
   return chunks;
 }

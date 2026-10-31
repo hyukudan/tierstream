@@ -15,16 +15,34 @@
 /* types */
 typedef ss_backend_kind ts_backend_kind;
 typedef ss_budget ts_budget;
+typedef ss_budget_component ts_budget_component;
+typedef ss_budget_entry ts_budget_entry;
+typedef ss_budget_in ts_budget_in;
+typedef ss_budget_kind ts_budget_kind;
+typedef ss_budget_kind_stats ts_budget_kind_stats;
+typedef ss_budget_ledger ts_budget_ledger;
+typedef ss_budget_out ts_budget_out;
+typedef ss_budget_stats ts_budget_stats;
 typedef ss_ctx ts_ctx;
 typedef ss_desc ts_desc;
+typedef ss_devprof ts_devprof;
+typedef ss_devprof_detect_opts ts_devprof_detect_opts;
+typedef ss_devprof_device ts_devprof_device;
+typedef ss_devprof_info ts_devprof_info;
+typedef ss_devprof_piece_in ts_devprof_piece_in;
+typedef ss_devprof_topology_in ts_devprof_topology_in;
+typedef ss_devprof_topology_out ts_devprof_topology_out;
 typedef ss_dg_boundary_timeline ts_dg_boundary_timeline;
 typedef ss_dg_device_view ts_dg_device_view;
 typedef ss_dg_layer_timeline ts_dg_layer_timeline;
 typedef ss_dg_part ts_dg_part;
+typedef ss_dg_round_params ts_dg_round_params;
+typedef ss_dg_round_result ts_dg_round_result;
 typedef ss_dg_stats ts_dg_stats;
 typedef ss_dg_unit ts_dg_unit;
 typedef ss_dg_winpf_params ts_dg_winpf_params;
 typedef ss_exclusive_stats ts_exclusive_stats;
+typedef ss_file_identity ts_file_identity;
 typedef ss_forward_mode ts_forward_mode;
 typedef ss_group ts_group;
 typedef ss_layer_stats ts_layer_stats;
@@ -32,9 +50,19 @@ typedef ss_layer_view ts_layer_view;
 typedef ss_mfile ts_mfile;
 typedef ss_mfile_counters ts_mfile_counters;
 typedef ss_mfile_io ts_mfile_io;
+typedef ss_mfile_location ts_mfile_location;
 typedef ss_mfile_options ts_mfile_options;
 typedef ss_mfile_verify ts_mfile_verify;
 typedef ss_options ts_options;
+typedef ss_pack ts_pack;
+typedef ss_pack_entry ts_pack_entry;
+typedef ss_pack_options ts_pack_options;
+typedef ss_pack_read_req ts_pack_read_req;
+typedef ss_pack_record_spec ts_pack_record_spec;
+typedef ss_pack_segment ts_pack_segment;
+typedef ss_pack_unit ts_pack_unit;
+typedef ss_pack_verify ts_pack_verify;
+typedef ss_pack_writer ts_pack_writer;
 typedef ss_plan ts_plan;
 typedef ss_plan_totals ts_plan_totals;
 typedef ss_policy ts_policy;
@@ -50,6 +78,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_BACKEND_CPU SS_BACKEND_CPU
 #define TS_BACKEND_CUDA SS_BACKEND_CUDA
 #define TS_BACKEND_HIP SS_BACKEND_HIP
+#define TS_BUDGET_DEVICE SS_BUDGET_DEVICE
+#define TS_BUDGET_PAGEABLE SS_BUDGET_PAGEABLE
+#define TS_BUDGET_PINNED SS_BUDGET_PINNED
 #define TS_E_BACKEND SS_E_BACKEND
 #define TS_E_CAPACITY SS_E_CAPACITY
 #define TS_E_DESC SS_E_DESC
@@ -65,6 +96,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_MFILE_VERIFY_CACHED SS_MFILE_VERIFY_CACHED
 #define TS_MFILE_VERIFY_OFF SS_MFILE_VERIFY_OFF
 #define TS_OK SS_OK
+#define TS_PACK_VERIFY_ALWAYS SS_PACK_VERIFY_ALWAYS
+#define TS_PACK_VERIFY_CACHED SS_PACK_VERIFY_CACHED
+#define TS_PACK_VERIFY_OFF SS_PACK_VERIFY_OFF
 #define TS_POLICY_LRU SS_POLICY_LRU
 #define TS_POLICY_SCORED SS_POLICY_SCORED
 #define TS_POLICY_SCORED_AUTO SS_POLICY_SCORED_AUTO
@@ -78,17 +112,43 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_TIER_RESIDENT SS_TIER_RESIDENT
 #define TS_TIER_RESIDENT_BACKED SS_TIER_RESIDENT_BACKED
 #define TS_ABI_VERSION SS_ABI_VERSION
+#define TS_BUDGET SS_BUDGET
+#define TS_BUDGET_AUTO SS_BUDGET_AUTO
+#define TS_BUDGET_JSON SS_BUDGET_JSON
+#define TS_BUDGET_KINDS SS_BUDGET_KINDS
+#define TS_BUDGET_MARGINS SS_BUDGET_MARGINS
+#define TS_BUDGET_NAME SS_BUDGET_NAME
+#define TS_BUDGET_NO_SAMPLE SS_BUDGET_NO_SAMPLE
+#define TS_BUDGET_OBSERVE SS_BUDGET_OBSERVE
+#define TS_BUDGET_REFUSE SS_BUDGET_REFUSE
+#define TS_BUDGET_TOP SS_BUDGET_TOP
+#define TS_BUDGET_UNIFIED SS_BUDGET_UNIFIED
+#define TS_DEVPROF SS_DEVPROF
+#define TS_DEVPROF_MAX_WORLD SS_DEVPROF_MAX_WORLD
+#define TS_DEVPROF_NAME SS_DEVPROF_NAME
+#define TS_DEVPROF_NO_CACHE SS_DEVPROF_NO_CACHE
+#define TS_DEVPROF_NO_ENV SS_DEVPROF_NO_ENV
+#define TS_DEVPROF_NO_RUNTIME SS_DEVPROF_NO_RUNTIME
+#define TS_DEVPROF_SCHEMA SS_DEVPROF_SCHEMA
 #define TS_DG_AUTO_EVICT SS_DG_AUTO_EVICT
+#define TS_DG_DISK_QUEUE SS_DG_DISK_QUEUE
+#define TS_DG_DISK_RECEIPTS SS_DG_DISK_RECEIPTS
+#define TS_DG_DISK_TIER SS_DG_DISK_TIER
+#define TS_DG_MAKE_RESIDENT SS_DG_MAKE_RESIDENT
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
 #define TS_DG_RESET_OPEN SS_DG_RESET_OPEN
 #define TS_DG_RESIDENCY SS_DG_RESIDENCY
+#define TS_DG_ROUNDS SS_DG_ROUNDS
 #define TS_DG_SCORED SS_DG_SCORED
 #define TS_DG_SET_POLICY SS_DG_SET_POLICY
 #define TS_DG_SET_SCHED SS_DG_SET_SCHED
+#define TS_HAVE_PACK SS_HAVE_PACK
 #define TS_HAVE_STATS_SNAPSHOT SS_HAVE_STATS_SNAPSHOT
 #define TS_MFILE SS_MFILE
+#define TS_MFILE_LOCATION_ENABLED SS_MFILE_LOCATION_ENABLED
+#define TS_MFILE_LOCATION_OPEN SS_MFILE_LOCATION_OPEN
 #define TS_MFILE_MAX_LOCATIONS SS_MFILE_MAX_LOCATIONS
 #define TS_SNAPSHOT_EXCLUSIVE SS_SNAPSHOT_EXCLUSIVE
 #define TS_SNAPSHOT_READAHEAD SS_SNAPSHOT_READAHEAD
@@ -189,6 +249,63 @@ TS_API ss_status ts_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n
 TS_API ss_status ts_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out);
 TS_API const char* ts_mfile_location_path(const ss_mfile* f, int loc);
 TS_API const char* ts_mfile_open_report(const ss_mfile* f);
+TS_API ss_status ts_mfile_location_info(const ss_mfile* f, uint32_t loc, ss_mfile_location* out);
+TS_API void ts_budget_in_defaults_sized(ss_budget_in* in, uint32_t size);
+TS_API ss_status ts_budget_plan(const ss_budget_in* in, ss_budget_out* out);
+TS_API size_t ts_budget_plan_json(const ss_budget_in* in, const ss_budget_out* out, char* buf, size_t len);
+TS_API ss_status ts_budget_ledger_create(uint64_t vram_total_bytes, uint64_t ram_total_bytes, ss_budget_ledger** out);
+TS_API void ts_budget_ledger_free(ss_budget_ledger* l);
+TS_API ss_status ts_budget_ledger_add(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes);
+TS_API ss_status ts_budget_ledger_sub(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes);
+TS_API ss_status ts_budget_ledger_observe_device(ss_budget_ledger* l, uint64_t measured_used_bytes);
+TS_API ss_status ts_budget_ledger_stats(const ss_budget_ledger* l, ss_budget_stats* out);
+TS_API ss_status ts_budget_ledger_observe(ss_budget_ledger* l, const char* stage, uint64_t device_used_bytes, uint64_t host_used_bytes);
+TS_API int ts_budget_ledger_within_caps(const ss_budget_ledger* l);
+TS_API ss_status ts_dg_make_resident(ss_ctx* c, int g, const int32_t* ids, int n);
+TS_API void ts_dg_round_defaults_sized(ss_dg_round_params* p, uint32_t size);
+TS_API ss_status ts_dg_round_sized(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out, uint32_t size);
+TS_API ss_status ts_dg_round_cancel(ss_ctx* c);
+TS_API ss_status ts_dg_round_seed_counts(ss_ctx* c, const ss_dg_unit* units, const float* counts, uint32_t n);
+TS_API void ts_devprof_detect_opts_defaults_sized(ss_devprof_detect_opts* o, uint32_t size);
+TS_API ss_status ts_devprof_detect(const ss_devprof_detect_opts* o, ss_devprof** out);
+TS_API ss_status ts_devprof_from_json(const char* text, size_t len, ss_devprof** out);
+TS_API ss_status ts_devprof_merge_json(ss_devprof* p, const char* text, size_t len, const char* origin);
+TS_API void ts_devprof_free(ss_devprof* p);
+TS_API ss_status ts_devprof_to_json(const ss_devprof* p, char** out, size_t* len);
+TS_API ss_status ts_devprof_hash(const ss_devprof* p, char out[17]);
+TS_API ss_status ts_devprof_probe_report(const ss_devprof* p, const char* host, char** out, size_t* len);
+TS_API ss_status ts_devprof_get(const ss_devprof* p, ss_devprof_info* out);
+TS_API ss_status ts_devprof_limit(const ss_devprof* p, const char* key, uint64_t* value);
+TS_API ss_status ts_devprof_get_device(const ss_devprof* p, uint32_t i, ss_devprof_device* out);
+TS_API ss_status ts_devprof_budget(const ss_devprof* p, uint32_t device, ss_budget_in* in);
+TS_API void ts_devprof_topology_in_defaults_sized(ss_devprof_topology_in* in, uint32_t size);
+TS_API ss_status ts_devprof_topology(const ss_devprof* const* profiles, uint32_t n_profiles, const ss_devprof_topology_in* in, ss_devprof_topology_out* out);
+TS_API void ts_devprof_piece_in_defaults_sized(ss_devprof_piece_in* in, uint32_t size);
+TS_API ss_status ts_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* in, uint32_t* rows);
+TS_API void ts_pack_options_defaults_sized(ss_pack_options* o, uint32_t size);
+TS_API ss_status ts_pack_open(const char* dir, const ss_pack_options* opt, ss_pack** out);
+TS_API void ts_pack_close(ss_pack* p);
+TS_API uint64_t ts_pack_records(const ss_pack* p);
+TS_API ss_status ts_pack_entry_at_sized(const ss_pack* p, uint64_t index, ss_pack_entry* out, uint32_t size);
+TS_API ss_status ts_pack_find_sized(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out, uint32_t size);
+TS_API ss_status ts_pack_segment_at(const ss_pack* p, uint64_t record, uint32_t k, ss_pack_segment* out);
+TS_API ss_status ts_pack_unit_find(const ss_pack* p, int layer, int expert, ss_pack_unit* out);
+TS_API ss_status ts_pack_read(ss_pack* p, uint64_t record, uint32_t row0, uint32_t row1, void* dst);
+TS_API ss_status ts_pack_readv(ss_pack* p, const ss_pack_read_req* reads, uint32_t n);
+TS_API ss_status ts_pack_read_unit(ss_pack* p, int layer, int expert, void* dst);
+TS_API ss_status ts_pack_dg_descriptor(ss_pack* p, const char* base_json, size_t len, char** out_json, size_t* out_len);
+TS_API uint32_t ts_pack_files(const ss_pack* p);
+TS_API int ts_pack_has_layout(const ss_pack* p, const char* layout);
+TS_API ss_status ts_pack_file_identity(const ss_pack* p, uint32_t file, ss_file_identity* out);
+TS_API ss_status ts_pack_info_json(const ss_pack* p, char** out_json, size_t* out_len);
+TS_API ss_status ts_pack_verify_full(ss_pack* p, char** out_json, size_t* out_len);
+TS_API ss_status ts_pack_writer_begin(const char* dir, const char* meta_json, size_t len, ss_pack_writer** out);
+TS_API ss_status ts_pack_writer_record_begin(ss_pack_writer* w, const ss_pack_record_spec* r);
+TS_API ss_status ts_pack_writer_record_write(ss_pack_writer* w, const void* data, uint64_t n);
+TS_API ss_status ts_pack_writer_record_end(ss_pack_writer* w);
+TS_API ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, const void* data);
+TS_API ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256);
+TS_API void ts_pack_writer_abort(ss_pack_writer* w);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }
@@ -202,6 +319,14 @@ static __device__ __forceinline__ int32_t ts_dg_slot(const ss_dg_device_view* v,
 static __device__ __forceinline__ int32_t ts_dg_slot_if_ready(const ss_dg_device_view* v, uint32_t g, int32_t id) { return ss_dg_slot_if_ready(v, g, id); }
 #endif
 static inline void ts_mfile_options_defaults(ss_mfile_options* o) { ss_mfile_options_defaults(o); }
+static inline void ts_budget_in_defaults(ss_budget_in* in) { ss_budget_in_defaults(in); }
+static inline void ts_dg_round_defaults(ss_dg_round_params* p) { ss_dg_round_defaults(p); }
+static inline ss_status ts_dg_round(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out) { return ss_dg_round(c, p, out); }
+static inline void ts_devprof_detect_opts_defaults(ss_devprof_detect_opts* o) { ss_devprof_detect_opts_defaults(o); }
+static inline void ts_devprof_topology_in_defaults(ss_devprof_topology_in* in) { ss_devprof_topology_in_defaults(in); }
+static inline void ts_devprof_piece_in_defaults(ss_devprof_piece_in* in) { ss_devprof_piece_in_defaults(in); }
+static inline void ts_pack_options_defaults(ss_pack_options* o) { ss_pack_options_defaults(o); }
+static inline ss_status ts_pack_find(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out) { return ss_pack_find(p, layer, expert, name, out); }
 
 #ifdef __cplusplus
 }

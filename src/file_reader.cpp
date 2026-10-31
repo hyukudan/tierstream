@@ -32,15 +32,20 @@ std::wstring widen(const std::string& s) {
 }
 }  // namespace
 
-File::File(const std::string& path, bool direct) : path_(path) {
-  std::wstring w = widen(path);
+File::File(const std::string& path, bool direct) : path_(path), dirs_(std::make_unique<BoundDir>(path)) {
   DWORD flags = FILE_ATTRIBUTE_NORMAL | (direct ? FILE_FLAG_NO_BUFFERING : FILE_FLAG_SEQUENTIAL_SCAN);
-  HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+  HANDLE h = static_cast<HANDLE>(dirs_->open_leaf(GENERIC_READ, FILE_SHARE_READ, flags));
   if (h == INVALID_HANDLE_VALUE && direct) {
-    h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    h = static_cast<HANDLE>(dirs_->open_leaf(GENERIC_READ, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL));
     direct = false;
   }
   require(h != INVALID_HANDLE_VALUE, SS_E_IO, "open " + path + ": error " + std::to_string(GetLastError()));
+  try {
+    dirs_->check_leaf(h);
+  } catch (...) {
+    CloseHandle(h);
+    throw;
+  }
   LARGE_INTEGER sz;
   if (!GetFileSizeEx(h, &sz)) {
     CloseHandle(h);
@@ -54,6 +59,8 @@ File::File(const std::string& path, bool direct) : path_(path) {
 File::~File() {
   if (h_) CloseHandle(static_cast<HANDLE>(h_));
 }
+
+FileIdentity File::identity() const { return identity_of_handle(h_, path_); }
 
 uint64_t File::pread(void* dst, uint64_t n, uint64_t offset) const {
   uint64_t done = 0;
@@ -78,19 +85,25 @@ uint64_t File::pread(void* dst, uint64_t n, uint64_t offset) const {
 
 #else
 
-File::File(const std::string& path, bool direct) : path_(path) {
+File::File(const std::string& path, bool direct) : path_(path), dirs_(std::make_unique<BoundDir>(path)) {
   int fd = -1;
   if (direct) {
-    fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    fd = dirs_->open_leaf(O_RDONLY | O_DIRECT | O_NONBLOCK);
     if (fd < 0 && (errno == EINVAL || errno == EOPNOTSUPP)) direct = false;
     else if (fd < 0) fail(SS_E_IO, "open " + path + ": " + std::strerror(errno));
   }
   if (fd < 0) {
-    fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd = dirs_->open_leaf(O_RDONLY | O_NONBLOCK);
     require(fd >= 0, SS_E_IO, "open " + path + ": " + std::strerror(errno));
 #if defined(POSIX_FADV_RANDOM)
     posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
 #endif
+  }
+  try {
+    dirs_->check_leaf(fd);
+  } catch (...) {
+    ::close(fd);
+    throw;
   }
   struct stat st;
   if (fstat(fd, &st) != 0) {
@@ -105,6 +118,8 @@ File::File(const std::string& path, bool direct) : path_(path) {
 File::~File() {
   if (fd_ >= 0) ::close(fd_);
 }
+
+FileIdentity File::identity() const { return identity_of_fd(fd_, path_); }
 
 uint64_t File::pread(void* dst, uint64_t n, uint64_t offset) const {
   uint64_t done = 0;

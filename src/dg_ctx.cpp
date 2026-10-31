@@ -19,10 +19,12 @@
 
 #include <thread>
 
+#include "budget.hpp"
 #include "dg_core.hpp"
 #include "dg_load.hpp"
 #include "dg_kernels.hpp"
 #include "dg_service.hpp"
+#include "dg_steps.hpp"
 #include "source_file.hpp"
 #include "xxh64.hpp"
 #endif
@@ -216,6 +218,22 @@ class CudaTransport final : public DgTransport {
     const CUresult r = cuStreamQuery(reinterpret_cast<CUstream>(s_[s]));
     if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (prefetch flush)");
   }
+  // three-tier: the context's synchronous file read of a key into a host block (staging buffers follow the blocks);
+  // with a pool (dg_disk_queue > 1) the core's overlapped reads run on its threads
+  std::function<void(uint32_t, char*)> reader;
+  std::unique_ptr<DgReadPool> pool;
+  void read_unit(uint32_t key, int32_t block) override {
+    if (!reader) DgTransport::read_unit(key, block);
+    reader(key, host_block(block));
+  }
+  void* read_unit_begin(uint32_t key, int32_t block) override {
+    if (!pool) return DgTransport::read_unit_begin(key, block);
+    if (!reader) DgTransport::read_unit(key, block);
+    char* dst = host_block(block);
+    return pool->submit([this, key, dst] { reader(key, dst); });
+  }
+  uint64_t read_unit_end(void* handle) override { return pool ? pool->wait(handle) : 0; }
+  bool read_unit_done(void* handle) override { return !pool || pool->done(handle); }
   void* event_create() override {
     cudaEvent_t e = nullptr;
     ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
@@ -298,12 +316,24 @@ struct LoadRing {
 
 class CudaDgCtx final : public DgCtx {
  public:
-  CudaDgCtx(const Desc& d, const Plan& p, const ss_options& o) : d_(d), o_(o), x_(dg_layout(d, p, o)) {
+  CudaDgCtx(const Desc& d, const Plan& p, const ss_options& o)
+      : d_(d), o_(o), x_(dg_layout(d, p, o)), charges_(o.budget) {
     weight_dirs_ = o.weight_dirs ? o.weight_dirs : "";
     o_.weight_dirs = weight_dirs_.c_str();
     try {
       init();
     } catch (...) {
+      // The overlap's helper is joined first, its chunks completing or failing as in the serial order: its error is the
+      // open's error, as when every block was allocated before what follows (then everything allocated is freed).
+      try {
+        if (block_alloc_) {
+          const auto a = std::move(block_alloc_);
+          a->finish(&chunks_, &blocks_);
+        }
+      } catch (...) {
+        release_all(true);
+        throw;
+      }
       release_all(true);
       throw;
     }
@@ -318,16 +348,17 @@ class CudaDgCtx final : public DgCtx {
 
   void begin(const uint32_t* rows, int n_layers) override {
     require(!in_token_, SS_E_INVALID, "ss_begin: a gated token is already open (call ss_end)");
-    if (rows) {
+    if (rows)
       require(n_layers == int(d_.layers.size()), SS_E_INVALID, "ss_begin: rows_per_layer must cover every layer");
-      for (int L : x_.gated)
-        require(rows[size_t(L)] > 0, SS_E_INVALID,
-                "ss_begin: gated layer " + std::to_string(L) + " has 0 rows (every gated layer runs in every token)");
-    }
-    // design rev 3.4 §11.1: no step ran outside a pair (every word still holds the last token's sequence)
-    bool clean = dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_;
+    // The layers this step exports: rows > 0 (or no rows) and no ss_dg_make_resident set (a resident layer reads only
+    // its kept units, through ss_dg_slot, and is never exported while the set is held).
+    steps_.plan(rows, x_.gated);
+    // design rev 3.4 §11.1: no step ran outside a pair (every word still holds the last token's sequence; a gated
+    // layer's export flag the last sequence that exported it: an export of a layer the step did not announce shows here)
+    bool clean = dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_ &&
+                 steps_.flags_clean(m_.flag, dg_load_acquire);
     for (size_t g = 0; clean && g < x_.gated.size(); ++g)
-      clean = dg_load_acquire(m_.flag + g) == seq_ && int32_t(dg_load_acquire(m_.pflag + g) - seq_) <= 0;
+      clean = int32_t(dg_load_acquire(m_.pflag + g) - seq_) <= 0;
     if (!clean) {
       dg_store_release(m_.host_abort, 1);
       svc_->stop_join();
@@ -338,10 +369,11 @@ class CudaDgCtx final : public DgCtx {
                              "; the context is poisoned)");
     }
     ++seq_;
+    steps_.begin(seq_);
     in_token_ = true;
     device_busy_ = true;  // until its end kernel is seen
     dg_store_release(m_.host_seq, seq_);  // the begin kernel authorizes exactly this sequence
-    svc_->begin(seq_);
+    svc_->begin(seq_, &steps_.run());
   }
 
   void end(uint32_t rows = 1) override {
@@ -403,13 +435,15 @@ class CudaDgCtx final : public DgCtx {
                              " (the context is poisoned, the token's outputs must be discarded)");
     }
     // 4. The boundary.
-    std::vector<uint32_t> keep;
-    for (const auto& k : keep_) keep.insert(keep.end(), k.begin(), k.end());
-    core_->end_token(keep, rows);  // syncs the demand stream: the diagnostics marks have completed
+    core_->end_token(steps_.all_kept(), rows);  // syncs the demand stream: the diagnostics marks have completed
     if (o_.dg_diag) {
       transport_->diag_collect();
       for (uint32_t g = 0; g < uint32_t(diag_.size()); ++g) {
         LayerDiag& d = diag_[g];
+        if (!steps_.exported(g)) {  // not exported this token: nothing measured (its stamps are an older token's)
+          d = LayerDiag{};
+          continue;
+        }
         d.dma_ms = transport_->dma_ms(g);
         d.dma_first_ms = transport_->dma_first_ms(g);
         d.wb_left_ms = transport_->wb_left_ms(g);
@@ -479,7 +513,7 @@ class CudaDgCtx final : public DgCtx {
       require(seq_ ? state == DgService::kServed : state == DgService::kIdle,
               SS_E_BACKEND, "ss_dg_reset_open: service does not have terminal ownership");
       core_->reset_open();
-      for (auto& k : keep_) k.clear();
+      steps_.reset();
       svc_->invalidate_timeline();
       std::fill(diag_.begin(), diag_.end(), LayerDiag{});
       timeline_valid_ = false;
@@ -491,6 +525,8 @@ class CudaDgCtx final : public DgCtx {
       fold_free_slots_ = core_->free_slots();
       fold_free_blocks_ = core_->free_blocks();
       fold_wb_outstanding_ = core_->wb_outstanding_bytes();
+      fold_disk_units_ = core_->file_units();
+      fold_backed_units_ = core_->backed_units();
       stats_reset();
     } catch (...) {
       poisoned_ = true;
@@ -520,7 +556,85 @@ class CudaDgCtx final : public DgCtx {
       require(ids[i] >= 0 && uint32_t(ids[i]) < core_->units(uint32_t(g)), SS_E_INVALID, "ss_dg_keep: id out of range");
       k.push_back(core_->key(uint32_t(g), uint32_t(ids[i])));
     }
-    keep_[size_t(g)] = std::move(k);
+    steps_.keep(uint32_t(g), std::move(k));  // a plain keep: g is exported again
+  }
+
+  void make_resident(int g, const int32_t* ids, int n) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_make_resident: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_make_resident: poisoned context");
+    require(g >= 0 && uint32_t(g) < x_.gated.size(), SS_E_INVALID, "ss_dg_make_resident: gated layer out of range");
+    require(n >= 0 && (n == 0 || ids), SS_E_INVALID, "ss_dg_make_resident: bad arguments");
+    std::vector<uint32_t> units, keys;
+    std::vector<uint8_t> seen(core_->units(uint32_t(g)), 0);
+    for (int i = 0; i < n; ++i) {
+      require(ids[i] >= 0 && uint32_t(ids[i]) < core_->units(uint32_t(g)), SS_E_INVALID,
+              "ss_dg_make_resident: id out of range");
+      require(!seen[size_t(ids[i])], SS_E_INVALID, "ss_dg_make_resident: duplicate id " + std::to_string(ids[i]));
+      seen[size_t(ids[i])] = 1;
+      units.push_back(uint32_t(ids[i]));
+      keys.push_back(core_->key(uint32_t(g), uint32_t(ids[i])));
+    }
+    // the same state rules as ss_dg_set_policy / ss_dg_reset_open: the device and the service handed the core back
+    require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_, SS_E_BACKEND,
+            "ss_dg_make_resident: device sequence desync");
+    const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
+    require(seq_ ? state == DgService::kServed : state == DgService::kIdle, SS_E_BACKEND,
+            "ss_dg_make_resident: service does not have terminal ownership");
+    if (n == 0) {  // nothing to make resident: the release (as ss_dg_keep(c, g, NULL, 0))
+      steps_.keep(uint32_t(g), {});
+      return;
+    }
+    // every keep is protected during the call, g's current one included: a failed call leaves it, and its units, as
+    // they were
+    try {
+      core_->make_resident(uint32_t(g), units, steps_.protect());  // a capacity refusal changes nothing
+    } catch (...) {
+      // a read failure (SS_E_IO) leaves the cache consistent (the units moved so far stay); a device failure leaves
+      // the core poisoned: so is the context
+      if (core_->poisoned()) poisoned_ = true;
+      else fold(false);
+      throw;
+    }
+    steps_.hold(uint32_t(g), std::move(keys));
+    fold(false);  // publish the resident counters without reporting a token to the hook
+  }
+
+  // ss_dg_round: the state rules of ss_dg_make_resident; every keep (ss_dg_keep, held sets) is protected.
+  void round(const DgRoundIn& in) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_round: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_round: poisoned context");
+    require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_, SS_E_BACKEND,
+            "ss_dg_round: device sequence desync");
+    const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
+    require(seq_ ? state == DgService::kServed : state == DgService::kIdle, SS_E_BACKEND,
+            "ss_dg_round: service does not have terminal ownership");
+    try {
+      core_->round(in, steps_.protect());
+    } catch (...) {
+      // a read failure (SS_E_IO) leaves the cache consistent; a device failure leaves the core poisoned: so is the
+      // context
+      if (core_->poisoned()) poisoned_ = true;
+      else fold(false);
+      throw;
+    }
+    fold(false);  // publish the round counters without reporting a token to the hook
+  }
+  const DgRoundOut& last_round() const override { return core_->last_round(); }
+  void round_cancel() override { core_->cancel_round(); }
+  void round_seed_counts(const ss_dg_unit* units, const float* counts, uint32_t n) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_round_seed_counts: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_round_seed_counts: poisoned context");
+    std::vector<uint32_t> keys;
+    std::vector<float> c;
+    for (uint32_t i = 0; i < n; ++i) {
+      const int g = units[i].gated;
+      require(g >= 0 && uint32_t(g) < x_.gated.size(), SS_E_INVALID, "ss_dg_round_seed_counts: gated layer out of range");
+      require(units[i].unit >= 0 && uint32_t(units[i].unit) < core_->units(uint32_t(g)), SS_E_INVALID,
+              "ss_dg_round_seed_counts: unit out of range");
+      keys.push_back(core_->key(uint32_t(g), uint32_t(units[i].unit)));
+      c.push_back(counts[i]);
+    }
+    core_->seed_round_counts(keys, c);
   }
 
   void check_unit(int layer, int unit) override {
@@ -531,6 +645,17 @@ class CudaDgCtx final : public DgCtx {
     core_->drain();
     const uint32_t k = core_->key(uint32_t(g), uint32_t(unit));
     std::vector<char> got(size_t(x_.unit_bytes));
+    if (core_->home(k) == DgCore::Home::File) {  // three-tier: its only copy is the file
+      core_->check();
+      return;
+    }
+    if (core_->backed(k)) {  // a clean copy: its block must hold the bytes too
+      std::vector<char> expected(size_t(x_.unit_bytes));
+      read_unit(layer, unit, expected.data(), false, nullptr);
+      require(std::memcmp(blocks_[size_t(core_->block_of(k))], expected.data(), expected.size()) == 0, SS_E_HASH,
+              "check_unit: the clean copy of (" + std::to_string(layer) + ", " + std::to_string(unit) +
+                  ") differs from the source");
+    }
     if (core_->slot_of(k) >= 0 &&
         (core_->home(k) == DgCore::Home::Device || core_->home(k) == DgCore::Home::Evicting)) {
       for (size_t p = 0; p < x_.part_bytes.size(); ++p)
@@ -712,6 +837,30 @@ class CudaDgCtx final : public DgCtx {
     out->score_deferred = a.score_deferred;
     out->score_last_ns = a.score_last_ns;
     out->wb_outstanding_bytes = fold_wb_outstanding_;
+    out->disk_reads = a.disk_reads;
+    out->disk_read_bytes = a.disk_read_bytes;
+    out->disk_read_ns = a.disk_read_ns;
+    out->disk_wait_ns = a.disk_wait_ns;
+    out->disk_overlapped = a.disk_overlapped;
+    out->disk_max_in_flight = a.disk_max_in_flight;
+    out->disk_carried = a.disk_carried;
+    out->disk_carried_bytes = a.disk_carried_bytes;
+    out->disk_stage_waits = a.disk_stage_waits;
+    out->disk_drops = a.disk_drops;
+    out->disk_discards = a.disk_discards;
+    out->inclusive_kept = a.inclusive_kept;
+    out->inclusive_drops = a.inclusive_drops;
+    out->disk_units = fold_disk_units_;
+    out->backed_units = fold_backed_units_;
+    out->resident_units = a.resident_units;
+    out->resident_evicted = a.resident_evicted;
+    out->resident_bytes = a.resident_bytes;
+    out->resident_ns = a.resident_ns;
+    out->round_count = a.round_count;
+    out->round_units = a.round_units;
+    out->round_bytes = a.round_bytes;
+    out->round_ns = a.round_ns;
+    out->round_cancelled = a.round_cancelled;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
@@ -867,6 +1016,19 @@ class CudaDgCtx final : public DgCtx {
     d.wb_cancelled_bytes = a.wb_cancelled_bytes - b.wb_cancelled_bytes;
     d.wb_boundary_flushed_bytes = a.wb_boundary_flushed_bytes - b.wb_boundary_flushed_bytes;
     d.wb_forced_wait_ns = a.wb_forced_wait_ns - b.wb_forced_wait_ns;
+    d.disk_reads = a.disk_reads - b.disk_reads;
+    d.disk_read_bytes = a.disk_read_bytes - b.disk_read_bytes;
+    d.disk_read_ns = a.disk_read_ns - b.disk_read_ns;
+    d.disk_wait_ns = a.disk_wait_ns - b.disk_wait_ns;
+    d.disk_overlapped = a.disk_overlapped - b.disk_overlapped;
+    d.disk_carried = a.disk_carried - b.disk_carried;
+    d.disk_carried_bytes = a.disk_carried_bytes - b.disk_carried_bytes;
+    d.disk_max_in_flight = a.disk_max_in_flight;  // a gauge
+    d.disk_stage_waits = a.disk_stage_waits - b.disk_stage_waits;
+    d.disk_drops = a.disk_drops - b.disk_drops;
+    d.disk_discards = a.disk_discards - b.disk_discards;
+    d.inclusive_kept = a.inclusive_kept - b.inclusive_kept;
+    d.inclusive_drops = a.inclusive_drops - b.inclusive_drops;
     d.winpf_hints = a.winpf_hints - b.winpf_hints;
     d.winpf_hint_rows = a.winpf_hint_rows - b.winpf_hint_rows;
     d.prior_issued = a.prior_issued - b.prior_issued;
@@ -889,6 +1051,15 @@ class CudaDgCtx final : public DgCtx {
     d.score_ns = a.score_ns - b.score_ns;
     d.score_deferred = a.score_deferred - b.score_deferred;
     d.score_last_ns = a.score_last_ns - b.score_last_ns;
+    d.resident_units = a.resident_units - b.resident_units;
+    d.resident_evicted = a.resident_evicted - b.resident_evicted;
+    d.resident_bytes = a.resident_bytes - b.resident_bytes;
+    d.resident_ns = a.resident_ns - b.resident_ns;
+    d.round_count = a.round_count - b.round_count;
+    d.round_units = a.round_units - b.round_units;
+    d.round_bytes = a.round_bytes - b.round_bytes;
+    d.round_ns = a.round_ns - b.round_ns;
+    d.round_cancelled = a.round_cancelled - b.round_cancelled;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -967,7 +1138,8 @@ class CudaDgCtx final : public DgCtx {
     j["total"] = one(t);
     j["layers"] = ls;
     Json x = Json::object();
-    x["writebacks"] = Json::number(life.evicted - life.wb_cancelled);
+    // (three-tier drops are evictions without a write-back: 0 in the two-tier cache)
+    x["writebacks"] = Json::number(life.evicted - life.wb_cancelled - life.inclusive_drops - life.disk_discards);
     x["writeback_bytes"] = Json::number(life.wb_issued_bytes);
     x["deferred"] = Json::number(life.evict_short);  // the host contract's: victims kept for want of a block
     x["wb_deferred"] = Json::number(life.wb_deferred);  // write-backs deferred into the next token (dg_wb_defer)
@@ -1010,10 +1182,33 @@ class CudaDgCtx final : public DgCtx {
         {"score_saturated", s.score_saturated},
         {"score_ns", s.score_ns},
         {"score_deferred", s.score_deferred},
-        {"score_last_ns", s.score_last_ns}};
+        {"score_last_ns", s.score_last_ns},
+        {"resident_units", s.resident_units},
+        {"resident_evicted", s.resident_evicted},
+        {"resident_bytes", s.resident_bytes},
+        {"resident_ns", s.resident_ns},
+        {"round_count", s.round_count},
+        {"round_units", s.round_units},
+        {"round_bytes", s.round_bytes},
+        {"round_ns", s.round_ns},
+        {"round_cancelled", s.round_cancelled}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
     g["policy"] = Json::string(core_->policy() == 2 ? "auto" : core_->policy() == 1 ? "scored" : "lru");
     if (!core_->profile_provenance().empty()) g["score_profile"] = Json::string(core_->profile_provenance());
+    if (x_.disk_tier || x_.I) {  // three-tier (SS_DG_DISK_TIER): only when on, so the two-tier document is unchanged
+      Json tt = Json::object();
+      const std::pair<const char*, uint64_t> tf[] = {
+          {"disk_reads", s.disk_reads}, {"disk_read_bytes", s.disk_read_bytes}, {"disk_read_ns", s.disk_read_ns},
+          {"disk_stage_waits", s.disk_stage_waits}, {"disk_drops", s.disk_drops}, {"disk_discards", s.disk_discards},
+          {"inclusive_kept", s.inclusive_kept}, {"inclusive_drops", s.inclusive_drops},
+          {"disk_wait_ns", s.disk_wait_ns}, {"disk_overlapped", s.disk_overlapped},
+          {"disk_carried", s.disk_carried}, {"disk_carried_bytes", s.disk_carried_bytes},
+          {"disk_max_in_flight", s.disk_max_in_flight}, {"unit_subread_bytes", x_.unit_subread},
+          {"disk_queue", uint64_t(x_.disk_queue)},
+          {"disk_units_open", uint64_t(x_.F)}, {"staging", uint64_t(x_.S)}, {"inclusive_blocks", uint64_t(x_.I)}};
+      for (const auto& f : tf) tt[f.first] = Json::number(f.second);
+      g["three_tier"] = tt;
+    }
     j["device_gated"] = g;
     return j;
   }
@@ -1028,6 +1223,8 @@ class CudaDgCtx final : public DgCtx {
     fold_free_slots_ = core_->free_slots();
     fold_free_blocks_ = core_->free_blocks();
     fold_wb_outstanding_ = core_->wb_outstanding_bytes();
+    fold_disk_units_ = core_->file_units();
+    fold_backed_units_ = core_->backed_units();
     min_free_blocks_ = std::min(min_free_blocks_, fold_free_blocks_);
     if (hook_ && call_hook) {
       std::fill(hook_fwd_.begin(), hook_fwd_.end(), ss_layer_stats{});
@@ -1071,46 +1268,12 @@ class CudaDgCtx final : public DgCtx {
     }
   }
 
-  // One unit's bytes (its parts back to back) into dst, with the covering aligned range through the staging buffer
-  // when the direct-I/O alignment rules are not met.
+  // One unit's bytes (its parts back to back) into dst, with the covering aligned range through the bounce buffer
+  // when the direct-I/O alignment rules are not met (one bounce buffer: the pool's readers take turns on it); the
+  // in-place parts of a multi-location session as one preadv (dg_read_unit).
   void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest, DgLoadStats* stats = nullptr) {
-    const Layer& l = d_.layers[size_t(layer)];
-    auto read = [&](const SourceFile& file, void* out, uint64_t n, uint64_t off) {
-      const uint64_t got = file.pread(out, n, off);
-      if (stats) { stats->read_bytes += got; ++stats->read_calls; }
-      return got;
-    };
-    Xxh64 h;
-    uint64_t pos = 0;
-    for (const Part& part : l.parts) {
-      const SourceFile& f = *files_[size_t(part.source)];
-      const uint64_t al = f.alignment(d_.sources[size_t(part.source)].align);
-      const uint64_t F = part.offset + uint64_t(unit) * part.stride;
-      char* out = at(dst, pos);
-      require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
-                                                       ") part " + part.name + " is past the end of its source");
-      const bool in_place = !f.direct() || (F % al == 0 && part.bytes % al == 0 && uintptr_t(out) % al == 0);
-      if (in_place) {
-        require(read(f, out, part.bytes, F) == part.bytes, SS_E_IO, "short read");
-      } else {
-        if (stats) stats->bounce_bytes += part.bytes;
-        const uint64_t cap = (bounce_bytes_ - 2 * al) / al * al;
-        for (uint64_t c = 0; c < part.bytes;) {
-          const uint64_t len = std::min(cap, part.bytes - c);
-          const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = round_up(F + c + len, al);
-          require(read(f, bounce_, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
-          std::memcpy(out + c, at(bounce_, delta), size_t(len));
-          c += len;
-        }
-      }
-      if (hash) {
-        const auto hash_start = std::chrono::steady_clock::now();
-        h.update(out, size_t(part.bytes));
-        if (stats) stats->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now()-hash_start).count();
-      }
-      pos += part.bytes;
-    }
-    if (digest) *digest = h.digest();
+    dg_read_unit(d_, files_, layer, unit, dst, bounce_, bounce_bytes_, hash, digest, stats, &bounce_mu_, true,
+                 x_.unit_subread);
   }
 
   void read_checked(int layer, int unit, void* dst, DgLoadStats* stats = nullptr) {
@@ -1130,6 +1293,9 @@ class CudaDgCtx final : public DgCtx {
     // Dense weights belong to the caller; entry is the expert-loader boundary.
     std::fprintf(stderr, "dg_load dense_done=external expert_start_s=0 mode=%s\n",
                  x_.load_serial ? "serial" : "pipeline");
+    // Whole-device budgets (ss_options.budget): every allocation below is charged before it is made, so a cap refuses
+    // the open naming it; the context's charges go back when it closes, the load ring's when the open ends.
+    BudgetCharges ring_charges(o_.budget);
     LoadRing ring;
     double pinned_alloc_s = 0;
     auto pin = [&](void** p, size_t n, unsigned flags, const char* what) {
@@ -1140,13 +1306,21 @@ class CudaDgCtx final : public DgCtx {
     device_ = o_.device;
     ck(cudaSetDevice(device_), "cudaSetDevice");
     ck_launch(dgk::preload(), "loading the kernels");
-    for (const auto& s : d_.sources) files_.push_back(open_source(s.path, o_));
+    for (size_t i = 0; i < d_.sources.size(); ++i)
+      files_.push_back(open_source(d_.sources[i].path, o_, expected_source_identity(o_, i)));
+    o_.source_identity_n = 0;  // read only during ss_open
+    o_.source_identities = nullptr;
     bounce_bytes_ = x_.bounce_bytes;  // the sizes admission billed (dg_layout)
+    charges_.charge(SS_BUDGET_PINNED, "dg bounce", bounce_bytes_);
+    charges_.charge(SS_BUDGET_PINNED, "dg staging", x_.staging_bytes);
     pin(&bounce_, size_t(bounce_bytes_), cudaHostAllocPortable, "cudaHostAlloc (bounce)");
     pin(reinterpret_cast<void**>(&staging_), size_t(x_.staging_bytes), cudaHostAllocPortable,  // also the reset spare
         "cudaHostAlloc (staging)");
 
     // Device: the arena (one array per part; the guard slot last, zeroed), the table, the controls.
+    for (uint64_t pb : x_.part_bytes) charges_.charge(SS_BUDGET_DEVICE, "dg arena", uint64_t(x_.slots) * pb);
+    charges_.charge(SS_BUDGET_DEVICE, "dg slot table", uint64_t(x_.keys) * 4);
+    charges_.charge(SS_BUDGET_DEVICE, "dg controls", uint64_t(DgLayout::ctl_words(uint32_t(x_.gated.size()))) * 4);
     for (uint64_t pb : x_.part_bytes) {
       void* a = nullptr;
       ck(cudaMalloc(&a, size_t(uint64_t(x_.slots) * pb)), "cudaMalloc (arena)");
@@ -1173,6 +1347,7 @@ class CudaDgCtx final : public DgCtx {
 
     // Mapped control area.
     void* mh = nullptr;
+    charges_.charge(SS_BUDGET_PINNED, "dg mapped controls", x_.mapped_bytes);
     pin(&mh, size_t(x_.mapped_bytes), cudaHostAllocMapped | cudaHostAllocPortable, "cudaHostAlloc (mapped)");
     mapped_ = mh;
     std::memset(mh, 0, size_t(x_.mapped_bytes));
@@ -1209,24 +1384,65 @@ class CudaDgCtx final : public DgCtx {
     dev_.began = words_d + 5;
     dev_.m_err_count = words_d + 6;
 
-    // Pinned blocks: P + Q of the host stride, in chunks of at most 1 GiB.
+    // Pinned blocks: P + Q of the host stride, in chunks of at most 1 GiB; three-tier: then one chunk of the file
+    // reads' staging buffers, block indices blocks .. blocks + S - 1.
     const uint64_t hs = x_.host_stride;
     const uint64_t per_chunk = std::max<uint64_t>(1, (uint64_t(1) << 30) / hs);
+    std::vector<uint64_t> chunk_blocks;
     for (uint64_t left = x_.blocks; left > 0;) {
       const uint64_t n = std::min(per_chunk, left);
-      void* c = nullptr;
-      pin(&c, size_t(n * hs), cudaHostAllocPortable, "cudaHostAlloc (blocks)");
-      chunks_.push_back(c);
-      for (uint64_t i = 0; i < n; ++i) blocks_.push_back(at(c, i * hs));
+      chunk_blocks.push_back(n);
       left -= n;
     }
-
-    const auto ring_start = Clock::now();
-    ring.allocate(x_);
-    pinned_alloc_s += std::chrono::duration<double>(Clock::now()-ring_start).count();
-    std::fprintf(stderr, "dg_load pinned_alloc_done_s=%.6f pinned_alloc_s=%.6f readers=%u buffers=%u buffer_bytes=%llu\n",
-                 elapsed(), pinned_alloc_s,
-                 x_.load_readers, x_.load_buffers, (unsigned long long)x_.load_buffer_bytes);
+    if (x_.S) chunk_blocks.push_back(x_.S);
+    const size_t disk_staging_chunk = x_.S ? chunk_blocks.size() - 1 : chunk_blocks.size();
+    charges_.charge(SS_BUDGET_PINNED, "dg pinned blocks", uint64_t(x_.blocks) * hs);
+    if (x_.S) charges_.charge(SS_BUDGET_PINNED, "dg disk staging", uint64_t(x_.S) * hs);
+    auto pin_chunk = [disk_staging_chunk](size_t c, uint64_t bytes) {
+      void* p = nullptr;
+      ck(cudaHostAlloc(&p, size_t(bytes), cudaHostAllocPortable),
+         c == disk_staging_chunk ? "cudaHostAlloc (disk staging)" : "cudaHostAlloc (blocks)");
+      return p;
+    };
+    auto pin_ring = [&] {
+      const auto ring_start = Clock::now();
+      if (!x_.load_serial)
+        ring_charges.charge(SS_BUDGET_PINNED, "dg load staging", uint64_t(x_.load_buffers) * x_.load_buffer_bytes);
+      ring.allocate(x_);
+      pinned_alloc_s += std::chrono::duration<double>(Clock::now()-ring_start).count();
+    };
+    auto print_pinned = [&](double done_s) {
+      std::fprintf(stderr, "dg_load pinned_alloc_done_s=%.6f pinned_alloc_s=%.6f readers=%u buffers=%u buffer_bytes=%llu\n",
+                   done_s, pinned_alloc_s,
+                   x_.load_readers, x_.load_buffers, (unsigned long long)x_.load_buffer_bytes);
+    };
+    // DG_LOAD_OVERLAP_ALLOC (dg_layout; pipeline only): the ring first, then the chunks on a helper thread while the
+    // loader reads the residents (they need only the arena and the ring); a host unit is read once its chunk exists.
+    // blocks_ is filled when the helper is joined, right after the loader: nothing before uses a block pointer (the
+    // core places by index; the transport keeps a reference to blocks_ and first uses it from the service).
+    const bool overlap = x_.load_overlap_alloc && !x_.load_serial;
+    if (overlap) {
+      pin_ring();
+      const int dev = device_;
+      block_alloc_ = std::make_unique<DgBlockAlloc>(
+          chunk_blocks, hs,
+          [dev, pin_chunk](size_t c, uint64_t bytes) {
+            ck(cudaSetDevice(dev), "cudaSetDevice (blocks)");
+            return pin_chunk(c, bytes);
+          },
+          [](void* p) { cudaFreeHost(p); });
+      block_alloc_->start();
+    } else {
+      for (size_t c = 0; c < chunk_blocks.size(); ++c) {
+        const auto t = Clock::now();
+        void* p = pin_chunk(c, chunk_blocks[c] * hs);
+        pinned_alloc_s += std::chrono::duration<double>(Clock::now()-t).count();
+        chunks_.push_back(p);
+        for (uint64_t i = 0; i < chunk_blocks[c]; ++i) blocks_.push_back(at(p, i * hs));
+      }
+      pin_ring();
+      print_pinned(elapsed());
+    }
 
     const auto touch_start = Clock::now();
     // Reads first-touch payload pages in parallel; spare blocks are filled on use.
@@ -1235,6 +1451,7 @@ class CudaDgCtx final : public DgCtx {
                  std::chrono::duration<double>(Clock::now()-touch_start).count());
 
     // The core: residents in slots 0..R-1, every other unit in a block (key order), spares free.
+    charges_.charge(SS_BUDGET_PINNED, "dg table staging", uint64_t(x_.keys ? x_.keys : 1) * 4);
     transport_ = std::make_unique<CudaTransport>(x_, arena_, slot_of_, dev_.ready, blocks_, staging_, o_.dg_flush_ready != 0);
     DgConfig c;
     for (int L : x_.gated) c.n_units.push_back(uint32_t(d_.layers[size_t(L)].n_units));
@@ -1261,6 +1478,22 @@ class CudaDgCtx final : public DgCtx {
     c.w_freq = x_.w_freq;
     c.w_rec = x_.w_rec;
     c.max_ids = x_.B;
+    c.disk_tier = x_.disk_tier;  // three-tier (SS_DG_DISK_TIER): all four stay 0 / false without dg_disk_tier
+    c.disk_prefetch = x_.disk_prefetch;
+    c.home_blocks = x_.disk_tier ? x_.P : 0;
+    c.disk_staging = x_.S;
+    c.inclusive = x_.I;
+    c.disk_queue = x_.disk_queue;
+    c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
+    if (x_.disk_tier) {
+      // (the gated layer from the layout's bases: the pool's threads never touch the core)
+      transport_->reader = [this](uint32_t key, char* dst) {
+        const uint32_t g = uint32_t(std::upper_bound(x_.unit_base.begin(), x_.unit_base.end(), key) -
+                                    x_.unit_base.begin()) - 1;
+        read_checked(x_.gated[g], int(key - x_.unit_base[g]), dst);
+      };
+      if (x_.disk_queue > 1) transport_->pool = std::make_unique<DgReadPool>(x_.disk_queue);
+    }
     core_ = std::make_unique<DgCore>(c, transport_.get());
     // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()
     // keeps the first persistent_slots - T distinct keys, and that order is the recency order.
@@ -1280,7 +1513,7 @@ class CudaDgCtx final : public DgCtx {
     o_.dg_seed_n = 0;
     order.insert(order.end(), x_.residents.begin(), x_.residents.end());
     for (uint32_t k = 0; k < x_.keys; ++k) order.push_back(k);
-    core_->place(order);
+    core_->place(order, x_.disk_tier ? &x_.disk : nullptr);
     if (o_.dg_prior_len) {  // winpf: validated and copied now, before the service starts (ss.h: Window prefetch)
       require(o_.dg_prior != nullptr, SS_E_INVALID, "device-gated: dg_prior_len > 0 with a null dg_prior");
       core_->set_prior(parse_hint_prior(o_.dg_prior, o_.dg_prior_len, d_, x_.gated));
@@ -1296,6 +1529,7 @@ class CudaDgCtx final : public DgCtx {
       core_->set_diag(true);
       // the kernels' stamps: a small mapped buffer of its own (diagnostics only, not billed)
       void* h = nullptr;
+      charges_.charge(SS_BUDGET_PINNED, "dg diag stamps", uint64_t(G) * 4 * sizeof(unsigned long long));
       ck(cudaHostAlloc(&h, size_t(G) * 4 * sizeof(unsigned long long), cudaHostAllocMapped | cudaHostAllocPortable),
          "cudaHostAlloc (diag stamps)");
       gts_h_ = static_cast<unsigned long long*>(h);
@@ -1323,12 +1557,12 @@ class CudaDgCtx final : public DgCtx {
                  "cudaMemcpy (fill)");
               load.h2d_bytes += x_.part_bytes[p];
             }
-          } else {
+          } else if (core_->block_of(k) >= 0) {  // (a file home is read when it is fetched)
             read_checked(L, int(u), blocks_[size_t(core_->block_of(k))], &load);
           }
         }
       }
-      load.payload_bytes = uint64_t(x_.keys) * x_.unit_bytes;
+      load.payload_bytes = uint64_t(x_.keys - core_->file_units()) * x_.unit_bytes;
       load.read_seconds = std::chrono::duration<double>(Clock::now()-fill_start).count();
     } else {
       std::vector<DgLoadUnit> units;
@@ -1337,8 +1571,11 @@ class CudaDgCtx final : public DgCtx {
         for (uint32_t u = 0; u < core_->units(g); ++u) {
           const uint32_t k = core_->key(g, u);
           const int32_t slot = core_->slot_of(k);
-          units.push_back({x_.gated[g], int(u), slot,
-                           slot >= 0 ? nullptr : blocks_[size_t(core_->block_of(k))]});
+          if (slot < 0 && core_->block_of(k) < 0) continue;  // a file home (three-tier): read when it is fetched
+          DgLoadUnit unit{x_.gated[g], int(u), slot, nullptr};
+          if (slot < 0 && overlap) unit.block = core_->block_of(k);  // resolved when its chunk exists
+          else if (slot < 0) unit.host = blocks_[size_t(core_->block_of(k))];
+          units.push_back(unit);
         }
       }
       read_start = Clock::now();
@@ -1355,7 +1592,15 @@ class CudaDgCtx final : public DgCtx {
               pipeline_h2d_bytes += cpy.bytes;
             }
             ck(cudaEventRecord(ring.events[i], ring.stream), "startup buffer event");
-          }, &files_);
+          }, &files_, block_alloc_.get());
+      if (overlap) {  // the join: every block exists (or the helper's error is the open's)
+        const auto a = std::move(block_alloc_);
+        a->finish(&chunks_, &blocks_);
+        pinned_alloc_s += a->seconds();
+        print_pinned(std::chrono::duration<double>(a->done_at()-start).count());
+      }
+      std::fprintf(stderr, "dg_load overlap_alloc=%d pinned_alloc_wait_s=%.6f resident_done_s=%.6f\n", overlap ? 1 : 0,
+                   load.alloc_wait_seconds, std::chrono::duration<double>(read_start-start).count()+load.resident_seconds);
       load.h2d_bytes = pipeline_h2d_bytes;
       ck(cudaStreamSynchronize(ring.stream), "startup H2D done");
     }
@@ -1372,7 +1617,7 @@ class CudaDgCtx final : public DgCtx {
     ring.release();
     transport_->upload_table(core_->table().data(), x_.keys);
     core_->check();
-    keep_.resize(G);
+    steps_.init(G);
     // Every stats buffer sized once: folding and publishing never allocate.
     fold_l_.assign(G, DgLayerCounts{});
     prev_l_.assign(G, DgLayerCounts{});
@@ -1423,9 +1668,13 @@ class CudaDgCtx final : public DgCtx {
                    "strix-stream device-gated: closing while token %u may still run on the device: its arena, tables, "
                    "control words and pinned blocks are left allocated\n",
                    unsigned(seq_));
+      // the disk readers use this context's files and options: queued reads are dropped and running ones joined now,
+      // while those are alive (their staging blocks stay allocated with the rest)
+      if (transport_) transport_->pool.reset();
       svc_.release();     // NOLINT: deliberately leaked with the memory it references
       core_.release();
       transport_.release();
+      charges_.forget();  // the memory stays allocated: so do its charges
       return;
     }
     // dg_wb_defer, healthy or poisoned: no new copy here (noexcept, the device may be failing). Write-backs nothing was
@@ -1458,11 +1707,13 @@ class CudaDgCtx final : public DgCtx {
   const Desc& d_;
   ss_options o_;
   DgLayout x_;
+  BudgetCharges charges_;  // ss_options.budget (none when NULL): released after release_all frees the memory
   int device_ = 0;
   std::string weight_dirs_;
   std::vector<std::unique_ptr<SourceFile>> files_;
   void* bounce_ = nullptr;
   uint64_t bounce_bytes_ = 0;
+  std::mutex bounce_mu_;
   char* staging_ = nullptr;
   std::vector<char*> arena_;
   int32_t* slot_of_ = nullptr;
@@ -1471,11 +1722,12 @@ class CudaDgCtx final : public DgCtx {
   DgMapped m_;
   dgk::Dev dev_;
   std::vector<void*> chunks_;
+  std::unique_ptr<DgBlockAlloc> block_alloc_;  // the overlap's helper, during the open only
   std::vector<char*> blocks_;
   std::unique_ptr<CudaTransport> transport_;
   std::unique_ptr<DgCore> core_;
   std::unique_ptr<DgService> svc_;
-  std::vector<std::vector<uint32_t>> keep_;
+  DgSteps steps_;  // keeps, held resident sets, the exported layers, the export flags' expected values
   // dg_diag: the last token's per-layer device timings (-1 = not measured)
   struct LayerDiag {
     double dma_ms = -1, dma_first_ms = -1, wb_left_ms = -1, gpu_wait_us = -1, gpu_export_ready_us = -1;
@@ -1489,6 +1741,7 @@ class CudaDgCtx final : public DgCtx {
   Published pending_;
   uint32_t fold_free_slots_ = 0, fold_free_blocks_ = 0, min_free_blocks_ = UINT32_MAX;
   uint64_t fold_wb_outstanding_ = 0;
+  uint64_t fold_disk_units_ = 0, fold_backed_units_ = 0;  // three-tier gauges at the last fold
   ss_stats_hook hook_ = nullptr;
   void* hook_user_ = nullptr;
   mutable std::atomic<bool> snap_armed_{false};

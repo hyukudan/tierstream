@@ -24,6 +24,12 @@ struct DgLayout {
   uint32_t B = 0;  // bank size = dg_max_ids
   uint32_t P = 0;  // pinned units (tier P)
   uint32_t Q = 0;  // spare blocks the planner granted and billed
+  // three-tier (dg_disk_tier): F = file-homed gated units (the plan's tier DISK), their per-key flags (keys order;
+  // empty without the disk tier), S = staging buffers (pinned, one unit each); I = the inclusive share; disk_queue =
+  // file reads in flight (1 = synchronous)
+  uint32_t F = 0, S = 0, I = 0, disk_queue = 0;
+  bool disk_tier = false, disk_prefetch = false;
+  std::vector<uint8_t> disk;
   uint32_t persistent_slots = 0, slots = 0, guard_slot = 0, blocks = 0;
   std::vector<uint32_t> residents;  // keys of the tier-R units, in key order
   uint64_t need = 0, billed = 0;    // device bytes: the arena + tables + controls, and what the plan billed for them
@@ -38,6 +44,11 @@ struct DgLayout {
   std::string score_identity;
   uint32_t load_readers = 0, load_buffers = 0;
   uint64_t load_buffer_bytes = 0;  // additional temporary pinned ring, admitted at open
+  // DG_LOAD_OVERLAP_ALLOC (pipeline only, default on; 0 restores the serial order): the ring first, then the pinned
+  // blocks on a helper thread while the loader reads the residents
+  bool load_overlap_alloc = false;
+  // DG_UNIT_SUBREAD_KIB: the sub-read size of one unit's in-place parts (dg_read_unit; 0 = one request per part)
+  uint64_t unit_subread = 0;
   // Exactly what the context allocates, so admission bills what it allocates.
   // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1], absent_err
   static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1) + 1; }

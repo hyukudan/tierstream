@@ -34,6 +34,7 @@ uint64_t elapsed(Clock::time_point start) {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
+// Links resolved (each file is then opened through a BoundDir: resolved once, then bound).
 std::string canonical(const std::string& path) {
   std::error_code ec;
   fs::path p = fs::weakly_canonical(fs::absolute(fs::u8path(path)), ec);
@@ -54,14 +55,17 @@ bool digest_valid(const std::string& s) {
   return s.size() == 64 && s.find_first_not_of("0123456789abcdef") == std::string::npos;
 }
 
-std::string read_text(const std::string& path, uint64_t limit) {
-  RawFile f(path, false);
+std::string read_all(const RawFile& f, uint64_t limit) {
+  const std::string& path = f.path();
   auto n = f.size();
   require(n <= limit, SS_E_DESC, "file exceeds size limit: " + path);
   std::string s(size_t(n), '\0');
   require(!n || f.read(&s[0], n, 0) == n, SS_E_IO, "cannot read " + path);
   return s;
 }
+
+// A cache file of this user's (not a model file: opened by path).
+std::string read_text(const std::string& path, uint64_t limit) { return read_all(RawFile(path, false, false), limit); }
 
 struct Buffer {
   char* p;
@@ -193,17 +197,22 @@ constexpr uint64_t kSubRead = uint64_t(4) << 20;
 // (a decode step's 24-48 Engram pages) are latency bound: a split batch waits for the slower drive's page, so they stay
 // on the primary, which serves them as single-drive reading always did.
 constexpr uint64_t kSplitBytes = uint64_t(8) << 20;
+// Requests of kBalanceBytes up to kSplitBytes are never split, but while other requests are in flight a request whose
+// chunks all have a stripe copy on one location goes whole to the less loaded of the primary and that location.
+constexpr uint64_t kBalanceBytes = uint64_t(1) << 20;
 constexpr uint32_t kSplitBatch = 64;
 
 struct MFile::Impl {
   struct Loc {
     std::string path, manifest_path, manifest_text, manifest_digest, open_reason;
-    FileIdentity id;
+    FileIdentity id, manifest_id;
     std::unique_ptr<RawFile> file;
+    std::unique_ptr<RawFile> manifest_file;  // held for the session's lifetime (Windows: no writer, no rename)
     StripeManifest manifest;
     std::atomic<bool> enabled{false};
     std::atomic<uint32_t> errors{0};
     std::atomic<uint64_t> bytes{0}, reads{0}, busy_ns{0}, serving{0};
+    uint64_t inflight = 0;  // bytes of large requests planned onto this location and not finished (under plan_mu)
     std::mutex injection_mu;
     int injection = 0;
     uint64_t after = 0;
@@ -237,7 +246,7 @@ struct MFile::Impl {
   // request reads the primary alone, so a fresh single-drive baseline is always known, and while split requests measure
   // slower than that baseline, splitting stays off for kSplitOff large requests (then it is tried again).
   static constexpr uint64_t kSingleEvery = 16, kSplitOff = 64;
-  std::mutex share_mu;
+  std::mutex share_mu, plan_mu;
   std::vector<double> rate;           // bytes per ns per location (EWMA)
   double split_rate = 0, single_rate = 0;  // whole large requests, split / primary only (EWMA, bytes per ns)
   uint64_t large = 0, split_samples = 0, split_off_until = 0;
@@ -263,7 +272,9 @@ struct MFile::Impl {
         }
         // Other rejection reasons must be retried on another open.
         if (!loc->file || identity_of(loc->path) != loc->id) return false;
-        if (!loc->manifest_path.empty() && read_text(loc->manifest_path, uint64_t(256) << 20) != loc->manifest_text)
+        if (!loc->manifest_path.empty() &&
+            (!loc->manifest_file || identity_of(loc->manifest_path) != loc->manifest_file->identity() ||
+             read_all(*loc->manifest_file, uint64_t(256) << 20) != loc->manifest_text))
           return false;
       }
     } catch (const Error&) { return false; }
@@ -372,11 +383,14 @@ struct MFile::Impl {
 
   // allow_stripe: the request may use the stripe copies of its chunks (the caller's size rule, kSplitBytes /
   // kSplitBatch); otherwise every piece is read from the primary, which holds every byte.
-  // share (large requests): a stripe chunk goes to whichever of its two homes has the least of (bytes this request
-  // already gave it + this chunk) / its share; a location with share 0 gets nothing.
+  // share (large requests): a stripe chunk goes to whichever of its two homes has the least of (bytes already
+  // planned onto it and not finished, by this and concurrent large requests, + this chunk) / its share; a location
+  // with share 0 gets nothing. Concurrent one-chunk requests therefore spread over the drives by their shares.
   uint64_t plan(void* dst, uint64_t n, uint64_t off, std::vector<Piece>& out, bool allow_stripe,
                 const std::vector<double>* share = nullptr) const {
     std::vector<uint64_t> given(locs.size(), 0);
+    if (share)
+      for (size_t l = 0; l < locs.size(); ++l) given[l] = locs[l]->inflight;
     require(off % kAlign == 0 && n % kAlign == 0 && reinterpret_cast<uintptr_t>(dst) % kAlign == 0 &&
             (dst || !n), SS_E_INVALID, "mfile read requires aligned offset, bytes and destination");
     uint64_t end = (size + kAlign - 1) / kAlign * kAlign;
@@ -407,11 +421,22 @@ struct MFile::Impl {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
   }
 
+  // The current shares without counting a large request.
+  Route route_large_shares() {
+    std::lock_guard<std::mutex> lock(share_mu);
+    return shares_locked();
+  }
+
   Route route_large() {
     std::lock_guard<std::mutex> lock(share_mu);
-    Route r;
     ++large;
+    Route r = shares_locked();
     r.split = large % kSingleEvery != 0 && large >= split_off_until;
+    return r;
+  }
+
+  Route shares_locked() {
+    Route r;
     if (rate.empty()) rate.assign(locs.size(), 6.0);  // 6 GB/s until measured
     double sum = 0;
     for (size_t l = 0; l < locs.size(); ++l) sum += locs[l]->enabled.load() || !l ? rate[l] : 0.0;
@@ -449,11 +474,79 @@ struct MFile::Impl {
     }
   }
 
+  // A medium request (kBalanceBytes..kSplitBytes): one location serves all of it. It goes to the stripe location only
+  // when other reads are in flight on the primary or that location, every chunk it touches is served from there, and
+  // that location's in-flight bytes per share are lower than the primary's; with nothing in flight it reads the
+  // primary, exactly as before. Appends the pieces and reserves their in-flight bytes; plan_mu must be held.
+  uint64_t plan_balanced(void* dst, uint64_t n, uint64_t off, std::vector<Piece>& out, const Route& r) {
+    std::vector<Piece> pieces;
+    uint64_t got = plan(dst, n, off, pieces, true);
+    size_t loc = pieces.empty() ? 0 : pieces.front().loc;
+    for (const Piece& p : pieces) if (p.loc != loc) loc = 0;
+    bool stripe = loc && locs[0]->inflight + locs[loc]->inflight > 0 && r.share[loc] > 0 &&
+                  (r.share[0] <= 0 || double(locs[loc]->inflight + n) / r.share[loc] <
+                                          double(locs[0]->inflight + n) / r.share[0]);
+    if (!stripe) {
+      pieces.clear();
+      got = plan(dst, n, off, pieces, false);
+    }
+    for (const Piece& p : pieces) {
+      locs[p.loc]->inflight += p.bytes;
+      out.push_back(p);
+    }
+    return got;
+  }
+
+  uint64_t read_balanced(void* dst, uint64_t n, uint64_t off) {
+    Route r = route_large_shares();
+    std::vector<Piece> pieces;
+    uint64_t got;
+    {
+      std::lock_guard<std::mutex> lock(plan_mu);
+      got = plan_balanced(dst, n, off, pieces, r);
+    }
+    struct Release {
+      Impl& f;
+      const std::vector<Piece>& pieces;
+      ~Release() {
+        std::lock_guard<std::mutex> lock(f.plan_mu);
+        for (const Piece& p : pieces) f.locs[p.loc]->inflight -= p.bytes;
+      }
+    } release{*this, pieces};
+    if (pieces.size() != 1) {
+      parallel(pieces);
+      return got;
+    }
+    // a single-location read also measures its location: its share follows it like a large request's
+    int64_t t0 = now_ns();
+    size_t served = run(pieces.front());
+    int64_t t1 = now_ns();
+    if (t1 > t0) {
+      std::lock_guard<std::mutex> lock(share_mu);
+      double sample = double(pieces.front().bytes) / double(t1 - t0);
+      rate[served] = rate[served] > 0 ? rate[served] * 0.75 + sample * 0.25 : sample;
+    }
+    return got;
+  }
+
   // A large request: planned with the current shares, timed per piece, and fed back into the shares.
   uint64_t read_large(void* dst, uint64_t n, uint64_t off) {
     Route r = route_large();
     std::vector<Piece> pieces;
-    uint64_t got = plan(dst, n, off, pieces, r.split, &r.share);
+    uint64_t got;
+    {
+      std::lock_guard<std::mutex> lock(plan_mu);
+      got = plan(dst, n, off, pieces, r.split, &r.share);
+      for (const Piece& p : pieces) locs[p.loc]->inflight += p.bytes;
+    }
+    struct Release {
+      Impl& f;
+      const std::vector<Piece>& pieces;
+      ~Release() {
+        std::lock_guard<std::mutex> lock(f.plan_mu);
+        for (const Piece& p : pieces) f.locs[p.loc]->inflight -= p.bytes;
+      }
+    } release{*this, pieces};
     std::vector<int64_t> done_at(pieces.size(), 0);
     std::vector<size_t> served_by(pieces.size(), 0);
     int64_t t0 = now_ns();
@@ -641,13 +734,16 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
       std::error_code absent_ec;
       l.manifest_absent = !fs::exists(fs::u8path(l.manifest_path), absent_ec) && !absent_ec;
       require(!l.manifest_absent, SS_E_IO, "manifest is absent");
-      l.manifest_text = read_text(l.manifest_path, uint64_t(256) << 20);
+      // read through the held handle, which stays open (bound: no link, no rename while the session lives)
+      l.manifest_file = std::make_unique<RawFile>(l.manifest_path, false);
+      l.manifest_id = l.manifest_file->identity();
+      l.manifest_text = read_all(*l.manifest_file, uint64_t(256) << 20);
       l.manifest = stripe_manifest_parse(l.manifest_text);
       l.manifest_digest = json_str(*json_parse(l.manifest_text).find("digest"), "digest");
       const auto& m = l.manifest;
       require(m.primary_size == f.size && canonical(joined(fs::u8path(path).parent_path().u8string(), m.primary_basename)) == path,
               SS_E_DESC, "primary basename or size mismatch");
-      if (f.bound_digest.empty()) f.bound_digest = file_sha256_cached(path);
+      if (f.bound_digest.empty()) f.bound_digest = file_sha256_cached(*f.locs[0]->file);
       require(m.primary_sha256 == f.bound_digest, SS_E_DESC, "primary SHA-256 mismatch");
       require(!grid_set || f.chunk == m.chunk_bytes, SS_E_DESC, "secondary chunk grid mismatch");
       if (grid_set) for (const auto& r : m.runs)
@@ -686,6 +782,8 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
       l.enabled.store(false);
       l.pool.reset();
       l.file.reset();
+      l.manifest_file.reset();
+      l.manifest_digest.clear();
       f.report += "location " + std::to_string(index) + ": " + e.what() + "\n";
     }
   }
@@ -715,6 +813,7 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
 }
 
 uint64_t MFile::size() const { return impl_->size; }
+uint64_t MFile::chunk_bytes() const { return impl_->chunk; }
 bool MFile::direct() const { return impl_->locs[0]->file->direct(); }
 int MFile::locations() const { return int(impl_->locs.size()); }
 bool MFile::multi() const {
@@ -727,9 +826,41 @@ std::string MFile::location_path(int loc) const {
 }
 std::string MFile::reasons() const { return impl_->report; }
 
+FileIdentity MFile::primary_identity() const { return impl_->locs[0]->id; }
+
+void MFile::location_info(int loc, ss_mfile_location* out) const {
+  require(out && out->struct_size >= 2 * sizeof(uint32_t), SS_E_INVALID, "mfile location info: struct_size not set");
+  require(loc >= 0 && size_t(loc) < impl_->locs.size(), SS_E_INVALID, "mfile location info: no location " +
+                                                                          std::to_string(loc));
+  auto put = [](ss_file_identity& to, const FileIdentity& id) {
+    to.volume = id.volume;
+    to.index = id.index;
+    to.size = id.size;
+  };
+  const auto& l = *impl_->locs[size_t(loc)];
+  ss_mfile_location x{};
+  x.struct_size = std::min<uint32_t>(out->struct_size, uint32_t(sizeof x));
+  if (l.file) {
+    x.flags |= SS_MFILE_LOCATION_OPEN;
+    if (l.enabled.load()) x.flags |= SS_MFILE_LOCATION_ENABLED;
+    put(x.data, l.id);
+  }
+  if (l.manifest_file) {
+    put(x.manifest, l.manifest_id);
+    std::snprintf(x.manifest_digest, sizeof x.manifest_digest, "%s", l.manifest_digest.c_str());
+  }
+  put(x.primary, impl_->locs[0]->id);
+  std::memcpy(out, &x, x.struct_size);
+}
+
 uint64_t MFile::pread(void* dst, uint64_t n, uint64_t offset) {
   if (n >= kSplitBytes && impl_->locs.size() > 1) {
     uint64_t got = impl_->read_large(dst, n, offset);
+    impl_->zero_tail(dst, n, offset);
+    return got;
+  }
+  if (n >= kBalanceBytes && impl_->locs.size() > 1) {
+    uint64_t got = impl_->read_balanced(dst, n, offset);
     impl_->zero_tail(dst, n, offset);
     return got;
   }
@@ -746,9 +877,30 @@ void MFile::preadv(const ss_mfile_io* ios, uint32_t n) {
   std::vector<Impl::Piece> pieces;
   // large ios go through the adaptive shares (read_large, after the scattered ios); in a batch of at least
   // kSplitBatch, every other small io comes from the stripe
+  // medium ios (kBalanceBytes..kSplitBytes) are routed whole like a medium pread, their in-flight bytes reserved
+  // until every job of this call finished
   bool multi_loc = impl_->locs.size() > 1;
+  struct Reserved {
+    MFile::Impl& m;
+    std::vector<Impl::Piece> pieces;
+    ~Reserved() {
+      if (pieces.empty()) return;
+      std::lock_guard<std::mutex> lock(m.plan_mu);
+      for (const auto& p : pieces) m.locs[p.loc]->inflight -= p.bytes;
+    }
+  } reserved{*impl_, {}};
+  bool any_medium = false;
+  for (uint32_t i = 0; i < n; ++i) any_medium |= multi_loc && ios[i].bytes >= kBalanceBytes && ios[i].bytes < kSplitBytes;
+  if (any_medium) {
+    Impl::Route r = impl_->route_large_shares();
+    std::lock_guard<std::mutex> lock(impl_->plan_mu);
+    for (uint32_t i = 0; i < n; ++i)
+      if (ios[i].bytes >= kBalanceBytes && ios[i].bytes < kSplitBytes)
+        impl_->plan_balanced(ios[i].dst, ios[i].bytes, ios[i].offset, reserved.pieces, r);
+  }
+  pieces = reserved.pieces;
   for (uint32_t i = 0; i < n; ++i)
-    if (!(multi_loc && ios[i].bytes >= kSplitBytes))
+    if (!(multi_loc && ios[i].bytes >= kSplitBytes) && !(any_medium && ios[i].bytes >= kBalanceBytes))
       impl_->plan(ios[i].dst, ios[i].bytes, ios[i].offset, pieces, n >= kSplitBatch && (i & 1));
   struct Large {
     MFile::Impl& m;

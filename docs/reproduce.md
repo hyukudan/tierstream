@@ -10,6 +10,7 @@ command lines for the model runs. This page covers the library part.
 | Feature | Default | Switch back to the old path |
 |---|---|---|
 | Pipelined startup loader (overlapped reads, staging and device copies, bounded buffers) | on | `DG_LOAD_SERIAL=1` (serial loader) |
+| Pinned-block allocation overlapped with the resident reads (pipelined loader) | on | `DG_LOAD_OVERLAP_ALLOC=0` (blocks allocated before any read) |
 | Deferred, bounded write-backs (`dg_wb_defer`) | on (`ss_options_defaults` sets 1) | `dg_wb_defer = 0` at open, engine option `--no-wb-defer`, or `ss_dg_set_sched(c, 0, flush_ready)` between tokens |
 | Demand-stream flush after each ready (`dg_flush_ready`) | off | `ss_dg_set_sched(c, wb_defer, 1)` |
 | Cache reset to the fresh-load placement (`ss_dg_reset_open`) | API call | not called |

@@ -33,6 +33,12 @@ class DgCtx {
   virtual void reset_open() = 0;
   virtual void seed(int layer, const int32_t* units, int n) = 0;
   virtual void keep(int g, const int32_t* ids, int n) = 0;
+  virtual void make_resident(int g, const int32_t* ids, int n) = 0;
+  // Placement rounds (ss.h SS_DG_ROUNDS): between tokens; the cancellation from any thread.
+  virtual void round(const DgRoundIn& in) = 0;
+  virtual const DgRoundOut& last_round() const = 0;  // the last round's result (also after a failure)
+  virtual void round_cancel() = 0;
+  virtual void round_seed_counts(const ss_dg_unit* units, const float* counts, uint32_t n) = 0;
   virtual void check_unit(int layer, int unit) = 0;
 
   // Device side: kernel launchers on the engine's stream (capturable).
