@@ -452,6 +452,40 @@ TEST(budget_plan_arguments_and_saturation) {
   CHECK_EQ(int(ss_budget_plan(&in, &out)), int(SS_E_CAPACITY));
   CHECK_EQ(out.min_vram_total_bytes, UINT64_MAX);
   CHECK(std::string(out.refuse).find("unnamed") != std::string::npos);
+  {  // no minimum exists: its bytes, GiB and flag GiB are null in the JSON
+    std::string j(ss_budget_plan_json(&in, &out, nullptr, 0) + 1, '\0');
+    j.resize(ss_budget_plan_json(&in, &out, &j[0], j.size()));
+    for (const char* m : {"\"min_vram_total_bytes\":null", "\"min_vram_total_gib\":null",
+                          "\"min_vram_total_flag_gib\":null"})
+      CHECK(j.find(m) != std::string::npos);
+  }
+  // a refusal cut to the field never splits a UTF-8 character of a component's name
+  {
+    std::string name;
+    for (int i = 0; i < 200; ++i) name += "\xc3\xa9";  // e-acute, two bytes each
+    ss_budget_component named[1] = {{name.c_str(), UINT64_MAX - 5}};
+    in.device_fixed = named;
+    in.n_device_fixed = 1;
+    CHECK_EQ(int(ss_budget_plan(&in, &out)), int(SS_E_CAPACITY));
+    const std::string r(out.refuse);
+    CHECK(r.size() < sizeof out.refuse && r.size() > 200);
+    size_t i = 0;  // every sequence complete
+    while (i < r.size()) {
+      const unsigned char c = static_cast<unsigned char>(r[i]);
+      const size_t len = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3 : 4;
+      CHECK(i + len <= r.size());
+      i += len;
+    }
+    in.device_fixed = huge;
+    in.n_device_fixed = 2;
+  }
+  // a key count the host sums cannot hold: a bad argument, never a saturated plan
+  in.device_fixed = nullptr;
+  in.n_device_fixed = 0;
+  in.keys = UINT64_MAX - 4;
+  CHECK_EQ(int(ss_budget_plan(&in, &out)), int(SS_E_INVALID));
+  in.unified = 1;
+  CHECK_EQ(int(ss_budget_plan(&in, &out)), int(SS_E_INVALID));
   // nothing to place: no experts, no refusal
   ss_budget_in_defaults(&in);
   CHECK_OK(ss_budget_plan(&in, &out));
@@ -1057,6 +1091,9 @@ TEST(ledger_add_sub_peak_and_components_at_the_peak) {
   CHECK(std::string(ss_last_error()).find("kv") != std::string::npos);
   CHECK_EQ(int(ss_budget_ledger_sub(l, SS_BUDGET_DEVICE, "nothing", 1)), int(SS_E_INVALID));
   CHECK_EQ(int(ss_budget_ledger_add(l, ss_budget_kind(7), "x", 1)), int(SS_E_INVALID));
+  // no cap: a sum past 2^64 is refused (nothing counted), never wrapped
+  CHECK_EQ(int(ss_budget_ledger_add(l, SS_BUDGET_DEVICE, "huge", UINT64_MAX - 100)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_budget_ledger_add(l, SS_BUDGET_PAGEABLE, "huge", UINT64_MAX - 10)), int(SS_E_INVALID));
   CHECK_OK(ss_budget_ledger_observe_device(l, 5000));
   CHECK_OK(ss_budget_ledger_observe_device(l, 4000));
   ss_budget_stats s;

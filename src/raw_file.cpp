@@ -142,12 +142,24 @@ std::wstring long_path(const std::wstring& w) {
   return L"\\\\?\\" + w;
 }
 
-DWORD attributes_of(HANDLE h) {
+// *tag: the reparse tag when FILE_ATTRIBUTE_REPARSE_POINT is set (0 when the fallback could not read it)
+DWORD attributes_of(HANDLE h, DWORD* tag_out) {
+  *tag_out = 0;
   FILE_ATTRIBUTE_TAG_INFO tag{};
-  if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag)) return tag.FileAttributes;
+  if (GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag)) {
+    *tag_out = tag.ReparseTag;
+    return tag.FileAttributes;
+  }
   BY_HANDLE_FILE_INFORMATION bi;
   if (GetFileInformationByHandle(h, &bi)) return bi.dwFileAttributes;
   return INVALID_FILE_ATTRIBUTES;
+}
+
+// A link: a name-surrogate reparse point (symlink, junction, mount point, or a third-party tag marked as one), or one
+// whose tag is unknown. Other reparse points (cloud files such as OneDrive's, dedup, WOF compression) are the entry's
+// own data and are allowed.
+bool is_link(DWORD attributes, DWORD tag) {
+  return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) && (tag == 0 || IsReparseTagNameSurrogate(tag));
 }
 
 std::wstring final_path(HANDLE h) {
@@ -209,8 +221,8 @@ BoundDir::BoundDir(const std::string& file_path) {
       chain.push_back(dir);
     }
     // each directory from the volume root down: held without FILE_SHARE_DELETE (no rename or delete while held), a
-    // reparse point (junction, symlink, mount point) refused. FILE_TRAVERSE counts for share access; attributes alone
-    // would not.
+    // name-surrogate reparse point (junction, symlink, mount point) refused. FILE_TRAVERSE counts for share access;
+    // attributes alone would not.
     for (const fs::path& d : chain) {
       const std::wstring dw = long_path(d.wstring());
       const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
@@ -223,10 +235,11 @@ BoundDir::BoundDir(const std::string& file_path) {
       require(h != INVALID_HANDLE_VALUE, SS_E_IO,
               "open " + path_ + ": directory " + d.u8string() + ": error " + std::to_string(GetLastError()));
       dirs_.push_back(h);
-      const DWORD a = attributes_of(h);
+      DWORD tag = 0;
+      const DWORD a = attributes_of(h, &tag);
       require(a != INVALID_FILE_ATTRIBUTES, SS_E_IO,
               "open " + path_ + ": attributes of " + d.u8string() + ": error " + std::to_string(GetLastError()));
-      require(!(a & FILE_ATTRIBUTE_REPARSE_POINT), SS_E_IO,
+      require(!is_link(a, tag), SS_E_IO,
               "open " + path_ + ": " + d.u8string() + " is a reparse point (junction or link)");
       require((a & FILE_ATTRIBUTE_DIRECTORY) != 0, SS_E_IO, "open " + path_ + ": " + d.u8string() + " is not a directory");
     }
@@ -251,9 +264,10 @@ void* BoundDir::open_leaf(unsigned long access, unsigned long share, unsigned lo
 
 void BoundDir::check_leaf(void* handle) const {
   HANDLE h = static_cast<HANDLE>(handle);
-  const DWORD a = attributes_of(h);
+  DWORD tag = 0;
+  const DWORD a = attributes_of(h, &tag);
   require(a != INVALID_FILE_ATTRIBUTES, SS_E_IO, "attributes of " + path_ + ": error " + std::to_string(GetLastError()));
-  require(!(a & FILE_ATTRIBUTE_REPARSE_POINT), SS_E_IO, "open " + path_ + ": a reparse point (link)");
+  require(!is_link(a, tag), SS_E_IO, "open " + path_ + ": a reparse point (link)");
   require(!(a & FILE_ATTRIBUTE_DIRECTORY), SS_E_IO, "open " + path_ + ": not a regular file");
   // the leaf must be the entry of the held directory: its final path is the directory's plus the leaf name
   std::wstring expect = dir_final_;

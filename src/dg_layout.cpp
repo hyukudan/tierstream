@@ -25,7 +25,59 @@ uint64_t mul_ck(uint64_t a, uint64_t b, const char* what) {
 uint64_t align64(uint64_t v) { return (v + 63) / 64 * 64; }
 std::string gib(uint64_t b) { return std::to_string(double(b) / double(kGiB)); }
 
+// The startup environment switches. A count: decimal digits only (no sign, no leading whitespace), at most max; a
+// flag: exactly 0 / false / off or 1 / true / on (unset or empty = def). Anything else refuses the open (SS_E_INVALID).
+bool env_count(const char* name, unsigned long max, unsigned long* out) {
+  const char* v = std::getenv(name);
+  if (!v) return false;
+  char* end = nullptr;
+  const unsigned long n = std::strtoul(v, &end, 10);
+  require(*v >= '0' && *v <= '9' && end && !*end && n <= max, SS_E_INVALID,
+          std::string("device-gated: invalid ") + name);
+  *out = n;
+  return true;
+}
+bool env_flag(const char* name, bool def) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return def;
+  const std::string s = v;
+  if (s == "1" || s == "true" || s == "on") return true;
+  require(s == "0" || s == "false" || s == "off", SS_E_INVALID,
+          std::string("device-gated: invalid ") + name + " (use 0, 1, false, true, off or on)");
+  return false;
+}
+
 }  // namespace
+
+std::string dg_device_error(uint32_t code, uint32_t aux) {
+  if (code == kDgOk) return std::string();
+  const char* what = code == kDgTimeout  ? "a wait timed out"
+                     : code == kDgBadId  ? "an id was out of range"
+                     : code == kDgDesync ? "a step ran outside ss_begin / ss_end (sequence desync)"
+                     : code == kDgAbsent ? "a slot lookup met an absent entry"
+                                         : "the host aborted the token";
+  const std::string where = code == kDgDesync   ? " (that step's seq " + std::to_string(aux) + ")"
+                            : code == kDgAbsent ? std::string()
+                                                : " at gated layer " + std::to_string(aux);
+  return what + where;
+}
+
+std::string dg_token_failure(uint32_t seq, const std::string& device, const std::string& host) {
+  std::string m = "device-gated: token " + std::to_string(seq) + ": ";
+  if (!device.empty()) m += "the device: " + device + (host.empty() ? "" : "; ");
+  m += host;
+  return m + " (the context is poisoned, the token's outputs must be discarded)";
+}
+
+const char* dg_module_loading_name(uint32_t mode) {
+  return mode == 1 ? "eager" : mode == 2 ? "lazy" : "unknown";
+}
+
+std::string dg_module_loading_notice(uint32_t mode, size_t gated) {
+  if (mode != 2 || gated == 0) return std::string();
+  return "CUDA module loading is lazy: the gated layers' wait kernels can stall behind the first-use kernel loads of "
+         "the engine (CUDA_MODULE_LOADING=EAGER loads every module at startup and avoids it)";
+}
 
 uint64_t dg_mapped_bytes(uint32_t G) {
   // Record[G], PredRecord[G], flag[G], pflag[G], ready[G], then done / err_code / err_aux / host_abort / host_seq /
@@ -168,7 +220,9 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     refuse(SS_E_CAPACITY, "dg_inclusive_blocks " + std::to_string(x.I) + " must stay below the spare blocks (" +
                               std::to_string(x.Q) + "): raise host_spare_units by the inclusive share");
   x.S = x.disk_tier ? (o.dg_disk_staging ? o.dg_disk_staging : 8u) : 0u;
-  x.disk_queue = x.disk_tier ? (o.dg_disk_queue ? o.dg_disk_queue : 1u) : 0u;  // off until it measures faster
+  // 0 = 1 (synchronous reads): a measured A/B ran depth 16 slower while the reads shared one bounce buffer and ended in
+  // fetch order; the default stays 1 until an A/B with per-reader bounce buffers and independent read ends says otherwise
+  x.disk_queue = x.disk_tier ? (o.dg_disk_queue ? o.dg_disk_queue : 1u) : 0u;
 
   // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
   // format; the context loads it before the service starts).
@@ -215,51 +269,52 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               " GiB; with the rest of the plan (" + gib(other) + " GiB) that is above the cap - margin (" +
                               gib(limit) + " GiB)");
   // Host admission: on top of what the plan bills (blocks of P + Q, host_fixed): the mapped control area, the bounce
-  // buffer (min(staging_bytes, 16 MiB), at least 4 x the largest source alignment) and the open-time staging buffer
-  // (serial only: one unit, 4 KiB rounded). The context allocates exactly these.
+  // buffers and the open-time staging buffer (serial only: one unit, 4 KiB rounded). The context allocates exactly
+  // these. A bounce buffer per reader (the context's own thread, and each disk reader with dg_disk_queue > 1: none
+  // waits for another's): min(staging_bytes, 16 MiB), at least 4 x the largest source alignment; with disk readers
+  // each is cut to what the largest part's covering read needs (one read per part, never more than that size).
   uint64_t max_align = 4096;
   for (const Source& src : d.sources) max_align = std::max(max_align, src.align);
   const uint64_t want = std::min<uint64_t>(o.staging_bytes ? o.staging_bytes : (uint64_t(16) << 20), uint64_t(16) << 20);
-  x.bounce_bytes = std::max<uint64_t>((add_ck(want, max_align - 1, "the bounce buffer") / max_align) * max_align,
-                                      mul_ck(4, max_align, "the bounce buffer"));
-  const char* serial = std::getenv("DG_LOAD_SERIAL");
-  const std::string serial_value = serial ? serial : "";
-  x.load_serial = serial_value == "1" || serial_value == "true" || serial_value == "on";
-  require(serial_value.empty() || serial_value == "0" || x.load_serial, SS_E_INVALID,
-          "device-gated: invalid DG_LOAD_SERIAL (use 0, 1, true, or on)");
+  const auto aligned_up = [max_align](uint64_t v) {
+    return (add_ck(v, max_align - 1, "the bounce buffer") / max_align) * max_align;
+  };
+  x.bounce_bytes = std::max<uint64_t>(aligned_up(want), mul_ck(4, max_align, "the bounce buffer"));
+  x.bounce_readers = 1 + (x.disk_queue > 1 ? x.disk_queue : 0);
+  if (x.bounce_readers > 1) {
+    uint64_t part_max = 0;
+    for (int L : x.gated)
+      for (const Part& part : d.layers[size_t(L)].parts) part_max = std::max(part_max, part.bytes);
+    const uint64_t cover = aligned_up(add_ck(part_max, 2 * max_align, "the bounce buffer"));
+    x.bounce_bytes = std::max<uint64_t>(std::min(x.bounce_bytes, cover), mul_ck(4, max_align, "the bounce buffer"));
+  }
+  const uint64_t bounce_total = mul_ck(x.bounce_bytes, x.bounce_readers, "the bounce buffers");
+  x.load_serial = env_flag("DG_LOAD_SERIAL", false);
   x.staging_bytes = (add_ck(x.unit_bytes, 4095, "the staging buffer") / 4096) * 4096;
   // kept in pipeline mode too: ss_dg_reset_open's one-unit spare for placement cycles (persist)
   x.mapped_bytes = dg_mapped_bytes(G);
   const uint64_t host_extra =
-      add_ck(add_ck(add_ck(x.mapped_bytes, x.bounce_bytes, "the host extras"), x.staging_bytes, "the host extras"),
+      add_ck(add_ck(add_ck(x.mapped_bytes, bounce_total, "the host extras"), x.staging_bytes, "the host extras"),
              mul_ck(x.S, x.host_stride, "the disk staging buffers"), "the host extras");
   if (add_ck(p.pinned, host_extra, "the host total") > b.host_pinned_bytes)
     refuse(SS_E_CAPACITY, "the plan's pinned bytes (" + std::to_string(p.pinned) + ") plus the mapped control area (" +
-                              std::to_string(x.mapped_bytes) + "), the bounce buffer (" +
-                              std::to_string(x.bounce_bytes) + ") and the staging buffer (" +
+                              std::to_string(x.mapped_bytes) + "), the bounce buffers (" +
+                              std::to_string(bounce_total) + ") and the staging buffer (" +
                               std::to_string(x.staging_bytes) + "), the disk staging buffers (" +
                               std::to_string(uint64_t(x.S) * x.host_stride) + ") exceed the host budget (" +
                               std::to_string(b.host_pinned_bytes) + ")");
   // A unit's in-place parts as concurrent sub-reads (the file misses, the prefetch reads, the serial loader), e.g.
   // 1024 = 1 MiB pieces (a medium request: a multi-location session balances each across the homes of its chunk); a
   // multiple of 4 KiB keeps every piece aligned; 0 (default, until it measures faster) = one request per part.
-  if (const char* v = std::getenv("DG_UNIT_SUBREAD_KIB")) {
-    char* end = nullptr;
-    const unsigned long n = std::strtoul(v, &end, 10);
-    require(*v && end && !*end && n <= 65536 && n % 4 == 0, SS_E_INVALID,
-            "device-gated: invalid DG_UNIT_SUBREAD_KIB (0..65536, a multiple of 4)");
-    x.unit_subread = uint64_t(n) << 10;
-  } else {
-    x.unit_subread = 0;
-  }
+  unsigned long subread = 0;
+  if (env_count("DG_UNIT_SUBREAD_KIB", 65536, &subread))
+    require(subread % 4 == 0, SS_E_INVALID, "device-gated: invalid DG_UNIT_SUBREAD_KIB (0..65536, a multiple of 4)");
+  x.unit_subread = uint64_t(subread) << 10;
   if (!x.load_serial) {
     auto option = [](const char* name, uint32_t def, uint32_t max) {
-      const char* v = std::getenv(name);
-      if (!v) return def;
-      char* end = nullptr;
-      const unsigned long n = std::strtoul(v, &end, 10);
-      require(*v && end && !*end && n >= 1 && n <= max, SS_E_INVALID,
-              std::string("device-gated: invalid ") + name);
+      unsigned long n = def;
+      if (env_count(name, max, &n))
+        require(n >= 1, SS_E_INVALID, std::string("device-gated: invalid ") + name);
       return uint32_t(n);
     };
     x.load_readers = option("DG_LOAD_READERS", 8, 32);
@@ -273,12 +328,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     require(x.load_buffer_bytes >= x.unit_bytes &&
             x.load_buffer_bytes <= available / x.load_buffers, SS_E_CAPACITY,
             "device-gated: startup ring exceeds the host budget (reduce DG_LOAD_BUFFERS or DG_LOAD_BUFFER_MIB)");
-    const char* overlap = std::getenv("DG_LOAD_OVERLAP_ALLOC");
-    const std::string overlap_value = overlap ? overlap : "";
-    x.load_overlap_alloc = overlap_value != "0";
-    require(overlap_value.empty() || overlap_value == "0" || overlap_value == "1" || overlap_value == "true" ||
-                overlap_value == "on",
-            SS_E_INVALID, "device-gated: invalid DG_LOAD_OVERLAP_ALLOC (use 0, 1, true, or on)");
+    x.load_overlap_alloc = env_flag("DG_LOAD_OVERLAP_ALLOC", true);
   }
   return x;
 }

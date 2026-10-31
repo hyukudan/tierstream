@@ -154,3 +154,9 @@ ss.h-sha256 93233cb622d076fabfc95751d99ab8b7e9a327c668ce2610ca800ac5ac4f9824
 
 # public main write-back stream default (#7) on top of the release tip (comment only: dg_wb_stream default 1)
 ss.h-sha256 7263a29b3e9b15fa0ad0e5987db55394082be0d0a98268f95539c46fc071dc6a
+
+# release review fixes (comments only: name-surrogate reparse points, DELETE-access holders, a cancelled round may leave a home empty, ss_dg_round_cancel vs ss_close, ss_pack_readv stride cap)
+ss.h-sha256 db3e05d3614c9768ee625ff415491777851b1cd4a3ceb6c68b5ff372a6f68c2d
+
+# exact I/O serialization fixes (additive: appended ss_dg_stats cuda_module_loading / reserved1; comments: bounce buffers pageable per file reader, each three-tier read ends on its own)
+ss.h-sha256 f15eb1f777bfb7d2ef58fce966743b7c2540e3fde884fd2deb4cfe2ec8acf6a5

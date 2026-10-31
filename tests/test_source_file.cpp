@@ -539,7 +539,6 @@ TEST(source_dg_read_unit_parts_in_parallel) {
       auto* a = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
       auto* b = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
       auto* bounce = static_cast<char*>(::operator new(size_t(bounce_bytes), std::align_val_t(4096)));
-      std::mutex mu;
       for (int u : {0, 3, 7, U - 1}) {
         std::vector<uint8_t> expected;
         for (int p = 0; p < 3; ++p)
@@ -548,8 +547,8 @@ TEST(source_dg_read_unit_parts_in_parallel) {
         std::memset(b, 0x22, size_t(unit));
         ts::DgLoadStats sa, sb;
         uint64_t da = 0, db = 1;
-        ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, &mu, true);
-        ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, &mu, false);
+        ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, true);
+        ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, false);
         CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
         CHECK(std::memcmp(b, expected.data(), expected.size()) == 0);
         CHECK_EQ(da, ts::xxh64(expected.data(), expected.size()));
@@ -621,7 +620,6 @@ TEST(source_dg_read_unit_subreads) {
         auto* a = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
         auto* b = static_cast<char*>(::operator new(size_t(unit), std::align_val_t(4096)));
         auto* bounce = static_cast<char*>(::operator new(size_t(bounce_bytes), std::align_val_t(4096)));
-        std::mutex mu;
         for (int u : {0, 5, 15}) {
           std::vector<uint8_t> expected;
           for (int p = 0; p < 3; ++p)
@@ -630,8 +628,8 @@ TEST(source_dg_read_unit_subreads) {
           std::memset(b, 0x22, size_t(unit));
           ts::DgLoadStats sa, sb;
           uint64_t da = 0, db = 1;
-          ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, &mu, true, sub);
-          ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, &mu, true, 0);
+          ts::dg_read_unit(d, files, 0, u, a, bounce, bounce_bytes, true, &da, &sa, true, sub);
+          ts::dg_read_unit(d, files, 0, u, b, bounce, bounce_bytes, true, &db, &sb, true, 0);
           CHECK(std::memcmp(a, expected.data(), expected.size()) == 0);
           CHECK(std::memcmp(b, expected.data(), expected.size()) == 0);
           CHECK_EQ(da, ts::xxh64(expected.data(), expected.size()));
@@ -653,14 +651,14 @@ TEST(source_dg_read_unit_subreads) {
           ts::RawFile::test_fail_piece(3);
           bool threw = false;
           try {
-            ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, nullptr, nullptr, &mu, true, sub);
+            ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, nullptr, nullptr, true, sub);
           } catch (const ts::Error& e) {
             threw = e.status() == SS_E_IO;
           }
           CHECK(threw);
           ts::RawFile::test_fail_piece(0);
           uint64_t dg = 0;
-          ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, &dg, nullptr, &mu, true, sub);
+          ts::dg_read_unit(d, files, 0, 2, a, bounce, bounce_bytes, true, &dg, nullptr, true, sub);
           std::vector<uint8_t> expected;
           for (int p = 0; p < 3; ++p)
             for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(7, off[p] + 2ull * pb[p] + i));
@@ -669,7 +667,7 @@ TEST(source_dg_read_unit_subreads) {
         } else {  // a failing stripe location: its pieces fall back to the primary, the same bytes
           files[0]->session()->test_inject(1, 1, 0);
           uint64_t dg = 0;
-          ts::dg_read_unit(d, files, 0, 9, a, bounce, bounce_bytes, true, &dg, nullptr, &mu, true, sub);
+          ts::dg_read_unit(d, files, 0, 9, a, bounce, bounce_bytes, true, &dg, nullptr, true, sub);
           std::vector<uint8_t> expected;
           for (int p = 0; p < 3; ++p)
             for (uint64_t i = 0; i < pb[p]; ++i) expected.push_back(sstest::byte_at(7, off[p] + 9ull * pb[p] + i));

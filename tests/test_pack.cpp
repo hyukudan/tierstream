@@ -970,6 +970,12 @@ TEST(c_abi) {
     CHECK_EQ(ss_pack_readv(p, &nq[0].q, 2), SS_OK);
     CHECK(std::memcmp(r1.data(), a.data() + 2000, 3000) == 0 && r2 == b);
   }
+  {  // an element size past 4096 bytes is refused (a stride the array cannot plausibly have)
+    std::vector<uint64_t> big(2 * 4104 / 8, 0);
+    ss_pack_read_req* q = reinterpret_cast<ss_pack_read_req*>(big.data());
+    q->struct_size = 4104;
+    CHECK_EQ(ss_pack_readv(p, q, 1), SS_E_INVALID);
+  }
   ss_pack_unit u;
   CHECK_EQ(ss_pack_unit_find(p, 0, 1, &u), SS_OK);
   CHECK(u.count == 1 && u.bytes == b.size());

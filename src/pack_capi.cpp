@@ -184,7 +184,8 @@ ss_status ss_pack_readv(ss_pack* p, const ss_pack_read_req* reads, uint32_t n) {
     std::vector<ts::PackRead> rs(n);
     // one element size per call (the first's): the array is walked with it, fields past the caller's size default
     const size_t stride = n ? reads[0].struct_size : 0;
-    need(n == 0 || (stride >= kReadReqV1 && stride % alignof(ss_pack_read_req) == 0), "bad read request size");
+    need(n == 0 || (stride >= kReadReqV1 && stride <= 4096 && stride % alignof(ss_pack_read_req) == 0),
+         "bad read request size");
     for (uint32_t i = 0; i < n; ++i) {
       ss_pack_read_req q{};
       const char* at = reinterpret_cast<const char*>(reads) + size_t(i) * stride;

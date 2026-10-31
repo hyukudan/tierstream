@@ -178,16 +178,19 @@ void DgService::run(uint32_t seen) {
       serve_token(seq);
       if (cfg_.diag) std::copy(tl_.begin(), tl_.end(), tl_done_.begin());
     } catch (const Stop&) {
+      if (cfg_.diag) std::copy(tl_.begin(), tl_.end(), tl_done_.begin());  // the token's layers up to the stop
       boost_off();
       publish(kStopped, seq);
       return;
     } catch (const std::exception& e) {
       fail_with(e.what());
+      if (cfg_.diag) std::copy(tl_.begin(), tl_.end(), tl_done_.begin());  // the token's layers up to the failure
       boost_off();
       publish(kFailed, seq);
       return;
     } catch (...) {
       fail_with("device-gated: unknown exception in the service thread");
+      if (cfg_.diag) std::copy(tl_.begin(), tl_.end(), tl_done_.begin());
       boost_off();
       publish(kFailed, seq);
       return;
@@ -199,6 +202,8 @@ void DgService::run(uint32_t seen) {
 
 void DgService::serve_token(uint32_t seq) {
   const uint32_t G = core_->gated();
+  // a failed token publishes its rows too: the layers it did not reach are empty, never an older token's
+  if (cfg_.diag) std::fill(tl_.begin(), tl_.end(), DgLayerTimeline{});
   unranked_.clear();
   std::copy(run_next_.begin(), run_next_.end(), run_.begin());  // (begin's release, acquired with seq)
   core_->begin_token(seq, &run_);

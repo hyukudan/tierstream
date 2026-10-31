@@ -758,6 +758,14 @@ TEST(dg_cuda_wb_defer_stats_abi) {
   bool untouched = true;
   for (size_t i = 0; i < sizeof old - old_size; ++i) untouched = untouched && tail[i] == 0x5a;
   CHECK(untouched);
+  // the appended module loading mode (0 unknown, 1 eager, 2 lazy), named in the stats JSON
+  ss_dg_stats full;
+  CHECK_OK(ss_stats_dg(r.c, &full));
+  CHECK(full.cuda_module_loading <= 2u);
+  char* js = nullptr;
+  CHECK_OK(ss_stats_to_json(r.c, &js, nullptr));
+  CHECK(js && std::strstr(js, "\"cuda_module_loading\":") != nullptr);
+  ss_free(js);
 }
 
 // dg_wb_defer with victims still deferred when the service stops: the token fails, the context is poisoned, close
