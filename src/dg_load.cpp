@@ -17,12 +17,6 @@ namespace {
 struct Span { size_t source; uint64_t offset, bytes; char* dst; uint64_t room; };
 struct Batch { size_t first, count; bool resident; size_t need; };  // need: chunks published before a host read
 struct Ready { size_t buffer; std::vector<DgLoadCopy> copies; };
-// Pageable aligned bounce storage: never an H2D source. Each reader owns one.
-struct Bounce {
-  char* p; size_t alignment;
-  Bounce(size_t n, size_t a) : p(static_cast<char*>(::operator new(n, std::align_val_t(a)))), alignment(a) {}
-  ~Bounce() { ::operator delete(p, std::align_val_t(alignment)); }
-};
 }
 DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input,
     const std::vector<char*>& buffers, uint64_t buffer_bytes, uint32_t readers,
@@ -101,7 +95,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
         alignment = std::max(alignment, src.align);
       }
       const uint64_t bounce_bytes = std::max<uint64_t>(1ull << 20, 4 * alignment);
-      std::unique_ptr<Bounce> bounce; // allocated only if a destination cannot hold covering-read slack
+      std::unique_ptr<DgBounce> bounce; // allocated only if a destination cannot hold covering-read slack
       for (;;) {
         Batch b{}; size_t bi = 0;
         bool done = false;
@@ -227,7 +221,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
             std::memmove(a.dst, aligned+delta, size_t(a.bytes));
           } else {
             require(a.bytes <= file.size()-a.offset, SS_E_IO, "startup loader: source range past EOF");
-            if (!bounce) bounce = std::make_unique<Bounce>(size_t(bounce_bytes), size_t(alignment));
+            if (!bounce) bounce = std::make_unique<DgBounce>(size_t(bounce_bytes), size_t(alignment));
             bounced += a.bytes;
             const uint64_t cap = (bounce_bytes - 2*al) / al * al;
             for (uint64_t c = 0; c < a.bytes;) {
@@ -307,7 +301,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input
 
 void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>& files, int layer, int unit,
                   void* dst, void* bounce, uint64_t bounce_bytes, bool hash, uint64_t* digest, DgLoadStats* stats,
-                  std::mutex* bounce_mu, bool parallel, uint64_t subread) {
+                  bool parallel, uint64_t subread) {
   const Layer& l = d.layers[size_t(layer)];
   auto read = [&](const SourceFile& file, void* out, uint64_t n, uint64_t off) {
     const uint64_t got = file.pread(out, n, off);
@@ -381,17 +375,28 @@ void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>&
     if (in_place) {
       require(read(f, out, part.bytes, F) == part.bytes, SS_E_IO, "short read");
     } else {
-      if (stats) stats->bounce_bytes += part.bytes;
-      std::unique_lock<std::mutex> lk;
-      if (bounce_mu) lk = std::unique_lock<std::mutex>(*bounce_mu);
-      const uint64_t cap = (bounce_bytes - 2 * al) / al * al;
-      for (uint64_t c = 0; c < part.bytes;) {
-        const uint64_t len = std::min(cap, part.bytes - c);
-        const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = (F + c + len + al - 1) / al * al;
-        require(read(f, bounce, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
-        std::memcpy(out + c, static_cast<char*>(bounce) + delta, size_t(len));
-        c += len;
+      // [lo, hi): the aligned middle, read in place when the destination has the offset's misalignment (aligned
+      // offset, length and address there); the rest through the bounce buffer, in covering aligned reads
+      uint64_t lo = 0, hi = 0;
+      if (uintptr_t(out) % al == F % al) {
+        lo = (al - F % al) % al;
+        if (part.bytes > lo) hi = lo + (part.bytes - lo) / al * al;
+        if (hi <= lo) lo = hi = 0;  // no aligned middle (a part ending before the next sector): bounced whole
       }
+      if (hi > lo) require(read(f, out + lo, hi - lo, F + lo) == hi - lo, SS_E_IO, "short read");
+      const uint64_t cap = (bounce_bytes - 2 * al) / al * al;
+      auto bounced = [&](uint64_t from, uint64_t to) {
+        if (stats) stats->bounce_bytes += to - from;
+        for (uint64_t c = from; c < to;) {
+          const uint64_t len = std::min(cap, to - c);
+          const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = (F + c + len + al - 1) / al * al;
+          require(read(f, bounce, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
+          std::memcpy(out + c, static_cast<char*>(bounce) + delta, size_t(len));
+          c += len;
+        }
+      };
+      bounced(0, lo);
+      bounced(hi > lo ? hi : 0, part.bytes);
     }
   }
   for (const Cut& c : cuts) {  // every piece lands or it throws (after none is in flight)
@@ -506,7 +511,7 @@ void DgBlockAlloc::finish(std::vector<void*>* out_chunks, std::vector<char*>* ou
 
 DgReadPool::DgReadPool(uint32_t threads) {
   try {
-    for (uint32_t i = 0; i < std::max<uint32_t>(threads, 1); ++i) threads_.emplace_back([this] { work(); });
+    for (uint32_t i = 0; i < std::max<uint32_t>(threads, 1); ++i) threads_.emplace_back([this, i] { work(i); });
   } catch (...) {
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -529,7 +534,7 @@ DgReadPool::~DgReadPool() {
   for (auto& t : threads_) t.join();
 }
 
-void DgReadPool::work() {
+void DgReadPool::work(uint32_t worker) {
   for (;;) {
     Job* j = nullptr;
     {
@@ -543,7 +548,7 @@ void DgReadPool::work() {
     const auto t0 = std::chrono::steady_clock::now();
     std::exception_ptr error;
     try {
-      j->read();
+      j->read(worker);
     } catch (...) {
       error = std::current_exception();
     }
@@ -561,6 +566,10 @@ void DgReadPool::work() {
 }
 
 void* DgReadPool::submit(std::function<void()> read) {
+  return submit_indexed([read = std::move(read)](uint32_t) { read(); });
+}
+
+void* DgReadPool::submit_indexed(std::function<void(uint32_t)> read) {
   auto j = std::make_unique<Job>();
   j->read = std::move(read);
   Job* p = j.get();

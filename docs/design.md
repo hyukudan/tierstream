@@ -568,13 +568,16 @@ lookup tables (Engram) unbuffered (study §6.5).
   (Windows: opened normally and `GetFinalPathNameByHandleW`, which also expands 8.3 short names; Linux: `realpath`),
   so symlinked or junctioned model and stripe directories keep working: a link that exists then is followed once.
   That real path is then opened through held handles of its directory and of every ancestor from the volume root,
-  and a directory or file found to be a symlink, junction or other reparse point during that walk (one swapped in
-  after the resolve) is refused (a stripe location is disabled, a primary or source fails to open). Windows holds
-  each directory with `FILE_FLAG_OPEN_REPARSE_POINT` and without `FILE_SHARE_DELETE` (none can be renamed or deleted
-  while held), and checks that the file's final path is its held directory's plus its name; Linux walks
-  `openat(O_PATH | O_DIRECTORY | O_NOFOLLOW)` from `/` and opens the file `O_NOFOLLOW` relative to the held directory
-  (renames cannot be denied there). The manifest stays open for the session's lifetime and is read through its
-  handle. Resolving follows whatever the path names at open time, so a caller binds to what it authenticated by
+  and a directory or file found to be a link during that walk (one swapped in after the resolve) is refused (a stripe
+  location is disabled, a primary or source fails to open). On Windows a link is a name-surrogate reparse point
+  (symlink, junction, mount point); other reparse points (OneDrive and other cloud files, dedup, compression) are the
+  entry's own data and are accepted. Windows holds each directory with `FILE_FLAG_OPEN_REPARSE_POINT` and without
+  `FILE_SHARE_DELETE`: while a session (or a context's source) is open, the model directory and every ancestor up to
+  the volume root cannot be renamed or deleted, and opening fails while another process holds one of them with
+  DELETE access (e.g. a rename or delete in progress). It also checks that the file's final path is its held
+  directory's plus its name. Linux walks `openat(O_PATH | O_DIRECTORY | O_NOFOLLOW)` from `/` and opens the file
+  `O_NOFOLLOW` relative to the held directory (renames cannot be denied there). The manifest stays open for the
+  session's lifetime and is read through its handle. Resolving follows whatever the path names at open time, so a caller binds to what it authenticated by
   identity: `ss_mfile_location_info` reports, per location, the manifest's digest field and the identities (volume +
   file index, or dev + inode, and size) of the held manifest, data file and primary; `ss_options.source_identities`
   makes `ss_open` require an identity per descriptor source (`SS_E_DESC` naming the source otherwise). The loaders'
@@ -700,8 +703,8 @@ sample per side (the engine's cudaMemGetInfo / NVML device use, its process comm
 may be absent): the last value, the peak with the stage it happened at, and the samples above each cap;
 `within_caps` is 1 when every measured peak stayed at or below its cap (the receipt's "peak <= cap"). Passed as `ss_options.budget`, the
 context charges its own allocations before making them: in device-gated mode the arena, slot table, controls, mapped
-area, pinned blocks, disk staging, staging, bounce, table staging, diagnostics and (until the open ends) the load
-ring; in host mode every allocation of its backend. A cap overrun fails `ss_open` naming the allocation; closing
+area, pinned blocks, disk staging, staging, bounce (pageable, one per file reader), table staging, diagnostics and
+(until the open ends) the load ring; in host mode every allocation of its backend. A cap overrun fails `ss_open` naming the allocation; closing
 releases the charges.
 
 ### 5.2 Device profiles

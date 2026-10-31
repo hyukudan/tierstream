@@ -858,13 +858,14 @@ bool file_link(const fs::path& link, const fs::path& target) {
 }
 #if defined(_WIN32)
 // Sets (or removes) a third-party reparse tag on an existing file: any user who may write the file can, unlike a
-// symlink. The file then is a reparse point with its own bytes (no filter acts on the tag).
-bool reparse_tag(const fs::path& p, bool set) {
+// symlink. The file then is a reparse point with its own bytes (no filter acts on the tag). surrogate: the tag is
+// marked a name surrogate (a link, as a symlink or junction); without it, the entry's own data (as a cloud file).
+bool reparse_tag(const fs::path& p, bool set, bool surrogate = false) {
   HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (h == INVALID_HANDLE_VALUE) return false;
   REPARSE_GUID_DATA_BUFFER b{};
-  b.ReparseTag = 0x00005A17;  // not a Microsoft tag
+  b.ReparseTag = surrogate ? 0x20005A17 : 0x00005A17;  // not a Microsoft tag
   b.ReparseGuid = GUID{0x6b1f2c4e, 0x51a3, 0x4d6e, {0x9a, 0x2b, 0x7c, 0x10, 0x3e, 0x55, 0x81, 0x2f}};
   DWORD n = 0;
   const BOOL ok = DeviceIoControl(h, set ? FSCTL_SET_REPARSE_POINT : FSCTL_DELETE_REPARSE_POINT, &b,
@@ -1001,10 +1002,11 @@ TEST(mfile_bound_opens_refuse_links_swapped_in_after_resolve) {
   test_bound_resolved_hook(nullptr);
   unlink_path(t.primary.parent_path());
   fs::rename(primary_real, t.primary.parent_path());
-  // the leaf: the data file becomes a link (Linux: a symlink; Windows: a reparse point, no privilege needed)
+  // the leaf: the data file becomes a link (Linux: a symlink; Windows: a name-surrogate reparse point, no privilege
+  // needed)
   const fs::path data = t.secondary / t.manifest.data_name;
 #if defined(_WIN32)
-  fired = arm(t.manifest.data_name, [&] { CHECK(reparse_tag(data, true)); });
+  fired = arm(t.manifest.data_name, [&] { CHECK(reparse_tag(data, true, true)); });
 #else
   fired = arm(t.manifest.data_name, [&] {
     fs::rename(data, t.root / "moved.data");
@@ -1020,6 +1022,16 @@ TEST(mfile_bound_opens_refuse_links_swapped_in_after_resolve) {
   CHECK(*fired);
   test_bound_resolved_hook(nullptr);
 #if defined(_WIN32)
+  CHECK(reparse_tag(data, false, true));
+  // a reparse point that is not a name surrogate (cloud files, dedup) is the file's own data: the bound open accepts it
+  const uint64_t data_size = uint64_t(fs::file_size(data));
+  fired = arm(t.manifest.data_name, [&] { CHECK(reparse_tag(data, true)); });
+  {
+    RawFile f(data.u8string(), false);
+    CHECK_EQ(f.size(), data_size);
+  }
+  CHECK(*fired);
+  test_bound_resolved_hook(nullptr);
   CHECK(reparse_tag(data, false));
 #else
   unlink_path(data);

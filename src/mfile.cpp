@@ -272,10 +272,15 @@ struct MFile::Impl {
         }
         // Other rejection reasons must be retried on another open.
         if (!loc->file || identity_of(loc->path) != loc->id) return false;
-        if (!loc->manifest_path.empty() &&
-            (!loc->manifest_file || identity_of(loc->manifest_path) != loc->manifest_file->identity() ||
-             read_all(*loc->manifest_file, uint64_t(256) << 20) != loc->manifest_text))
-          return false;
+        // the manifest: the same file (volume, index, size; its bytes are compared next, so a timestamp-only change
+        // such as a metadata event moving the Linux ctime does not keep the stripe from serving again)
+        if (!loc->manifest_path.empty()) {
+          if (!loc->manifest_file) return false;
+          const FileIdentity now = identity_of(loc->manifest_path), held = loc->manifest_file->identity();
+          if (now.volume != held.volume || now.index != held.index || now.size != held.size ||
+              read_all(*loc->manifest_file, uint64_t(256) << 20) != loc->manifest_text)
+            return false;
+        }
       }
     } catch (const Error&) { return false; }
     return true;

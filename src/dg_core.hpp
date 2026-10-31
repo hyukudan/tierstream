@@ -187,6 +187,12 @@ struct DgStats {
   uint64_t round_count = 0, round_units = 0, round_bytes = 0, round_ns = 0, round_cancelled = 0;
 };
 
+// The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
+// unit back. A cancelled deferred write-back copied nothing; a three-tier drop or a clean copy's drop needs no copy.
+inline uint64_t dg_exclusive_writebacks(const DgStats& s) {
+  return s.evicted - s.wb_cancelled - s.inclusive_drops - s.disk_discards;
+}
+
 // A placement round (ss_dg_round), docs/design.md §3.10.
 struct DgRoundIn {
   uint64_t budget_bytes = 0;  // file reads + H2D + write-back bytes the round may move (0 = no limit)
@@ -363,8 +369,13 @@ class DgCore {
   // (SS_E_IO) leaves the cache consistent (the moves committed so far stay, the table uploaded); any device failure
   // poisons the core. Counted only in the round_* stats.
   DgRoundOut round(const DgRoundIn& in, const std::vector<uint32_t>& kept);
-  // Any thread: the round in progress stops at its next unit boundary (cancelled = 1). No effect between rounds.
-  void cancel_round() { round_cancel_.store(true, std::memory_order_release); }
+  // Any thread: the round in progress stops at its next unit boundary (cancelled = 1). No effect between rounds: a
+  // round is in progress from the entry of round() (before its argument checks) until it returns, and only then is the
+  // request recorded (running -> cancel); round() resets the state to idle on every exit.
+  void cancel_round() {
+    int running = kRoundRunning;
+    round_state_.compare_exchange_strong(running, kRoundCancel, std::memory_order_acq_rel);
+  }
   // Between tokens: the decayed counts of `keys` (finite, >= 0), e.g. from a routing profile; every key checked first.
   void seed_round_counts(const std::vector<uint32_t>& keys, const std::vector<float>& counts);
   const DgRoundOut& last_round() const { return last_round_; }  // also after a failure (zero after a refusal)
@@ -518,10 +529,11 @@ class DgCore {
   bool fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted);
   void serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead);
   void copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t src);  // h2d + entry (kEntryBeforeCopy order)
-  // three-tier, overlapped file misses: the reads begun and not ended, oldest first. drain_pending(n) ends the n oldest
-  // (all by default) and enqueues what their fetch would have enqueued after the read: the copy, the entry, the
-  // staging buffer's event, a prefetch's event. A failed read returns its key to its file (fetch undone); the first
-  // error is rethrown after every record was ended.
+  // three-tier, overlapped file misses: the reads begun and not ended, oldest first. Ending a record enqueues what its
+  // fetch would have enqueued after the read: the copy, the entry, the staging buffer's event, a prefetch's event.
+  // drain_pending(n) ends the n oldest (all by default); end_reads / drain_through end only the records they select,
+  // in any position (the others stay in flight, in order). A failed read returns its key to its file (fetch undone);
+  // the first error is rethrown after every selected record was ended.
   struct Pending {
     uint32_t key;
     int32_t slot, stage;
@@ -531,10 +543,11 @@ class DgCore {
     uint64_t entry;  // the public call that began it (entries_)
   };
   void drain_pending(size_t n = SIZE_MAX);
-  void drain_through(const std::function<bool(const Pending&)>& f);  // up to the last record f accepts
-  void drain_demand();               // up to the last demand record
-  void drain_key(uint32_t k);        // up to k's record
-  void drain_layer(uint32_t g);      // up to the last demand record or record of gated layer g
+  void end_reads(const std::function<bool(const Pending&)>& pick);
+  void drain_through(const std::function<bool(const Pending&)>& f);  // the records f accepts (only those)
+  void drain_demand();               // every demand record
+  void drain_key(uint32_t k);        // k's record
+  void drain_layer(uint32_t g);      // every demand record and every record of gated layer g
   void enter();                      // a public entry point: counted, the demand records drained
   void undo_pending(const Pending& p);
   void finish_pending(const Pending& p);
@@ -607,10 +620,12 @@ class DgCore {
   std::vector<uint8_t> layer_missed_;  // per gated layer, this token
   std::vector<uint8_t> run_;           // per gated layer: exported this token (begin_token)
   std::vector<uint32_t> res_victims_;  // make_resident's last victims (test hook)
-  // placement rounds: the decayed counts, the exports since the last round, the cancellation flag
+  // placement rounds: the decayed counts, the exports since the last round, the round's state (idle, running, a
+  // cancellation requested while running)
   std::vector<double> rs_;
   std::vector<uint32_t> rhits_;
-  std::atomic<bool> round_cancel_{false};
+  static constexpr int kRoundIdle = 0, kRoundRunning = 1, kRoundCancel = 2;
+  std::atomic<int> round_state_{kRoundIdle};
   DgRoundOut last_round_;
   std::function<void(uint32_t)> round_probe_;
   bool diag_ = false;

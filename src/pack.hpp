@@ -158,6 +158,7 @@ class PackWriter {
   struct Out;
   std::unique_ptr<Out> out_;
   bool open_rec_ = false, finished_ = false, failed_ = false;
+  bool tmp_left_ = false;  // poison() could not remove DIR.incomplete (the destructor tries once more)
   PackRecord rec_;
   uint64_t rec_written_ = 0;
   std::vector<uint64_t> seg_end_;

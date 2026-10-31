@@ -46,7 +46,7 @@ class Scripted final : public DgTransport {
   struct Ev {
     uint64_t recorded = 0, completed = 0;
   };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read };
+  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark };
   struct Op {
     Kind kind;
     int32_t a = 0, b = 0;
@@ -129,7 +129,8 @@ class Scripted final : public DgTransport {
       v_->set("a file read ended twice, or never begun");
       return 0;
     }
-    if (it != in_flight_.begin()) ++out_of_order_;  // (the core ends the oldest first: the reads landed in any order)
+    if (it != in_flight_.begin()) ++out_of_order_;  // (ended out of begin order: only the reads needed end)
+    ended_.push_back(it->key);
     land(*it);
     const bool fails = it->fails;
     in_flight_.erase(it);
@@ -141,6 +142,12 @@ class Scripted final : public DgTransport {
     read_rng_.seed(seed);
   }
   void fail_read(int n) { fail_read_at_ = n; }  // the n-th later read fails (0 = off)
+  // Held reads (asynchronous reads only): a read of a held key never lands before it is ended (a read that does not
+  // complete), every other read lands as it begins. Empty (default): the random landing above.
+  void hold_reads(std::vector<uint32_t> keys) { held_reads_ = std::move(keys); }
+  const std::vector<uint32_t>& ended() const { return ended_; }  // the keys whose reads were ended, in order
+  // dg_diag: the marks in the trace, {kDem, Mark, g, which, 0} (no device work)
+  void diag_mark(uint32_t g, int which) override { trace_.push_back({int64_t(kDem), int64_t(Mark), g, which, 0}); }
   void set_eager(bool on) { eager_ = on; }      // every operation runs as soon as it can (no scheduler draws)
   size_t reads_in_flight() const { return in_flight_.size(); }
   uint64_t max_in_flight() const { return max_in_flight_; }
@@ -324,7 +331,15 @@ class Scripted final : public DgTransport {
     fill_block(r.block, r.fails ? -3 : int32_t(r.key));
     if (!r.fails) ++reads_;
   }
+  bool read_held(uint32_t key) const {
+    return std::find(held_reads_.begin(), held_reads_.end(), key) != held_reads_.end();
+  }
   void land_some() {  // each read in flight lands now with probability 1/3, any of them first
+    if (!held_reads_.empty()) {
+      for (Pend& r : in_flight_)
+        if (!read_held(r.key)) land(r);
+      return;
+    }
     for (size_t i = 0; i < in_flight_.size(); ++i)
       if (!in_flight_[i].landed && read_rng_() % 3 == 0) {
         for (size_t j = 0; j < i; ++j) landed_ooo_ += in_flight_[j].landed ? 0 : 1;
@@ -375,6 +390,7 @@ class Scripted final : public DgTransport {
         table_ = o.table;
         break;
       case Read:
+      case Mark:  // (traced only, never queued)
         break;
     }
   }
@@ -396,6 +412,7 @@ class Scripted final : public DgTransport {
   bool async_ = false, eager_ = false;
   int fail_read_at_ = 0;
   std::deque<Pend> in_flight_;
+  std::vector<uint32_t> held_reads_, ended_;
   uint64_t read_id_ = 0, max_in_flight_ = 0, out_of_order_ = 0, landed_ooo_ = 0;
   std::mt19937_64 read_rng_{1};
   int32_t staging_ = -1;
@@ -3584,6 +3601,10 @@ TEST(dg_three_tier_runs) {
         std::printf("  seed %llu (reads %d): %s\n", (unsigned long long)seed, how, o.violation.c_str());
       CHECK(o.violation.empty());
       if (how == 2) CHECK_EQ(o.st.disk_overlapped + o.st.disk_carried, 0ull);
+      // the exclusive write-backs (ss_exclusive_stats): drops and cancelled deferrals are evictions without a copy;
+      // the rest were issued (collected, or still deferred or in flight at the end of the run)
+      CHECK(o.st.evicted >= o.st.wb_cancelled + o.st.inclusive_drops + o.st.disk_discards);
+      CHECK(ts::dg_exclusive_writebacks(o.st) >= o.st.writebacks_done);
       overlapped += o.st.disk_overlapped;
       carried += o.st.disk_carried;
       carried_bytes += o.st.disk_carried_bytes;
@@ -3955,6 +3976,188 @@ TEST(dg_three_tier_prefetch_reads_carried) {
                 (unsigned long long)o.st.disk_read_bytes, (unsigned long long)o.st.prefetched,
                 (unsigned long long)o.st.disk_overlapped, (unsigned long long)o.st.disk_carried,
                 (unsigned long long)o.st.disk_carried_bytes);
+  }
+}
+
+// Reads end out of order (each only when its own record is needed): a rig with file units in both gated layers (keys
+// 5..8 and 25..28), depth 16, reads that land as they begin except the held ones.
+namespace {
+struct OooRig {
+  Violation v;
+  Scripted t{40, 12 + 2 * 4, 30 + 6, 2, 5, &v};
+  DgConfig c;
+  std::unique_ptr<DgCore> core;
+  explicit OooRig(std::vector<uint32_t> held, uint32_t queue = 16) {
+    c.n_units = {20, 20};
+    c.persistent_slots = 12;
+    c.bank_slots = 4;
+    c.blocks = 30;
+    c.spare_target = 4;
+    c.disk_tier = true;
+    c.home_blocks = 24;  // the 24 other non-residents: the disk keys get no block
+    c.disk_staging = 6;
+    c.disk_queue = queue;
+    c.disk_prefetch = true;
+    core = std::make_unique<DgCore>(c, &t);
+    std::vector<uint8_t> disk(40, 0);
+    for (uint32_t k : {5u, 6u, 7u, 8u, 25u, 26u, 27u, 28u}) disk[k] = 1;
+    std::vector<uint32_t> order;  // the residents: keys 10..17
+    for (uint32_t k = 10; k < 18; ++k) order.push_back(k);
+    for (uint32_t k = 0; k < 40; ++k) order.push_back(k);
+    core->place(order, &disk);
+    for (uint32_t k = 0; k < 40; ++k) {
+      if (core->slot_of(k) >= 0) t.fill_slot(core->slot_of(k), int32_t(k));
+      if (core->block_of(k) >= 0) t.fill_block(core->block_of(k), int32_t(k));
+    }
+    t.set_table(core->table());
+    t.set_async_reads(true, 3);
+    t.hold_reads(std::move(held));
+    core->begin_token(1);
+    t.clear_issued();
+  }
+  // the trace index of the first op of `kind` with field a == a (and key == key when key >= 0), or the trace size
+  size_t find(Scripted::Kind kind, int64_t a, int64_t key = -1, int64_t b = INT64_MIN) const {
+    const auto& tr = t.trace();
+    for (size_t i = 0; i < tr.size(); ++i)
+      if (tr[i][1] == kind && tr[i][2] == a && (key < 0 || tr[i][4] == key) && (b == INT64_MIN || tr[i][3] == b))
+        return i;
+    return tr.size();
+  }
+  void finish() {
+    core->end_token({});
+    core->check();
+    t.drain_all();
+    for (uint32_t k = 0; k < 40; ++k) CHECK_EQ(t.entry(k), core->table()[k]);
+    CHECK(v.what.empty());
+  }
+};
+}  // namespace
+
+TEST(dg_three_tier_reads_end_out_of_order) {
+  {  // a prefetch read of layer 1 that does not complete delays neither layer 0's demand read nor layer 0's ready
+    OooRig r({25});
+    DgCore& core = *r.core;
+    CHECK(core.fetch(1, 5, true));  // key 25: in flight, held
+    const uint32_t id = 5;          // key 5: a file miss of layer 0, begun behind it
+    core.serve_demand(0, &id, 1, 1);
+    CHECK_EQ(core.reads_in_flight(), 1u);  // the prefetch only
+    CHECK_EQ(r.t.reads_in_flight(), 1u);
+    CHECK(r.t.ended() == std::vector<uint32_t>{5});
+    const size_t ready = r.find(Scripted::Ready, 0);
+    CHECK(ready < r.t.trace().size());
+    CHECK(r.find(Scripted::H2D, core.slot_of(5)) < ready);
+    CHECK(r.find(Scripted::Entry, core.slot_of(5), 5) < ready);
+    CHECK_EQ(r.find(Scripted::H2D, core.slot_of(25)), r.t.trace().size());  // its copy waits for its read's end
+    CHECK_EQ(core.stats().disk_overlapped, 1ull);
+    core.check();
+    // its own layer's ready ends it (only then: the entry is the device's to read after that ready)
+    const uint32_t id1 = 5;
+    core.serve_demand(1, &id1, 1, 1);  // covered: the cover ends its read and waits for its copy
+    CHECK_EQ(core.reads_in_flight(), 0u);
+    CHECK(r.t.ended() == (std::vector<uint32_t>{5, 25}));
+    CHECK(r.find(Scripted::H2D, core.slot_of(25)) < r.find(Scripted::Ready, 1));
+    r.finish();
+  }
+  {  // poll_reads ends a completed read behind one that has not completed (the held one keeps its place)
+    OooRig r({25});
+    DgCore& core = *r.core;
+    CHECK(core.fetch(1, 5, true));  // key 25, held
+    CHECK(core.fetch(1, 6, true));  // key 26, landed
+    CHECK(core.fetch(1, 7, true));  // key 27, landed
+    CHECK_EQ(core.reads_in_flight(), 3u);
+    core.poll_reads();
+    CHECK_EQ(core.reads_in_flight(), 1u);
+    CHECK(r.t.ended() == (std::vector<uint32_t>{26, 27}));
+    CHECK(r.find(Scripted::H2D, core.slot_of(26)) < r.t.trace().size());
+    CHECK_EQ(r.find(Scripted::H2D, core.slot_of(25)), r.t.trace().size());
+    core.check();
+    core.poll_reads();  // still not complete: nothing more ends
+    CHECK_EQ(core.reads_in_flight(), 1u);
+    r.finish();  // the boundary ends it
+    CHECK(r.t.ended() == (std::vector<uint32_t>{26, 27, 25}));
+  }
+  {  // the queue depth: a full queue ends the completed reads first, the held oldest one stays in flight
+    OooRig r({25}, 2);
+    DgCore& core = *r.core;
+    CHECK(core.fetch(1, 5, true));  // key 25, held
+    CHECK(core.fetch(1, 6, true));  // key 26
+    CHECK(core.fetch(1, 7, true));  // key 27: the queue is full; 26 completed and ends, 25 stays
+    CHECK_EQ(core.reads_in_flight(), 2u);
+    CHECK(r.t.ended() == std::vector<uint32_t>{26});
+    core.check();
+    r.finish();
+  }
+  {  // several demand reads of one layer in flight together, ended out of begin order; a failed copy among the ones a
+     // drain picks ends and undoes every record still pending, picked or not (nothing more is enqueued)
+    OooRig r({25, 6});
+    DgCore& core = *r.core;
+    CHECK(core.fetch(1, 5, true));  // key 25: a prefetch of layer 1, held (not picked by layer 0's drain)
+    CHECK(core.fetch(0, 5, false));  // key 5, landed
+    CHECK(core.fetch(0, 6, false));  // key 6, held
+    CHECK(core.fetch(0, 7, false));  // key 7, landed
+    CHECK_EQ(core.reads_in_flight(), 4u);
+    core.poll_reads();  // the public entry ends the demand reads (5, 6, 7), not the prefetch
+    CHECK_EQ(core.reads_in_flight(), 1u);
+    CHECK(r.t.ended() == (std::vector<uint32_t>{5, 6, 7}));
+    core.check();
+    r.finish();
+    OooRig f({25});
+    DgCore& g = *f.core;
+    CHECK(g.fetch(1, 5, true));   // key 25: held, not picked
+    CHECK(g.fetch(0, 5, false));  // key 5: its copy fails
+    CHECK(g.fetch(0, 6, false));  // key 6: ended and undone
+    f.t.fail_kind(Scripted::kFH2D, 1);
+    bool threw = false;
+    try {
+      g.signal(0);
+    } catch (const ts::Error& e) {
+      threw = e.status() == SS_E_BACKEND;
+    }
+    CHECK(threw && f.t.kind_fired());
+    f.t.fail_kind(Scripted::kFH2D, 0);
+    CHECK_EQ(g.reads_in_flight(), 0u);
+    CHECK_EQ(f.t.reads_in_flight(), 0u);
+    CHECK(g.home(5) == DgCore::Home::Coming);  // as a synchronous fetch whose copy failed
+    CHECK(g.home(6) == DgCore::Home::File && g.table()[6] == -1);
+    CHECK(g.home(25) == DgCore::Home::File && g.table()[25] == -1);
+    CHECK_EQ(f.find(Scripted::H2D, g.slot_of(5) >= 0 ? g.slot_of(5) : -9), f.t.trace().size());
+    CHECK(f.t.ended() == (std::vector<uint32_t>{5, 6, 25}));
+    CHECK_EQ(g.stats().prefetched, 0ull);
+    CHECK_EQ(g.stats().fetched, 1ull);
+    g.check();
+    f.t.drain_all();
+    CHECK(f.v.what.empty());
+  }
+}
+
+// dg_diag: every miss of a layer is issued before the first one's read is ended; the mark "after the first fetched
+// unit's copies" (2) then follows that unit's copy and entry and precedes the others' copies.
+TEST(dg_three_tier_diag_issues_every_miss_first) {
+  OooRig r({5, 6, 7});  // nothing lands before it is ended
+  DgCore& core = *r.core;
+  core.set_diag(true);
+  const uint32_t ids[3] = {5, 6, 7};
+  core.serve_demand(0, ids, 3, 7);
+  const auto& tr = r.t.trace();
+  const size_t first_copy = r.find(Scripted::H2D, core.slot_of(5));
+  for (uint32_t k : {5u, 6u, 7u}) CHECK(r.find(Scripted::Read, k) < first_copy);  // every read begun first
+  const size_t mark = r.find(Scripted::Mark, 0, -1, 2);
+  CHECK(mark < tr.size());
+  CHECK(first_copy < mark && r.find(Scripted::Entry, core.slot_of(5), 5) < mark);
+  CHECK(mark < r.find(Scripted::H2D, core.slot_of(6)) && mark < r.find(Scripted::H2D, core.slot_of(7)));
+  CHECK(r.find(Scripted::Mark, 0, -1, 0) < r.find(Scripted::Read, 5));
+  CHECK(r.find(Scripted::H2D, core.slot_of(7)) < r.find(Scripted::Ready, 0));
+  CHECK(r.t.ended() == (std::vector<uint32_t>{5, 6, 7}));
+  CHECK_EQ(core.stats().disk_overlapped, 2ull);
+  r.finish();
+  {  // a first miss from a pinned block: the mark right after its copy, as before
+    OooRig p({});
+    p.core->set_diag(true);
+    const uint32_t two[2] = {2, 6};
+    p.core->serve_demand(0, two, 2, 3);
+    const size_t m = p.find(Scripted::Mark, 0, -1, 2);
+    CHECK(p.find(Scripted::H2D, p.core->slot_of(2)) < m && m < p.find(Scripted::Read, 6));
+    p.finish();
   }
 }
 
@@ -5034,6 +5237,14 @@ TEST(dg_round_cancel_from_thread) {
     std::thread th([core] { core->cancel_round(); });
     th.join();
   };
+  {  // between rounds: no effect on the next round
+    auto r = seeded_rig();
+    cancel_now(r->core.get());
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK_EQ(res.cancelled, 0u);
+    CHECK(res.promoted_to_device > 0);
+    r->verify();
+  }
   {  // at a unit boundary
     auto r = seeded_rig();
     DgCore* core = r->core.get();

@@ -53,8 +53,8 @@ class BudgetCharges {
   std::vector<Charge> charges_;
 };
 
-// Host mode: a backend whose alloc_device / alloc_pinned are charged to the ledger first ("device" / "pinned"
-// components named after the context) and released by their frees.
+// Host mode: a backend whose alloc_device / alloc_pinned are charged to the ledger first (the fixed components
+// "tierstream device" / "tierstream pinned") and released by their frees.
 std::unique_ptr<Backend> budget_backend(std::unique_ptr<Backend> inner, ss_budget_ledger* l);
 
 }  // namespace ts

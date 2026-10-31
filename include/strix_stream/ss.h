@@ -318,7 +318,8 @@ typedef struct ss_options {
   /* appended, three-tier: file reads of disk units in flight at once (reader threads; also bounded by
    * dg_disk_staging): the misses of a layer are read together and each copy is enqueued once its read finished (the
    * same bytes, slots and table entries); a prefetch's read stays in flight across the service's calls until its
-   * layer is demanded; 0 = 1 (default: one read at a time inside its fetch, as before), 2..64 = that many in flight;
+   * layer is demanded; each read ends on its own (a demand or a layer's ready waits only for the reads it needs, not
+   * for older ones); 0 = 1 (default: one read at a time inside its fetch, as before), 2..64 = that many in flight;
    * only with dg_disk_tier. */
   uint32_t dg_disk_queue;
   uint32_t reserved4;  /* explicit padding (never read) */
@@ -331,8 +332,8 @@ typedef struct ss_options {
   uint32_t reserved5;  /* explicit padding (never read) */
   const ss_file_identity* source_identities;
   /* appended, whole-device budgets ("Whole-device budgets" below): a ledger the context charges its own device and
-   * pinned allocations to (device-gated: the arena, slot table, controls, pinned blocks, staging, bounce and mapped
-   * buffers; host mode: every allocation of its backend). An allocation that would exceed the ledger's cap fails
+   * pinned allocations to (device-gated: the arena, slot table, controls, pinned blocks, staging and mapped buffers,
+   * and the pageable bounce buffers, one per file reader; host mode: every allocation of its backend). An allocation that would exceed the ledger's cap fails
    * ss_open with SS_E_CAPACITY naming it. The ledger must outlive the context; closing the context releases its
    * charges. NULL (default) = nothing charged. */
   struct ss_budget_ledger* budget;
@@ -706,6 +707,11 @@ typedef struct ss_dg_stats {
    * the pinned tier, demoted from the device, dropped to their file), the bytes they moved (file reads + host-to-device
    * copies + write-backs), their host time, rounds that stopped at a cancellation. Their copies count nowhere else. */
   uint64_t round_count, round_units, round_bytes, round_ns, round_cancelled;
+  /* appended: the CUDA driver's module loading mode at open (CUDA_MODULE_LOADING; 0 = unknown or not CUDA, 1 = eager,
+   * 2 = lazy). Lazy loading can stall the gated layers' wait kernels behind the engine's first-use kernel loads (the
+   * open then adds a notice to the stats JSON); CUDA_MODULE_LOADING=EAGER avoids it. Not reset by ss_stats_reset. */
+  uint32_t cuda_module_loading;
+  uint32_t reserved1; /* explicit padding (never read) */
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -960,10 +966,12 @@ SS_API const char* ss_mfile_open_report(const ss_mfile* f);
 /* appended, bound opens: what a session holds, to compare with what the caller authenticated by its own handles.
  * Every file of a session (the primary, each stripe directory's manifest and data file) is resolved once to its real
  * final path (a link that exists then is followed once), then opened through held handles of its directory and of
- * every ancestor directory from the volume root: a directory or file found to be a symlink, junction or other reparse
- * point during that walk (swapped in after the resolve) is refused (the primary: the open fails; a secondary
+ * every ancestor directory from the volume root: a directory or file found to be a link during that walk (swapped in
+ * after the resolve; Windows: a name-surrogate reparse point such as a symlink, junction or mount point, while other
+ * reparse points such as cloud files or dedup are allowed) is refused (the primary: the open fails; a secondary
  * location: disabled, with the reason in the open report). Windows holds those directories without
- * FILE_SHARE_DELETE (none can be renamed or deleted while the session lives) and the manifest and data files with
+ * FILE_SHARE_DELETE (none can be renamed or deleted while the session lives; the open fails while another process
+ * holds one of them with DELETE access) and the manifest and data files with
  * FILE_SHARE_READ (no writer, no rename); the leaf's final path must be its held directory's plus its name. Linux holds
  * the directory fds (openat O_NOFOLLOW walk from "/"; renames are not prevented, the identity checks above apply).
  * The manifest stays open for the session's lifetime and is read through its held handle. */
@@ -1202,7 +1210,8 @@ typedef struct ss_dg_round_params {
 typedef struct ss_dg_round_result {
   uint32_t struct_size;
   uint32_t promoted_to_device, promoted_to_pinned, demoted_from_device, dropped_to_file;
-  uint32_t cancelled;    /* 1: ss_dg_round_cancel stopped it at a unit boundary (no unit half moved) */
+  uint32_t cancelled;    /* 1: ss_dg_round_cancel stopped it at a unit boundary (every unit in one home with its
+                            bytes; a device slot or pinned block it emptied for a dropped move may stay empty) */
   uint64_t bytes_read, bytes_h2d, bytes_written_back, ns;
 } ss_dg_round_result;
 SS_API void ss_dg_round_defaults_sized(ss_dg_round_params* p, uint32_t size);
@@ -1213,7 +1222,10 @@ static inline ss_status ss_dg_round(ss_ctx* c, const ss_dg_round_params* p, ss_d
   return ss_dg_round_sized(c, p, out, (uint32_t)sizeof *out);
 }
 /* Any thread: the round in progress stops at its next unit boundary; a copy made but not committed is dropped (its
-   source keeps its home) and the round returns SS_OK with cancelled = 1. No effect when no round is running. */
+   source keeps its home) and the round returns SS_OK with cancelled = 1. A round it stops may leave a pinned or device
+   home it emptied for that move empty (no unit's bytes are affected; a later round or the cache fills it). No effect
+   when no round is running (a cancellation before ss_dg_round is called does not stop that round). It must not race
+   ss_close of c (the caller's obligation: c stays open until this returns). */
 SS_API ss_status ss_dg_round_cancel(ss_ctx* c);
 /* Engine thread, between tokens: the decayed counts of units[0..n) (finite, >= 0), e.g. from a shipped routing
    profile; every entry is checked before any is set. */
@@ -1449,7 +1461,8 @@ SS_API ss_status ss_pack_unit_find(const ss_pack* p, int layer, int expert, ss_p
  * whole segments). All reads of one call are in flight together per data file; each is verified per the verify
  * mode (a range: by the segments it covers exactly, else through one read of the whole record). SS_E_HASH on a
  * mismatch (nothing is marked verified). Any thread; destinations must not overlap. struct_size = sizeof
- * (ss_pack_read_req), the same in every element of one call (the array is walked with it). */
+ * (ss_pack_read_req), the same in every element of one call (the array is walked with it; at most 4096, else
+ * SS_E_INVALID). */
 typedef struct ss_pack_read_req {
   size_t struct_size;
   uint64_t record;

@@ -69,9 +69,14 @@ Parts parts(const ss_budget_component* c, uint32_t n, const char* what) {
   return p;
 }
 
+// The message, cut to the field at a UTF-8 boundary (a component's name is never split mid-character).
 void set_refuse(ss_budget_out& out, const std::string& msg) {
   out.refused = 1;
-  std::snprintf(out.refuse, sizeof out.refuse, "%s", msg.c_str());
+  size_t n = std::min(msg.size(), sizeof out.refuse - 1);
+  if (n < msg.size())
+    while (n > 0 && (static_cast<unsigned char>(msg[n]) & 0xC0) == 0x80) --n;
+  std::memcpy(out.refuse, msg.data(), n);
+  out.refuse[n] = '\0';
 }
 
 const char* kind_name(ss_budget_kind k) {
@@ -105,6 +110,10 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   const uint64_t unit = in.unit_bytes;
   const auto units_of = [unit](uint64_t bytes) { return unit ? bytes / unit : 0; };
   const uint64_t keys = in.keys;
+  // the host placement's sums (non-residents + spares + staging + one block) are exact below this: a larger key count
+  // is refused as a bad argument rather than saturated into a plan
+  require(add_sat(add_sat(keys, in.host_spares), uint64_t(in.staging) + 1) != UINT64_MAX, SS_E_INVALID,
+          "ss_budget_plan: keys " + std::to_string(keys) + " is out of range");
 
   // Device: context + components + the arena's spares (+ the smallest arena accepted), then the residents.
   out.device_fixed_bytes = add_sat(in.device_context_bytes, dev.sum);
@@ -200,7 +209,7 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   } else {
     three = true;
     staging = in.staging;
-    if (cap < spares + staging + 1) {
+    if (cap < add_sat(add_sat(spares, staging), 1)) {
       if (!out.refused)
         set_refuse(out, "not enough host memory even for the spare blocks and the file tier's staging buffers");
       pinned = 0;
@@ -210,7 +219,7 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
     disk = nonres - pinned;
     if (disk == 0) three = false, staging = 0;
   }
-  const uint64_t used = pinned + spares + staging;
+  const uint64_t used = add_sat(add_sat(pinned, spares), staging);
   uint64_t left = cap > used ? cap - used : 0;
   // under a RAM cap the clean copies only take what the capped room leaves (without the file tier an explicit RAM
   // request is not clamped to the room above, and the copies would otherwise fill the request past the cap)
@@ -364,10 +373,16 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
     }
     s += '}';
   };
-  const auto minimum = [&](const char* gib_key, const char* flag_key, uint64_t v) {
-    key(gib_key);  // GiB rounded up to 0.01 (a value that holds), then the whole-GiB flag value
-    s += v == UINT64_MAX ? std::string("null") : gib_up(v);
-    num(flag_key, gib_ceil(v));
+  const auto minimum = [&](const char* bytes_key, const char* gib_key, const char* flag_key, uint64_t v) {
+    // the bytes, GiB rounded up to 0.01 (a value that holds), then the whole-GiB flag value; null when no minimum
+    // exists (UINT64_MAX: the arithmetic saturated)
+    const bool none = v == UINT64_MAX;
+    key(bytes_key);
+    s += none ? std::string("null") : std::to_string(v);
+    key(gib_key);
+    s += none ? std::string("null") : gib_up(v);
+    key(flag_key);
+    s += none ? std::string("null") : std::to_string(gib_ceil(v));
   };
   num("vram_total_bytes", in.vram_total_bytes);
   num("ram_total_bytes", in.ram_total_bytes);
@@ -413,10 +428,8 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
   flag("host_capped", out.host_capped != 0);
   num("need_host_bytes", out.need_host_bytes);
   num("pinned_peak_bytes", out.pinned_peak_bytes);
-  num("min_vram_total_bytes", out.min_vram_total_bytes);
-  minimum("min_vram_total_gib", "min_vram_total_flag_gib", out.min_vram_total_bytes);
-  num("min_ram_total_bytes", out.min_ram_total_bytes);
-  minimum("min_ram_total_gib", "min_ram_total_flag_gib", out.min_ram_total_bytes);
+  minimum("min_vram_total_bytes", "min_vram_total_gib", "min_vram_total_flag_gib", out.min_vram_total_bytes);
+  minimum("min_ram_total_bytes", "min_ram_total_gib", "min_ram_total_flag_gib", out.min_ram_total_bytes);
   flag("refused", out.refused != 0);
   key("refuse");
   char r[SS_BUDGET_REFUSE + 1];
@@ -449,13 +462,16 @@ void ledger_add(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint
   std::lock_guard<std::mutex> lock(l->mu);
   const size_t k = size_t(kind);
   const bool host = kind != SS_BUDGET_DEVICE;
-  const uint64_t in_use = host ? l->cur[SS_BUDGET_PINNED] + l->cur[SS_BUDGET_PAGEABLE] : l->cur[k];
+  const uint64_t in_use = host ? add_sat(l->cur[SS_BUDGET_PINNED], l->cur[SS_BUDGET_PAGEABLE]) : l->cur[k];
   if (l->cap[k] && (bytes > l->cap[k] || in_use > l->cap[k] - bytes)) {
     ++l->refusals;
     fail(SS_E_CAPACITY, std::string("budget: ") + kind_name(kind) + " allocation '" + n + "' of " + gib(bytes) +
                             " GiB (" + std::to_string(bytes) + " bytes) would exceed the " + (host ? "RAM" : "VRAM") +
                             " cap: " + gib(in_use) + " of " + gib(l->cap[k]) + " GiB in use");
   }
+  // no cap: the counts must still fit (a component's and a kind's sum are at most the host or device sum)
+  require(in_use <= UINT64_MAX - bytes, SS_E_INVALID,
+          std::string("ss_budget_ledger_add: ") + kind_name(kind) + " allocation '" + n + "' overflows the ledger");
   l->cur[k] += bytes;
   l->comp[k][n] += bytes;
   l->host_peak = std::max(l->host_peak, l->cur[SS_BUDGET_PINNED] + l->cur[SS_BUDGET_PAGEABLE]);

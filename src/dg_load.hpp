@@ -15,6 +15,16 @@
 #include "desc.hpp"
 #include "source_file.hpp"
 namespace ts {
+// Pageable aligned bounce storage for the covering reads of unaligned parts: never an H2D source. Each reader owns one
+// (no reader waits for another's).
+struct DgBounce {
+  char* p; size_t bytes, alignment;
+  DgBounce(size_t n, size_t a)
+      : p(static_cast<char*>(::operator new(n, std::align_val_t(a)))), bytes(n), alignment(a) {}
+  ~DgBounce() { ::operator delete(p, std::align_val_t(alignment)); }
+  DgBounce(const DgBounce&) = delete;
+  DgBounce& operator=(const DgBounce&) = delete;
+};
 struct DgLoadUnit {
   int layer = 0, unit = 0;
   int32_t slot = -1;
@@ -98,8 +108,10 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& units
     const std::vector<std::unique_ptr<SourceFile>>* sources = nullptr, DgBlockAlloc* blocks = nullptr);
 
 // One unit's bytes (its parts back to back) into dst, from the open sources of d. A part read in place (no direct I/O,
-// or aligned offset, bytes and destination) lands directly; any other goes through `bounce` (bounce_bytes, aligned),
-// under bounce_mu when given (one bounce buffer shared by concurrent readers). parallel: the in-place parts of one
+// or aligned offset, bytes and destination) lands directly; a part whose destination has its file offset's
+// misalignment reads its aligned middle in place and only its head and tail blocks through `bounce`; any other goes
+// through `bounce` (bounce_bytes, aligned) whole. `bounce` is the caller's own: concurrent readers pass their own
+// buffers (nothing here is shared between calls but the open sources). parallel: the in-place parts of one
 // multi-location session (MFileSource) are issued as one MFile::preadv, so they run on the drives' pools together;
 // the bytes are the same. subread > 0 (DG_UNIT_SUBREAD_KIB): every in-place part, of any source, is cut into pieces
 // of subread bytes (never across a session's chunk), and all pieces of the unit on one source are in flight together
@@ -107,8 +119,7 @@ DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& units
 // xxh64 of the unit's bytes into digest (computed once every part landed, in part order).
 void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>& files, int layer, int unit,
                   void* dst, void* bounce, uint64_t bounce_bytes, bool hash, uint64_t* digest,
-                  DgLoadStats* stats = nullptr, std::mutex* bounce_mu = nullptr, bool parallel = true,
-                  uint64_t subread = 0);
+                  DgLoadStats* stats = nullptr, bool parallel = true, uint64_t subread = 0);
 
 // The three-tier file reads in flight (dg_disk_queue): `threads` workers run the submitted reads, oldest first. wait()
 // blocks until that read finished, rethrows its error and returns its own time in ns; every handle is waited for
@@ -120,17 +131,19 @@ class DgReadPool {
   DgReadPool(const DgReadPool&) = delete;
   DgReadPool& operator=(const DgReadPool&) = delete;
   void* submit(std::function<void()> read);
+  // the same, the read given the index of the worker that runs it (0 .. threads - 1; e.g. its own bounce buffer)
+  void* submit_indexed(std::function<void(uint32_t)> read);
   uint64_t wait(void* handle);
   bool done(void* handle);  // finished (wait would not block)
 
  private:
   struct Job {
-    std::function<void()> read;
+    std::function<void(uint32_t)> read;
     std::exception_ptr error;
     uint64_t ns = 0;
     bool done = false;
   };
-  void work();
+  void work(uint32_t worker);
   std::mutex mu_;
   std::condition_variable cv_, done_cv_;
   std::deque<Job*> queue_;

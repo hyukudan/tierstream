@@ -35,7 +35,8 @@ struct DgLayout {
   uint64_t need = 0, billed = 0;    // device bytes: the arena + tables + controls, and what the plan billed for them
   uint64_t mapped_bytes = 0;        // the mapped control area
   uint64_t device_ctl_bytes = 0;    // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1]
-  uint64_t bounce_bytes = 0;        // pinned: the covering aligned reads of unaligned parts
+  uint64_t bounce_bytes = 0;        // pageable, per reader: the covering aligned reads of unaligned parts
+  uint32_t bounce_readers = 0;      // readers with their own bounce buffer: the context's thread + the disk readers
   uint64_t staging_bytes = 0;       // pinned: one resident's bytes on their way to the arena at open
   bool load_serial = false;
   // scored eviction (policy SCORED): the resolved weights, the profile's identity (empty without a profile)
@@ -44,8 +45,9 @@ struct DgLayout {
   std::string score_identity;
   uint32_t load_readers = 0, load_buffers = 0;
   uint64_t load_buffer_bytes = 0;  // additional temporary pinned ring, admitted at open
-  // DG_LOAD_OVERLAP_ALLOC (pipeline only, default on; 0 restores the serial order): the ring first, then the pinned
-  // blocks on a helper thread while the loader reads the residents
+  // DG_LOAD_OVERLAP_ALLOC (pipeline only, default on; 0 / false / off restores the serial order, as DG_LOAD_SERIAL
+  // takes 0 / false / off or 1 / true / on): the ring first, then the pinned blocks on a helper thread while the
+  // loader reads the residents
   bool load_overlap_alloc = false;
   // DG_UNIT_SUBREAD_KIB: the sub-read size of one unit's in-place parts (dg_read_unit; 0 = one request per part)
   uint64_t unit_subread = 0;
@@ -58,5 +60,15 @@ struct DgLayout {
 uint64_t dg_mapped_bytes(uint32_t gated);
 // Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);
+
+// The device's own error word (err_code, err_aux; dg_proto.hpp) as text, empty for kDgOk.
+std::string dg_device_error(uint32_t code, uint32_t aux);
+// A failed token's message: the device's error word first (when it holds one), then what the host saw (the end edge,
+// the service's error), then the poisoning.
+std::string dg_token_failure(uint32_t seq, const std::string& device, const std::string& host);
+// The CUDA driver's module loading mode (ss_dg_stats.cuda_module_loading: 0 unknown, 1 eager, 2 lazy) by name, and the
+// open's notice for it (empty unless lazy with gated layers).
+const char* dg_module_loading_name(uint32_t mode);
+std::string dg_module_loading_notice(uint32_t mode, size_t gated);
 
 }  // namespace ts

@@ -221,6 +221,8 @@ class CudaTransport final : public DgTransport {
   // three-tier: the context's synchronous file read of a key into a host block (staging buffers follow the blocks);
   // with a pool (dg_disk_queue > 1) the core's overlapped reads run on its threads
   std::function<void(uint32_t, char*)> reader;
+  // (reader, key, block) on that reader's own bounce buffer: 0 = the context's thread, 1 + i = the pool's worker i
+  std::function<void(uint32_t, uint32_t, char*)> pool_reader;
   std::unique_ptr<DgReadPool> pool;
   void read_unit(uint32_t key, int32_t block) override {
     if (!reader) DgTransport::read_unit(key, block);
@@ -230,7 +232,7 @@ class CudaTransport final : public DgTransport {
     if (!pool) return DgTransport::read_unit_begin(key, block);
     if (!reader) DgTransport::read_unit(key, block);
     char* dst = host_block(block);
-    return pool->submit([this, key, dst] { reader(key, dst); });
+    return pool->submit_indexed([this, key, dst](uint32_t worker) { pool_reader(worker + 1, key, dst); });
   }
   uint64_t read_unit_end(void* handle) override { return pool ? pool->wait(handle) : 0; }
   bool read_unit_done(void* handle) override { return !pool || pool->done(handle); }
@@ -323,11 +325,13 @@ class CudaDgCtx final : public DgCtx {
     try {
       init();
     } catch (...) {
-      // The overlap's helper is joined first, its chunks completing or failing as in the serial order: its error is the
-      // open's error, as when every block was allocated before what follows (then everything allocated is freed).
+      // The overlap's helper is stopped (no further chunk) and joined first, the chunk in progress completing or
+      // failing as in the serial order: its error is the open's error, as when every block was allocated before what
+      // follows (then everything allocated is freed).
       try {
         if (block_alloc_) {
           const auto a = std::move(block_alloc_);
+          a->cancel();
           a->finish(&chunks_, &blocks_);
         }
       } catch (...) {
@@ -394,45 +398,40 @@ class CudaDgCtx final : public DgCtx {
       const Seen w = wait_seq(m_.done, seq_, left());
       const uint32_t began = dg_load_acquire(m_.began);
       if (w != kAt || began != seq_) {
+        const std::string device = device_error();  // (before the host's abort reaches the device)
         dg_store_release(m_.host_abort, 1);
         svc_->stop_join();
         poisoned_ = true;
+        failed_timeline();
         if (w == kBefore)
-          fail(SS_E_BACKEND, "device-gated: the device did not finish token " + std::to_string(seq_) +
-                                 " (no end kernel: the context is poisoned, the token's outputs must be discarded)");
-        fail(SS_E_BACKEND, "device-gated: sequence desync at ss_end: another gated step ran in token " +
-                               std::to_string(seq_) + " (done " + std::to_string(dg_load_acquire(m_.done)) +
-                               ", began " + std::to_string(began) +
-                               "; the context is poisoned, the token's outputs must be discarded)");
+          fail(SS_E_BACKEND, dg_token_failure(seq_, device, "the device did not finish it (no end kernel)"));
+        fail(SS_E_BACKEND,
+             dg_token_failure(seq_, device, "sequence desync at ss_end: another gated step ran in it (done " +
+                                                std::to_string(dg_load_acquire(m_.done)) + ", began " +
+                                                std::to_string(began) + ")"));
       }
     }
     device_busy_ = false;
     // 2. The service's terminal word for this token: the core is the engine thread's again.
+    // The device's error word (written before done) is reported first: the service's error is often its consequence
+    // (e.g. a wait that timed out on the device, then the service's own wait for that layer).
     const DgService::State st = svc_->wait_terminal(seq_, left());
     if (st != DgService::kServed) {
+      const std::string device = device_error();  // (before the host's abort reaches the device)
       dg_store_release(m_.host_abort, 1);
       svc_->stop_join();
       poisoned_ = true;
+      failed_timeline();
       const std::string why = svc_->error();
-      fail(SS_E_BACKEND, "device-gated: token " + std::to_string(seq_) + " failed in the service: " +
-                             (why.empty() ? std::string("it did not finish") : why) +
-                             " (the context is poisoned, the token's outputs must be discarded)");
+      fail(SS_E_BACKEND, dg_token_failure(seq_, device, "the service: " +
+                                                            (why.empty() ? std::string("it did not finish") : why)));
     }
-    // 3. The device's error word (written before done).
-    const uint32_t code = dg_load_acquire(m_.err_code);
-    if (code != kDgOk) {
+    // 3. The device's error word alone (the service served the token).
+    const std::string device = device_error();
+    if (!device.empty()) {
       poisoned_ = true;
-      const char* what = code == kDgTimeout   ? "a wait timed out"
-                         : code == kDgBadId   ? "an id was out of range"
-                         : code == kDgDesync  ? "a step ran outside ss_begin / ss_end (sequence desync)"
-                         : code == kDgAbsent  ? "a slot lookup met an absent entry"
-                                              : "the host aborted the token";
-      const uint32_t aux = dg_load_acquire(m_.err_aux);
-      const std::string where = code == kDgDesync   ? " (that step's seq " + std::to_string(aux) + ")"
-                                : code == kDgAbsent ? std::string()
-                                                    : " at gated layer " + std::to_string(aux);
-      fail(SS_E_BACKEND, std::string("device-gated: token ") + std::to_string(seq_) + ": " + what + where +
-                             " (the context is poisoned, the token's outputs must be discarded)");
+      failed_timeline();
+      fail(SS_E_BACKEND, dg_token_failure(seq_, device, std::string()));
     }
     // 4. The boundary.
     core_->end_token(steps_.all_kept(), rows);  // syncs the demand stream: the diagnostics marks have completed
@@ -861,6 +860,7 @@ class CudaDgCtx final : public DgCtx {
     out->round_bytes = a.round_bytes;
     out->round_ns = a.round_ns;
     out->round_cancelled = a.round_cancelled;
+    out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
@@ -879,8 +879,8 @@ class CudaDgCtx final : public DgCtx {
     const DgStats& a = fold_;  // since open: the exclusive counters are never reset (ss.h)
     ss_exclusive_stats x{};
     x.struct_size = uint32_t(sizeof x);
-    x.writebacks = a.evicted - a.wb_cancelled;  // a cancelled deferred write-back copied nothing
-    x.writeback_bytes = a.wb_issued_bytes;       // the bytes copied (a resurrected partial one: its sent parts)
+    x.writebacks = dg_exclusive_writebacks(a);  // evictions that copied (not cancelled, not dropped)
+    x.writeback_bytes = a.wb_issued_bytes;      // the bytes copied (a resurrected partial one: its sent parts)
     x.promoted = a.fetched - a.bank_serves + a.prefetched;  // copies into persistent slots
     x.free_blocks = fold_free_blocks_;
     x.min_free_blocks = min_free_blocks_;
@@ -912,7 +912,7 @@ class CudaDgCtx final : public DgCtx {
       info->flags = SS_SNAPSHOT_EXCLUSIVE;
       info->sequence = snap_.seq;
       info->forwards = snap_.s.tokens;
-      info->exclusive_writebacks = snap_.life.evicted - snap_.life.wb_cancelled;
+      info->exclusive_writebacks = dg_exclusive_writebacks(snap_.life);
       info->exclusive_writeback_bytes = snap_.life.wb_issued_bytes;
       info->exclusive_promoted = snap_.life.fetched - snap_.life.bank_serves + snap_.life.prefetched;
       info->exclusive_free_blocks = snap_.free_blocks;
@@ -945,6 +945,18 @@ class CudaDgCtx final : public DgCtx {
     out->upload_us = b.upload_us;
     out->issue_us = b.issue_us;
   }
+  // The device's error word as text (empty while it holds none).
+  std::string device_error() const {
+    return dg_device_error(dg_load_acquire(m_.err_code), dg_load_acquire(m_.err_aux));
+  }
+  // dg_diag, a failed ss_end: the failed token's host timeline (the service published it; it is stopped or done)
+  // stays readable through ss_dg_timeline; its device measurements are not collected (-1).
+  void failed_timeline() {
+    if (!o_.dg_diag) return;
+    std::fill(diag_.begin(), diag_.end(), LayerDiag{});
+    timeline_valid_ = true;
+  }
+
   void timeline(int g, ss_dg_layer_timeline* out) const override {
     require(!in_token_, SS_E_INVALID, "ss_dg_timeline: between tokens only");
     require(o_.dg_diag, SS_E_INVALID, "ss_dg_timeline: open with dg_diag = 1");
@@ -1138,8 +1150,7 @@ class CudaDgCtx final : public DgCtx {
     j["total"] = one(t);
     j["layers"] = ls;
     Json x = Json::object();
-    // (three-tier drops are evictions without a write-back: 0 in the two-tier cache)
-    x["writebacks"] = Json::number(life.evicted - life.wb_cancelled - life.inclusive_drops - life.disk_discards);
+    x["writebacks"] = Json::number(dg_exclusive_writebacks(life));
     x["writeback_bytes"] = Json::number(life.wb_issued_bytes);
     x["deferred"] = Json::number(life.evict_short);  // the host contract's: victims kept for want of a block
     x["wb_deferred"] = Json::number(life.wb_deferred);  // write-backs deferred into the next token (dg_wb_defer)
@@ -1194,6 +1205,12 @@ class CudaDgCtx final : public DgCtx {
         {"round_cancelled", s.round_cancelled}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
     g["policy"] = Json::string(core_->policy() == 2 ? "auto" : core_->policy() == 1 ? "scored" : "lru");
+    g["cuda_module_loading"] = Json::string(dg_module_loading_name(module_loading_));
+    if (!notices_.empty()) {
+      Json n = Json::array();
+      for (const std::string& text : notices_) n.push(Json::string(text));
+      g["notices"] = n;
+    }
     if (!core_->profile_provenance().empty()) g["score_profile"] = Json::string(core_->profile_provenance());
     if (x_.disk_tier || x_.I) {  // three-tier (SS_DG_DISK_TIER): only when on, so the two-tier document is unchanged
       Json tt = Json::object();
@@ -1268,19 +1285,21 @@ class CudaDgCtx final : public DgCtx {
     }
   }
 
-  // One unit's bytes (its parts back to back) into dst, with the covering aligned range through the bounce buffer
-  // when the direct-I/O alignment rules are not met (one bounce buffer: the pool's readers take turns on it); the
-  // in-place parts of a multi-location session as one preadv (dg_read_unit).
-  void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest, DgLoadStats* stats = nullptr) {
-    dg_read_unit(d_, files_, layer, unit, dst, bounce_, bounce_bytes_, hash, digest, stats, &bounce_mu_, true,
-                 x_.unit_subread);
+  // One unit's bytes (its parts back to back) into dst, with the covering aligned ranges through a bounce buffer when
+  // the direct-I/O alignment rules are not met; the in-place parts of a multi-location session as one preadv
+  // (dg_read_unit). reader: whose bounce buffer, 0 = the context's own thread (the service during a token, the engine
+  // thread between tokens and at open: never both), 1 + i = disk reader i. No reader waits for another.
+  void read_unit(int layer, int unit, void* dst, bool hash, uint64_t* digest, DgLoadStats* stats = nullptr,
+                 uint32_t reader = 0) {
+    DgBounce& b = *bounces_[reader];
+    dg_read_unit(d_, files_, layer, unit, dst, b.p, b.bytes, hash, digest, stats, true, x_.unit_subread);
   }
 
-  void read_checked(int layer, int unit, void* dst, DgLoadStats* stats = nullptr) {
+  void read_checked(int layer, int unit, void* dst, DgLoadStats* stats = nullptr, uint32_t reader = 0) {
     const Layer& l = d_.layers[size_t(layer)];
     const bool want = o_.verify_hash && !l.hash.empty();
     uint64_t digest = 0;
-    read_unit(layer, unit, dst, want, &digest, stats);
+    read_unit(layer, unit, dst, want, &digest, stats, reader);
     if (want && digest != l.hash[size_t(unit)])
       fail(SS_E_HASH, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
                           ") bytes differ from the descriptor hash");
@@ -1306,14 +1325,27 @@ class CudaDgCtx final : public DgCtx {
     device_ = o_.device;
     ck(cudaSetDevice(device_), "cudaSetDevice");
     ck_launch(dgk::preload(), "loading the kernels");
+    // The driver's module loading mode (CUDA_MODULE_LOADING): lazy loading can make the wait kernels of the gated
+    // layers stall behind the engine's own first-use kernel loads (ours are loaded above). Reported, not changed.
+    CUmoduleLoadingMode loading{};
+    if (cuModuleGetLoadingMode(&loading) == CUDA_SUCCESS)
+      module_loading_ = loading == CU_MODULE_EAGER_LOADING ? 1u : loading == CU_MODULE_LAZY_LOADING ? 2u : 0u;
+    const std::string loading_notice = dg_module_loading_notice(module_loading_, x_.gated.size());
+    if (!loading_notice.empty()) {
+      notices_.push_back(loading_notice);
+      std::fprintf(stderr, "dg_load notice: %s\n", loading_notice.c_str());
+    }
     for (size_t i = 0; i < d_.sources.size(); ++i)
       files_.push_back(open_source(d_.sources[i].path, o_, expected_source_identity(o_, i)));
     o_.source_identity_n = 0;  // read only during ss_open
     o_.source_identities = nullptr;
-    bounce_bytes_ = x_.bounce_bytes;  // the sizes admission billed (dg_layout)
-    charges_.charge(SS_BUDGET_PINNED, "dg bounce", bounce_bytes_);
+    // the sizes admission billed (dg_layout): one pageable bounce buffer per reader
+    charges_.charge(SS_BUDGET_PAGEABLE, "dg bounce", x_.bounce_bytes * x_.bounce_readers);
     charges_.charge(SS_BUDGET_PINNED, "dg staging", x_.staging_bytes);
-    pin(&bounce_, size_t(bounce_bytes_), cudaHostAllocPortable, "cudaHostAlloc (bounce)");
+    uint64_t max_align = 4096;
+    for (const Source& src : d_.sources) max_align = std::max(max_align, src.align);
+    for (uint32_t i = 0; i < x_.bounce_readers; ++i)
+      bounces_.push_back(std::make_unique<DgBounce>(size_t(x_.bounce_bytes), size_t(max_align)));
     pin(reinterpret_cast<void**>(&staging_), size_t(x_.staging_bytes), cudaHostAllocPortable,  // also the reset spare
         "cudaHostAlloc (staging)");
 
@@ -1487,11 +1519,12 @@ class CudaDgCtx final : public DgCtx {
     c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
     if (x_.disk_tier) {
       // (the gated layer from the layout's bases: the pool's threads never touch the core)
-      transport_->reader = [this](uint32_t key, char* dst) {
+      transport_->pool_reader = [this](uint32_t reader, uint32_t key, char* dst) {
         const uint32_t g = uint32_t(std::upper_bound(x_.unit_base.begin(), x_.unit_base.end(), key) -
                                     x_.unit_base.begin()) - 1;
-        read_checked(x_.gated[g], int(key - x_.unit_base[g]), dst);
+        read_checked(x_.gated[g], int(key - x_.unit_base[g]), dst, nullptr, reader);
       };
+      transport_->reader = [this](uint32_t key, char* dst) { transport_->pool_reader(0, key, dst); };
       if (x_.disk_queue > 1) transport_->pool = std::make_unique<DgReadPool>(x_.disk_queue);
     }
     core_ = std::make_unique<DgCore>(c, transport_.get());
@@ -1691,13 +1724,11 @@ class CudaDgCtx final : public DgCtx {
     if (ctl_) cudaFree(ctl_);
     if (mapped_) cudaFreeHost(mapped_);
     for (void* c : chunks_) cudaFreeHost(c);
-    if (bounce_) cudaFreeHost(bounce_);
     if (staging_) cudaFreeHost(staging_);
     if (gts_h_) cudaFreeHost(gts_h_);
     slot_of_ = nullptr;
     ctl_ = nullptr;
     mapped_ = nullptr;
-    bounce_ = nullptr;
     staging_ = nullptr;
     gts_h_ = nullptr;
     dev_.gts = nullptr;
@@ -1711,9 +1742,9 @@ class CudaDgCtx final : public DgCtx {
   int device_ = 0;
   std::string weight_dirs_;
   std::vector<std::unique_ptr<SourceFile>> files_;
-  void* bounce_ = nullptr;
-  uint64_t bounce_bytes_ = 0;
-  std::mutex bounce_mu_;
+  std::vector<std::unique_ptr<DgBounce>> bounces_;  // per reader (read_unit), pageable
+  uint32_t module_loading_ = 0;                       // ss_dg_stats.cuda_module_loading (0 unknown, 1 eager, 2 lazy)
+  std::vector<std::string> notices_;                  // the open's notices (the stats JSON)
   char* staging_ = nullptr;
   std::vector<char*> arena_;
   int32_t* slot_of_ = nullptr;

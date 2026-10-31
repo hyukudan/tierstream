@@ -22,13 +22,14 @@ struct FileIdentity {
 // GetFinalPathNameByHandleW, which also expands 8.3 short names; Linux: realpath), so a link that exists then is
 // followed once. That real path is then opened through held handles of its directory and of every ancestor
 // directory, from the root of its volume down, and no held component may be a link (one swapped in after the resolve
-// is refused): Windows opens each directory with FILE_FLAG_OPEN_REPARSE_POINT and rejects a reparse point (junction,
-// symlink, mount point), and holds it without FILE_SHARE_DELETE, so no held directory can be renamed or deleted while
-// it is held; Linux walks openat(O_PATH | O_DIRECTORY | O_NOFOLLOW) from "/" (it cannot deny renames; the directory
-// fds pin the inodes the walk used). The leaf is opened relative to the held directory (Windows: by its full path with
-// FILE_FLAG_OPEN_REPARSE_POINT, then its final path must be the held directory's final path plus the leaf name; Linux:
-// openat(dirfd, leaf, O_NOFOLLOW)) and must be a regular file, not a link. Every failure throws SS_E_IO naming the
-// component. The held handles live as long as the object.
+// is refused): Windows opens each directory with FILE_FLAG_OPEN_REPARSE_POINT and rejects a name-surrogate reparse
+// point (junction, symlink, mount point; other tags such as cloud files or dedup are allowed), and holds it without
+// FILE_SHARE_DELETE, so no held directory can be renamed or deleted while it is held (and the open fails while another
+// process holds one of them with DELETE access); Linux walks openat(O_PATH | O_DIRECTORY | O_NOFOLLOW) from "/" (it
+// cannot deny renames; the directory fds pin the inodes the walk used). The leaf is opened relative to the held
+// directory (Windows: by its full path with FILE_FLAG_OPEN_REPARSE_POINT, then its final path must be the held
+// directory's final path plus the leaf name; Linux: openat(dirfd, leaf, O_NOFOLLOW)) and must be a regular file, not a
+// link (Windows: not a name surrogate). Every failure throws SS_E_IO naming the component. The held handles live as long as the object.
 class BoundDir {
  public:
   explicit BoundDir(const std::string& file_path);

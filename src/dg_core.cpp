@@ -161,18 +161,14 @@ bool DgCore::drop_host_lru(const std::vector<uint8_t>* skip, bool count) {
 }
 
 // The next staging buffer of the file reads: its previous copy must have landed before the read overwrites it.
-// Drain point: a buffer whose read is still in flight has its copy enqueued first (the records up to its own). The wait
-// that follows is on that buffer's own last copy (recorded when its record was ended): no other read in flight holds
-// the buffer or that event, so the others stay in flight.
+// Drain point: a buffer whose read is still in flight has its copy enqueued first (its own record only). The wait that
+// follows is on that buffer's own last copy (recorded when its record was ended): no other read in flight holds the
+// buffer or that event, so the others stay in flight.
 int32_t DgCore::take_stage() {
   const uint32_t i = stage_next_;
   stage_next_ = (i + 1) % c_.disk_staging;
   const int32_t block = int32_t(c_.blocks + i);
-  for (size_t j = 0; j < pending_.size(); ++j)
-    if (pending_[j].stage == block) {
-      drain_pending(j + 1);
-      break;
-    }
+  drain_through([block](const Pending& p) { return p.stage == block; });
   if (stage_ev_[i] && !t_->done(stage_ev_[i]) && mut_ != kStageNoWait) {
     t_->event_sync(stage_ev_[i]);
     ++st_.disk_stage_waits;
@@ -246,12 +242,34 @@ void DgCore::undo_pending(const Pending& p) {
 }
 
 void DgCore::drain_pending(size_t n) {
+  end_reads([&n](const Pending&) {
+    if (n == 0) return false;
+    --n;
+    return true;
+  });
+}
+
+// The records `pick` accepts leave pending_ (the others stay, in their order) and are ended oldest first. Each record
+// is independent of the others (its own key, slot, staging buffer and events), so ending them out of fetch order
+// enqueues the same work per record. After a failed copy every record still pending, picked or not, is ended and
+// undone in this call (nothing more is enqueued), as when everything was drained.
+void DgCore::end_reads(const std::function<bool(const Pending&)>& pick) {
+  if (pending_.empty()) return;
+  std::vector<uint8_t> picked(pending_.size());  // decided first: nothing has changed if a pick throws
+  for (size_t i = 0; i < pending_.size(); ++i) picked[i] = pick(pending_[i]) ? 1 : 0;
+  std::vector<Pending> ending;
+  ending.reserve(pending_.size());  // room for every record: moving the rest in after a failure cannot throw
+  size_t kept = 0;
+  for (size_t i = 0; i < pending_.size(); ++i) {
+    if (picked[i]) ending.push_back(pending_[i]);
+    else pending_[kept++] = pending_[i];
+  }
+  pending_.resize(kept);
   std::exception_ptr first;
   bool device_failed = false;  // a failed copy: the later records are ended and undone, nothing more is enqueued
   bool pf = false;
-  for (; n > 0 && !pending_.empty(); --n) {
-    const Pending p = pending_.front();
-    pending_.pop_front();
+  for (size_t i = 0; i < ending.size(); ++i) {
+    const Pending p = ending[i];
     if (p.entry != entries_) {  // ended in a later call than its fetch's (it overlapped that call's caller)
       ++st_.disk_carried;
       st_.disk_carried_bytes += unit_bytes_;
@@ -278,23 +296,21 @@ void DgCore::drain_pending(size_t n) {
     } catch (...) {
       if (!first) first = std::current_exception();
       device_failed = true;  // (this record stays fetched, as a synchronous fetch whose copy failed)
-      n = SIZE_MAX;          // every later record is ended and undone in this call
+      ending.insert(ending.end(), pending_.begin(), pending_.end());  // every record left: ended and undone here
+      pending_.clear();
     }
   }
   if (pf && !first) t_->flush(DgTransport::kPf);  // prefetch copies enqueued outside their call: submitted now
   if (first) std::rethrow_exception(first);
 }
 
-// Prefetch reads in flight across calls: a public entry point ends the demand reads (the records up to the last demand
-// one, oldest first); a prefetch's read ends when its key is touched again (drain_key: a fetch or a cover), when its
-// layer is done (drain_layer: before its ready), or at a drain of everything (the end of the token, slot / stage
-// pressure, write-backs submitted between tokens, a seed, a reset, a setting, destruction).
+// Prefetch reads in flight across calls: a public entry point ends the demand reads (only those: an older prefetch read
+// stays in flight); a prefetch's read ends when its key is touched again (drain_key: a fetch or a cover), when its
+// layer is done (drain_layer: before its ready), once it completed (poll_reads, a full queue), or at a drain of
+// everything (the end of the token, slot pressure, write-backs submitted between tokens, a seed, a reset, a setting,
+// destruction). A staging buffer reused ends the one read that holds it.
 void DgCore::drain_through(const std::function<bool(const Pending&)>& f) {
-  for (size_t i = pending_.size(); i-- > 0;)
-    if (f(pending_[i])) {
-      drain_pending(i + 1);
-      return;
-    }
+  end_reads(f);
 }
 
 void DgCore::drain_demand() {
@@ -316,9 +332,7 @@ void DgCore::enter() {
 
 void DgCore::poll_reads() {
   enter();
-  size_t n = 0;
-  while (n < pending_.size() && t_->read_unit_done(pending_[n].handle)) ++n;
-  if (n) drain_pending(n);
+  end_reads([this](const Pending& p) { return t_->read_unit_done(p.handle); });  // every completed one, in any position
 }
 
 // The derived write-back scheduling state of c_.wb_defer (at construction, and after set_wb_defer / reset_open).
@@ -807,7 +821,10 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     int32_t stage = -1;
     void* h = nullptr;
     try {
-      if (pending_.size() >= depth) drain_pending(pending_.size() + 1 - depth);  // the queue depth
+      if (pending_.size() >= depth) {  // the queue depth: the completed reads first, then the oldest
+        end_reads([this](const Pending& p) { return t_->read_unit_done(p.handle); });
+        if (pending_.size() >= depth) drain_pending(pending_.size() + 1 - depth);
+      }
       stage = take_stage();
       const auto t0 = std::chrono::steady_clock::now();
       h = t_->read_unit_begin(k, stage);
@@ -921,6 +938,7 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
                            " ids: not rows x top_k (" + std::to_string(wp_.top_k) + ")");
   if (diag_ && mask) t_->diag_mark(g, 0);
   bool first_marked = false;
+  uint32_t first_read = kNone;  // dg_diag: the first fetched key while its read is in flight
   // true misses first (the device waits for them), per masked occurrence in export order: a repeated id is fetched at
   // its first occurrence and covered at the later ones (site.cu)
   for (uint32_t i = 0; i < n; ++i) {
@@ -931,11 +949,16 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
     } else {
       fetch(g, ids[i], false);
       if (diag_ && !first_marked) {
-        drain_demand();  // (dg_diag: the mark follows the first fetched unit's copies)
-        t_->diag_mark(g, 2);
         first_marked = true;
+        const uint32_t k = key(g, ids[i]);
+        if (std::any_of(pending_.begin(), pending_.end(), [k](const Pending& p) { return p.key == k; })) first_read = k;
+        else t_->diag_mark(g, 2);  // (dg_diag: the mark follows the first fetched unit's copies, enqueued already)
       }
     }
+  }
+  if (first_read != kNone) {  // every miss of the layer is issued first; then that one read ends, its copies enqueued,
+    drain_key(first_read);    // and the mark follows them
+    t_->diag_mark(g, 2);
   }
   if (mask) signal(g);
   else drain_layer(g);  // (no miss: the layer's prefetch reads still end before it is done)
@@ -1920,6 +1943,13 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
 // home changes, so a cancellation, a read failure or a device failure finds every unit in exactly one home.
 DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_keys) {
   const auto t0 = std::chrono::steady_clock::now();
+  // in progress from here: a cancellation from now on stops this round (none is lost before the drain below); idle
+  // again on every exit, so a later cancellation between rounds has no effect
+  round_state_.store(kRoundRunning, std::memory_order_release);
+  struct Idle {
+    std::atomic<int>& state;
+    ~Idle() { state.store(kRoundIdle, std::memory_order_release); }
+  } idle{round_state_};
   last_round_ = DgRoundOut{};
   require(!reset_failed_, SS_E_BACKEND,
           "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
@@ -1937,7 +1967,6 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
   for (uint32_t k = 0; k < keys_; ++k)
     require(e_[k].home != Home::Bank, SS_E_BACKEND, "ss_dg_round: a bank unit between tokens");
   stamp_room("ss_dg_round");
-  round_cancel_.store(false, std::memory_order_release);
   // drain point: everything settled (reads, copies, deferred and recorded write-backs collected); a device failure
   // here poisons the core (nothing of this call changed yet)
   try {
@@ -1960,7 +1989,7 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
   uint32_t moved = 0;
   auto fits = [&](uint64_t b) { return !in.budget_bytes || (spent <= in.budget_bytes && b <= in.budget_bytes - spent); };
   auto cancelled = [&] {
-    if (round_cancel_.load(std::memory_order_acquire)) r.cancelled = 1;
+    if (round_state_.load(std::memory_order_acquire) == kRoundCancel) r.cancelled = 1;
     return r.cancelled != 0;
   };
   auto boundary = [&] {  // a unit boundary: the cancellation check (the test probe runs first)

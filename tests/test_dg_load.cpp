@@ -1,6 +1,10 @@
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <new>
@@ -10,7 +14,9 @@
 #include "dg_fixture.hpp"
 #include "dg_load.hpp"
 #include "dg_layout.hpp"
+#include "dg_proto.hpp"
 #include "errors.hpp"
+#include "fixture.hpp"
 #include "file_reader.hpp"
 #include "xxh64.hpp"
 namespace {
@@ -182,9 +188,14 @@ TEST(dg_load_admission_and_options) {
   for (const char* value : {"true","on"}) {
     serial.set(value); CHECK(ss::dg_layout(f.d,p,o).load_serial);
   }
-  serial.set("yes");
-  try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
-  catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
+  for (const char* value : {"false","off"}) {
+    serial.set(value); CHECK(!ss::dg_layout(f.d,p,o).load_serial);
+  }
+  for (const char* value : {"yes"," 1","+1","On"}) {
+    serial.set(value);
+    try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
+    catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
+  }
   serial.set("1");
   p.budget.host_pinned_bytes=p.pinned+old.mapped_bytes+old.bounce_bytes+old.staging_bytes+4*f.model.unit();
   serial.set("0");
@@ -194,7 +205,8 @@ TEST(dg_load_admission_and_options) {
   CHECK(!old.load_overlap_alloc);
   overlap.set("0"); CHECK(!ss::dg_layout(f.d,p,o).load_overlap_alloc);
   for (const char* value : {"1","true","on"}) { overlap.set(value); CHECK(ss::dg_layout(f.d,p,o).load_overlap_alloc); }
-  overlap.set("off");
+  for (const char* value : {"false","off"}) { overlap.set(value); CHECK(!ss::dg_layout(f.d,p,o).load_overlap_alloc); }
+  overlap.set("yes");
   try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
   catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
   overlap.set(nullptr);
@@ -205,9 +217,13 @@ TEST(dg_load_admission_and_options) {
   bytes.set("1");
   try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
   catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_CAPACITY));}
-  bytes.set(nullptr); readers.set("0");
-  try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
-  catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
+  bytes.set(nullptr);
+  for (const char* bad : {"0"," 4","+4","-4","4x"}) {  // digits only, no sign or leading whitespace
+    readers.set(bad);
+    try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
+    catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
+  }
+  readers.set("4"); CHECK_EQ(ss::dg_layout(f.d,p,o).load_readers,4u);
   readers.set(nullptr);
   {  // DG_UNIT_SUBREAD_KIB: one request per part by default (0), 1024 = 1 MiB pieces, a multiple of 4 KiB up to 64 MiB
     Env sub("DG_UNIT_SUBREAD_KIB", nullptr);
@@ -215,7 +231,7 @@ TEST(dg_load_admission_and_options) {
     sub.set("1024"); CHECK_EQ(ss::dg_layout(f.d,p,o).unit_subread,uint64_t(1)<<20);
     sub.set("0"); CHECK_EQ(ss::dg_layout(f.d,p,o).unit_subread,0ull);
     sub.set("256"); CHECK_EQ(ss::dg_layout(f.d,p,o).unit_subread,uint64_t(256)<<10);
-    for (const char* bad : {"6","65540","x"}) {
+    for (const char* bad : {"6","65540","x"," 8","+8","-0"}) {
       sub.set(bad);
       try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
       catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
@@ -263,6 +279,191 @@ TEST(dg_read_pool_overlaps_and_rethrows) {
   CHECK(most.load() > 1);
   ts::DgReadPool left(2);  // never waited for: the destructor drops the queued ones, waits for the running ones
   for (int i = 0; i < 6; ++i) left.submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(3)); });
+}
+
+// Concurrent three-tier reads (dg_disk_queue > 1): every reader reads with its own bounce buffer (no lock is shared;
+// only the open source is), and units whose gate / up parts are not sector multiples (DeepSeek's are 3,041,280 bytes)
+// land the same bytes and digest from four readers at once. A part whose destination has its file offset's
+// misalignment reads its aligned middle in place, only its head and tail sectors through the bounce buffer; any other
+// unaligned part goes through it whole. Buffered: every part lands in place.
+TEST(dg_read_unit_concurrent_readers_own_bounces) {
+  const auto dir = sstest::Fixture::temp_root() / "ss-test-dg-read-concurrent";
+  std::filesystem::create_directories(dir);
+  const auto file = dir / "experts.bin";
+  const int U = 16;
+  const uint64_t pb[3] = {14336, 14336, 20480}, al = 4096;  // 3.5, 3.5 and 5 sectors
+  uint64_t off[3];
+  off[0] = 4096;
+  off[1] = off[0] + uint64_t(U) * pb[0];
+  off[2] = off[1] + uint64_t(U) * pb[1];
+  const uint64_t size = off[2] + uint64_t(U) * pb[2] + 4096;
+  {
+    std::vector<char> buf(static_cast<size_t>(size));
+    for (uint64_t i = 0; i < size; ++i) buf[size_t(i)] = char(sstest::byte_at(9, i));
+    std::ofstream f(file, std::ios::binary);
+    f.write(buf.data(), std::streamsize(size));
+  }
+  std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                     file.generic_string() + R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":)" +
+                     std::to_string(U) + R"(,"top_k":4,"parts":[)";
+  const char* names[3] = {"gate", "up", "down"};
+  for (int p = 0; p < 3; ++p)
+    json += std::string(p ? "," : "") + R"({"name":")" + names[p] + R"(","format":"Q4_K","offset":)" +
+            std::to_string(off[p]) + R"(,"stride":)" + std::to_string(pb[p]) + R"(,"bytes":)" +
+            std::to_string(pb[p]) + "}";
+  json += "]}]}";
+  const auto d = ss::desc_from_json(ss::json_parse(json));
+  const uint64_t unit = pb[0] + pb[1] + pb[2];
+  std::vector<std::vector<uint8_t>> expected(U);
+  std::vector<uint64_t> digests(U);
+  for (int u = 0; u < U; ++u) {
+    for (int p = 0; p < 3; ++p)
+      for (uint64_t i = 0; i < pb[p]; ++i) expected[size_t(u)].push_back(sstest::byte_at(9, off[p] + uint64_t(u) * pb[p] + i));
+    digests[size_t(u)] = ss::xxh64(expected[size_t(u)].data(), expected[size_t(u)].size());
+  }
+  for (bool direct : {false, true}) {
+    ss_options o;
+    ss_options_defaults(&o);
+    o.direct_io = direct;
+    std::vector<std::unique_ptr<ss::SourceFile>> files;
+    files.push_back(ss::open_source(d.sources[0].path, o));
+    const bool dio = files[0]->direct();
+    // the bytes one unit's read bounces: a part in place, its head and tail sectors, or the whole part
+    auto bounced_of = [&](int u) {
+      uint64_t want = 0, at = 0;
+      for (int p = 0; p < 3; ++p, at += pb[p - 1]) {
+        const uint64_t F = off[p] + uint64_t(u) * pb[p];
+        if (!dio || (F % al == 0 && pb[p] % al == 0 && at % al == 0)) continue;
+        if (at % al != F % al) {
+          want += pb[p];
+          continue;
+        }
+        const uint64_t lo = (al - F % al) % al, middle = pb[p] > lo ? (pb[p] - lo) / al * al : 0;
+        want += pb[p] - middle;
+      }
+      return want;
+    };
+    std::atomic<int> bad{0};
+    std::atomic<uint64_t> bounced{0}, saved{0};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r)
+      readers.emplace_back([&, r] {
+        ss::DgBounce bounce(size_t(1) << 20, size_t(al));
+        ss::DgBounce dst{size_t(unit), size_t(al)};  // aligned, as a pinned block
+        for (int rep = 0; rep < 6; ++rep)
+          for (int n = 0; n < U; ++n) {
+            const int u = (r * 5 + rep + n) % U;
+            std::memset(dst.p, 0x5a, size_t(unit));
+            ss::DgLoadStats st;
+            uint64_t digest = 0;
+            try {
+              ss::dg_read_unit(d, files, 0, u, dst.p, bounce.p, bounce.bytes, true, &digest, &st);
+            } catch (...) {
+              ++bad;
+              continue;
+            }
+            if (std::memcmp(dst.p, expected[size_t(u)].data(), size_t(unit)) != 0 || digest != digests[size_t(u)] ||
+                st.bounce_bytes != bounced_of(u))
+              ++bad;
+            bounced += st.bounce_bytes;
+            uint64_t whole = 0;  // what bouncing every unaligned part whole would have copied
+            for (int p = 0, at = 0; p < 3; at += int(pb[p]), ++p) {
+              const uint64_t F = off[p] + uint64_t(u) * pb[p];
+              if (dio && !(F % al == 0 && pb[p] % al == 0 && uint64_t(at) % al == 0)) whole += pb[p];
+            }
+            saved += whole - st.bounce_bytes;
+          }
+      });
+    for (std::thread& t : readers) t.join();
+    CHECK_EQ(bad.load(), 0);
+    if (dio) {
+      CHECK(bounced.load() > 0);
+      CHECK(saved.load() > 0);  // some middles landed in place
+    } else {
+      CHECK_EQ(bounced.load(), 0ull);
+    }
+  }
+}
+
+// A short part with the destination's misalignment that ends before its next sector (the last part of a unit, at an
+// unaligned end of file): bounced whole, nothing written past the unit, no read past the end of the file.
+TEST(dg_read_unit_short_part_without_aligned_middle) {
+  const auto dir = sstest::Fixture::temp_root() / "ss-test-dg-read-short-part";
+  std::filesystem::create_directories(dir);
+  const auto file = dir / "experts.bin";
+  const uint64_t al = 4096, b0 = 2816, b1 = 768, off0 = 4096, off1 = 8192 + 2816;  // part 1 at the offset's misalignment
+  const uint64_t size = off1 + b1;                                                     // the file ends inside a sector
+  {
+    std::vector<char> buf(static_cast<size_t>(size));
+    for (uint64_t i = 0; i < size; ++i) buf[size_t(i)] = char(sstest::byte_at(11, i));
+    std::ofstream f(file, std::ios::binary);
+    f.write(buf.data(), std::streamsize(size));
+  }
+  const std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                           file.generic_string() +
+                           R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":1,"top_k":1,"parts":[)" +
+                           R"({"name":"up","format":"Q4_K","offset":)" + std::to_string(off0) + R"(,"stride":)" +
+                           std::to_string(b0) + R"(,"bytes":)" + std::to_string(b0) + R"(},{"name":"down","format":)" +
+                           R"("Q4_K","offset":)" + std::to_string(off1) + R"(,"stride":)" + std::to_string(b1) +
+                           R"(,"bytes":)" + std::to_string(b1) + "}]}]}";
+  const auto d = ss::desc_from_json(ss::json_parse(json));
+  std::vector<uint8_t> expected;
+  for (uint64_t i = 0; i < b0; ++i) expected.push_back(sstest::byte_at(11, off0 + i));
+  for (uint64_t i = 0; i < b1; ++i) expected.push_back(sstest::byte_at(11, off1 + i));
+  for (bool direct : {false, true}) {
+    ss_options o;
+    ss_options_defaults(&o);
+    o.direct_io = direct;
+    std::vector<std::unique_ptr<ss::SourceFile>> files;
+    files.push_back(ss::open_source(d.sources[0].path, o));
+    ss::DgBounce bounce(size_t(1) << 20, size_t(al));
+    ss::DgBounce dst{size_t(2 * al), size_t(al)};  // aligned; past the unit = a guard
+    std::memset(dst.p, 0x5a, size_t(2 * al));
+    ss::DgLoadStats st;
+    uint64_t digest = 0;
+    ss::dg_read_unit(d, files, 0, 0, dst.p, bounce.p, bounce.bytes, true, &digest, &st);
+    CHECK(std::memcmp(dst.p, expected.data(), expected.size()) == 0);
+    CHECK_EQ(digest, ss::xxh64(expected.data(), expected.size()));
+    bool guard = true;
+    for (size_t i = expected.size(); i < size_t(2 * al); ++i) guard = guard && uint8_t(dst.p[i]) == 0x5a;
+    CHECK(guard);
+    if (files[0]->direct()) CHECK_EQ(st.bounce_bytes, b0 + b1);  // part 0 unaligned at its offset, part 1 bounced whole
+  }
+}
+
+// A failed token's report (the CUDA context's ss_end; the text is built here): the device's own error word first, then
+// what the host saw, then the poisoning. The CUDA module loading mode by name, and the open's notice when it is lazy
+// with gated layers. ss_dg_stats.cuda_module_loading is appended (an older caller's prefix is unchanged).
+TEST(dg_failure_report_and_module_loading) {
+  CHECK(ss::dg_device_error(ss::kDgOk, 7).empty());
+  CHECK(ss::dg_device_error(ss::kDgTimeout, 3) == "a wait timed out at gated layer 3");
+  CHECK(ss::dg_device_error(ss::kDgBadId, 1) == "an id was out of range at gated layer 1");
+  CHECK(ss::dg_device_error(ss::kDgDesync, 12) == "a step ran outside ss_begin / ss_end (sequence desync) (that "
+                                                  "step's seq 12)");
+  CHECK(ss::dg_device_error(ss::kDgAbsent, 4) == "a slot lookup met an absent entry");
+  CHECK(ss::dg_device_error(ss::kDgHostAbort, 2) == "the host aborted the token at gated layer 2");
+  const std::string tail = " (the context is poisoned, the token's outputs must be discarded)";
+  const std::string both = ss::dg_token_failure(9, ss::dg_device_error(ss::kDgTimeout, 3),
+                                                "the service: device-gated: export flag wait timed out");
+  CHECK(both == "device-gated: token 9: the device: a wait timed out at gated layer 3; the service: device-gated: "
+                "export flag wait timed out" + tail);
+  CHECK(both.find("the device:") < both.find("the service:"));
+  CHECK(ss::dg_token_failure(9, "", "the service: x") == "device-gated: token 9: the service: x" + tail);
+  CHECK(ss::dg_token_failure(9, "an id was out of range at gated layer 1", "") ==
+        "device-gated: token 9: the device: an id was out of range at gated layer 1" + tail);
+  CHECK(std::string(ss::dg_module_loading_name(0)) == "unknown");
+  CHECK(std::string(ss::dg_module_loading_name(1)) == "eager");
+  CHECK(std::string(ss::dg_module_loading_name(2)) == "lazy");
+  CHECK(std::string(ss::dg_module_loading_name(7)) == "unknown");
+  const std::string notice = ss::dg_module_loading_notice(2, 3);
+  CHECK(notice.find("lazy") != std::string::npos && notice.find("CUDA_MODULE_LOADING=EAGER") != std::string::npos);
+  CHECK(ss::dg_module_loading_notice(2, 0).empty());
+  CHECK(ss::dg_module_loading_notice(1, 3).empty());
+  CHECK(ss::dg_module_loading_notice(0, 3).empty());
+  CHECK_EQ(offsetof(ss_dg_stats, cuda_module_loading), offsetof(ss_dg_stats, round_cancelled) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, reserved1) + 4);
+  ss_dg_stats z{};
+  CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }
 
 // The overlap (DG_LOAD_OVERLAP_ALLOC): the pinned blocks come from the helper thread while the loader reads. The test's

@@ -583,7 +583,9 @@ PackWriter::PackWriter(const std::string& dir, PackWriterOptions o) : dir_(dir),
 }
 
 PackWriter::~PackWriter() {
-  if (finished_ || failed_) return;  // a poisoned writer already removed its directory (another build may own it now)
+  // a poisoned writer already removed its directory (another build may own it now), unless that removal failed: then
+  // the directory is still there (no other build could create it) and one more attempt is made
+  if (finished_ || (failed_ && !tmp_left_)) return;
   poison();
 }
 
@@ -598,6 +600,7 @@ void PackWriter::poison() {
   out_.reset();
   std::error_code ec;
   fs::remove_all(fs::u8path(tmp_), ec);
+  tmp_left_ = ec && !tmp_left_;  // retried once, by the destructor
 }
 
 uint32_t PackWriter::intern(const std::string& s) {
@@ -833,8 +836,12 @@ std::string PackWriter::finish_checked() {
   const std::string pin = sha256_hex(text.data(), text.size());
   publish_dir(tmp_, dir_);
   finished_ = true;
-  const fs::path parent = fs::u8path(dir_).parent_path();
-  sync_dir(parent.empty() ? "." : parent.u8string());
+  // the pack is published: a failure to make its rename durable does not fail the build
+  try {
+    const fs::path parent = fs::u8path(dir_).parent_path();
+    sync_dir(parent.empty() ? "." : parent.u8string());
+  } catch (...) {
+  }
   return pin;
 }
 
