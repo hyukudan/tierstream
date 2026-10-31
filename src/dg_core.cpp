@@ -653,6 +653,7 @@ void DgTransport::signal_ready_part(uint32_t, uint32_t) {
 void DgCore::set_layer_token(uint32_t g, const std::vector<uint32_t>& kept) {
   require(!reset_failed_, SS_E_BACKEND,
           "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
+  no_ring("ss_dg_begin_layer");
   require(g < gated(), SS_E_INVALID, "device-gated: layer token of gated layer " + std::to_string(g) + " of " +
                                          std::to_string(gated()));
   lm_kept_.clear();
@@ -1100,6 +1101,7 @@ void DgCore::begin_token(uint32_t seq, const std::vector<uint8_t>* run) {
   require(!reset_failed_, SS_E_BACKEND,
           "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
   require(!run || run->size() == gated(), SS_E_INVALID, "device-gated: the exported layers do not cover the gated layers");
+  no_ring("ss_begin");
   enter();
   if (run) std::copy(run->begin(), run->end(), run_.begin());
   else std::fill(run_.begin(), run_.end(), uint8_t(1));
@@ -2059,6 +2061,7 @@ DgCore::ScoreCand DgCore::score_candidate(uint32_t g, uint32_t u, uint64_t D, co
 void DgCore::set_policy(uint32_t policy) {
   drain_pending();  // drain point: between tokens, the policy (everything settled)
   require(policy <= 2, SS_E_INVALID, "device-gated: policy must be LRU, SCORED or SCORED_AUTO");
+  no_ring("ss_dg_set_policy");
   require(!policy || !sc_.empty(), SS_E_INVALID, "device-gated: scoring must be provisioned at open");
   drain();
   collect();
@@ -2147,6 +2150,7 @@ void DgCore::observe_copy(double unit_ms) {
 // Drain point: the start (a public entry point). issue_prior's file reads stay in flight into the token (they end
 // when their layer is demanded, or at a drain of everything).
 void DgCore::window_hint(const int32_t* symbols, const float* weights, uint32_t rows) {
+  no_ring("ss_dg_window_hint");
   enter();
   stamp_room("window_hint");
   ++st_.winpf_hints;
@@ -2214,6 +2218,7 @@ void DgCore::issue_prior() {
 }
 
 uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
+  no_ring("ss_seed");
   drain_pending();  // drain point: between tokens (copies, then an upload)
   // winpf: prior prefetches issued between tokens are Coming with their entries already in the mirror; their bytes
   // land before the upload below publishes the mirror
@@ -2251,6 +2256,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
   require(!reset_failed_, SS_E_BACKEND,
           "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
   require(g < gated(), SS_E_INVALID, "ss_dg_make_resident: gated layer out of range");
+  no_ring("ss_dg_make_resident");
   std::vector<uint8_t> want(keys_, 0), other(keys_, 0);
   for (uint32_t u : ids) {
     require(u < units(g), SS_E_INVALID, "ss_dg_make_resident: id out of range");
@@ -2977,6 +2983,7 @@ void DgCore::reset_open() {
   require(!reset_failed_, SS_E_BACKEND,
           "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
   require(open_e_.size() == keys_, SS_E_INVALID, "device-gated: reset before place");
+  no_ring("ss_dg_reset_open");
   try {
     drain();
     // drain submits deferred parts but deliberately does not collect. Wait for every record, including discards.
@@ -3328,6 +3335,35 @@ void DgCore::check() const {
     if (uint32_t(s) >= bank_first_) broken("a bank slot in the free list");
     take(slot_used, s, "free slot");
   }
+  // layer leases: the ring's slots (persistent, out of the free list), its tags both ways, the active leases' holdings,
+  // the release events (each once; every list only points at them), the leases' ready events
+  if (!ring_on_ && (!ring_.empty() || leases_active() || !releases_.empty())) broken("a lease or a ring without a ring");
+  for (size_t i = 0; i < ring_.size(); ++i) {
+    const RingSlot& r = ring_[i];
+    if (uint32_t(r.slot) >= bank_first_) broken("a bank slot in the ring");
+    take(slot_used, r.slot, "ring slot");
+    if (r.key != kNone && (r.key >= keys_ || ring_of_[r.key] != int32_t(i))) broken("a ring tag without its key");
+    if (r.lease != kNone) {
+      const LeaseRec& l = leases_[r.lease];
+      if (!l.active || std::find(l.ring.begin(), l.ring.end(), uint32_t(i)) == l.ring.end())
+        broken("a ring slot held by no active lease");
+    }
+    for (void* ev : r.rel)
+      if (std::find(releases_.begin(), releases_.end(), ev) == releases_.end()) broken("a ring slot's stale release");
+  }
+  for (size_t k = 0; k < ring_of_.size(); ++k)
+    if (ring_of_[k] >= 0 && (size_t(ring_of_[k]) >= ring_.size() || ring_[size_t(ring_of_[k])].key != k))
+      broken("a key tagged in no ring slot");
+  for (uint32_t i = 0; i < kMaxLeases; ++i) {
+    const LeaseRec& l = leases_[i];
+    if (l.ready) take(ev_used, ev_index(l.ready), "lease ready event");
+    for (uint32_t ri : l.ring)
+      if (!l.active || ri >= ring_.size() || ring_[ri].lease != i) broken("a lease's ring slot not held by it");
+    if (l.active && l.map.size() != units(l.g)) broken("a lease map not covering its layer");
+    for (void* ev : l.rel)
+      if (std::find(releases_.begin(), releases_.end(), ev) == releases_.end()) broken("a lease map's stale release");
+  }
+  for (void* ev : releases_) take(ev_used, ev_index(ev), "release event");
   for (int32_t b : free_blocks_) take(block_used, b, "free block");
   for (void* ev : event_pool_) take(ev_used, ev_index(ev), "pooled event");
   for (void* ev : stage_ev_)

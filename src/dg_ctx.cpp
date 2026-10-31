@@ -90,6 +90,8 @@ class CudaTransport final : public DgTransport {
       if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : wb_end_)
       if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : lease_ev_)
+      if (e) cudaEventDestroy(e);
     for (cudaStream_t s : s_)
       if (s) cudaStreamDestroy(s);
   }
@@ -338,6 +340,30 @@ class CudaTransport final : public DgTransport {
     sync(kDem);
   }
   void gate(Stream s, void* ev) { wait(s, ev); }
+  // Layer leases: the release event on the engine's stream; a lease map into its device buffer on kDem from its own
+  // pinned staging (reused only after its previous copy landed).
+  void record_on(void* ev, void* stream) override {
+    ck(cudaEventRecord(static_cast<cudaEvent_t>(ev), static_cast<cudaStream_t>(stream)), "cudaEventRecord (release)");
+  }
+  void set_lease_maps(int32_t* dev, int32_t* pin, uint32_t stride) {
+    lease_dev_ = dev;
+    lease_pin_ = pin;
+    lease_stride_ = stride;
+  }
+  void upload_lease_map(uint32_t index, const int32_t* map, uint32_t n) override {
+    require(lease_dev_ && index < DgCore::kMaxLeases && n <= lease_stride_, SS_E_BACKEND,
+            "device-gated: lease map buffers missing or too small");
+    cudaEvent_t& e = lease_ev_[index];
+    if (!e) ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate (lease map)");
+    else ck(cudaEventSynchronize(e), "cudaEventSynchronize (lease map)");
+    int32_t* pin = lease_pin_ + size_t(index) * lease_stride_;
+    std::memcpy(pin, map, size_t(n) * 4);
+    ck(cudaMemcpyAsync(lease_dev_ + size_t(index) * lease_stride_, pin, size_t(n) * 4, cudaMemcpyHostToDevice, s_[kDem]),
+       "cudaMemcpyAsync (lease map)");
+    ck(cudaEventRecord(e, s_[kDem]), "cudaEventRecord (lease map)");
+  }
+  int32_t* lease_map_dev(uint32_t index) const { return lease_dev_ + size_t(index) * lease_stride_; }
+  bool has_lease_maps() const { return lease_dev_ != nullptr; }
   std::vector<cudaEvent_t> dma_a_, dma_b_, dma_f_;
   std::vector<uint8_t> dma_used_;  // 0 unmarked, 1 marked, 2 marked with a first-fetch mark
   std::vector<double> dma_ms_, dma_first_ms_, wb_left_ms_;  // the last token's per-layer results (diag_collect)
@@ -361,6 +387,10 @@ class CudaTransport final : public DgTransport {
   cudaStream_t s_[3] = {nullptr, nullptr, nullptr};
   int32_t* table_pin_ = nullptr;  // keys entries
   bool flush_ready_ = false;
+  int32_t* lease_dev_ = nullptr;  // layer leases: kMaxLeases maps of lease_stride_ entries (device, pinned staging)
+  int32_t* lease_pin_ = nullptr;
+  uint32_t lease_stride_ = 0;
+  cudaEvent_t lease_ev_[DgCore::kMaxLeases] = {};
 };
 
 // Startup resources cannot outlive their pending DMA, including exceptional exits.
@@ -428,6 +458,8 @@ class CudaDgCtx final : public DgCtx {
   void begin(const uint32_t* rows, int n_layers) override { begin(rows, n_layers, 0, 0); }
   void begin(const uint32_t* rows, int n_layers, uint32_t lm_g, uint32_t lm_parts) {
     require(!in_token_, SS_E_INVALID, "ss_begin: a gated token is already open (call ss_end)");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_begin: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     if (rows)
       require(n_layers == int(d_.layers.size()), SS_E_INVALID, "ss_begin: rows_per_layer must cover every layer");
     // The layers this step exports: rows > 0 (or no rows) and no ss_dg_make_resident set (a resident layer reads only
@@ -465,6 +497,8 @@ class CudaDgCtx final : public DgCtx {
     require(parts >= 1 && uint32_t(parts) <= kDgMaxParts, SS_E_INVALID,
             "ss_dg_begin_layer: parts must be 1.." + std::to_string(kDgMaxParts));
     require(!in_token_, SS_E_INVALID, "ss_dg_begin_layer: a gated token is already open (call ss_end)");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_begin_layer: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     require(!steps_.resident(uint32_t(g)), SS_E_INVALID,
             "ss_dg_begin_layer: gated layer " + std::to_string(g) +
                 " holds a ss_dg_make_resident set (never exported while held: release it first)");
@@ -566,6 +600,105 @@ class CudaDgCtx final : public DgCtx {
     fold();
   }
 
+  // ---- layer leases (ss.h "Layer leases"; the core's dg_lease.cpp) ----
+  // The state rules of ss_dg_make_resident: between tokens, the device and the service handed the core back.
+  void quiescent(const char* what) {
+    require(!in_token_, SS_E_INVALID, std::string(what) + ": between tokens only");
+    require(!poisoned_, SS_E_BACKEND, std::string(what) + ": poisoned context");
+    require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_, SS_E_BACKEND,
+            std::string(what) + ": device sequence desync");
+    const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
+    require(seq_ ? state == DgService::kServed : state == DgService::kIdle, SS_E_BACKEND,
+            std::string(what) + ": service does not have terminal ownership");
+  }
+  // A core failure that poisoned the core poisons the context; anything else (a refusal, a read failure) only
+  // publishes the counters.
+  template <class F>
+  void lease_call(F&& f) {
+    try {
+      f();
+    } catch (...) {
+      if (core_->poisoned()) poisoned_ = true;
+      else fold(false);
+      throw;
+    }
+    fold(false);  // publish the lease counters without reporting a token to the hook
+  }
+  void ring_plan(uint32_t depth, ss_dg_ring_sizing* out) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_ring_plan: between tokens only");
+    const DgCore::RingSizing r = core_->ring_sizing(depth, steps_.all_kept());
+    std::memset(out, 0, sizeof *out);
+    out->struct_size = uint32_t(sizeof *out);
+    out->persistent_slots = x_.persistent_slots;
+    out->slot_bytes = x_.unit_bytes;
+    out->reservable = r.reservable;
+    out->free_slots = r.free_slots;
+    out->max_layer_units = r.max_layer_units;
+    out->max_layer_need = r.max_layer_need;
+    out->plan = r.plan;
+    out->ring_slots = core_->ring_size();
+  }
+  uint32_t reserve_ring(uint32_t n) override {
+    quiescent("ss_dg_reserve_ring");
+    if (!transport_->has_lease_maps()) {  // the lease maps, once (charged as the rest of the context)
+      uint32_t stride = 1;
+      for (uint32_t g = 0; g < core_->gated(); ++g) stride = std::max(stride, core_->units(g));
+      const uint64_t bytes = uint64_t(DgCore::kMaxLeases) * stride * 4;
+      charges_.charge(SS_BUDGET_DEVICE, "dg lease maps", bytes);
+      charges_.charge(SS_BUDGET_PINNED, "dg lease map staging", bytes);
+      ck(cudaMalloc(reinterpret_cast<void**>(&lease_dev_), size_t(bytes)), "cudaMalloc (lease maps)");
+      ck(cudaHostAlloc(reinterpret_cast<void**>(&lease_pin_), size_t(bytes), cudaHostAllocPortable),
+         "cudaHostAlloc (lease map staging)");
+      transport_->set_lease_maps(lease_dev_, lease_pin_, stride);
+    }
+    uint32_t evicted = 0;
+    lease_call([&] { evicted = core_->reserve_ring(n, steps_.all_kept()).evicted; });
+    return evicted;
+  }
+  void return_ring() override {
+    quiescent("ss_dg_return_ring");
+    lease_call([&] { core_->return_ring(); });
+  }
+  void lease_layer(int g, const int32_t* ids, int n, uint32_t ring_slots, ss_dg_lease* out) override {
+    quiescent("ss_dg_lease_layer");
+    check_g(g, "ss_dg_lease_layer");
+    const bool all = n == SS_DG_LEASE_ALL;
+    require(all || (n >= 0 && (n == 0 || ids)), SS_E_INVALID, "ss_dg_lease_layer: bad arguments");
+    std::vector<uint32_t> units;
+    for (int i = 0; !all && i < n; ++i) {
+      require(ids[i] >= 0, SS_E_INVALID, "ss_dg_lease_layer: id out of range");
+      units.push_back(uint32_t(ids[i]));
+    }
+    DgCore::LeaseResult r;
+    lease_call([&] { r = core_->lease_layer(uint32_t(g), units, all, ring_slots); });
+    std::memset(out, 0, sizeof *out);
+    out->struct_size = uint32_t(sizeof *out);
+    out->id = int32_t(r.index);
+    out->gated = g;
+    out->n_units = core_->units(uint32_t(g));
+    out->map_dev = transport_->lease_map_dev(r.index);
+    out->map_host = r.map;
+    out->ready_event = r.ready;
+    out->leased = r.leased;
+    out->resident = r.resident;
+    out->ring_hits = r.hits;
+    out->ring_misses = r.misses;
+    out->ring_waits = r.waits;
+  }
+  void enqueue_lease_wait(int lease, void* stream) override {
+    require(stream != nullptr, SS_E_INVALID, "ss_dg_enqueue_lease_wait: null stream");
+    require(lease >= 0 && core_->lease_active(uint32_t(lease)), SS_E_INVALID,
+            "ss_dg_enqueue_lease_wait: not an active lease");
+    // (the lease's ready event: the core records it at every lease of this id)
+    ck(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(core_->lease_ready(uint32_t(lease))), 0),
+       "cudaStreamWaitEvent (lease)");
+  }
+  void release_layer(int lease, void* stream) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_release_layer: between tokens only");
+    require(lease >= 0, SS_E_INVALID, "ss_dg_release_layer: not an active lease");
+    lease_call([&] { core_->release_layer(uint32_t(lease), stream); });
+  }
+
   uint32_t residency(ss_dg_unit* out, uint32_t cap) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_residency: between tokens only");
     const std::vector<uint32_t> keys = core_->residency();
@@ -619,6 +752,8 @@ class CudaDgCtx final : public DgCtx {
   void set_policy(ss_policy policy) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_set_policy: between tokens only");
     require(!poisoned_, SS_E_BACKEND, "ss_dg_set_policy: poisoned context");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_set_policy: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_,
             SS_E_BACKEND, "ss_dg_set_policy: device sequence desync");
     const auto state = svc_->wait_terminal(seq_, std::chrono::milliseconds(0));
@@ -631,6 +766,8 @@ class CudaDgCtx final : public DgCtx {
   void reset_open() override {
     require(!in_token_, SS_E_INVALID, "ss_dg_reset_open: between tokens only");
     require(!poisoned_, SS_E_BACKEND, "ss_dg_reset_open: poisoned context");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_reset_open: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     // ss_end has returned service ownership; at open the service has not been given a token yet.
     try {
       require(!device_busy_ && dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_,
@@ -664,6 +801,8 @@ class CudaDgCtx final : public DgCtx {
 
   void seed(int layer, const int32_t* units, int n) override {
     require(!in_token_, SS_E_INVALID, "ss_seed: between tokens only");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_seed: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     const int g = gated_index(layer);
     require(g >= 0, SS_E_INVALID, "ss_seed: layer " + std::to_string(layer) + " is not gated");
     require(n >= 0 && (n == 0 || units), SS_E_INVALID, "ss_seed: bad arguments");
@@ -677,6 +816,8 @@ class CudaDgCtx final : public DgCtx {
 
   void keep(int g, const int32_t* ids, int n) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_keep: between tokens only");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_keep: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     require(g >= 0 && uint32_t(g) < x_.gated.size(), SS_E_INVALID, "ss_dg_keep: gated layer out of range");
     require(n >= 0 && (n == 0 || ids), SS_E_INVALID, "ss_dg_keep: bad arguments");
     std::vector<uint32_t> k;
@@ -690,6 +831,8 @@ class CudaDgCtx final : public DgCtx {
 
   void make_resident(int g, const int32_t* ids, int n) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_make_resident: between tokens only");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_make_resident: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     require(!poisoned_, SS_E_BACKEND, "ss_dg_make_resident: poisoned context");
     require(g >= 0 && uint32_t(g) < x_.gated.size(), SS_E_INVALID, "ss_dg_make_resident: gated layer out of range");
     require(n >= 0 && (n == 0 || ids), SS_E_INVALID, "ss_dg_make_resident: bad arguments");
@@ -883,6 +1026,8 @@ class CudaDgCtx final : public DgCtx {
   }
   void window_hint(const int32_t* symbols, const float* weights, uint32_t rows) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_window_hint: between tokens only (after ss_end, before ss_begin)");
+    require(!core_->ring_on(), SS_E_INVALID,
+            "ss_dg_window_hint: a prefill ring is reserved (release every lease and call ss_dg_return_ring first)");
     for (uint32_t r = 0; weights && r < rows; ++r)
       require(weights[r] >= 0.0f && weights[r] <= 1.0f, SS_E_INVALID, "ss_dg_window_hint: weights must be in [0, 1]");
     require(core_->hinted_rows() + rows <= kDgMaxIds, SS_E_INVALID,
@@ -1064,6 +1209,21 @@ class CudaDgCtx final : public DgCtx {
         out->disk_depth_calibrations = c->calibrations;
       });
     out->disk_locations = x_.disk_locations;
+    out->lease_reserves = a.lease_reserves;
+    out->lease_reserve_evicted = a.lease_reserve_evicted;
+    out->lease_returns = a.lease_returns;
+    out->lease_ring_slots = fold_ring_slots_;
+    out->leases = a.leases;
+    out->lease_units = a.lease_units;
+    out->lease_resident = a.lease_resident;
+    out->lease_ring_hits = a.lease_ring_hits;
+    out->lease_ring_misses = a.lease_ring_misses;
+    out->lease_bytes = a.lease_bytes;
+    out->lease_disk_reads = a.lease_disk_reads;
+    out->lease_disk_bytes = a.lease_disk_bytes;
+    out->lease_ring_waits = a.lease_ring_waits;
+    out->lease_return_wait_ns = a.lease_return_wait_ns;
+    out->lease_ns = a.lease_ns;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
@@ -1312,6 +1472,20 @@ class CudaDgCtx final : public DgCtx {
     d.bank_kept = a.bank_kept - b.bank_kept;
     d.bank_keep_drops = a.bank_keep_drops - b.bank_keep_drops;
     d.bank_keep_rereads = a.bank_keep_rereads - b.bank_keep_rereads;
+    d.lease_reserves = a.lease_reserves - b.lease_reserves;
+    d.lease_reserve_evicted = a.lease_reserve_evicted - b.lease_reserve_evicted;
+    d.lease_returns = a.lease_returns - b.lease_returns;
+    d.leases = a.leases - b.leases;
+    d.lease_units = a.lease_units - b.lease_units;
+    d.lease_resident = a.lease_resident - b.lease_resident;
+    d.lease_ring_hits = a.lease_ring_hits - b.lease_ring_hits;
+    d.lease_ring_misses = a.lease_ring_misses - b.lease_ring_misses;
+    d.lease_bytes = a.lease_bytes - b.lease_bytes;
+    d.lease_disk_reads = a.lease_disk_reads - b.lease_disk_reads;
+    d.lease_disk_bytes = a.lease_disk_bytes - b.lease_disk_bytes;
+    d.lease_ring_waits = a.lease_ring_waits - b.lease_ring_waits;
+    d.lease_return_wait_ns = a.lease_return_wait_ns - b.lease_return_wait_ns;
+    d.lease_ns = a.lease_ns - b.lease_ns;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1541,6 +1715,18 @@ class CudaDgCtx final : public DgCtx {
       }
       g["three_tier"] = tt;
     }
+    if (fold_.lease_reserves) {  // layer leases: only once a ring was reserved, so other documents are unchanged
+      Json lt = Json::object();
+      const std::pair<const char*, uint64_t> lf[] = {
+          {"reserves", s.lease_reserves}, {"reserve_evicted", s.lease_reserve_evicted}, {"returns", s.lease_returns},
+          {"ring_slots", uint64_t(fold_ring_slots_)}, {"leases", s.leases},
+          {"units", s.lease_units}, {"resident", s.lease_resident}, {"ring_hits", s.lease_ring_hits},
+          {"ring_misses", s.lease_ring_misses}, {"bytes", s.lease_bytes}, {"disk_reads", s.lease_disk_reads},
+          {"disk_bytes", s.lease_disk_bytes}, {"ring_waits", s.lease_ring_waits},
+          {"return_wait_ns", s.lease_return_wait_ns}, {"ns", s.lease_ns}};
+      for (const auto& f : lf) lt[f.first] = Json::number(f.second);
+      g["layer_lease"] = lt;
+    }
     j["device_gated"] = g;
     return j;
   }
@@ -1557,6 +1743,7 @@ class CudaDgCtx final : public DgCtx {
     fold_wb_outstanding_ = core_->wb_outstanding_bytes();
     fold_disk_units_ = core_->file_units();
     fold_backed_units_ = core_->backed_units();
+    fold_ring_slots_ = core_->ring_size();
     min_free_blocks_ = std::min(min_free_blocks_, fold_free_blocks_);
     if (hook_ && call_hook) {
       std::fill(hook_fwd_.begin(), hook_fwd_.end(), ss_layer_stats{});
@@ -2103,6 +2290,10 @@ class CudaDgCtx final : public DgCtx {
     for (void* c : chunks_) cudaFreeHost(c);
     if (staging_) cudaFreeHost(staging_);
     if (gts_h_) cudaFreeHost(gts_h_);
+    if (lease_dev_) cudaFree(lease_dev_);
+    if (lease_pin_) cudaFreeHost(lease_pin_);
+    lease_dev_ = nullptr;
+    lease_pin_ = nullptr;
     slot_of_ = nullptr;
     ctl_ = nullptr;
     mapped_ = nullptr;
@@ -2156,6 +2347,9 @@ class CudaDgCtx final : public DgCtx {
   uint32_t fold_free_slots_ = 0, fold_free_blocks_ = 0, min_free_blocks_ = UINT32_MAX;
   uint64_t fold_wb_outstanding_ = 0;
   uint64_t fold_disk_units_ = 0, fold_backed_units_ = 0;  // three-tier gauges at the last fold
+  uint32_t fold_ring_slots_ = 0;                          // layer leases: ring slots reserved at the last fold
+  int32_t* lease_dev_ = nullptr;                          // layer leases: the maps (device) and their staging
+  int32_t* lease_pin_ = nullptr;
   ss_stats_hook hook_ = nullptr;
   void* hook_user_ = nullptr;
   mutable std::atomic<bool> snap_armed_{false};

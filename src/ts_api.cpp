@@ -159,5 +159,11 @@ ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream) { re
 ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream) { return ss_dg_enqueue_end_layer(c, stream); }
 ss_status ts_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on) { return ss_dg_set_pf_revert_unused(c, on); }
 ss_status ts_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o) { return ss_budget_in_dg_library(in, d, o); }
+ss_status ts_dg_ring_plan_sized(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out, uint32_t size) { return ss_dg_ring_plan_sized(c, depth, out, size); }
+ss_status ts_dg_reserve_ring(ss_ctx* c, uint32_t n, uint32_t* evicted) { return ss_dg_reserve_ring(c, n, evicted); }
+ss_status ts_dg_return_ring(ss_ctx* c) { return ss_dg_return_ring(c); }
+ss_status ts_dg_lease_layer_sized(ss_ctx* c, int g, const int32_t* ids, int n, uint32_t ring_slots, ss_dg_lease* out, uint32_t size) { return ss_dg_lease_layer_sized(c, g, ids, n, ring_slots, out, size); }
+ss_status ts_dg_enqueue_lease_wait(ss_ctx* c, int lease, void* stream) { return ss_dg_enqueue_lease_wait(c, lease, stream); }
+ss_status ts_dg_release_layer(ss_ctx* c, int lease, void* stream) { return ss_dg_release_layer(c, lease, stream); }
 
 }  // extern "C"
