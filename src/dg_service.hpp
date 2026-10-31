@@ -44,8 +44,10 @@ class DgService {
 
   void start();
   // Engine thread: hands token `seq` to the service (release). The service owns the core until it publishes the
-  // terminal word for seq.
-  void begin(uint32_t seq);
+  // terminal word for seq. run (G flags, NULL = every gated layer): the gated layers the step exports. The service
+  // waits for, validates and serves exactly those, in order; a layer not exported is never waited for (no flag, no
+  // prediction for it, no ready), and the core treats it as unused this token (DgCore::begin_token).
+  void begin(uint32_t seq, const std::vector<uint8_t>* run = nullptr);
   // Engine thread: the terminal word for `seq`, waiting at most `limit`. kIdle = not yet (deadline passed).
   State wait_terminal(uint32_t seq, std::chrono::milliseconds limit);
   // Requests stop, sets host_abort and joins the thread. Idempotent. After it, the core belongs to the engine thread.
@@ -67,9 +69,9 @@ class DgService {
   void run(uint32_t seen);
   void serve_token(uint32_t seq);
   // Waits until *w == seq (acquire); the deadline and the stop request end the wait. strict (the export flag, written
-  // every token): any value other than seq - 1 or seq is a desync. The prediction flag is written only on tokens that
-  // predict, so it may hold any older token.
-  void wait_word(const uint32_t* w, uint32_t seq, const char* what, uint32_t g, bool strict);
+  // by every token that exports the layer): any value other than `last` (the last token that exported it) or seq is a
+  // desync. The prediction flag is written only on tokens that predict, so it may hold any older token.
+  void wait_word(const uint32_t* w, uint32_t seq, const char* what, uint32_t g, bool strict, uint32_t last = 0);
   void wait_began(uint32_t seq);
   void publish(State s, uint32_t seq);
   void fail_with(const std::string& msg);
@@ -88,6 +90,8 @@ class DgService {
   std::string err_;
   std::vector<uint32_t> ids_, pred_;
   std::vector<uint32_t> unranked_;  // scored eviction: served layers whose ranking waits (the device ran ahead)
+  std::vector<uint8_t> run_next_, run_;  // the exported layers: handed over by begin (release), the token's own copy
+  std::vector<uint32_t> last_flag_;      // per gated layer: the last token that exported it (0 = none yet)
   std::vector<DgLayerTimeline> tl_, tl_done_;
   std::atomic<bool> new_origin_{false};
   bool boosted_ = false;

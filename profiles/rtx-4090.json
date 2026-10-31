@@ -1,0 +1,1 @@
+{"class":"rtx-4090","evidence":"","limits":{},"margins":{"device_reserve_bytes":2147483648,"host_floor_bytes":8589934592},"match":{"api":"cuda","arch":"sm_89","memory_max_bytes":27917287424,"memory_min_bytes":21474836480,"name_contains":"4090"},"mem_gbps":null,"schema":"strix/device-class-v1","unified":false}

@@ -47,6 +47,9 @@ DgService::DgService(DgCore* core, const DgMapped& m, const DgServiceConfig& cfg
   ids_.reserve(kDgMaxIds);
   pred_.reserve(kDgMaxIds);
   unranked_.reserve(core_->gated());
+  run_next_.assign(core_->gated(), 1);
+  run_.assign(core_->gated(), 1);
+  last_flag_.assign(core_->gated(), 0);
   tl_.assign(core_->gated(), DgLayerTimeline{});
   tl_done_.assign(core_->gated(), DgLayerTimeline{});  // preallocated: publishing it never allocates
 }
@@ -59,7 +62,12 @@ void DgService::start() {
   th_ = std::thread([this, seen] { run(seen); });
 }
 
-void DgService::begin(uint32_t seq) { host_seq_.store(seq, std::memory_order_release); }
+void DgService::begin(uint32_t seq, const std::vector<uint8_t>* run) {
+  require(!run || run->size() == run_next_.size(), SS_E_INVALID, "device-gated: the exported layers do not cover the gated layers");
+  if (run) std::copy(run->begin(), run->end(), run_next_.begin());
+  else std::fill(run_next_.begin(), run_next_.end(), uint8_t(1));
+  host_seq_.store(seq, std::memory_order_release);  // publishes run_next_ (the service reads it after this load)
+}
 
 DgService::State DgService::wait_terminal(uint32_t seq, std::chrono::milliseconds limit) {
   const auto end = clock_type::now() + limit;
@@ -97,15 +105,17 @@ void DgService::fail_with(const std::string& msg) {
   if (m_.host_abort) dg_store_release(m_.host_abort, 1);
 }
 
-void DgService::wait_word(const uint32_t* w, uint32_t seq, const char* what, uint32_t g, bool strict) {
+void DgService::wait_word(const uint32_t* w, uint32_t seq, const char* what, uint32_t g, bool strict, uint32_t last) {
   const auto start = clock_type::now();
   for (uint32_t spins = 0;; ++spins) {
     const uint32_t v = dg_load_acquire(w);
     if (v == seq) return;
-    if (strict && v != seq - 1u)
+    if (strict && v != last)
       fail(SS_E_BACKEND, std::string("device-gated: sequence desync: ") + what + " of gated layer " +
                              std::to_string(g) + " holds " + std::to_string(v) + " while serving token " +
                              std::to_string(seq));
+    // three-tier: prefetch reads in flight across calls get their copies enqueued as soon as they finished
+    if ((spins & 63u) == 0 && core_->reads_in_flight()) core_->poll_reads();
     if ((spins & 4095u) == 0) {
       if (stop_.load(std::memory_order_acquire)) throw Stop{};
       if (clock_type::now() - start > cfg_.timeout)
@@ -124,6 +134,7 @@ void DgService::wait_began(uint32_t seq) {
   for (uint32_t spins = 0;; ++spins) {
     const uint32_t v = dg_load_acquire(m_.began);
     if (v == seq) return;
+    if ((spins & 63u) == 0 && core_->reads_in_flight()) core_->poll_reads();  // a window's prior reads
     if (int32_t(v - seq) > 0)
       fail(SS_E_BACKEND, "device-gated: sequence desync: a gated step began with seq " + std::to_string(v) +
                              " while serving token " + std::to_string(seq) +
@@ -189,12 +200,25 @@ void DgService::run(uint32_t seen) {
 void DgService::serve_token(uint32_t seq) {
   const uint32_t G = core_->gated();
   unranked_.clear();
-  core_->begin_token(seq);
+  std::copy(run_next_.begin(), run_next_.end(), run_.begin());  // (begin's release, acquired with seq)
+  core_->begin_token(seq, &run_);
   auto t_prev = new_origin_.exchange(false, std::memory_order_acquire) ? clock_type::now() : t_served_;
   wait_began(seq);  // every flag deadline starts once the step began
+  // the next exported layer after g (G = none): the "device ran ahead" checks look at its flag
+  auto next_run = [&](uint32_t g) {
+    uint32_t h = g + 1;
+    while (h < G && !run_[h]) ++h;
+    return h;
+  };
   for (uint32_t g = 0; g < G; ++g) {
+    if (!run_[g]) {  // not exported this token: nothing to wait for or serve
+      if (cfg_.diag) tl_[g] = DgLayerTimeline{};
+      continue;
+    }
+    const uint32_t nx = next_run(g);
     DgLayerTimeline t;
-    wait_word(&m_.flag[g], seq, "export flag", g, true);
+    wait_word(&m_.flag[g], seq, "export flag", g, true, last_flag_[g]);
+    last_flag_[g] = seq;
     const auto t_seen = clock_type::now();
     t.seen_us = us_since(t_prev, t_seen);
     const DgRecord& r = m_.rec[g];
@@ -215,7 +239,7 @@ void DgService::serve_token(uint32_t seq) {
     const auto t_demand = clock_type::now();
     t.demand_us = us_since(t_seen, t_demand);  // ends at ready, before recency (site.cu)
     core_->serve_use(g, ids_.data(), n, mask);
-    if (n_pred > 0) {
+    if (n_pred > 0 && run_[g + 1]) {  // (a prediction for a layer this token does not export is ignored)
       wait_word(&m_.pflag[g], seq, "prediction flag", g, false);
       const auto t_pw = clock_type::now();
       t.pred_wait_us = us_since(t_demand, t_pw);
@@ -229,8 +253,8 @@ void DgService::serve_token(uint32_t seq) {
     }
     // dg_wb_defer: deferred write-back parts behind this layer's ready and prefetches; no more once the next layer
     // exported (the device ran ahead over layers without a miss: its demand comes first), asked before every part
-    if (core_->deferred() && g + 1 < G)
-      core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.flag[g + 1]) == seq; });
+    if (core_->deferred() && nx < G)
+      core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.flag[nx]) == seq; });
     // scored eviction: close layer g now that its union, epochs and stamps are final (after the ready,
     // the next layer's prefetches and the write-back slice). When the next layer already exported (the device ran
     // ahead) the ranking waits behind that layer's service, at the latest until the token is published: a served
@@ -238,7 +262,7 @@ void DgService::serve_token(uint32_t seq) {
     // the terminal path and timed. The bounded selector only tags the layer here; ranking waits for the boundary's
     // final eligibility and row count. The original full-list path remains an internal differential reference.
     if (core_->scored()) {
-      if (g + 1 < G && dg_load_acquire(&m_.flag[g + 1]) == seq) {
+      if (nx < G && dg_load_acquire(&m_.flag[nx]) == seq) {
         unranked_.push_back(g);
         core_->note_score_deferred();
       } else {
@@ -246,7 +270,7 @@ void DgService::serve_token(uint32_t seq) {
         for (uint32_t d : unranked_) core_->score_layer(d);
         unranked_.clear();
         core_->score_layer(g);
-        if (g + 1 == G)
+        if (nx == G)
           core_->add_score_last_ns(uint64_t(
               std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now() - t_rank).count()));
       }

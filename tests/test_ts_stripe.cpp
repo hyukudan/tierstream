@@ -327,6 +327,38 @@ void run(const fs::path& root, const fs::path& exe) {
 
 }  // namespace
 
+// blocks:K / blocks-even:K place alternating runs of K chunks; the two parities cover each placed range exactly once
+void run_block_placement(const fs::path& root) {
+  const fs::path ranges = root / "blocks.json";
+  const uint64_t chunk = kMiB, size = 20 * chunk - 5;
+  auto write = [&](const char* policy, uint64_t offset, uint64_t bytes) {
+    ts::Json j = ts::Json::object();
+    j["schema"] = ts::Json::string("tierstream/stripe-ranges-v1");
+    j["primary"] = ts::Json::string("weights.bin");
+    j["size"] = ts::Json::number(size);
+    j["ranges"] = ts::Json::array();
+    ts::Json r = ts::Json::object();
+    r["name"] = ts::Json::string("experts");
+    r["offset"] = ts::Json::number(offset);
+    r["bytes"] = ts::Json::number(bytes);
+    r["policy"] = ts::Json::string(policy);
+    j["ranges"].push(std::move(r));
+    write_text(ranges, ts::json_write(j));
+  };
+  write("blocks:4", 0, size);
+  check(placement(ranges, "weights.bin", size, chunk) == std::vector<uint64_t>{4, 5, 6, 7, 12, 13, 14, 15},
+        "blocks:4 places the odd runs of 4 chunks");
+  write("blocks-even:4", 2 * chunk, 15 * chunk);
+  check(placement(ranges, "weights.bin", size, chunk) == std::vector<uint64_t>{2, 3, 8, 9, 10, 11, 16},
+        "blocks-even:4 places the even runs inside the range");
+  write("blocks:1", 0, size);
+  check(placement(ranges, "weights.bin", size, chunk).size() == 10, "blocks:1 equals interleave");
+  for (const char* bad : {"blocks:", "blocks:0", "blocks:x", "blocks:1234567", "blocks-odd:4", "blocks:-1"}) {
+    write(bad, 0, size);
+    rejects([&] { placement(ranges, "weights.bin", size, chunk); });
+  }
+}
+
 int main(int argc, char** argv) {
   fs::path root;
   try {
@@ -336,6 +368,7 @@ int main(int argc, char** argv) {
     root = parent / ("run-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     check(fs::create_directory(root), "create unique fixture root");
     run(root, fs::absolute(path_of(argv[2])));
+    run_block_placement(root);
     fs::remove_all(root);
     std::puts("stripe tool tests passed");
     return 0;

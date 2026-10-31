@@ -1,9 +1,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <iterator>
+#include <memory>
 #include <random>
 #include <thread>
 
@@ -15,7 +21,16 @@
 #include "stripe_manifest.hpp"
 #include "xxh64.hpp"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <winioctl.h>
+#else
 #include <sys/stat.h>
 #endif
 
@@ -645,6 +660,54 @@ TEST(mfile_concurrent_reads_and_injection) {
   CHECK(t.equal(*f, 0, 8 * C));
 }
 
+TEST(mfile_medium_reads_balance_only_under_load) {
+  // a whole-chunk read below the split size is never split; alone it reads the primary, and while other reads are in
+  // flight it may go whole to the stripe copy of its chunk
+  Fixture t;
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  CHECK(t.equal(*f, 1 * C, C));
+  CHECK_EQ(counters(*f).bytes[1], uint64_t(0));
+  std::atomic<bool> start{false};
+  std::atomic<int> failures{0};
+  std::vector<std::thread> threads;
+  for (unsigned id = 0; id < 8; ++id) threads.emplace_back([&, id] {
+    while (!start.load()) std::this_thread::yield();
+    for (int i = 0; i < 40; ++i)
+      if (!t.equal(*f, uint64_t(2 * ((id + i) % 19) + 1) * C, C)) failures.fetch_add(1);
+  });
+  start.store(true);
+  for (auto& thread : threads) thread.join();
+  CHECK_EQ(failures.load(), 0);
+  const auto c = counters(*f);
+  CHECK(c.bytes[1] > 0);
+  CHECK(c.bytes[1] % C == 0);  // whole chunks only
+  CHECK_EQ(c.fallback_bytes, uint64_t(0));
+}
+
+TEST(mfile_medium_reads_idle_stay_on_primary_and_batches_balance) {
+  // an isolated medium read reads the primary even after the stripe was measured faster; the medium ios of one preadv
+  // are balanced against each other and the bytes in flight
+  Fixture t;
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  f->test_delay(0, 3000);  // a slow primary: concurrent reads teach a higher stripe share
+  std::vector<std::thread> threads;
+  for (unsigned id = 0; id < 8; ++id)
+    threads.emplace_back([&, id] { for (int i = 0; i < 10; ++i) t.equal(*f, uint64_t(2 * ((id + i) % 19) + 1) * C, C); });
+  for (auto& thread : threads) thread.join();
+  f->test_delay(0, 0);
+  const uint64_t trained = counters(*f).bytes[1];
+  for (int i = 0; i < 6; ++i) CHECK(t.equal(*f, uint64_t(2 * i + 1) * C, C));
+  CHECK_EQ(counters(*f).bytes[1], trained);
+  Buffer mem(size_t(3 * C));
+  char* buf = mem.p;
+  ss_mfile_io ios[3];
+  for (int i = 0; i < 3; ++i) ios[i] = ss_mfile_io{buf + size_t(i) * C, uint64_t(2 * i + 1) * C, C};
+  f->preadv(ios, 3);
+  CHECK(counters(*f).bytes[1] > trained);  // the second whole-chunk io went to the stripe
+  for (int i = 0; i < 3; ++i)
+    CHECK(std::memcmp(buf + size_t(i) * C, t.bytes.data() + size_t(2 * i + 1) * C, size_t(C)) == 0);
+}
+
 TEST(mfile_open_validates_options_without_stripes) {
   Fixture t;
   const auto p = t.primary.u8string(), absent = (t.root / "absent").u8string(), secondary = t.secondary.u8string();
@@ -773,6 +836,290 @@ TEST(mfile_tail_zero_and_fallback_learning) {
   CHECK_EQ(stripe->test_rate(1), 6.0);
   CHECK(stripe->test_rate(0) > 0);
 }
+
+namespace {
+// A directory link: Windows a junction (mklink /J needs no privilege), Linux a symlink.
+bool dir_link(const fs::path& link, const fs::path& target) {
+#if defined(_WIN32)
+  const std::string cmd = "cmd /c mklink /J \"" + fs::path(link).make_preferred().string() + "\" \"" +
+                          fs::path(target).make_preferred().string() + "\" >nul 2>&1";
+  return std::system(cmd.c_str()) == 0 && fs::is_directory(link);
+#else
+  std::error_code ec;
+  fs::create_directory_symlink(target, link, ec);
+  return !ec;
+#endif
+}
+// A file symlink: Windows needs the symlink privilege (or developer mode); false when it is refused.
+bool file_link(const fs::path& link, const fs::path& target) {
+  std::error_code ec;
+  fs::create_symlink(target, link, ec);
+  return !ec;
+}
+#if defined(_WIN32)
+// Sets (or removes) a third-party reparse tag on an existing file: any user who may write the file can, unlike a
+// symlink. The file then is a reparse point with its own bytes (no filter acts on the tag).
+bool reparse_tag(const fs::path& p, bool set) {
+  HANDLE h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                         FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  REPARSE_GUID_DATA_BUFFER b{};
+  b.ReparseTag = 0x00005A17;  // not a Microsoft tag
+  b.ReparseGuid = GUID{0x6b1f2c4e, 0x51a3, 0x4d6e, {0x9a, 0x2b, 0x7c, 0x10, 0x3e, 0x55, 0x81, 0x2f}};
+  DWORD n = 0;
+  const BOOL ok = DeviceIoControl(h, set ? FSCTL_SET_REPARSE_POINT : FSCTL_DELETE_REPARSE_POINT, &b,
+                                  REPARSE_GUID_DATA_BUFFER_HEADER_SIZE, nullptr, 0, &n, nullptr);
+  CloseHandle(h);
+  return ok != 0;
+}
+#endif
+void unlink_path(const fs::path& link) {
+  std::error_code ec;
+  fs::remove(link, ec);  // the link itself (a junction is removed, never its target's contents)
+}
+bool same(const ss_file_identity& a, const FileIdentity& b) {
+  return a.volume == b.volume && a.index == b.index && a.size == b.size;
+}
+ss_mfile_location info(const MFile& f, int loc) {
+  ss_mfile_location l{};
+  l.struct_size = sizeof l;
+  f.location_info(loc, &l);
+  return l;
+}
+}  // namespace
+
+// Resolve then bind: a link that already exists (the stripe directory, an ancestor, the primary's directory, the
+// manifest, the data file) is followed once and the session serves from the real files, which location_info reports.
+TEST(mfile_bound_opens_follow_existing_links_once) {
+  Fixture t;
+  const fs::path manifest = t.secondary / stripe_manifest_name(t.manifest.primary_basename);
+  const fs::path data = t.secondary / t.manifest.data_name;
+  auto serves = [&](const fs::path& primary, const fs::path& dir, const char* what) {
+    auto f = MFile::open(primary.u8string(), dir.u8string(), t.options());
+    if (!f->multi()) std::printf("  %s: %s\n", what, f->reasons().c_str());
+    CHECK(f->multi());
+    CHECK(t.equal(*f, 0, 8 * C));
+    const auto l = info(*f, 1);
+    CHECK_EQ(l.flags, SS_MFILE_LOCATION_OPEN | SS_MFILE_LOCATION_ENABLED);
+    CHECK(same(l.data, identity_of(data.u8string())));
+    CHECK(same(l.manifest, identity_of(manifest.u8string())));
+    CHECK(same(l.primary, identity_of(t.primary.u8string())));
+  };
+  const fs::path linked = t.root / "linked", ancestor = t.root / "ancestor";
+  CHECK(dir_link(linked, t.secondary));
+  CHECK(dir_link(ancestor, t.root));
+  serves(t.primary, linked, "stripe directory link");
+  serves(t.primary, ancestor / "secondary", "ancestor link");
+  serves(ancestor / "primary" / "weights.bin", t.secondary, "primary directory link");
+  {
+    RawFile f((ancestor / "primary" / "weights.bin").u8string(), false);
+    CHECK(f.identity() == identity_of(t.primary.u8string()));
+  }
+  unlink_path(linked);
+  unlink_path(ancestor);
+  // file links (Windows needs the symlink privilege): the manifest and the data file elsewhere, linked in
+  const fs::path elsewhere = t.root / "elsewhere";
+  fs::create_directories(elsewhere);
+  fs::rename(manifest, elsewhere / "m.json");
+  if (file_link(manifest, elsewhere / "m.json")) {
+    fs::rename(data, elsewhere / "d.data");
+    CHECK(file_link(data, elsewhere / "d.data"));
+    auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+    CHECK(f->multi());
+    CHECK(t.equal(*f, 0, 8 * C));
+    CHECK(same(info(*f, 1).data, identity_of((elsewhere / "d.data").u8string())));
+    CHECK(same(info(*f, 1).manifest, identity_of((elsewhere / "m.json").u8string())));
+    f.reset();
+    unlink_path(data);
+    fs::rename(elsewhere / "d.data", data);
+    unlink_path(manifest);
+  } else {
+    std::printf("  file symlinks refused here (no symlink privilege): manifest / data file link cases skipped\n");
+  }
+  fs::rename(elsewhere / "m.json", manifest);
+#if defined(_WIN32)
+  // a reparse point the resolve cannot follow (a third-party tag, no filter) is refused
+  CHECK(reparse_tag(manifest, true));
+  {
+    auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+    CHECK(!f->multi());
+    CHECK_EQ(info(*f, 1).flags, 0u);
+  }
+  CHECK(reparse_tag(manifest, false));
+#endif
+  auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+  CHECK(f->multi());
+}
+
+// Resolve then bind: a link swapped in between the resolve and the bound walk (the test hook runs there) is refused:
+// the stripe directory, an ancestor of the primary, the manifest or data file leaf.
+TEST(mfile_bound_opens_refuse_links_swapped_in_after_resolve) {
+  Fixture t;
+  const std::string manifest_name = stripe_manifest_name(t.manifest.primary_basename);
+  const fs::path real = t.root / "secondary-real";
+  struct Hook {
+    ~Hook() { test_bound_resolved_hook(nullptr); }
+  } hook_guard;
+  // once, when the file whose real path ends with `leaf` is resolved, run swap()
+  auto arm = [&](const std::string& leaf, std::function<void()> swap) {
+    auto fired = std::make_shared<bool>(false);
+    test_bound_resolved_hook([leaf, swap, fired](const std::string& p) {
+      if (*fired || p.size() < leaf.size() || p.compare(p.size() - leaf.size(), leaf.size(), leaf) != 0) return;
+      *fired = true;
+      swap();
+    });
+    return fired;
+  };
+  auto refused = [&](const char* what) {
+    auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+    CHECK(!f->multi());
+    CHECK(counters(*f).disabled_mask & 2);
+    CHECK_EQ(info(*f, 1).flags, 0u);
+    const bool named = f->reasons().find("link") != std::string::npos;
+    if (!named) std::printf("  %s: %s\n", what, f->reasons().c_str());
+    CHECK(named);
+    CHECK(t.equal(*f, 0, 8 * C));
+  };
+  // the stripe directory becomes a link (to its own contents) after the manifest's path was resolved
+  auto fired = arm(manifest_name, [&] {
+    fs::rename(t.secondary, real);
+    CHECK(dir_link(t.secondary, real));
+  });
+  refused("stripe directory swapped");
+  CHECK(*fired);
+  test_bound_resolved_hook(nullptr);
+  unlink_path(t.secondary);
+  fs::rename(real, t.secondary);
+  // the primary's directory becomes a link: the open fails
+  const fs::path primary_real = t.root / "primary-real";
+  fired = arm("weights.bin", [&] {
+    fs::rename(t.primary.parent_path(), primary_real);
+    CHECK(dir_link(t.primary.parent_path(), primary_real));
+  });
+  CHECK_EQ(status([&] { MFile::open(t.primary.u8string(), "", t.options()); }), int(SS_E_IO));
+  CHECK(*fired);
+  test_bound_resolved_hook(nullptr);
+  unlink_path(t.primary.parent_path());
+  fs::rename(primary_real, t.primary.parent_path());
+  // the leaf: the data file becomes a link (Linux: a symlink; Windows: a reparse point, no privilege needed)
+  const fs::path data = t.secondary / t.manifest.data_name;
+#if defined(_WIN32)
+  fired = arm(t.manifest.data_name, [&] { CHECK(reparse_tag(data, true)); });
+#else
+  fired = arm(t.manifest.data_name, [&] {
+    fs::rename(data, t.root / "moved.data");
+    CHECK(file_link(data, t.root / "moved.data"));
+  });
+#endif
+  {
+    auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+    CHECK(!f->multi());
+    CHECK_EQ(info(*f, 1).flags, 0u);
+    CHECK(f->reasons().find("link") != std::string::npos);
+  }
+  CHECK(*fired);
+  test_bound_resolved_hook(nullptr);
+#if defined(_WIN32)
+  CHECK(reparse_tag(data, false));
+#else
+  unlink_path(data);
+  fs::rename(t.root / "moved.data", data);
+#endif
+  auto f = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options());
+  CHECK(f->multi());
+}
+
+// What a session holds: the manifest digest it parsed and the identities of the manifest, the data file and the
+// primary, as a separate identity read sees them; through the C API too, sized.
+TEST(mfile_location_info_matches_identities) {
+  Fixture t;
+  const fs::path manifest = t.secondary / stripe_manifest_name(t.manifest.primary_basename);
+  const fs::path data = t.secondary / t.manifest.data_name;
+  std::string digest;
+  {
+    std::ifstream in(manifest, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    digest = json_str(*json_parse(text).find("digest"), "digest");
+  }
+  CHECK_EQ(digest.size(), size_t(16));
+  auto f = t.open();
+  CHECK(f->multi());
+  const auto p = info(*f, 0), s = info(*f, 1);
+  CHECK_EQ(p.flags, SS_MFILE_LOCATION_OPEN | SS_MFILE_LOCATION_ENABLED);
+  CHECK(same(p.data, identity_of(t.primary.u8string())));
+  CHECK(same(p.primary, identity_of(t.primary.u8string())));
+  CHECK_EQ(p.manifest.volume | p.manifest.index | p.manifest.size, uint64_t(0));
+  CHECK_EQ(std::string(p.manifest_digest), std::string());
+  CHECK_EQ(s.flags, SS_MFILE_LOCATION_OPEN | SS_MFILE_LOCATION_ENABLED);
+  CHECK_EQ(std::string(s.manifest_digest), digest);
+  CHECK(same(s.data, identity_of(data.u8string())));
+  CHECK(same(s.manifest, identity_of(manifest.u8string())));
+  CHECK(same(s.primary, identity_of(t.primary.u8string())));
+  CHECK_EQ(status([&] { info(*f, 2); }), int(SS_E_INVALID));
+  // a location disabled after its reads failed is still open (held) but no longer enabled
+  f->test_inject(1, 1, 0);
+  Buffer one{size_t(C)};
+  for (uint64_t c = 1; c < 9; c += 2) f->pread(one.p, C, c * C);  // distinct stripe chunks (each failure demotes one)
+  CHECK_EQ(info(*f, 1).flags, SS_MFILE_LOCATION_OPEN);
+  f.reset();
+  ss_mfile_options o;
+  ss_mfile_options_defaults(&o);
+  o.verify_mode = SS_MFILE_VERIFY_ALWAYS;
+  ss_mfile* m = nullptr;
+  CHECK_OK(ss_mfile_open(t.primary.u8string().c_str(), t.secondary.u8string().c_str(), &o, &m));
+  ss_mfile_location l{};
+  l.struct_size = sizeof l;
+  CHECK_OK(ss_mfile_location_info(m, 1, &l));
+  CHECK_EQ(std::string(l.manifest_digest), digest);
+  CHECK(same(l.data, identity_of(data.u8string())));
+  CHECK(ss_mfile_location_info(m, 2, &l) == SS_E_INVALID);
+  CHECK(ss_mfile_location_info(m, 0, nullptr) == SS_E_INVALID);
+  // sized: an older caller's shorter struct gets only its own bytes
+  alignas(ss_mfile_location) unsigned char shorter[64];
+  std::memset(shorter, 0xa5, sizeof shorter);
+  reinterpret_cast<ss_mfile_location*>(shorter)->struct_size = 32;
+  CHECK_OK(ss_mfile_location_info(m, 1, reinterpret_cast<ss_mfile_location*>(shorter)));
+  CHECK_EQ(reinterpret_cast<ss_mfile_location*>(shorter)->struct_size, 32u);
+  CHECK(same(reinterpret_cast<ss_mfile_location*>(shorter)->data, identity_of(data.u8string())));
+  for (size_t i = 32; i < sizeof shorter; ++i) CHECK_EQ(shorter[i], 0xa5);
+  ss_mfile_close(m);
+}
+
+#if defined(_WIN32)
+// Windows: while a session lives, no held directory (the stripe directory, its ancestors, the primary's directory) can
+// be renamed and the manifest and data file cannot be renamed or replaced; once it closes they can.
+TEST(mfile_held_directories_cannot_be_renamed) {
+  Fixture t;
+  const fs::path manifest = t.secondary / stripe_manifest_name(t.manifest.primary_basename);
+  auto f = t.open();
+  CHECK(f->multi());
+  std::error_code ec;
+  fs::rename(t.secondary, t.root / "renamed", ec);
+  CHECK(ec);
+  ec.clear();
+  const fs::path moved_root = t.root.parent_path() / (t.root.filename().u8string() + "-renamed");
+  fs::rename(t.root, moved_root, ec);
+  CHECK(ec);
+  ec.clear();
+  fs::rename(t.primary.parent_path(), t.root / "primary-renamed", ec);
+  CHECK(ec);
+  ec.clear();
+  fs::rename(manifest, t.root / "manifest-renamed", ec);
+  CHECK(ec);
+  ec.clear();
+  fs::rename(t.secondary / t.manifest.data_name, t.root / "data-renamed", ec);
+  CHECK(ec);
+  CHECK(status([&] { t.publish(); }) != SS_OK);
+  CHECK(t.equal(*f, 0, 8 * C));
+  f.reset();
+  ec.clear();
+  fs::rename(t.secondary, t.root / "renamed", ec);
+  CHECK(!ec);
+  fs::rename(t.root / "renamed", t.secondary, ec);
+  CHECK(!ec);
+  CHECK_EQ(status([&] { t.publish(); }), int(SS_OK));
+}
+#endif
 
 #if !defined(_WIN32)
 TEST(mfile_rejects_special_files_without_blocking) {

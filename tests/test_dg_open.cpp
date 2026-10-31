@@ -62,6 +62,20 @@ TEST(dg_open_valid_layout_needs_cuda) {
   expect(try_open(m, [](B&, O&, T&) {}), SS_E_UNSUPPORTED, "needs the CUDA backend");
 }
 
+// The GPU test's production configuration (dg_cuda_make_resident_prefill_production: 6 x 288 units, 64 resident per
+// layer, 16 spares, SCORED_AUTO, three-tier with mixed pinned / file-only units) passes every layout check.
+TEST(dg_open_production_layout_needs_cuda) {
+  DgModel m("open-prod", 6, 288);
+  expect(try_open(
+             m,
+             [](B&, O& o, T& t) {
+               sstest::dg_production_options(o);
+               sstest::dg_production_tiers(t);
+             },
+             64, 16, 8),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
 TEST(dg_open_refusals) {
   DgModel m("open");
   expect(try_open(m, [](B& b, O&, T&) { b.tier_mode = SS_TIER_MODE_INCLUSIVE; }), SS_E_INVALID, "tier_mode EXCLUSIVE");
@@ -414,4 +428,31 @@ TEST(dg_open_scored_options) {
            o.dg_score_profile_len = 3;
          }),
          SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
+// dg_no_admit: 0 or 1; every miss through a bank slot: a ring without both banks and the guard is refused naming the
+// count. Placement rounds: the defaults, and the calls on no context.
+TEST(dg_no_admit_and_rounds_abi_cpu) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_no_admit = 2; }), SS_E_INVALID, "dg_no_admit must be 0 or 1");
+  expect(try_open(m, [](B& b, O& o, T&) {
+           o.dg_no_admit = 1;
+           b.ring_slots = 16;
+         }),
+         SS_E_CAPACITY, "dg_no_admit serves every miss through a bank slot: it needs 16 bank slots");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_no_admit = 1; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_no_admit, 0u);
+  ss_dg_round_params p;
+  ss_dg_round_defaults(&p);
+  CHECK_EQ(p.struct_size, uint32_t(sizeof p));
+  CHECK_EQ(p.max_units, 96u);
+  CHECK(p.hysteresis == 1.25f && p.decay == 0.85f && p.budget_bytes == 0 && p.flags == 0);
+  ss_dg_round_result r;
+  CHECK_EQ(int(ss_dg_round(nullptr, &p, &r)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_dg_round_cancel(nullptr)), int(SS_E_INVALID));
+  ss_dg_unit u{0, 0};
+  const float one = 1.f;
+  CHECK_EQ(int(ss_dg_round_seed_counts(nullptr, &u, &one, 1)), int(SS_E_INVALID));
 }

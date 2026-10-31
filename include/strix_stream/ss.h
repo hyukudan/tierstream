@@ -190,6 +190,14 @@ typedef enum ss_policy {
 } ss_policy;
 
 struct ss_dg_unit; /* device-gated seed entry (below) */
+/* appended: a file's identity as the operating system names it, for callers that authenticated a file by their own
+ * handle (ss_options.source_identities, ss_mfile_location_info). Windows: the volume serial number and the file index
+ * (BY_HANDLE_FILE_INFORMATION); Linux: st_dev and st_ino; size in bytes. All zero = none. */
+typedef struct ss_file_identity {
+  uint64_t volume;
+  uint64_t index;
+  uint64_t size;
+} ss_file_identity;
 typedef struct ss_options {
   uint32_t struct_size;           /* sizeof(ss_options), set by ss_options_defaults */
   ss_backend_kind backend;
@@ -294,6 +302,48 @@ typedef struct ss_options {
   const char* weight_dirs;
   uint32_t drive_readers;         /* reader threads per volume with weight_dirs: 1..32 (default 4), always validated */
   int weight_verify;              /* CACHED (default) or ALWAYS; always validated, including without weight_dirs */
+  /* appended, device-gated three-tier placement (SS_DG_DISK_TIER below). dg_disk_tier: 1 = gated units of tier DISK
+   * are accepted (file homes: read from their file on demand); 0 (default) = refused as before. dg_disk_prefetch: 1 =
+   * predictions / window prefetches may read a disk unit too (the read runs while the layer computes; its copy and
+   * entry follow the read, before the unit's layer is signalled ready); 0 (default) = disk units arrive on demand
+   * only. dg_disk_staging: pinned one-unit buffers the file reads land in before their copy to the device (0 = 8;
+   * only with dg_disk_tier). dg_inclusive_blocks: at most this many device-resident units keep their pinned block as
+   * a clean copy after a promotion (their eviction is then a drop: no device-to-host copy); the blocks come from the
+   * spare blocks (host_spare_units), so it must leave at least one spare block for write-backs; 0 (default) =
+   * exclusive as before. */
+  uint32_t dg_disk_tier;
+  uint32_t dg_disk_prefetch;
+  uint32_t dg_disk_staging;
+  uint32_t dg_inclusive_blocks;
+  /* appended, three-tier: file reads of disk units in flight at once (reader threads; also bounded by
+   * dg_disk_staging): the misses of a layer are read together and each copy is enqueued once its read finished (the
+   * same bytes, slots and table entries); a prefetch's read stays in flight across the service's calls until its
+   * layer is demanded; 0 = 1 (default: one read at a time inside its fetch, as before), 2..64 = that many in flight;
+   * only with dg_disk_tier. */
+  uint32_t dg_disk_queue;
+  uint32_t reserved4;  /* explicit padding (never read) */
+  /* appended, bound source opens: every descriptor source is resolved once to its real path, then opened through
+   * held handles of its directory and of each ancestor directory (see ss_mfile_location_info below), never reopened
+   * by path. source_identities[i] (i < source_identity_n <= the descriptor's source count) is the identity
+   * desc source i must have (volume, index and size; an all-zero entry is not checked): any other file fails ss_open
+   * with SS_E_DESC naming the source. Read only during ss_open; 0 / NULL (default) = no expected identity. */
+  uint32_t source_identity_n;
+  uint32_t reserved5;  /* explicit padding (never read) */
+  const ss_file_identity* source_identities;
+  /* appended, whole-device budgets ("Whole-device budgets" below): a ledger the context charges its own device and
+   * pinned allocations to (device-gated: the arena, slot table, controls, pinned blocks, staging, bounce and mapped
+   * buffers; host mode: every allocation of its backend). An allocation that would exceed the ledger's cap fails
+   * ss_open with SS_E_CAPACITY naming it. The ledger must outlive the context; closing the context releases its
+   * charges. NULL (default) = nothing charged. */
+  struct ss_budget_ledger* budget;
+  /* appended, device-gated no-admission misses (SS_DG_ROUNDS below): 1 = a demand miss is served through a bank slot
+   * (pinned block -> bank, or file -> staging -> bank) and released at ss_end without evicting a resident and without
+   * changing the unit's home; no prefetch is issued and no boundary evicts, so placement changes only through
+   * ss_dg_round, ss_dg_make_resident and ss_seed. Every distinct miss of a layer takes one of a bank's dg_max_ids
+   * slots: ss_open refuses (SS_E_CAPACITY, naming the count) when the plan's ring cannot hold both banks and the
+   * guard. 0 (default) = misses are admitted as before. */
+  uint32_t dg_no_admit;
+  uint32_t reserved6;  /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -316,7 +366,10 @@ SS_API int ss_source_direct(const ss_ctx* c, int source);
 SS_API ss_status ss_seed(ss_ctx* c, int layer, const int32_t* units, int n);
 
 /* One forward (a prefill request or a decode step). rows_per_layer may be NULL (all layers run); else
- * rows_per_layer[L] == 0 marks a layer the forward skips (e.g. a cone). */
+ * rows_per_layer[L] == 0 marks a layer the forward skips (e.g. a cone). Device-gated: a gated layer with 0 rows is
+ * not exported by the step (no ss_dg_enqueue_export / predict / wait for it): the service does not wait for it and the
+ * boundary treats it as unused this token (no lookups, misses or recency, no score history; its units age as unrouted
+ * ones). A gated layer holding an ss_dg_make_resident set is never exported either, whatever its rows. */
 SS_API ss_status ss_begin(ss_ctx* c, const uint32_t* rows_per_layer, int n_layers);
 
 /* Routes of layer L for this forward: n ids (rows x top_k, any order, duplicates allowed, -1 ignored). Host ids. */
@@ -476,9 +529,10 @@ SS_API ss_status ss_stats_snapshot_json(const ss_ctx* c, char** out_json, size_t
  * Every streamable layer is a gated layer g = 0..G-1 (descriptor order; ss_dg_gated_index maps a layer). Their units
  * share one device arena per part: unit (g, u) is at parts[p].base + slot * parts[p].stride for
  * slot = slot_of[unit_base[g] + u] (-1: not on the device). Per token, inside the engine's graph (capturable, no host
- * work per token): ss_dg_enqueue_begin once; for each g in order: ss_dg_enqueue_export of g's routed ids, the engine's
+ * work per token): ss_dg_enqueue_begin once; for each exported g in order (ss_begin: every gated layer except one with
+ * 0 rows or holding an ss_dg_make_resident set): ss_dg_enqueue_export of g's routed ids, the engine's
  * work that does not read g's slots, ss_dg_enqueue_wait(g), then the readers of g's slots, which must resolve every id
- * through ss_dg_slot and must finish before the export of g + 1 (a side branch must be joined before it);
+ * through ss_dg_slot and must finish before the next export (a side branch must be joined before it);
  * optionally ss_dg_enqueue_predict(g) with g + 1's predicted ids on a side stream (the export of g promised their
  * count); ss_dg_enqueue_end after every reader and join. On the host: ss_begin before launching the step and ss_end
  * after it (ss_end waits for the end kernel, evicts and writes back, and fails the token on any device or service
@@ -508,6 +562,11 @@ typedef struct ss_dg_device_view {  /* passed by value to the engine's kernels *
    * the guard slot; an entry < 0 -> atomicOr(absent_err, 1) and the guard slot. */
   uint32_t* absent_err;
 } ss_dg_device_view;
+/* Kept units in any token: a unit kept on the device (an ss_dg_make_resident set, or an ss_dg_keep unit from the
+ * boundary at which it is on the device) resolves through ss_dg_slot / ss_dg_slot_if_ready in every token, its layer
+ * exported or not (no wait needed: its entry was published before the token began), and keeps its slot while it is
+ * kept: entries change inside a token only from -1 to a slot, and the boundaries never evict a kept unit. The release
+ * (or ss_dg_reset_open, which drops every keep) makes it an ordinary unit from the next boundary on. */
 typedef struct ss_dg_unit {  /* a gated unit: gated ordinal and unit index */
   int32_t gated, unit;
 } ss_dg_unit;
@@ -523,7 +582,9 @@ SS_API ss_status ss_dg_enqueue_export(ss_ctx* c, int g, const int32_t* ids_dev, 
 SS_API ss_status ss_dg_enqueue_predict(ss_ctx* c, int g, const int32_t* ids_dev, int n, void* stream);
 SS_API ss_status ss_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
 SS_API ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream);
-/* Between tokens: units of gated layer g the next boundary must not evict (opt-in; replaces the previous set of g). */
+/* Between tokens: units of gated layer g the next boundary must not evict (opt-in; replaces the previous set of g,
+ * also an ss_dg_make_resident set: g is exported again; n = 0 releases). A kept unit on the device stays in its slot
+ * (no boundary evicts or reverts it) while kept. */
 SS_API ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
 /* Between tokens: the spare target (<= the billed spares; the next boundary's evictions) and the prefetch budgets
  * (from the next token). The default prefetch reserve follows the spare target, min(24, spare_target / 4); an
@@ -620,6 +681,31 @@ typedef struct ss_dg_stats {
    * had already exported it; score_last_ns = ranking time after the last gated layer was served (the terminal path,
    * part of score_ns) */
   uint64_t score_deferred, score_last_ns;
+  /* appended, three-tier placement (SS_DG_DISK_TIER; 0 when off): disk_reads / disk_read_bytes / disk_read_ns = file
+   * reads of disk-homed units (demand, prefetch) and their summed read time; disk_stage_waits = reads that waited for a
+   * staging buffer's previous copy; disk_drops = pinned units dropped to their file to free a block for a write-back
+   * (RAM -> drop, no copy); disk_discards = device victims dropped to their file because no block could be freed (no
+   * copy); inclusive_kept = promotions that kept their block as a clean copy; inclusive_drops = evictions of such units
+   * (no write-back); disk_units / backed_units = file-homed units and device units holding a clean copy at the last
+   * boundary (gauges, not differences) */
+  uint64_t disk_reads, disk_read_bytes, disk_read_ns, disk_stage_waits, disk_drops, disk_discards;
+  uint64_t inclusive_kept, inclusive_drops, disk_units, backed_units;
+  /* appended, three-tier: the service's wall time waiting for file reads to finish (disk_read_ns sums the reads' own
+   * times: with dg_disk_queue > 1 they overlap, so this is the smaller one) */
+  uint64_t disk_wait_ns;
+  /* appended, three-tier overlap receipts: disk_overlapped = file reads begun while another was still in flight;
+   * disk_max_in_flight = the most in flight at once since open (a gauge, not a difference); disk_carried /
+   * disk_carried_bytes = prefetch reads that ended in a later service call than the one that began them (they ran
+   * while the layer computed) */
+  uint64_t disk_overlapped, disk_max_in_flight, disk_carried, disk_carried_bytes;
+  /* appended, kept-resident layers (SS_DG_MAKE_RESIDENT): units ss_dg_make_resident copied in (from a pinned block or
+   * a file), device units it evicted, the bytes it copied in, its host time. Its copies count nowhere else (not
+   * misses, fetches, prefetches, evictions, write-backs or file reads). */
+  uint64_t resident_units, resident_evicted, resident_bytes, resident_ns;
+  /* appended, placement rounds (SS_DG_ROUNDS): rounds run, units whose home they changed (promoted to the device or to
+   * the pinned tier, demoted from the device, dropped to their file), the bytes they moved (file reads + host-to-device
+   * copies + write-backs), their host time, rounds that stopped at a cancellation. Their copies count nowhere else. */
+  uint64_t round_count, round_units, round_bytes, round_ns, round_cancelled;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -761,6 +847,24 @@ SS_API ss_status ss_dg_reset_open(ss_ctx* c);
    verify rows. ss_end / ts_end is exactly one row. AUTO learns as SCORED on every cycle, but R1 uses the unchanged
    LRU walk without ranking. The public integer score, weights and optional TSSCPRF1 profile are shared by both. */
 #define SS_DG_AUTO_EVICT 1
+/* Three-tier device-gated placement (ss_options dg_disk_tier / dg_disk_prefetch / dg_disk_staging /
+ * dg_inclusive_blocks): device slots, pinned blocks, then the unit's file. With dg_disk_tier = 1 a plan may give gated
+ * units tier DISK: such a unit has no block; a miss reads it from its file (through dg_weight_dirs stripes when given)
+ * into a pinned staging buffer and copies it to its slot. Victims go down one tier: a device victim is written back
+ * into a free block (device -> pinned); when no block is free, the least recently homed pinned unit is dropped to its
+ * file (no copy: the file holds the same bytes) and its block takes the victim; with no pinned unit left the victim
+ * itself is dropped to its file. Bank serves, reverted prefetches and their returns of a disk unit go back to the file.
+ * The pinned units are kept in their own recency order (most recently homed first). Inclusive share
+ * (dg_inclusive_blocks > 0): a promotion from a pinned block keeps the block as a clean copy while fewer than that many
+ * device units hold one; evicting such a unit makes the block its home again with no copy. Placement only: every byte
+ * a slot receives is the unit's file bytes, so the outputs are those of the exclusive two-tier cache. Both off (the
+ * defaults) = the two-tier exclusive behaviour byte for byte. ss_dg_reset_open restores the open placement (clean
+ * copies dropped, disk units read again where the open placed them). */
+#define SS_DG_DISK_TIER 1
+/* ss_options.dg_disk_queue and ss_dg_stats.disk_wait_ns exist (overlapped three-tier file reads) */
+#define SS_DG_DISK_QUEUE 1
+/* ss_dg_stats.disk_overlapped / disk_max_in_flight / disk_carried / disk_carried_bytes exist (overlap receipts) */
+#define SS_DG_DISK_RECEIPTS 1
 SS_API ss_status ss_dg_end_rows(ss_ctx* c, uint32_t rows);
 /* Engine thread, between tokens after the device and service have returned ownership (as after ss_end).
    Drains/collects write-backs, switches LRU / SCORED / SCORED_AUTO, and resets learning to the open profile (or zero)
@@ -853,6 +957,558 @@ SS_API ss_status ss_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out
 SS_API const char* ss_mfile_location_path(const ss_mfile* f, int loc);
 /* Why secondary locations were disabled at open ("" when none); valid until ss_mfile_close. */
 SS_API const char* ss_mfile_open_report(const ss_mfile* f);
+/* appended, bound opens: what a session holds, to compare with what the caller authenticated by its own handles.
+ * Every file of a session (the primary, each stripe directory's manifest and data file) is resolved once to its real
+ * final path (a link that exists then is followed once), then opened through held handles of its directory and of
+ * every ancestor directory from the volume root: a directory or file found to be a symlink, junction or other reparse
+ * point during that walk (swapped in after the resolve) is refused (the primary: the open fails; a secondary
+ * location: disabled, with the reason in the open report). Windows holds those directories without
+ * FILE_SHARE_DELETE (none can be renamed or deleted while the session lives) and the manifest and data files with
+ * FILE_SHARE_READ (no writer, no rename); the leaf's final path must be its held directory's plus its name. Linux holds
+ * the directory fds (openat O_NOFOLLOW walk from "/"; renames are not prevented, the identity checks above apply).
+ * The manifest stays open for the session's lifetime and is read through its held handle. */
+#define SS_MFILE_LOCATION_OPEN 1u     /* the location's data file is open (held) */
+#define SS_MFILE_LOCATION_ENABLED 2u  /* and the location serves reads (not disabled at open or after errors) */
+typedef struct ss_mfile_location {
+  uint32_t struct_size;           /* set by the caller: sizeof(ss_mfile_location) */
+  uint32_t flags;                 /* SS_MFILE_LOCATION_* */
+  ss_file_identity data;          /* the held file this location reads (location 0: the primary); zero when none */
+  ss_file_identity manifest;      /* the held manifest (zero for location 0 or when none is held) */
+  ss_file_identity primary;       /* the session's primary (every location) */
+  char manifest_digest[24];       /* the held manifest's "digest" field (16 lowercase hex digits), "" when none */
+} ss_mfile_location;
+/* loc: 0 = the primary .. ss_mfile_get_counters' locations - 1; SS_E_INVALID past the last. */
+SS_API ss_status ss_mfile_location_info(const ss_mfile* f, uint32_t loc, ss_mfile_location* out);
+
+/* Whole-device budgets (docs/design.md §5.1). One cap for the whole device (--vram-total-gib: as if the card had that
+ * much memory) and one for the host (--ram-total-gib, pinned included). ss_budget_plan subtracts what is fixed (the
+ * measured device context; the engine's named device components: trunk / dense weights, KV for the context,
+ * workspaces, drafter; its pinned and pageable host components; the load staging) and gives the expert tiers what is
+ * left: the arena gets the device's rest, the pinned tier the host's rest, the file tier the experts left over. Pure
+ * integer arithmetic on bytes (saturating); no device call. With both caps 0 it is the engines' three-tier placement
+ * unchanged (DeepSeek's tier_plan), so an engine moves to it with no change of behaviour. A cap that cannot hold the
+ * fixed parts is refused (SS_E_CAPACITY, ss_last_error = out->refuse) naming the components and the smallest cap that
+ * would hold them (min_vram_total_bytes / min_ram_total_bytes); the outputs are written on refusal too.
+ * The ledger tracks what is really allocated against the same caps: every add is checked against its cap, and the
+ * stats give the peak per kind with the components at that peak. Thread-safe. */
+#define SS_BUDGET 1
+#define SS_BUDGET_MARGINS 1            /* ss_budget_in.vram_margin_bytes / ram_margin_bytes */
+#define SS_BUDGET_JSON 1               /* ss_budget_plan_json; ss_budget_out.device_room_bytes .. host_capped */
+#define SS_BUDGET_UNIFIED 1            /* ss_budget_in.unified */
+#define SS_BUDGET_OBSERVE 1            /* ss_budget_ledger_observe / _within_caps; ss_budget_stats.measured_host_last .. */
+#define SS_BUDGET_NO_SAMPLE (~(uint64_t)0)  /* ss_budget_ledger_observe: nothing measured on that side */
+#define SS_BUDGET_AUTO (~(uint64_t)0)  /* the "auto" value of the uint64_t knobs below */
+#define SS_BUDGET_TOP 16               /* components kept per kind at its peak */
+#define SS_BUDGET_NAME 48              /* bytes of a component name in the stats (longer names are cut) */
+#define SS_BUDGET_REFUSE 256           /* bytes of ss_budget_out.refuse */
+typedef enum ss_budget_kind {
+  SS_BUDGET_DEVICE = 0,   /* device memory (cudaMalloc): the VRAM cap */
+  SS_BUDGET_PINNED = 1,   /* page-locked host memory (cudaHostAlloc): the RAM cap */
+  SS_BUDGET_PAGEABLE = 2  /* ordinary host memory: the RAM cap */
+} ss_budget_kind;
+#define SS_BUDGET_KINDS 3
+typedef struct ss_budget_component {
+  const char* name;     /* NUL-terminated, named in refusals; NULL = "unnamed" */
+  uint64_t bytes;
+} ss_budget_component;
+typedef struct ss_budget_in {
+  uint32_t struct_size;           /* sizeof(ss_budget_in), set by ss_budget_in_defaults */
+  uint32_t file_tier;             /* 1 (default) = experts that fit nowhere else are read from their files */
+  uint64_t vram_total_bytes;      /* the whole device's cap; 0 (default) = uncapped */
+  uint64_t ram_total_bytes;       /* the host's cap, pinned included; 0 (default) = uncapped */
+  uint64_t device_context_bytes;  /* the measured device context (CUDA context, library handles) */
+  const ss_budget_component* device_fixed;    /* the engine's device components (trunk, KV, workspaces, drafter) */
+  const ss_budget_component* pinned_fixed;    /* the engine's pinned host buffers (outside the expert tiers) */
+  const ss_budget_component* pageable_fixed;  /* the engine's pageable host memory (the RAM cap only) */
+  uint32_t n_device_fixed, n_pinned_fixed, n_pageable_fixed;
+  uint32_t host_spares;           /* free pinned blocks for write-backs */
+  uint64_t keys;                  /* routed experts (layers x experts) */
+  uint64_t slot_bytes;            /* one expert's device slot */
+  uint64_t unit_bytes;            /* one expert's pinned host stride (every host count is in these units) */
+  uint64_t arena_spares;          /* free arena slots beside the residents */
+  uint32_t staging;               /* the file tier's pinned staging buffers (default 8) */
+  uint32_t reserved0;             /* explicit padding (never read) */
+  uint64_t arena_units;           /* resident experts asked for; SS_BUDGET_AUTO (default) = what the VRAM cap allows
+                                     (every expert when uncapped); never more than the cap allows */
+  uint64_t ram_expert_bytes;      /* the pinned expert tier asked for (spares and staging included); SS_BUDGET_AUTO
+                                     (default) = what fits */
+  uint64_t inclusive_bytes;       /* clean copies of device experts, from RAM left over: 0 (default) = off,
+                                     SS_BUDGET_AUTO = at most inclusive_auto_cap_bytes */
+  uint64_t inclusive_auto_cap_bytes;  /* default 16 GiB */
+  uint64_t host_avail_bytes;      /* host memory available now; SS_BUDGET_AUTO (default) = not limited */
+  uint64_t host_margin_bytes;     /* kept free of host_avail_bytes (default 0) */
+  uint64_t max_pinned_bytes;      /* engine + expert pinned bytes at most; SS_BUDGET_AUTO (default) = not limited */
+  uint64_t load_staging_bytes;    /* the load's staging the host budget always adds (a fixed host part) */
+  uint64_t min_resident;          /* the smallest arena (resident experts) a capped plan accepts (default 0) */
+  /* SS_BUDGET_MARGINS: kept free under each cap for what is allocated after the plan (graph capture, warmup,
+     per-request buffers, allocator slack). With a cap the arena gets cap - fixed parts - vram_margin_bytes, the
+     pinned tier cap - host fixed parts - ram_margin_bytes; the minimum caps include them (an uncapped plan: only
+     there). host_margin_bytes above is the margin of host_avail_bytes, not of the RAM cap. */
+  uint64_t vram_margin_bytes;     /* default 0 */
+  uint64_t ram_margin_bytes;      /* default 0 */
+  /* SS_BUDGET_UNIFIED (appended): the device's memory IS host RAM (Strix Halo and successors). 1 = one pool: the cap
+     is ram_total_bytes (or the smaller of both caps when vram_total_bytes is set too); the arena gets the pool minus
+     the host fixed parts and ram_margin_bytes (and the device fixed parts and vram_margin_bytes), the pinned tier what
+     the planned device bytes leave; min_vram_total_bytes / min_ram_total_bytes are then both the pool's minimum.
+     Default 0 (two caps, unchanged); with no cap it changes nothing. */
+  uint32_t unified;
+  uint32_t reserved1;             /* explicit padding (never read) */
+} ss_budget_in;
+typedef struct ss_budget_out {
+  uint32_t struct_size;           /* set by the caller; the library writes min(struct_size, sizeof) bytes */
+  uint32_t refused;               /* 1 = the plan cannot run: refuse says why */
+  uint32_t three_tier;            /* disk > 0: the file tier is on */
+  uint32_t ram_auto;              /* ram_expert_bytes was auto */
+  uint64_t resident, arena_spares, arena_slots;  /* arena_slots = resident + arena_spares */
+  uint64_t pinned, disk;          /* non-resident experts in pinned blocks / read from their files */
+  uint64_t inclusive;             /* spare blocks device experts may keep as clean copies */
+  uint64_t spare_blocks;          /* host_spares + inclusive (host_spare_units) */
+  uint64_t staging;               /* file-tier staging buffers (three-tier only) */
+  uint64_t device_fixed_bytes;    /* context + device components */
+  uint64_t device_planned_bytes;  /* device_fixed_bytes + arena_slots x slot_bytes */
+  uint64_t host_fixed_bytes;      /* pinned + pageable components + load staging */
+  uint64_t host_planned_bytes;    /* host_fixed_bytes + (pinned + spare_blocks + staging) x unit_bytes */
+  uint64_t room_bytes;            /* pinned bytes the host can give the expert tiers (auto's ceiling) */
+  uint64_t need_host_bytes;       /* available host memory the load needs (blocks + load staging + margin) */
+  uint64_t pinned_peak_bytes;     /* engine + expert pinned bytes at peak */
+  uint64_t min_vram_total_bytes;  /* context + device components + vram_margin_bytes + (arena_spares + min_resident)
+                                     slots */
+  uint64_t min_ram_total_bytes;   /* host_fixed_bytes + ram_margin_bytes + the blocks the smallest placement needs */
+  char refuse[SS_BUDGET_REFUSE];  /* "" unless refused */
+  /* SS_BUDGET_JSON (appended): */
+  uint64_t device_room_bytes;     /* with a VRAM cap: cap - device_fixed_bytes - vram_margin_bytes (0: none left, or
+                                     no cap) */
+  uint64_t host_cap_units;        /* the pinned-tier ceiling the placement used, in units (with the file tier, or
+                                     a RAM cap: pinned + spare blocks + staging never exceed it) */
+  uint32_t device_capped;         /* 1 = the VRAM cap, not the arena request, sized the arena */
+  uint32_t host_capped;           /* 1 = the RAM cap lowered the pinned ceiling below what the non-resident experts
+                                     and the spares want */
+} ss_budget_out;
+SS_API void ss_budget_in_defaults_sized(ss_budget_in* in, uint32_t size);
+static inline void ss_budget_in_defaults(ss_budget_in* in) { ss_budget_in_defaults_sized(in, (uint32_t)sizeof *in); }
+/* SS_OK, or SS_E_CAPACITY when refused (out written either way); SS_E_INVALID for a bad argument. in is read up to
+ * its struct_size (the rest defaulted). */
+SS_API ss_status ss_budget_plan(const ss_budget_in* in, ss_budget_out* out);
+/* The plan as JSON members (no braces), for a receipt: the caps and margins, the fixed components by name, the expert
+ * geometry and requests, the placement, the planned bytes and the minimum caps (bytes, GiB rounded up to 0.01, and
+ * the whole-GiB flag value), the refusal. in / out as passed to / returned by ss_budget_plan (each read up to its
+ * struct_size). Writes at most len bytes (NUL-terminated when len > 0) and returns the length of the whole text
+ * (0 when in or out is NULL). */
+SS_API size_t ss_budget_plan_json(const ss_budget_in* in, const ss_budget_out* out, char* buf, size_t len);
+
+typedef struct ss_budget_ledger ss_budget_ledger;
+typedef struct ss_budget_entry {
+  char name[SS_BUDGET_NAME];
+  uint64_t bytes;
+} ss_budget_entry;
+typedef struct ss_budget_kind_stats {
+  uint64_t cap;                   /* the cap this kind is charged against (PINNED / PAGEABLE: the RAM cap); 0 = none */
+  uint64_t current, peak;
+  uint32_t n_top, reserved;
+  ss_budget_entry top[SS_BUDGET_TOP];  /* the components when this kind peaked, largest first */
+} ss_budget_kind_stats;
+typedef struct ss_budget_stats {
+  uint32_t struct_size;           /* set by the caller; the library writes min(struct_size, sizeof) bytes */
+  uint32_t refusals;              /* adds refused by a cap */
+  ss_budget_kind_stats kind[SS_BUDGET_KINDS];  /* indexed by ss_budget_kind */
+  uint64_t host_current, host_peak;            /* PINNED + PAGEABLE (what the RAM cap holds) */
+  uint64_t measured_device_last, measured_device_peak;  /* ss_budget_ledger_observe_device */
+  uint64_t observations;
+  /* SS_BUDGET_OBSERVE (appended): the measured samples of ss_budget_ledger_observe (and observe_device) against the
+     caps. observations counts the device samples. */
+  uint64_t measured_host_last, measured_host_peak;
+  uint64_t host_observations;
+  uint32_t device_over, host_over;  /* samples above the VRAM / RAM cap (0 without a cap) */
+  char measured_device_peak_at[SS_BUDGET_NAME];  /* the stage of the device peak ("" from observe_device) */
+  char measured_host_peak_at[SS_BUDGET_NAME];
+  uint32_t within_caps;             /* ss_budget_ledger_within_caps */
+  uint32_t reserved1;
+} ss_budget_stats;
+/* Caps in bytes, 0 = uncapped. */
+SS_API ss_status ss_budget_ledger_create(uint64_t vram_total_bytes, uint64_t ram_total_bytes, ss_budget_ledger** out);
+SS_API void ss_budget_ledger_free(ss_budget_ledger* l);
+/* Charges bytes to a named component of a kind (adds to one name accumulate). SS_E_CAPACITY when that would exceed
+ * the kind's cap: nothing is charged and ss_last_error names the component. */
+SS_API ss_status ss_budget_ledger_add(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes);
+/* Releases bytes of a component; SS_E_INVALID (nothing changed) when that is more than it holds. */
+SS_API ss_status ss_budget_ledger_sub(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes);
+/* An externally measured device use (cudaMemGetInfo total - free, NVML), kept as the last and the peak. */
+SS_API ss_status ss_budget_ledger_observe_device(ss_budget_ledger* l, uint64_t measured_used_bytes);
+SS_API ss_status ss_budget_ledger_stats(const ss_budget_ledger* l, ss_budget_stats* out);
+/* One measured sample at a named stage ("load", "warmup", "request:NAME", ...): the device use and the host use
+ * (process commit, pinned included) the engine measured, SS_BUDGET_NO_SAMPLE for a side it cannot measure. Keeps the
+ * last and the peak per side with the stage of the peak, and counts the samples above each cap. Charges nothing and
+ * never fails because of a cap (the caller decides what a peak above a cap means). */
+SS_API ss_status ss_budget_ledger_observe(ss_budget_ledger* l, const char* stage, uint64_t device_used_bytes,
+                                          uint64_t host_used_bytes);
+/* 1 when every measured peak is <= its cap and no sample was above it (no cap on a side = ok; no sample = ok); 0
+ * otherwise or for NULL. The ledger's own charges never exceed the caps (an add over a cap is refused). Measurements
+ * of the whole device (cudaMemGetInfo) include other processes' memory; the contexts never sample, they only charge their
+ * own allocations - measured samples are the engine's (e.g. relative to a baseline taken before it allocates). */
+SS_API int ss_budget_ledger_within_caps(const ss_budget_ledger* l);
+
+/* Kept-resident layers (layer-wide prefill through the device-gated cache, docs/design.md §3.9). Engine thread,
+   between tokens only, with the state rules of ss_dg_set_policy. Makes units ids[0..n) (distinct, < the layer's units)
+   of gated layer g resident and kept: when it returns every one is in an arena slot, its entry published, its bytes the
+   unit's file bytes (the cache decode uses, one copy of each unit: arena slot <- pinned block <- file). The kept set of
+   g becomes exactly ids (replacing any keep of g); n = 0 releases, as ss_dg_keep(c, g, NULL, 0) does. Every keep stays
+   protected during the call, g's current one included (replaced only on success). SS_E_CAPACITY, with nothing changed,
+   when n + the other kept units (every layer's ss_dg_keep / make_resident set, g's current one included, distinct, not
+   in ids) + the spare target > the persistent slots (residents + billed spares; the bank slots and the guard are never
+   kept), when the slots that are free or hold an evictable unit cannot take the missing units, or (two-tier) when no
+   free slot and no free pinned block exist to start with. Otherwise it drains every read, copy and write-back, then
+   units of g already on the device stay, the others take free slots, else evict device units no layer keeps in the
+   policy's order (LRU: least recent first; SCORED / SCORED_AUTO: the boundary's score order) with the boundary's
+   lower-tier rules (a clean copy back to its block, a write-back into a free pinned block, three-tier: a pinned unit
+   dropped to its file for that block, else the victim to its file), and copies the rest in from their pinned blocks or
+   files (synchronously). Counted only in ss_dg_stats.resident_*. A held set is never exported: the next steps leave g
+   out of the export / wait sequence (rows ignored) and read its kept ids through ss_dg_slot (any other id reads the
+   guard and fails the token). Release it (ss_dg_keep(c, g, NULL, 0)) before g is exported again. Usage per layer:
+   make_resident(g, all units), one step exporting no other layer (rows_per_layer[h] = 0 for h != g), release; several
+   layers may be held at once. A read failure (SS_E_IO) leaves the cache consistent and every keep unchanged, its units
+   in their slots (the units moved so far stay). A device failure (a copy, publication, event or synchronize:
+   SS_E_BACKEND) poisons the context. */
+#define SS_DG_MAKE_RESIDENT 1
+SS_API ss_status ss_dg_make_resident(ss_ctx* c, int g, const int32_t* ids, int n);
+
+/* Placement rounds (docs/design.md §3.10). Engine thread, between tokens, with the state rules of ss_dg_set_policy.
+   Each gated unit has a decayed count s = decay x s + hits, hits = the steps that exported it since the previous round
+   (its layer's unique routed ids, counted on the host: no device work). The rank by s is the target placement: the
+   top (persistent slots - spare target - kept units) on the device, the next in the pinned tier, the rest in their
+   files. A round moves units toward it, at most max_units promotions and budget_bytes bytes (file reads + host-to-
+   device copies + write-backs; 0 = no limit), hottest first: (a) a pinned unit to the device, into a free slot while
+   the device holds less than its share, else in place of the coldest device unit when its s > hysteresis x that
+   unit's; the demoted unit goes back to its pinned block when it holds a clean copy (no write), else it is written back
+   into a free pinned block (dg_wb_stream = 1: on the write-back stream, else the demand stream; three-tier with no
+   free block: the coldest pinned unit is dropped to its file for it); (b) three-tier: a file unit read into the block
+   of the coldest pinned unit (dropped to its file, no copy) when its s > hysteresis x that unit's, up to
+   dg_disk_queue reads in flight. A unit with s = 0 is never promoted; units kept by ss_dg_keep or held by
+   ss_dg_make_resident, units with a write-back in flight and prefetches still coming never move. Transactional as
+   ss_dg_make_resident: a unit's home changes only after its copy and entry were accepted and the stream that copied
+   it synced (a source block or slot is freed only then); a file read failure returns SS_E_IO with the cache
+   consistent (the moves made so far stay); any device failure poisons the context (SS_E_BACKEND). The table is
+   uploaded before it returns. Placement only: outputs are those of any other placement. Counted only in
+   ss_dg_stats.round_* and the result. ss_dg_reset_open zeroes every count. */
+#define SS_DG_ROUNDS 1
+typedef struct ss_dg_round_params {
+  uint32_t struct_size;  /* sizeof, set by ss_dg_round_defaults */
+  uint32_t flags;        /* 0 (none defined) */
+  uint64_t budget_bytes; /* default 0 = no byte limit */
+  uint32_t max_units;    /* promotions per round, default 96 (0 = only the counts decay) */
+  float hysteresis;      /* default 1.25 (>= 1) */
+  float decay;           /* default 0.85 (0..1) */
+  uint32_t reserved0;    /* explicit padding (never read) */
+} ss_dg_round_params;
+typedef struct ss_dg_round_result {
+  uint32_t struct_size;
+  uint32_t promoted_to_device, promoted_to_pinned, demoted_from_device, dropped_to_file;
+  uint32_t cancelled;    /* 1: ss_dg_round_cancel stopped it at a unit boundary (no unit half moved) */
+  uint64_t bytes_read, bytes_h2d, bytes_written_back, ns;
+} ss_dg_round_result;
+SS_API void ss_dg_round_defaults_sized(ss_dg_round_params* p, uint32_t size);
+static inline void ss_dg_round_defaults(ss_dg_round_params* p) { ss_dg_round_defaults_sized(p, (uint32_t)sizeof *p); }
+/* p NULL = the defaults; out may be NULL. The result is filled on success and on a failure after the round began. */
+SS_API ss_status ss_dg_round_sized(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out, uint32_t size);
+static inline ss_status ss_dg_round(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out) {
+  return ss_dg_round_sized(c, p, out, (uint32_t)sizeof *out);
+}
+/* Any thread: the round in progress stops at its next unit boundary; a copy made but not committed is dropped (its
+   source keeps its home) and the round returns SS_OK with cancelled = 1. No effect when no round is running. */
+SS_API ss_status ss_dg_round_cancel(ss_ctx* c);
+/* Engine thread, between tokens: the decayed counts of units[0..n) (finite, >= 0), e.g. from a shipped routing
+   profile; every entry is checked before any is set. */
+SS_API ss_status ss_dg_round_seed_counts(ss_ctx* c, const ss_dg_unit* units, const float* counts, uint32_t n);
+
+/* Device profiles (docs/design.md §5.2, schema strix/device-profile-v1). ONE machine as the engine sees it: host RAM
+ * (total, available, unified with the GPU or not), CPU cores, NVMe read rates, every GPU (api, name, arch, compute
+ * units, wave, LDS, memory / GTT / visible bytes, memory and host-to-device bandwidth), the inter-host links (kind,
+ * count, measured Gbps) and the margins (host floor, device reserve). Built by ss_devprof_detect: Linux sysfs / procfs
+ * (KFD topology, amdgpu DRM mem_info, /proc/meminfo, Thunderbolt / USB4 domains; GPUs the runtime hides are dropped), the HIP runtime (hipMemGetInfo,
+ * device properties) and on NVIDIA the CUDA runtime + NVML (both loaded at run time when present: the library needs
+ * neither to build), then a device CLASS picked by api + arch + memory size gives what detection cannot know (class
+ * name, conservative margins, measured bandwidths with their evidence ids, limits; matched on api + arch + name +
+ * a memory range, so a qualified class never covers another arch or size: those get a generic class and a notice;
+ * what a class filled is marked "class:..." in "evidence" and taken back when an override changes the class or device
+ * 0's identity), then the override (--device-profile FILE / STRIX_DEVICE_PROFILE: a full or partial profile merged
+ * over the detected one; "overrides" in the result records every merged path). The effective profile is canonical
+ * JSON with a 16-hex-digit hash (xxh64 of that text) for receipts. Values a source could not give are 0 (JSON null for
+ * bandwidths). Thread-safe for concurrent reads; nothing here allocates device memory. */
+#define SS_DEVPROF 1
+#define SS_DEVPROF_SCHEMA "strix/device-profile-v1"
+#define SS_DEVPROF_NO_RUNTIME 1u  /* detect: sysfs / procfs only, no HIP / CUDA / NVML call */
+#define SS_DEVPROF_NO_ENV 2u      /* detect: ignore STRIX_DEVICE_PROFILE / STRIX_DEVICE_PROFILE_ROOT */
+#define SS_DEVPROF_NO_CACHE 4u    /* detect: neither read nor write the measurement cache */
+typedef struct ss_devprof ss_devprof;
+typedef struct ss_devprof_detect_opts {
+  uint32_t struct_size;        /* sizeof, set by ss_devprof_detect_opts_defaults */
+  uint32_t flags;              /* SS_DEVPROF_* (default 0) */
+  const char* root;            /* filesystem root for /proc and /sys (tests: a fake tree); NULL (default) = "/", or
+                                  $STRIX_DEVICE_PROFILE_ROOT */
+  const char* override_path;   /* --device-profile FILE; NULL (default) = $STRIX_DEVICE_PROFILE (none when unset) */
+  const char* cache_dir;       /* measured values cached per device identity; NULL (default) = %LOCALAPPDATA%\strix,
+                                  $XDG_CACHE_HOME/strix or ~/.cache/strix */
+} ss_devprof_detect_opts;
+SS_API void ss_devprof_detect_opts_defaults_sized(ss_devprof_detect_opts* o, uint32_t size);
+static inline void ss_devprof_detect_opts_defaults(ss_devprof_detect_opts* o) {
+  ss_devprof_detect_opts_defaults_sized(o, (uint32_t)sizeof *o);
+}
+/* o NULL = the defaults. SS_E_IO / SS_E_RECIPE when the override file cannot be read / is not a valid profile
+ * (nothing is returned); detection itself never fails (what it cannot read stays 0, with a notice). */
+SS_API ss_status ss_devprof_detect(const ss_devprof_detect_opts* o, ss_devprof** out);
+/* A whole profile from its JSON (schema must be strix/device-profile-v1; unknown keys are refused). */
+SS_API ss_status ss_devprof_from_json(const char* text, size_t len, ss_devprof** out);
+/* Merges a partial (or a whole, e.g. saved) profile over p: objects key by key, "devices" / "links" / "nvme" element
+ * by element (index), "limits" / "evidence" by key, scalars replaced; "overrides" / "notices" / "sources" of the text
+ * are ignored (p's provenance stays); the merged paths are appended to p's "overrides" (origin names the text). A
+ * changed "class" or device 0 identity re-derives the class (see above). Atomic (a refused text changes nothing). */
+SS_API ss_status ss_devprof_merge_json(ss_devprof* p, const char* text, size_t len, const char* origin);
+SS_API void ss_devprof_free(ss_devprof* p);
+/* Canonical JSON (malloc'd, free with free()) / its hash (17 bytes: 16 lowercase hex digits + NUL). */
+SS_API ss_status ss_devprof_to_json(const ss_devprof* p, char** out, size_t* len);
+SS_API ss_status ss_devprof_hash(const ss_devprof* p, char out[17]);
+/* The probe report of the recipes (docs/recipes.md §8.2: devices with id / kind / name / memory_gib / host /
+ * host_ram_gib / disk_read_gbytes_ps / h2d_gbytes_ps, plus class and arch) for one host named host. */
+SS_API ss_status ss_devprof_probe_report(const ss_devprof* p, const char* host, char** out, size_t* len);
+
+#define SS_DEVPROF_NAME 128
+typedef struct ss_devprof_info {
+  uint32_t struct_size;        /* set by the caller; the library writes min(struct_size, sizeof) bytes */
+  uint32_t detected;           /* 1 = values come from this machine (0: a file / test profile only) */
+  uint32_t unified;            /* 1 = the GPU's memory is host RAM (one pool: Strix Halo and successors) */
+  uint32_t cpu_cores;
+  uint32_t n_devices, n_links, n_nvme;
+  uint32_t generic;            /* 1 = no known class matched (detected values only) */
+  uint64_t ram_bytes, ram_available_bytes;
+  uint64_t host_floor_bytes;   /* kept free of the host RAM (class margin) */
+  uint64_t device_reserve_bytes;  /* kept free of each device's memory (class margin) */
+  char class_name[64];
+  char hash[17];
+  char reserved[7];
+} ss_devprof_info;
+typedef struct ss_devprof_device {
+  uint32_t struct_size;        /* set by the caller; the library writes min(struct_size, sizeof) bytes */
+  ss_backend_kind api;         /* SS_BACKEND_HIP / SS_BACKEND_CUDA (SS_BACKEND_CPU: a host-only profile) */
+  uint32_t compute_units;      /* CUs (HIP) / SMs (CUDA) */
+  uint32_t wave;               /* wavefront / warp size */
+  uint64_t lds_bytes;          /* LDS / shared memory per block */
+  uint64_t memory_bytes;       /* what the device can allocate (HIP: hipMemGetInfo total, the GTT on an APU) */
+  uint64_t gtt_bytes, visible_bytes;  /* amdgpu GTT / VRAM carve-out (0 on CUDA) */
+  double mem_gbps;             /* device memory bandwidth, GB/s (0 = unknown) */
+  double h2d_gbps;             /* pinned host -> device copies, GB/s (0 = unknown; unified: 0) */
+  int32_t cc_major, cc_minor;  /* CUDA compute capability (0 on HIP) */
+  int32_t pcie_gen, pcie_width;  /* NVML current link (-1 = unknown) */
+  char name[SS_DEVPROF_NAME];
+  char arch[32];               /* "gfx1151", "sm_120", ... */
+  char id[64];                 /* GPU UUID / PCI bus id / KFD node */
+} ss_devprof_device;
+SS_API ss_status ss_devprof_get(const ss_devprof* p, ss_devprof_info* out);
+/* A class limit engines read instead of a literal ("limits" in the JSON; e.g. max_piece_rows, uma_ceiling_bytes,
+ * persist_blocks, long_vram_cap_bytes): today's value on the class it was qualified on. SS_E_INVALID (*value
+ * untouched) when the profile has none: the engine keeps its own rule. */
+SS_API ss_status ss_devprof_limit(const ss_devprof* p, const char* key, uint64_t* value);
+/* SS_E_INVALID past the last device. */
+SS_API ss_status ss_devprof_get_device(const ss_devprof* p, uint32_t i, ss_devprof_device* out);
+
+/* The whole-device planner's caps from the profile (design §2): only the fields still at their defaults are written,
+ * so an explicit --vram-total-gib / --ram-total-gib (or margins) always wins. Discrete device i: vram_total_bytes =
+ * memory_bytes - device_reserve_bytes, ram_total_bytes = ram_available_bytes - host_floor_bytes; unified: one pool =
+ * min(ram_available_bytes - host_floor_bytes, memory_bytes - device_reserve_bytes) as ram_total_bytes with
+ * unified = 1 (vram_total_bytes stays 0). A size the profile does not know leaves its cap at 0 (uncapped). SS_E_INVALID
+ * past the last device, and for a unified profile when in's struct_size predates the unified field (two independent
+ * caps could each take the whole pool); SS_E_CAPACITY when the margins eat a known size (a zero cap would mean
+ * "uncapped"). */
+SS_API ss_status ss_devprof_budget(const ss_devprof* p, uint32_t device, ss_budget_in* in);
+
+/* Single box vs pair (design §2): a planner output, not a literal. in: the model's fixed bytes at the requested
+ * context (trunk, KV, workspaces; summed over the boxes), the smallest expert tier that still runs (summed), the
+ * layer count; profiles[0] = this box, one profile per extra candidate box. Single box when profiles[0]'s budget
+ * (ss_devprof_budget's cap) holds fixed + min experts; else world = the fewest boxes whose summed budgets hold it,
+ * provided profiles[0] has a MEASURED link (links[] with count > 0 and gbps_measured > 0: discovery alone does not
+ * qualify a pair); the layers split by budget share (box b starts at round-half-up of the cumulative share before it
+ * x layers; equal boxes: ceil(layers / 2) on box 0). pinned_world (> 0) keeps a qualified recipe's choice and only
+ * checks that it fits. */
+typedef struct ss_devprof_topology_in {
+  uint32_t struct_size;        /* sizeof, set by ss_devprof_topology_in_defaults */
+  uint32_t layers;             /* the model's layers (> 0) */
+  uint64_t fixed_bytes;        /* the whole model's fixed parts at the context (summed over the boxes) */
+  uint64_t min_expert_bytes;   /* the smallest expert tier (summed over the boxes) */
+  uint32_t pinned_world;       /* 0 (default) = decide; else keep it */
+  uint32_t reserved0;          /* explicit padding (never read) */
+} ss_devprof_topology_in;
+#define SS_DEVPROF_MAX_WORLD 8
+typedef struct ss_devprof_topology_out {
+  uint32_t struct_size;        /* set by the caller; the library writes min(struct_size, sizeof) bytes */
+  uint32_t world;              /* boxes to run on (1 = single box) */
+  uint32_t fits;               /* 1 = the chosen world's budgets hold fixed + min experts */
+  uint32_t reserved0;
+  uint32_t first_layer[SS_DEVPROF_MAX_WORLD + 1];  /* box b runs layers [first_layer[b], first_layer[b+1]) */
+  uint32_t reserved1;
+  uint64_t budget_bytes[SS_DEVPROF_MAX_WORLD];     /* each box's cap the decision used */
+  char why[256];
+} ss_devprof_topology_out;
+SS_API void ss_devprof_topology_in_defaults_sized(ss_devprof_topology_in* in, uint32_t size);
+static inline void ss_devprof_topology_in_defaults(ss_devprof_topology_in* in) {
+  ss_devprof_topology_in_defaults_sized(in, (uint32_t)sizeof *in);
+}
+/* SS_E_CAPACITY (out written, fits = 0) when no world up to n_profiles holds the model or pinned_world does not fit;
+ * SS_E_INVALID for n_profiles 0 or > SS_DEVPROF_MAX_WORLD, layers 0 or >= 2^20, a pinned_world above n_profiles,
+ * fixed_bytes + min_expert_bytes past 2^64. */
+SS_API ss_status ss_devprof_topology(const ss_devprof* const* profiles, uint32_t n_profiles,
+                                     const ss_devprof_topology_in* in, ss_devprof_topology_out* out);
+
+/* The prefill piece (rows per piece) from the memory left after the plan (design §2): rows = min(floor(room /
+ * bytes_per_row), the largest multiple of row_align <= max_rows (or <= 2^32 - 1 without max_rows)) rounded down to a
+ * multiple of row_align; room = the budget cap of p's device (ss_devprof_budget's) - planned_bytes -
+ * piece_reserve_bytes. The caller passes its own rule's bounds; on the class the rule was tuned on (the Halo for
+ * today's auto pieces) the bounds bind, so its outputs are unchanged. A device whose memory the profile does not
+ * know gets that aligned maximum (SS_E_CAPACITY without max_rows); a known one the margins exhaust gets SS_E_CAPACITY. */
+typedef struct ss_devprof_piece_in {
+  uint32_t struct_size;        /* sizeof, set by ss_devprof_piece_in_defaults */
+  uint32_t device;             /* the profile's device (default 0) */
+  uint64_t planned_bytes;      /* what the plan already placed in that budget */
+  uint64_t bytes_per_row;      /* activation / workspace bytes one prompt row adds (> 0) */
+  uint64_t piece_reserve_bytes;  /* kept free besides the piece (default 0) */
+  uint32_t min_rows, max_rows; /* bounds (max_rows 0 = none) */
+  uint32_t row_align;          /* default 1 */
+  uint32_t reserved0;          /* explicit padding (never read) */
+} ss_devprof_piece_in;
+SS_API void ss_devprof_piece_in_defaults_sized(ss_devprof_piece_in* in, uint32_t size);
+static inline void ss_devprof_piece_in_defaults(ss_devprof_piece_in* in) {
+  ss_devprof_piece_in_defaults_sized(in, (uint32_t)sizeof *in);
+}
+/* *rows = the piece; SS_E_CAPACITY when even min_rows (or one aligned row) does not fit (*rows = 0); SS_E_INVALID
+ * when no multiple of row_align lies in [min_rows, max_rows]. */
+SS_API ss_status ss_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* in, uint32_t* rows);
+/* ---- Indexed prepared pack tierstream/pack-v1 (docs/pack.md) ----------------------------------------------------
+ * One pack per model: every tensor / expert part in the engine's final device format (the bytes its loader would
+ * produce before the host-to-device copy), whole, contiguous and 4 KiB aligned, in data files pack-NNNN.data, plus a
+ * binary index pack.index and a manifest pack.json (source identities, format tags, data / index SHA-256). A record's
+ * key is (layer, expert, name): layer -1 = global, expert -1 = a layer's dense tensor; a unit = the records of one
+ * (layer, expert >= 0), adjacent in the file. The library never produces device bytes: the engine's repacker (or
+ * ts-pack build from an engine-provided layout) writes them; the reader gives each app its records, row ranges and
+ * units. An engine that finds no matching pack (or is told not to use one) keeps its original loader. */
+#define SS_HAVE_PACK 1
+typedef enum ss_pack_verify {
+  SS_PACK_VERIFY_CACHED = 0, /* xxh64 of a record (or segment) the first time it is read with these data files; the
+                              * verified set is kept in the user's cache directory by data-file identity (default) */
+  SS_PACK_VERIFY_ALWAYS = 1, /* on every read */
+  SS_PACK_VERIFY_OFF = 2     /* never (the operator verified the pack: ts-pack verify --full) */
+} ss_pack_verify;
+typedef struct ss_pack ss_pack;
+typedef struct ss_pack_options {
+  uint32_t struct_size;
+  int verify;                        /* ss_pack_verify (default CACHED) */
+  const char* manifest_sha256;       /* the pin: SHA-256 of pack.json (NULL / empty = not pinned) */
+  const char* weight_dirs;           /* stripe directories of the data files (ss_options.weight_dirs rules) */
+  uint32_t drive_readers;            /* default 4 */
+  int direct_io;                     /* default 1 */
+  const char* const* source_sha256;  /* the app's authenticated source SHA-256s, in pack.json order (NULL = no check) */
+  uint32_t source_sha256_n;
+  uint32_t layouts_n;
+  const char* const* layouts;        /* optional layouts the app reads (e.g. "tp2-packed"); a pack built without one of
+                                      * them is refused with SS_E_DESC naming the layouts it has */
+} ss_pack_options;
+SS_API void ss_pack_options_defaults_sized(ss_pack_options* o, uint32_t size);
+static inline void ss_pack_options_defaults(ss_pack_options* o) { ss_pack_options_defaults_sized(o, (uint32_t)sizeof *o); }
+/* Opens DIR: pack.json (pinned when asked, held share-read), pack.index (its SHA-256 from pack.json, every rule
+ * validated), the data files through bound opens (and their stripes). A source SHA-256 mismatch is SS_E_DESC. */
+SS_API ss_status ss_pack_open(const char* dir, const ss_pack_options* opt, ss_pack** out);
+SS_API void ss_pack_close(ss_pack* p);
+typedef struct ss_pack_entry {
+  uint32_t struct_size;
+  int32_t layer, expert;
+  uint32_t file;           /* data file index */
+  uint64_t index;          /* record index */
+  const char* name;        /* valid while the pack is open */
+  const char* format;
+  uint64_t offset, bytes, xxh64;
+  uint32_t rows;           /* 0 = not row-addressable */
+  uint32_t segments;
+  uint64_t row_bytes;      /* uniform rows; 0 with segments = non-uniform (read by whole segments) */
+} ss_pack_entry;
+typedef struct ss_pack_segment {
+  uint32_t row0, row1;
+  uint64_t offset, bytes, xxh64;  /* offset relative to the record */
+} ss_pack_segment;
+SS_API uint64_t ss_pack_records(const ss_pack* p);
+SS_API ss_status ss_pack_entry_at_sized(const ss_pack* p, uint64_t index, ss_pack_entry* out, uint32_t size);
+/* SS_E_INVALID when no record has the key. */
+SS_API ss_status ss_pack_find_sized(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out,
+                                    uint32_t size);
+static inline ss_status ss_pack_find(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out) {
+  return ss_pack_find_sized(p, layer, expert, name, out, (uint32_t)sizeof *out);
+}
+SS_API ss_status ss_pack_segment_at(const ss_pack* p, uint64_t record, uint32_t k, ss_pack_segment* out);
+typedef struct ss_pack_unit {
+  uint32_t file, reserved0;
+  uint64_t offset, bytes;      /* the unit's contiguous span: its records and the zero padding between them */
+  uint64_t first, count;       /* its records */
+} ss_pack_unit;
+SS_API ss_status ss_pack_unit_find(const ss_pack* p, int layer, int expert, ss_pack_unit* out);
+/* Reads: row1 == 0 (and row0 == 0) = the whole record; else rows [row0, row1) (uniform rows: any range; non-uniform:
+ * whole segments). All reads of one call are in flight together per data file; each is verified per the verify
+ * mode (a range: by the segments it covers exactly, else through one read of the whole record). SS_E_HASH on a
+ * mismatch (nothing is marked verified). Any thread; destinations must not overlap. struct_size = sizeof
+ * (ss_pack_read_req), the same in every element of one call (the array is walked with it). */
+typedef struct ss_pack_read_req {
+  size_t struct_size;
+  uint64_t record;
+  uint32_t row0, row1;
+  void* dst;
+} ss_pack_read_req;
+SS_API ss_status ss_pack_read(ss_pack* p, uint64_t record, uint32_t row0, uint32_t row1, void* dst);
+SS_API ss_status ss_pack_readv(ss_pack* p, const ss_pack_read_req* reads, uint32_t n);
+SS_API ss_status ss_pack_read_unit(ss_pack* p, int layer, int expert, void* dst);  /* unit.bytes into dst */
+/* desc-v1 for the device-gated cache: base_json is the engine's own descriptor; the pack's data files are appended to
+ * its sources and every part of a routed layer (part name = the record name of each unit) is pointed into the pack
+ * (offset of unit 0, one stride; units in ascending order and at most 1024 sources in all, else SS_E_UNSUPPORTED).
+ * The parts' bytes must equal the records'. A routed layer without unit hashes gets
+ * them from the pack (verify CACHED / ALWAYS): its units' records are read once with the pack's verification and the
+ * xxh64 of each unit's parts back to back is listed (cached per selection and data-file identities), so the cache's
+ * verify_hash checks every landing. Canonical JSON; free with ss_free. */
+SS_API ss_status ss_pack_dg_descriptor(ss_pack* p, const char* base_json, size_t len, char** out_json,
+                                       size_t* out_len);
+SS_API uint32_t ss_pack_files(const ss_pack* p);
+/* 1 when the pack was built with that optional layout (pack.json "layouts"), else 0. */
+SS_API int ss_pack_has_layout(const ss_pack* p, const char* layout);
+/* The identity of data file i (for ss_options.source_identities with that descriptor). */
+SS_API ss_status ss_pack_file_identity(const ss_pack* p, uint32_t file, ss_file_identity* out);
+/* Manifest fields, per-format totals, files, verify mode and read counters (JSON; free with ss_free). */
+SS_API ss_status ss_pack_info_json(const ss_pack* p, char** out_json, size_t* out_len);
+/* Full check: every data file's SHA-256 and every record / segment xxh64 (JSON report; SS_E_HASH when any fails). */
+SS_API ss_status ss_pack_verify_full(ss_pack* p, char** out_json, size_t* out_len);
+
+/* Writer, in-process (engine repackers, ts-pack build). meta_json: {"model": str, "sources": [{"name", "size",
+ * "sha256"}], "formats": {tag: {"transform", "version", "tool"}}, "split_bytes": u64 (0 = one data file; else a new
+ * file starts at the first layer boundary past it), "layouts": [optional layouts this pack includes], "meta": {...},
+ * "receipt": {...}}. Every index record is kind 0 (stored bytes); other kinds are reserved for later versions and a
+ * v1 reader refuses them. Records go in unit-major order:
+ * layers ascending (-1 first), a layer's dense records (expert -1) before its units, a unit's records adjacent. The
+ * pack is built in DIR.incomplete and published by renaming it to DIR at finish; abort (or a failure) removes it. A
+ * refused record spec leaves the writer as it was; any other error (I/O, a data-file split, finish) fails the build:
+ * DIR.incomplete is removed at once and every later call except abort returns an error. */
+typedef struct ss_pack_writer ss_pack_writer;
+typedef struct ss_pack_record_spec {
+  uint32_t struct_size;       /* sizeof; a smaller size of an older header gets the defaults of the fields it lacks */
+  int32_t layer, expert;
+  uint32_t rows;              /* 0 = not row-addressable */
+  const char* name;
+  const char* format;         /* a tag listed in meta_json.formats */
+  uint64_t bytes;
+  uint64_t row_bytes;         /* uniform rows (rows x row_bytes = bytes); 0 with segments = non-uniform */
+  const uint32_t* seg_rows;   /* n_seg + 1 boundaries 0 < ... < rows (NULL = none) */
+  const uint64_t* seg_bytes;  /* n_seg sizes (required for non-uniform rows; NULL otherwise) */
+  uint32_t n_seg;
+  uint32_t reserved0;
+} ss_pack_record_spec;
+SS_API ss_status ss_pack_writer_begin(const char* dir, const char* meta_json, size_t len, ss_pack_writer** out);
+SS_API ss_status ss_pack_writer_record_begin(ss_pack_writer* w, const ss_pack_record_spec* r);
+SS_API ss_status ss_pack_writer_record_write(ss_pack_writer* w, const void* data, uint64_t n);
+SS_API ss_status ss_pack_writer_record_end(ss_pack_writer* w);
+SS_API ss_status ss_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, const void* data);
+/* Publishes the pack; manifest_sha256 (65 bytes, may be NULL) receives the pin. The writer is freed either way. */
+SS_API ss_status ss_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256);
+SS_API void ss_pack_writer_abort(ss_pack_writer* w);
 
 #ifdef __cplusplus
 }

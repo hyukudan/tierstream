@@ -1,11 +1,15 @@
 // C ABI: every entry point catches, maps to ss_status and keeps the message per thread.
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <new>
 #include <sstream>
 
+#include "budget.hpp"
+#include "devprof.hpp"
 #include "desc.hpp"
 #include "errors.hpp"
 #include "mfile.hpp"
@@ -34,6 +38,9 @@ struct ss_mfile {
   std::shared_ptr<ts::MFile> file;
   std::vector<std::string> paths;
   std::string report;
+};
+struct ss_devprof {
+  ts::devprof::Profile p;
 };
 
 namespace {
@@ -151,19 +158,60 @@ void winpf_defaults(ss_dg_winpf_params* p) {
   p->revert_unused = 1;
   p->top_k = 0;
 }
+void round_defaults(ss_dg_round_params* p) {
+  *p = ss_dg_round_params{};
+  p->struct_size = uint32_t(sizeof *p);
+  p->flags = 0;
+  p->budget_bytes = 0;
+  p->max_units = 96;
+  p->hysteresis = 1.25f;
+  p->decay = 0.85f;
+}
+void clear_reserved(ss_dg_round_params& p) { p.reserved0 = 0; }
 void clear_reserved(ss_options& o) {
   o.reserved0 = 0;
   o.reserved1 = 0;
   o.reserved2 = 0;
   o.reserved3 = 0;
+  o.reserved4 = 0;
+  o.reserved5 = 0;
+  o.reserved6 = 0;
 }
 void clear_reserved(ss_mfile_options&) {}
+void clear_reserved(ss_budget_in& b) { b.reserved0 = 0; }
 void mfile_defaults(ss_mfile_options* o) {
   *o = ss_mfile_options{};
   o->struct_size = uint32_t(sizeof *o);
   o->direct_io = 1;
   o->drive_readers = 4;
   o->verify_mode = SS_MFILE_VERIFY_CACHED;
+}
+
+void devprof_detect_defaults(ss_devprof_detect_opts* o) {
+  *o = ss_devprof_detect_opts{};
+  o->struct_size = uint32_t(sizeof *o);
+}
+void clear_reserved(ss_devprof_detect_opts&) {}
+void topology_in_defaults(ss_devprof_topology_in* in) {
+  *in = ss_devprof_topology_in{};
+  in->struct_size = uint32_t(sizeof *in);
+}
+void clear_reserved(ss_devprof_topology_in& in) { in.reserved0 = 0; }
+void piece_in_defaults(ss_devprof_piece_in* in) {
+  *in = ss_devprof_piece_in{};
+  in->struct_size = uint32_t(sizeof *in);
+  in->row_align = 1;
+}
+void clear_reserved(ss_devprof_piece_in& in) { in.reserved0 = 0; }
+// An output struct: the library writes min(struct_size, sizeof) bytes.
+template <class T>
+void write_sized(T* out, T x) {
+  x.struct_size = std::min<uint32_t>(out->struct_size, uint32_t(sizeof x));
+  std::memcpy(static_cast<void*>(out), &x, x.struct_size);
+}
+template <size_t N>
+void copy_text(char (&dst)[N], const std::string& s) {
+  std::snprintf(dst, N, "%s", s.c_str());
 }
 
 // Versioned structs: start from this build's defaults and take min(struct_size, sizeof) bytes from the caller
@@ -192,6 +240,12 @@ void sized_defaults(T* out, uint32_t size, void (*defaults)(T*)) {
 }
 
 }  // namespace
+
+namespace ts {
+// The guard and the text output for the C entry points of other files (pack_capi.cpp): one per-thread message.
+ss_status capi_guard(const std::function<void()>& f) { return guard(f); }
+ss_status capi_give_text(const std::string& s, char** out, size_t* len) { return give_text(s, out, len); }
+}  // namespace ts
 
 extern "C" {
 
@@ -244,6 +298,13 @@ const char* ss_mfile_location_path(const ss_mfile* f, int loc) {
   return !f || loc < 0 || size_t(loc) >= f->paths.size() ? nullptr : f->paths[size_t(loc)].c_str();
 }
 const char* ss_mfile_open_report(const ss_mfile* f) { return f ? f->report.c_str() : nullptr; }
+ss_status ss_mfile_location_info(const ss_mfile* f, uint32_t loc, ss_mfile_location* out) {
+  return guard([&] {
+    need(f && out, "ss_mfile_location_info: null argument");
+    need(loc < uint32_t(f->file->locations()), "ss_mfile_location_info: no such location");
+    f->file->location_info(int(loc), out);
+  });
+}
 
 ss_status ss_desc_from_json(const char* json_text, size_t len, ss_desc** out) {
   return guard([&] {
@@ -368,6 +429,8 @@ ss_status ss_open(const ss_desc* d, const ss_budget* budget, const ss_plan* plan
     need(o.drive_readers >= 1 && o.drive_readers <= 32, "drive_readers must be in 1..32");
     need(o.weight_verify == SS_MFILE_VERIFY_CACHED || o.weight_verify == SS_MFILE_VERIFY_ALWAYS,
          "weight_verify must be cached or always");
+    need(!o.source_identity_n || o.source_identities, "ss_open: source_identities is NULL");
+    need(o.source_identity_n <= d->d.sources.size(), "ss_open: source_identity_n exceeds the descriptor's sources");
     ss_budget bb = versioned(budget, budget_defaults, "ss_open budget");
     need(!plan || ts::same_budget(plan->p.budget, bb), "ss_open: the plan was made with another budget");
     ts::Plan p = plan ? plan->p : ts::plan_make(d->d, bb, {});
@@ -879,6 +942,61 @@ ss_status ss_dg_reset_open(ss_ctx* c) {
 ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_keep").keep(g, ids, n); });
 }
+ss_status ss_dg_make_resident(ss_ctx* c, int g, const int32_t* ids, int n) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_make_resident").make_resident(g, ids, n); });
+}
+void ss_dg_round_defaults_sized(ss_dg_round_params* p, uint32_t size) { sized_defaults(p, size, round_defaults); }
+ss_status ss_dg_round_sized(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out, uint32_t size) {
+  return ctx_guard(c, [&] {
+    need(!out || size >= sizeof(uint32_t), "ss_dg_round: bad result size");
+    const ss_dg_round_params v = versioned(p, round_defaults, "ss_dg_round");
+    ts::DgRoundIn in;
+    in.flags = v.flags;
+    in.budget_bytes = v.budget_bytes;
+    in.max_units = v.max_units;
+    in.hysteresis = double(v.hysteresis);
+    in.decay = double(v.decay);
+    ts::DgCtx& dg = dg_ctx(c, "ss_dg_round");
+    auto fill = [&] {
+      if (!out) return;
+      const ts::DgRoundOut& r = dg.last_round();
+      ss_dg_round_result x{};
+      x.promoted_to_device = r.promoted_to_device;
+      x.promoted_to_pinned = r.promoted_to_pinned;
+      x.demoted_from_device = r.demoted_from_device;
+      x.dropped_to_file = r.dropped_to_file;
+      x.cancelled = r.cancelled;
+      x.bytes_read = r.bytes_read;
+      x.bytes_h2d = r.bytes_h2d;
+      x.bytes_written_back = r.bytes_written_back;
+      x.ns = r.ns;
+      x.struct_size = std::min<uint32_t>(size, uint32_t(sizeof x));
+      std::memcpy(static_cast<void*>(out), &x, x.struct_size);
+    };
+    try {
+      dg.round(in);
+    } catch (...) {
+      fill();
+      throw;
+    }
+    fill();
+  });
+}
+// Any thread: only an atomic store (no context state is read: a poisoned or busy context is the engine's to report).
+ss_status ss_dg_round_cancel(ss_ctx* c) {
+  if (!c || !c->dg) {
+    g_err = "ss_dg_round_cancel: not a device-gated context";
+    return SS_E_INVALID;
+  }
+  c->dg->round_cancel();
+  return SS_OK;
+}
+ss_status ss_dg_round_seed_counts(ss_ctx* c, const ss_dg_unit* units, const float* counts, uint32_t n) {
+  return ctx_guard(c, [&] {
+    need(n == 0 || (units && counts), "ss_dg_round_seed_counts: bad arguments");
+    dg_ctx(c, "ss_dg_round_seed_counts").round_seed_counts(units, counts, n);
+  });
+}
 ss_status ss_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total) {
   return ctx_guard(c, [&] {
     need(total != nullptr && (cap == 0 || out != nullptr), "ss_dg_residency: bad arguments");
@@ -953,5 +1071,264 @@ ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size) {
     std::memcpy(static_cast<void*>(out), &x, x.struct_size);
   });
 }
+
+// Whole-device budgets (budget.cpp).
+void ss_budget_in_defaults_sized(ss_budget_in* in, uint32_t size) { sized_defaults(in, size, ts::budget_in_defaults); }
+ss_status ss_budget_plan(const ss_budget_in* in, ss_budget_out* out) {
+  return guard([&] {
+    need(in && out && out->struct_size >= 2 * sizeof(uint32_t),
+         "ss_budget_plan: null argument or out->struct_size not set");
+    const ss_budget_in v = versioned(in, ts::budget_in_defaults, "ss_budget_plan input");
+    ss_budget_out x;
+    const bool ok = ts::budget_plan(v, x);
+    x.struct_size = std::min<uint32_t>(out->struct_size, uint32_t(sizeof x));
+    std::memcpy(static_cast<void*>(out), &x, x.struct_size);
+    if (!ok) ts::fail(SS_E_CAPACITY, x.refuse);
+  });
+}
+size_t ss_budget_plan_json(const ss_budget_in* in, const ss_budget_out* out, char* buf, size_t len) {
+  std::string s;
+  try {
+    if (in && out && in->struct_size >= 2 * sizeof(uint32_t) && out->struct_size >= 2 * sizeof(uint32_t)) {
+      const ss_budget_in v = versioned(in, ts::budget_in_defaults, "ss_budget_plan_json input");
+      ss_budget_out o{};  // an older caller's output: read up to its struct_size, the rest zero
+      std::memcpy(static_cast<void*>(&o), out, std::min<size_t>(out->struct_size, sizeof o));
+      s = ts::budget_plan_json(v, o);
+    }
+  } catch (...) {
+    s.clear();
+  }
+  if (buf && len) {
+    const size_t n = std::min(s.size(), len - 1);
+    std::memcpy(buf, s.data(), n);
+    buf[n] = '\0';
+  }
+  return s.size();
+}
+ss_status ss_budget_ledger_create(uint64_t vram_total_bytes, uint64_t ram_total_bytes, ss_budget_ledger** out) {
+  return guard([&] {
+    need(out != nullptr, "ss_budget_ledger_create: null output");
+    *out = ts::ledger_create(vram_total_bytes, ram_total_bytes);
+  });
+}
+void ss_budget_ledger_free(ss_budget_ledger* l) { ts::ledger_free(l); }
+ss_status ss_budget_ledger_add(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes) {
+  return guard([&] { ts::ledger_add(l, kind, name, bytes); });
+}
+ss_status ss_budget_ledger_sub(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes) {
+  return guard([&] { ts::ledger_sub(l, kind, name, bytes); });
+}
+ss_status ss_budget_ledger_observe_device(ss_budget_ledger* l, uint64_t measured_used_bytes) {
+  return guard([&] { ts::ledger_observe_device(l, measured_used_bytes); });
+}
+ss_status ss_budget_ledger_observe(ss_budget_ledger* l, const char* stage, uint64_t device_used_bytes,
+                                   uint64_t host_used_bytes) {
+  return guard([&] { ts::ledger_observe(l, stage, device_used_bytes, host_used_bytes); });
+}
+int ss_budget_ledger_within_caps(const ss_budget_ledger* l) {
+  try {
+    return l && ts::ledger_within_caps(l) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+ss_status ss_budget_ledger_stats(const ss_budget_ledger* l, ss_budget_stats* out) {
+  return guard([&] {
+    need(out && out->struct_size >= sizeof(uint32_t), "ss_budget_ledger_stats: null output or struct_size not set");
+    const ss_budget_stats x = ts::ledger_stats(l);
+    const uint32_t n = std::min<uint32_t>(out->struct_size, uint32_t(sizeof x));
+    std::memcpy(static_cast<void*>(out), &x, n);
+    out->struct_size = n;
+  });
+}
+
+// Device profiles (devprof*.cpp).
+void ss_devprof_detect_opts_defaults_sized(ss_devprof_detect_opts* o, uint32_t size) {
+  sized_defaults(o, size, devprof_detect_defaults);
+}
+ss_status ss_devprof_detect(const ss_devprof_detect_opts* o, ss_devprof** out) {
+  return guard([&] {
+    need(out != nullptr, "ss_devprof_detect: null output");
+    *out = nullptr;
+    const ss_devprof_detect_opts v = versioned(o, devprof_detect_defaults, "ss_devprof_detect options");
+    ts::devprof::DetectOptions d;
+    d.flags = v.flags;
+    const char* root = v.root;
+    if (!root && !(v.flags & SS_DEVPROF_NO_ENV)) root = std::getenv("STRIX_DEVICE_PROFILE_ROOT");
+    d.root = root && *root ? root : "/";
+    d.override_path = v.override_path ? v.override_path : "";
+    d.cache_dir = v.cache_dir ? v.cache_dir : "";
+    auto r = std::make_unique<ss_devprof>();
+    r->p = ts::devprof::detect(d);
+    *out = r.release();
+  });
+}
+ss_status ss_devprof_from_json(const char* text, size_t len, ss_devprof** out) {
+  return guard([&] {
+    need(text && out, "ss_devprof_from_json: null argument");
+    *out = nullptr;
+    auto r = std::make_unique<ss_devprof>();
+    r->p = ts::devprof::from_json(parse_input(text, len, "device profile"));
+    *out = r.release();
+  });
+}
+ss_status ss_devprof_merge_json(ss_devprof* p, const char* text, size_t len, const char* origin) {
+  return guard([&] {
+    need(p && text, "ss_devprof_merge_json: null argument");
+    ts::devprof::merge(p->p, parse_input(text, len, "device profile override"), origin ? origin : "<text>");
+  });
+}
+void ss_devprof_free(ss_devprof* p) { delete p; }
+ss_status ss_devprof_to_json(const ss_devprof* p, char** out, size_t* len) {
+  std::string s;
+  const ss_status st = guard([&] {
+    need(p != nullptr, "ss_devprof_to_json: null profile");
+    s = ts::devprof::to_text(p->p);
+  });
+  return st != SS_OK ? st : give_text(s, out, len);
+}
+ss_status ss_devprof_hash(const ss_devprof* p, char out[17]) {
+  return guard([&] {
+    need(p && out, "ss_devprof_hash: null argument");
+    std::memcpy(out, ts::devprof::hash(p->p).c_str(), 17);
+  });
+}
+ss_status ss_devprof_probe_report(const ss_devprof* p, const char* host, char** out, size_t* len) {
+  std::string s;
+  const ss_status st = guard([&] {
+    need(p && host && *host, "ss_devprof_probe_report: null profile or empty host");
+    const auto& q = p->p;
+    const double g = double(uint64_t(1) << 30);
+    double disk = 0;
+    for (const auto& n : q.nvme) disk = std::max(disk, n.read_gbps);
+    ts::Json ds = ts::Json::array();
+    for (size_t i = 0; i < q.devices.size(); ++i) {
+      const auto& d = q.devices[i];
+      ts::Json j = ts::Json::object();
+      j["id"] = ts::Json::string(d.id.empty() ? std::string(host) + ":" + std::to_string(i) : d.id);
+      j["kind"] = ts::Json::string(d.api);
+      j["name"] = ts::Json::string(d.name);
+      j["memory_gib"] = ts::Json::number(double(d.memory_bytes) / g);
+      j["host"] = ts::Json::string(host);
+      j["ordinal"] = ts::Json::number(uint64_t(i));
+      j["class"] = ts::Json::string(q.cls);
+      j["arch"] = ts::Json::string(d.arch);
+      if (q.ram_bytes) j["host_ram_gib"] = ts::Json::number(double(q.ram_bytes) / g);
+      if (disk > 0) j["disk_read_gbytes_ps"] = ts::Json::number(disk);
+      if (d.h2d_gbps > 0) j["h2d_gbytes_ps"] = ts::Json::number(d.h2d_gbps);
+      if (!d.driver.empty()) j["driver"] = ts::Json::string(d.driver);
+      ds.push(j);
+    }
+    ts::Json r = ts::Json::object();
+    r["devices"] = ds;
+    r["links"] = ts::Json::array();  // links between hosts are known once the hosts' reports are put together
+    r["device_profile"] = ts::Json::string(ts::devprof::hash(q));
+    s = ts::json_write(r);
+  });
+  return st != SS_OK ? st : give_text(s, out, len);
+}
+ss_status ss_devprof_get(const ss_devprof* p, ss_devprof_info* out) {
+  return guard([&] {
+    need(p && out && out->struct_size >= 2 * sizeof(uint32_t), "ss_devprof_get: null argument or struct_size not set");
+    const auto& q = p->p;
+    ss_devprof_info x{};
+    x.detected = q.detected ? 1 : 0;
+    x.unified = q.unified ? 1 : 0;
+    x.cpu_cores = q.cpu_cores;
+    x.n_devices = uint32_t(q.devices.size());
+    x.n_links = uint32_t(q.links.size());
+    x.n_nvme = uint32_t(q.nvme.size());
+    x.generic = q.generic ? 1 : 0;
+    x.ram_bytes = q.ram_bytes;
+    x.ram_available_bytes = q.ram_available_bytes;
+    x.host_floor_bytes = q.host_floor_bytes;
+    x.device_reserve_bytes = q.device_reserve_bytes;
+    copy_text(x.class_name, q.cls);
+    copy_text(x.hash, ts::devprof::hash(q));
+    write_sized(out, x);
+  });
+}
+ss_status ss_devprof_limit(const ss_devprof* p, const char* key, uint64_t* value) {
+  return guard([&] {
+    need(p && key && value, "ss_devprof_limit: null argument");
+    const auto it = p->p.limits.find(key);
+    ts::require(it != p->p.limits.end(), SS_E_INVALID,
+                "ss_devprof_limit: the profile (class " + p->p.cls + ") has no limit " + key);
+    *value = it->second;
+  });
+}
+ss_status ss_devprof_get_device(const ss_devprof* p, uint32_t i, ss_devprof_device* out) {
+  return guard([&] {
+    need(p && out && out->struct_size >= 2 * sizeof(uint32_t),
+         "ss_devprof_get_device: null argument or struct_size not set");
+    ts::require(i < p->p.devices.size(), SS_E_INVALID,
+                "ss_devprof_get_device: device " + std::to_string(i) + " is past the last");
+    const auto& d = p->p.devices[i];
+    ss_devprof_device x{};
+    x.api = d.api == "hip" ? SS_BACKEND_HIP : d.api == "cuda" ? SS_BACKEND_CUDA : SS_BACKEND_CPU;
+    x.compute_units = d.compute_units;
+    x.wave = d.wave;
+    x.lds_bytes = d.lds_bytes;
+    x.memory_bytes = d.memory_bytes;
+    x.gtt_bytes = d.gtt_bytes;
+    x.visible_bytes = d.visible_bytes;
+    x.mem_gbps = d.mem_gbps;
+    x.h2d_gbps = d.h2d_gbps;
+    x.cc_major = d.cc_major;
+    x.cc_minor = d.cc_minor;
+    x.pcie_gen = d.pcie_gen;
+    x.pcie_width = d.pcie_width;
+    copy_text(x.name, d.name);
+    copy_text(x.arch, d.arch);
+    copy_text(x.id, d.id);
+    write_sized(out, x);
+  });
+}
+ss_status ss_devprof_budget(const ss_devprof* p, uint32_t device, ss_budget_in* in) {
+  return guard([&] {
+    need(p && in && in->struct_size >= 2 * sizeof(uint32_t), "ss_devprof_budget: null argument or struct_size not set");
+    // a caller whose struct predates SS_BUDGET_UNIFIED cannot plan one pool: two independent caps of the pool's size
+    // would let device and host each take all of it
+    ts::require(!p->p.unified || in->struct_size >= offsetof(ss_budget_in, unified) + sizeof(uint32_t),
+                SS_E_INVALID,
+                "ss_devprof_budget: a unified-memory profile needs an ss_budget_in with the unified field "
+                "(SS_BUDGET_UNIFIED); this caller's struct predates it");
+    ss_budget_in v = versioned(in, ts::budget_in_defaults, "ss_devprof_budget input");
+    ts::devprof::budget(p->p, device, v);
+    // back into the caller's struct up to its size
+    const uint32_t n = std::min<uint32_t>(in->struct_size, uint32_t(sizeof v));
+    v.struct_size = in->struct_size;
+    std::memcpy(static_cast<void*>(in), &v, n);
+  });
+}
+void ss_devprof_topology_in_defaults_sized(ss_devprof_topology_in* in, uint32_t size) {
+  sized_defaults(in, size, topology_in_defaults);
+}
+ss_status ss_devprof_topology(const ss_devprof* const* profiles, uint32_t n_profiles, const ss_devprof_topology_in* in,
+                              ss_devprof_topology_out* out) {
+  return guard([&] {
+    need(profiles && in && out && out->struct_size >= 2 * sizeof(uint32_t),
+         "ss_devprof_topology: null argument or out->struct_size not set");
+    const ss_devprof_topology_in v = versioned(in, topology_in_defaults, "ss_devprof_topology input");
+    std::vector<const ts::devprof::Profile*> boxes;
+    for (uint32_t i = 0; i < n_profiles; ++i) boxes.push_back(profiles[i] ? &profiles[i]->p : nullptr);
+    ss_devprof_topology_out x;
+    const bool ok = ts::devprof::topology(boxes, v, x);
+    write_sized(out, x);
+    if (!ok) ts::fail(SS_E_CAPACITY, x.why);
+  });
+}
+void ss_devprof_piece_in_defaults_sized(ss_devprof_piece_in* in, uint32_t size) {
+  sized_defaults(in, size, piece_in_defaults);
+}
+ss_status ss_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* in, uint32_t* rows) {
+  return guard([&] {
+    need(p && in && rows, "ss_devprof_piece_rows: null argument");
+    *rows = 0;
+    const ss_devprof_piece_in v = versioned(in, piece_in_defaults, "ss_devprof_piece_rows input");
+    *rows = ts::devprof::piece_rows(p->p, v);
+  });
+}
+
 
 }  // extern "C"

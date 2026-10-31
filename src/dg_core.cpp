@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <tuple>
 
 #include "dg_proto.hpp"
@@ -46,6 +47,7 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
   bank_key_.assign(2u * size_t(c_.bank_slots), kNone);
   pf_layer_.assign(gated(), 0);
   layer_missed_.assign(gated(), 0);
+  run_.assign(gated(), 1);
   lc_.assign(gated(), DgLayerCounts{});
   if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, c_.spare_target / 4);
   require(t_->parts() >= 1, SS_E_INVALID, "device-gated: a unit without parts");
@@ -75,6 +77,248 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
     select_heap_.reserve(c_.persistent_slots);
   }
   victims_.reserve(c_.persistent_slots);
+  require(!c_.disk_tier || c_.disk_staging >= 1, SS_E_INVALID, "device-gated: the disk tier needs staging buffers");
+  require(c_.disk_tier || (!c_.disk_prefetch && !c_.disk_staging && !c_.home_blocks), SS_E_INVALID,
+          "device-gated: disk options without the disk tier");
+  require(c_.inclusive < c_.blocks || c_.inclusive == 0, SS_E_INVALID,
+          "device-gated: the inclusive share must leave a block for write-backs");
+  if (c_.disk_tier) stage_ev_.assign(c_.disk_staging, nullptr);
+  // dg_no_admit: every distinct miss of a layer takes a bank slot (an export holds at most max_ids ids)
+  require(!c_.no_admit || c_.bank_slots >= c_.max_ids, SS_E_CAPACITY,
+          "device-gated: dg_no_admit serves every miss through a bank slot: it needs " + std::to_string(c_.max_ids) +
+              " bank slots per bank (dg_max_ids, two banks), " + std::to_string(c_.bank_slots) + " configured");
+  rs_.assign(keys_, 0.0);
+  rhits_.assign(keys_, 0);
+}
+
+void DgTransport::read_unit(uint32_t, int32_t) {
+  fail(SS_E_UNSUPPORTED, "device-gated: this transport cannot read a unit from its file");
+}
+
+// ---- three-tier: the pinned homes' recency list ----
+void DgCore::hpush(uint32_t k) {
+  ++on_host_;
+  if (!c_.disk_tier) return;
+  Entry& x = e_[k];
+  x.hprev = kNone;
+  x.hnext = hhead_;
+  if (hhead_ != kNone) e_[hhead_].hprev = k; else htail_ = k;
+  hhead_ = k;
+  x.in_hlist = true;
+}
+
+void DgCore::hunlink(uint32_t k) {
+  --on_host_;
+  if (!c_.disk_tier) return;
+  Entry& x = e_[k];
+  if (!x.in_hlist) broken("a pinned home outside the recency list");
+  if (x.hprev != kNone) e_[x.hprev].hnext = x.hnext; else hhead_ = x.hnext;
+  if (x.hnext != kNone) e_[x.hnext].hprev = x.hprev; else htail_ = x.hprev;
+  x.hprev = x.hnext = kNone;
+  x.in_hlist = false;
+}
+
+std::vector<uint32_t> DgCore::host_order() const {
+  std::vector<uint32_t> out;
+  for (uint32_t k = hhead_; k != kNone; k = e_[k].hnext) out.push_back(k);
+  return out;
+}
+
+// A key that leaves the device / a bank without a write-back: its block (it held one: a clean copy or a bank home)
+// is its home again, else its file (three-tier). Its slot and entry are the caller's.
+void DgCore::to_lower(uint32_t k) {
+  Entry& x = e_[k];
+  x.slot = -1;
+  if (x.backed) {
+    x.backed = false;
+    --backed_;
+  }
+  if (x.block >= 0) {
+    x.home = Home::Host;
+    hpush(k);
+  } else {
+    if (!c_.disk_tier) broken("a key without a block left the device without a write-back");
+    x.home = Home::File;
+    ++on_file_;
+  }
+}
+
+// RAM -> drop: the least recently homed pinned key goes to its file (no copy: the file holds its bytes); its block is
+// free at once (a Host key's block is quiescent: no copy reads or writes it).
+bool DgCore::drop_host_lru(const std::vector<uint8_t>* skip, bool count) {
+  if (!c_.disk_tier) return false;
+  uint32_t k = htail_;
+  while (k != kNone && skip && (*skip)[k]) k = e_[k].hprev;
+  if (k == kNone) return false;
+  Entry& x = e_[k];
+  hunlink(k);
+  free_blocks_.push_back(x.block);
+  x.block = -1;
+  x.home = Home::File;
+  ++on_file_;
+  if (count) ++st_.disk_drops;
+  return true;
+}
+
+// The next staging buffer of the file reads: its previous copy must have landed before the read overwrites it.
+// Drain point: a buffer whose read is still in flight has its copy enqueued first (the records up to its own). The wait
+// that follows is on that buffer's own last copy (recorded when its record was ended): no other read in flight holds
+// the buffer or that event, so the others stay in flight.
+int32_t DgCore::take_stage() {
+  const uint32_t i = stage_next_;
+  stage_next_ = (i + 1) % c_.disk_staging;
+  const int32_t block = int32_t(c_.blocks + i);
+  for (size_t j = 0; j < pending_.size(); ++j)
+    if (pending_[j].stage == block) {
+      drain_pending(j + 1);
+      break;
+    }
+  if (stage_ev_[i] && !t_->done(stage_ev_[i]) && mut_ != kStageNoWait) {
+    t_->event_sync(stage_ev_[i]);
+    ++st_.disk_stage_waits;
+  }
+  return block;
+}
+
+// ---- three-tier: overlapped file misses ----
+// A file miss's fetch takes its slot and staging buffer and updates every host structure as a synchronous fetch does
+// (homes, the mirror table_, lists, counters); only the device work that needs the read's bytes waits here: the copy,
+// the entry, the staging buffer's event and a prefetch's event, enqueued in fetch order once the read ended. A read in
+// flight holds exactly: its key (Coming / Bank, the mirror's entry set, no write-back record: it came from its file),
+// its slot (out of the free list, or its bank slot), its staging buffer, and no event yet. An operation drains only
+// the reads whose key, slot, staging buffer or event it touches (targeted), and the demand reads at a public entry
+// point; everything else it does is on other keys, slots, blocks and events, so it sees what it saw with synchronous
+// reads (the host state is the same, and the device work it enqueues or waits on is independent of the copies not
+// enqueued yet). The device reads a layer's entries only after its ready, which ends the layer's reads first.
+void DgCore::copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t src) {
+  if (mut_ == kEntryBeforeCopy) {
+    write_entry(s, k, slot);
+    t_->h2d(s, slot, src);
+  } else {
+    t_->h2d(s, slot, src);
+    write_entry(s, k, slot);
+  }
+}
+
+void DgCore::finish_pending(const Pending& p) {
+  Entry& x = e_[p.key];
+  copy_in(p.s, p.key, p.slot, p.stage);
+  void*& ev = stage_ev_[uint32_t(p.stage) - c_.blocks];  // the staging buffer is reusable once this copy landed
+  if (!ev) ev = event();
+  t_->record(ev, p.s);
+  if (p.prefetch) {
+    x.pf_done = event();
+    t_->record(x.pf_done, p.s);
+    if (mut_ == kEarlyEventRecycle) event_pool_.push_back(x.pf_done);
+  }
+}
+
+// A read that failed: the key goes back to its file, its slot to where it came from (a bank slot stays used for the
+// layer, unpublished), nothing was enqueued for it. Its stage keeps its last landed copy's event.
+void DgCore::undo_pending(const Pending& p) {
+  Entry& x = e_[p.key];
+  const uint32_t g = gated_of(p.key);
+  table_[p.key] = -1;
+  if (p.bank) {
+    bank_key_[size_t(p.slot) - bank_first_] = kNone;
+    banked_.erase(std::find(banked_.begin(), banked_.end(), p.key));
+    --st_.bank_serves;
+    --lc_[g].bank_serves;
+  } else {
+    unlink(p.key);
+    --on_device_;
+    coming_.erase(std::find(coming_.begin(), coming_.end(), p.key));
+    free_slots_.push_back(p.slot);
+    if (p.free_counted) --demand_free_used_;
+  }
+  x.home = Home::File;
+  x.slot = -1;
+  x.via_prefetch = x.used = x.pf_late = false;
+  x.pf_kind = 0;
+  ++on_file_;
+  if (p.prefetch) {
+    --st_.prefetched;
+    --lc_[g].prefetched;
+  } else {
+    --st_.fetched;
+    --lc_[g].fetched;
+  }
+}
+
+void DgCore::drain_pending(size_t n) {
+  std::exception_ptr first;
+  bool device_failed = false;  // a failed copy: the later records are ended and undone, nothing more is enqueued
+  bool pf = false;
+  for (; n > 0 && !pending_.empty(); --n) {
+    const Pending p = pending_.front();
+    pending_.pop_front();
+    if (p.entry != entries_) {  // ended in a later call than its fetch's (it overlapped that call's caller)
+      ++st_.disk_carried;
+      st_.disk_carried_bytes += unit_bytes_;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool read_ok = true;
+    try {
+      st_.disk_read_ns += t_->read_unit_end(p.handle);
+    } catch (...) {
+      read_ok = false;
+      if (!first) first = std::current_exception();
+    }
+    st_.disk_wait_ns += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    if (!read_ok || device_failed) {
+      undo_pending(p);
+      continue;
+    }
+    ++st_.disk_reads;
+    st_.disk_read_bytes += unit_bytes_;
+    try {
+      finish_pending(p);
+      pf = pf || p.prefetch;
+    } catch (...) {
+      if (!first) first = std::current_exception();
+      device_failed = true;  // (this record stays fetched, as a synchronous fetch whose copy failed)
+      n = SIZE_MAX;          // every later record is ended and undone in this call
+    }
+  }
+  if (pf && !first) t_->flush(DgTransport::kPf);  // prefetch copies enqueued outside their call: submitted now
+  if (first) std::rethrow_exception(first);
+}
+
+// Prefetch reads in flight across calls: a public entry point ends the demand reads (the records up to the last demand
+// one, oldest first); a prefetch's read ends when its key is touched again (drain_key: a fetch or a cover), when its
+// layer is done (drain_layer: before its ready), or at a drain of everything (the end of the token, slot / stage
+// pressure, write-backs submitted between tokens, a seed, a reset, a setting, destruction).
+void DgCore::drain_through(const std::function<bool(const Pending&)>& f) {
+  for (size_t i = pending_.size(); i-- > 0;)
+    if (f(pending_[i])) {
+      drain_pending(i + 1);
+      return;
+    }
+}
+
+void DgCore::drain_demand() {
+  drain_through([](const Pending& p) { return !p.prefetch; });
+}
+
+void DgCore::drain_key(uint32_t k) {
+  drain_through([k](const Pending& p) { return p.key == k; });
+}
+
+void DgCore::drain_layer(uint32_t g) {
+  drain_through([this, g](const Pending& p) { return !p.prefetch || gated_of(p.key) == g; });
+}
+
+void DgCore::enter() {
+  ++entries_;
+  drain_demand();
+}
+
+void DgCore::poll_reads() {
+  enter();
+  size_t n = 0;
+  while (n < pending_.size() && t_->read_unit_done(pending_[n].handle)) ++n;
+  if (n) drain_pending(n);
 }
 
 // The derived write-back scheduling state of c_.wb_defer (at construction, and after set_wb_defer / reset_open).
@@ -104,6 +348,7 @@ std::vector<uint32_t> DgCore::residency() const {
 }
 
 void DgCore::set_wb_defer(bool on) {
+  drain_pending();  // drain point: write-backs submitted (every read ended first)
   if (on == c_.wb_defer) return;
   if (!on)
     while (!deferred_.empty()) finish_deferred_front();
@@ -117,11 +362,20 @@ uint32_t DgCore::gated_of(uint32_t k) const {
   return uint32_t(std::upper_bound(base_.begin(), base_.end(), k) - base_.begin()) - 1;
 }
 
+// Destruction: the reads in flight are ended (their errors dropped) before anything they write into can be freed;
+// their copies are never enqueued (the owner drains or abandons the streams).
 DgCore::~DgCore() {
+  for (const Pending& p : pending_) {
+    try {
+      t_->read_unit_end(p.handle);
+    } catch (...) {
+    }
+  }
   for (void* ev : all_events_) t_->event_destroy(ev);
 }
 
-void DgCore::place(const std::vector<uint32_t>& residents) {
+void DgCore::place(const std::vector<uint32_t>& residents, const std::vector<uint8_t>* disk) {
+  drain_pending();  // drain point: the open placement
   // homes: the residents (by priority, then nothing else) on the device, every other key in a block
   const uint32_t dev_max = c_.persistent_slots - c_.spare_target;
   std::vector<uint8_t> placed(keys_, 0);
@@ -134,16 +388,49 @@ void DgCore::place(const std::vector<uint32_t>& residents) {
     }
   }
   const uint32_t dev0 = uint32_t(order.size());
-  require(uint64_t(keys_) - dev0 <= c_.blocks, SS_E_CAPACITY, "device-gated: fewer host blocks than non-resident units");
+  const bool three = c_.disk_tier;
+  const std::vector<uint8_t> none(three && !disk ? keys_ : 0, 0);  // no flags: no plan-disk key
+  if (three && !disk) disk = &none;
+  require(!three || disk->size() == keys_, SS_E_INVALID, "device-gated: the disk flags do not cover the keys");
+  // three-tier: which non-device keys get a block (plan-pinned first, then by priority), as flags in key order
+  std::vector<uint8_t> blocked(keys_, 0);
+  std::vector<uint32_t> host_rank;  // the pinned homes by priority (the recency order)
+  if (three) {
+    std::vector<uint8_t> seen(keys_, 0);
+    std::vector<uint32_t> prio;
+    for (uint32_t k : residents)
+      if (k < keys_ && !seen[k]) {
+        seen[k] = 1;
+        prio.push_back(k);
+      }
+    for (uint32_t k = 0; k < keys_; ++k)
+      if (!seen[k]) prio.push_back(k);
+    const uint32_t cap = std::min(c_.home_blocks, c_.blocks);  // exact: 0 = no pinned home (all spares)
+    for (int pass = 0; pass < 2; ++pass)
+      for (uint32_t k : prio)
+        if (!placed[k] && (*disk)[k] == uint8_t(pass) && host_rank.size() < cap) {
+          blocked[k] = 1;
+          host_rank.push_back(k);
+        }
+  } else {
+    require(uint64_t(keys_) - dev0 <= c_.blocks, SS_E_CAPACITY, "device-gated: fewer host blocks than non-resident units");
+  }
   int32_t next_block = 0;
+  on_host_ = on_file_ = backed_ = 0;
+  hhead_ = htail_ = kNone;
   for (uint32_t k = 0; k < keys_; ++k) {
     Entry& x = e_[k];
     x = Entry{};
-    if (!placed[k]) {
+    if (!placed[k] && (!three || blocked[k])) {
       x.home = Home::Host;
       x.block = next_block++;
+      if (!three) ++on_host_;
+    } else if (!placed[k]) {
+      x.home = Home::File;
+      ++on_file_;
     }
   }
+  for (size_t i = host_rank.size(); i-- > 0;) hpush(host_rank[i]);  // the first by priority most recent
   for (uint32_t i = 0; i < dev0; ++i) {
     Entry& x = e_[order[i]];
     x.home = Home::Device;
@@ -165,6 +452,10 @@ void DgCore::place(const std::vector<uint32_t>& residents) {
   open_head_ = head_;
   open_tail_ = tail_;
   open_on_device_ = on_device_;
+  open_hhead_ = hhead_;
+  open_htail_ = htail_;
+  open_on_host_ = on_host_;
+  open_on_file_ = on_file_;
   open_wp_ = wp_;
   open_rate_gbps_ = rate_gbps_;
   open_rate_set_ = rate_set_;
@@ -240,6 +531,7 @@ uint32_t DgCore::collect() {
       x.home = Home::Host;
       x.block = w.block;
       x.slot = -1;
+      hpush(w.key);
       free_slots_.push_back(w.slot);
     }
     ++n;
@@ -297,6 +589,7 @@ void* DgCore::finish_deferred_front() {
 }
 
 void DgCore::issue_writebacks(uint32_t g, const std::function<bool()>& ahead) {
+  enter();
   if (deferred_.empty()) {
     credit_ = 0;
     return;
@@ -354,16 +647,21 @@ int32_t DgCore::take_bank_slot(uint32_t g) {
   const int32_t slot = int32_t(bank_first_ + idx);
   const uint32_t old = bank_key_[idx];
   if (old != kNone && e_[old].home == Home::Bank && e_[old].slot == slot) {
-    e_[old].home = Home::Host;
-    e_[old].slot = -1;
+    drain_key(old);  // (its read, if one were still in flight: ended before the alias goes)
+    to_lower(old);  // its block (two-tier: always), or its file (fetched from it)
     if (mut_ != kNoBankUnpublish) write_entry(DgTransport::kDem, old, -1);
   }
   bank_key_[idx] = kNone;
   return slot;
 }
 
-void DgCore::begin_token(uint32_t seq) {
-  require(!reset_failed_, SS_E_BACKEND, "device-gated: reset failed; close the poisoned context");
+void DgCore::begin_token(uint32_t seq, const std::vector<uint8_t>* run) {
+  require(!reset_failed_, SS_E_BACKEND,
+          "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
+  require(!run || run->size() == gated(), SS_E_INVALID, "device-gated: the exported layers do not cover the gated layers");
+  enter();
+  if (run) std::copy(run->begin(), run->end(), run_.begin());
+  else std::fill(run_.begin(), run_.end(), uint8_t(1));
   if (c_.scored) {  // the token's epoch (the first is 1); one token cannot push more than 2^40 stamps
     stamp_room("begin_token");
     require(epoch_ < (uint64_t(1) << 63), SS_E_BACKEND,
@@ -388,15 +686,33 @@ bool DgCore::fetch(uint32_t g, uint32_t unit, bool prefetch) { return fetch_impl
 
 // budgeted = false: a winpf prior prefetch between tokens (its own caps and byte budget; the per-token budgets are
 // reset at begin_token).
+// Overlapped file misses: a fetch that does nothing (over budget, a key on the device, a file key a prefetch may not
+// read) reads one home and changes nothing, so it keeps the reads in flight; a fetch of a coming key ends that key's
+// read if it is in flight. Every other path of a miss keeps them too (pressure mode takes these on every miss):
+//  - resurrection: its key is Evicting (a read's key never is) and its slot is that key's; it cancels / records its
+//    own write-back and publishes its own entry;
+//  - a copy from a pinned block: another key, its own slot and block (a host block, never a staging buffer);
+//  - collect(): retires recorded write-backs only, whose keys are Evicting or resurrected (never a read's key: a key
+//    read from its file has no write-back record, check()), their slots (each held once) and host blocks back to the
+//    free lists, their events (recorded, never a read's) to the pool; done() is a host query;
+//  - force_free_slot(): submits / waits on deferred write-backs (victims chosen at the last boundary, after every read
+//    ended: Evicting keys, their slots, host blocks), then collect();
+//  - a bank slot: unpublishes the slot's previous alias, a key of layer g - 2 (its reads ended at its ready; a
+//    targeted drain covers it anyway).
+// Drain points here: the oldest past the queue depth, take_stage (a staging buffer reused), the bank slot's alias,
+// the no-slot fallback (an internal error), and everything with synchronous reads (disk_queue 1).
 bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted) {
   const uint32_t k = key(g, unit);
   Entry& x = e_[k];
-  // a prefetch over budget does nothing at all (no copy and no resurrection)
+  // a prefetch over budget does nothing at all (no copy and no resurrection); dg_no_admit issues none
   if (prefetch && budgeted && (pf_layer_[g] >= c_.prefetch_per_layer || pf_token_ >= c_.prefetch_per_token))
     return false;
+  if (prefetch && c_.no_admit) return false;
   switch (x.home) {
-    case Home::Device:
     case Home::Coming:
+      drain_key(k);  // (its own prefetch read in flight: ended; nothing else to do)
+      return false;
+    case Home::Device:
     case Home::Bank:
       return false;
     case Home::Evicting: {  // resurrect: the slot still holds the bytes (the write-back only reads them)
@@ -441,15 +757,28 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     }
     case Home::Host:
       break;
+    case Home::File:  // three-tier: a file read below; a prefetch only with disk_prefetch
+      if (prefetch && !c_.disk_prefetch) return false;
+      break;
   }
   int32_t slot = -1;
-  bool bank = false;
+  bool bank = false, free_counted = false;
   const size_t reserve = prefetch ? c_.prefetch_reserve : 0u;
-  if (free_slots_.size() <= reserve || (pressure_ && !prefetch)) st_.collected_mid += collect();
+  if (c_.no_admit) {  // a demand (prefetches return above): a bank slot, released at the boundary, its home unchanged
+    slot = take_bank_slot(g);
+    if (slot < 0) fail(SS_E_BACKEND, "device-gated: dg_no_admit: no bank slot for a miss of gated layer " +
+                                         std::to_string(g) + " (more distinct misses than dg_max_ids)");
+    bank = true;
+  } else if (free_slots_.size() <= reserve || (pressure_ && !prefetch)) {
+    st_.collected_mid += collect();
+  }
   const bool capped = !prefetch && pressure_ && demand_free_used_ >= pressure_free_;
-  if (!prefetch && !capped && free_slots_.empty()) force_free_slot();  // wb_defer only (else nothing is deferred)
-  if (!capped && free_slots_.size() > reserve) {
+  if (!bank && !prefetch && !capped && free_slots_.empty()) force_free_slot();  // wb_defer only (else none deferred)
+  if (bank) {
+    // (dg_no_admit: taken above)
+  } else if (!capped && free_slots_.size() > reserve) {
     if (!prefetch) ++demand_free_used_;
+    free_counted = !prefetch;
     slot = free_slots_.back();
     free_slots_.pop_back();
   } else if (prefetch) {
@@ -459,6 +788,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     if (slot >= 0) {
       bank = true;
     } else {  // a layer has at most bank_slots distinct misses: only reachable through an internal error
+      drain_pending();
       force_free_slot();
       while (free_slots_.empty() && !wbs_.empty()) {
         t_->event_sync(wbs_.front().done);
@@ -471,19 +801,40 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     }
   }
   const DgTransport::Stream s = prefetch ? DgTransport::kPf : DgTransport::kDem;
-  if (mut_ == kEntryBeforeCopy) {
-    write_entry(s, k, slot);
-    t_->h2d(s, slot, x.block);
+  const bool from_file = x.home == Home::File;
+  if (from_file) {  // its bytes from the file into a staging buffer, then the same copy (once the read ended)
+    const size_t depth = std::max<uint32_t>(c_.disk_queue, 1);
+    int32_t stage = -1;
+    void* h = nullptr;
+    try {
+      if (pending_.size() >= depth) drain_pending(pending_.size() + 1 - depth);  // the queue depth
+      stage = take_stage();
+      const auto t0 = std::chrono::steady_clock::now();
+      h = t_->read_unit_begin(k, stage);
+      st_.disk_read_ns += uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    } catch (...) {  // nothing begun for this key: its slot goes back (a bank slot stays used, unpublished)
+      if (!bank) {
+        free_slots_.push_back(slot);
+        if (free_counted) --demand_free_used_;
+      }
+      throw;
+    }
+    if (!pending_.empty()) ++st_.disk_overlapped;
+    pending_.push_back({k, slot, stage, s, prefetch, bank, free_counted, h, entries_});
+    st_.disk_max_in_flight = std::max<uint64_t>(st_.disk_max_in_flight, pending_.size());
+    table_[k] = slot;  // the mirror now (as a synchronous fetch), the device's entry with the copy
   } else {
-    t_->h2d(s, slot, x.block);
-    write_entry(s, k, slot);
+    copy_in(s, k, slot, x.block);
   }
+  if (x.home == Home::Host) hunlink(k);
+  else if (x.home == Home::File) --on_file_;
   x.slot = slot;
   x.via_prefetch = prefetch;
   x.used = false;
   x.pf_kind = 0;
   x.pf_late = false;
-  if (prefetch) {
+  if (prefetch && !from_file) {  // (a file read's: with its copy)
     x.pf_done = event();
     t_->record(x.pf_done, s);
     if (mut_ == kEarlyEventRecycle) event_pool_.push_back(x.pf_done);
@@ -496,7 +847,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     ++lc_[g].bank_serves;
   } else {
     x.home = Home::Coming;
-    if (mut_ == kEarlySourceFree) free_blocks_.push_back(x.block);
+    if (mut_ == kEarlySourceFree && x.block >= 0) free_blocks_.push_back(x.block);
     coming_.push_back(k);
     push_front(k);
     ++on_device_;
@@ -510,12 +861,15 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     ++st_.fetched;
     ++lc_[g].fetched;
   }
+  if (from_file && c_.disk_queue <= 1) drain_pending();  // synchronous reads: the copy now, as before
   return true;
 }
 
 void DgCore::cover(uint32_t g, uint32_t unit) {
   Entry& x = e_[key(g, unit)];
-  // only this key's copies land before ready
+  // only this key's copies land before ready; drain point: this key's read if in flight (a file prefetch's event is
+  // recorded with its copy). The wait is on this key's event only: the other reads stay in flight.
+  if (x.home == Home::Coming && x.via_prefetch && mut_ != kNoCover) drain_key(key(g, unit));
   if (x.home == Home::Coming && x.via_prefetch && x.pf_done && mut_ != kNoCover) {
     t_->wait(DgTransport::kDem, x.pf_done);
     ++st_.covered_waits;
@@ -527,6 +881,7 @@ void DgCore::cover(uint32_t g, uint32_t unit) {
 }
 
 void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
+  enter();
   const uint32_t k = key(g, unit);
   Entry& x = e_[k];
   ++st_.lookups;
@@ -552,7 +907,10 @@ void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
   }
 }
 
+// Drain points: the start (a public entry point: the demand reads), cover() of a prefetch (the demand reads and that
+// key's), signal() (this layer's reads, its misses' and its prefetches', in flight until its ready).
 void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
+  enter();
   const uint32_t nu = units(g);
   for (uint32_t i = 0; i < n; ++i)  // before any key is computed (the export kernel already aborted the token)
     require(ids[i] < nu, SS_E_INVALID,
@@ -573,21 +931,33 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
     } else {
       fetch(g, ids[i], false);
       if (diag_ && !first_marked) {
+        drain_demand();  // (dg_diag: the mark follows the first fetched unit's copies)
         t_->diag_mark(g, 2);
         first_marked = true;
       }
     }
   }
   if (mask) signal(g);
+  else drain_layer(g);  // (no miss: the layer's prefetch reads still end before it is done)
   if (diag_ && mask) t_->diag_mark(g, 1);
 }
 
+void DgCore::signal(uint32_t g) {
+  drain_layer(g);  // drain point: this layer's copies and entries (demand, prefetch) enqueued before its ready
+  t_->signal_ready(g, seq_);
+}
+
 void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
+  enter();
   const bool have_pred = pred_layer_ == g;
   uniq_.assign(ids, ids + n);
   std::sort(uniq_.begin(), uniq_.end());
   uniq_.erase(std::unique(uniq_.begin(), uniq_.end()), uniq_.end());
   if (c_.scored) score_history(g);  // the union saved before serve_prediction reuses uniq_
+  for (uint32_t id : uniq_) {  // placement rounds: the unit's exports since the last round (saturating)
+    uint32_t& h = rhits_[key(g, id)];
+    if (h != UINT32_MAX) ++h;
+  }
   for (uint32_t id : uniq_) {
     bool miss = false;
     for (uint32_t i = 0; i < n; ++i)
@@ -599,7 +969,14 @@ void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mas
   pred_layer_ = kNone;
 }
 
+// Drain point: the start (a public entry point). Its prefetches' file reads stay in flight past the call: they end when
+// layer g_next is demanded (cover of the key, at the latest its ready), or at a drain of everything.
 void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead) {
+  enter();
+  serve_prediction_impl(g_next, pred, n, n_export, ahead);
+}
+
+void DgCore::serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead) {
   if (g_next >= gated()) return;
   const uint32_t nu = units(g_next);
   if (wp_.enable && !win_w_.empty()) {
@@ -651,6 +1028,7 @@ void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n,
     for (const Cand& c : cand_) {
       if (issued >= wp_.l1_cap || c.votes < wp_.l1_min_votes - 1e-6f) break;
       if (on_device_or_coming(g_next, c.unit)) continue;
+      if (!c_.disk_prefetch && e_[key(g_next, c.unit)].home == Home::File) continue;  // demand only (three-tier)
       const uint32_t b = uint32_t(std::min(4L, std::lround(c.votes))) * 3u + (c.rank <= 1 ? 0u : c.rank <= 3 ? 1u : 2u);
       if (wp_.l1_pmin > 0 && (bkt_hit_[b] + 1) / (bkt_n_[b] + 1) < wp_.l1_pmin && ++explore_ % 64u != 0) {
         ++st_.l1_priced_out;
@@ -665,7 +1043,7 @@ void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n,
         ++issued;
       }
     }
-    if (issued) t_->flush(DgTransport::kPf);  // the copies start now, ahead of the next layer's demand
+    if (issued) t_->flush(DgTransport::kPf);  // the copies start now (a file read's: flushed when it ends)
     return;
   }
   uniq_.clear();
@@ -684,6 +1062,8 @@ void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n,
 
 void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   require(rows > 0, SS_E_INVALID, "device-gated: boundary rows must be positive");
+  drain_pending();  // drain point: the end of the token (before its streams are synchronized; victims are chosen
+                    // below with no read in flight)
   // every copy and table write of the token has landed before anything is invalidated
   DgBoundaryTimes bt = bt_;  // published in one step at the end (a throw leaves the last complete one)
   std::chrono::steady_clock::time_point t;
@@ -695,6 +1075,13 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     t_->diag_boundary();
   }
   const bool hinted = !win_w_.empty();  // winpf: this token was a hinted window
+  std::vector<uint8_t> keep_mask;
+  if (!keep.empty()) {
+    keep_mask.assign(keys_, 0);
+    for (uint32_t k : keep)
+      if (k < keys_) keep_mask[k] = 1;
+  }
+  auto kept = [&](uint32_t k) { return !keep_mask.empty() && keep_mask[k] && mut_ != kIgnoreKeep; };
   for (uint32_t k : coming_) {  // admitted: device homes now, their source blocks are free
     Entry& x = e_[k];
     if (x.home != Home::Coming) continue;
@@ -708,14 +1095,13 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
         h /= 2;
       }
     }
-    if (wp_.enable && wp_.revert_unused && hinted && x.via_prefetch && !x.used) {
+    if (wp_.enable && wp_.revert_unused && hinted && x.via_prefetch && !x.used && !kept(k)) {
       // winpf: an unused prefetch goes back to its source block, which still holds the bytes (a Coming unit's block
       // is freed only here, at admission): no write-back. The device is done with the token and kPf is synced; the
       // table upload below unpublishes it.
       if (x.pf_kind) ++(x.pf_kind == 1 ? st_.prior_reverted : st_.l1_reverted);
-      x.home = Home::Host;
       free_slots_.push_back(x.slot);
-      x.slot = -1;
+      to_lower(k);  // its block, or (read from its file) its file
       if (mut_ != kRevertKeepsEntry) table_[k] = -1;
       unlink(k);
       --on_device_;
@@ -736,15 +1122,22 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       event_pool_.push_back(x.pf_done);
       x.pf_done = nullptr;
     }
-    free_blocks_.push_back(x.block);
-    x.block = -1;
+    if (x.block >= 0) {  // (a unit read from its file holds none)
+      if (backed_ < c_.inclusive) {  // inclusive share: the source block stays, a clean copy of the slot's bytes
+        x.backed = true;
+        ++backed_;
+        ++st_.inclusive_kept;
+      } else {
+        free_blocks_.push_back(x.block);
+        x.block = -1;
+      }
+    }
   }
   coming_.clear();
   for (uint32_t k : banked_) {  // bank units: back to their blocks (the upload below resets the entry)
     Entry& x = e_[k];
     if (x.home == Home::Bank) {
-      x.home = Home::Host;
-      x.slot = -1;
+      to_lower(k);
       table_[k] = -1;
     }
     if (x.pf_done) {  // never: a bank serve is a demand
@@ -762,29 +1155,48 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   // pressure override from the recency head. Eligible = a device home, no write-back in flight, not kept (Coming units
   // were admitted or reverted above). A victim is accepted with a free block, until free + pending (in flight or
   // deferred) + accepted reaches the target; at the first victim without a block nothing more is accepted (it stays on
-  // the device, coverage kept). Only the accepted list feeds the write-backs below.
-  std::vector<uint8_t> keep_mask;
-  if (!keep.empty()) {
-    keep_mask.assign(keys_, 0);
-    for (uint32_t k : keep)
-      if (k < keys_) keep_mask[k] = 1;
-  }
+  // the device, coverage kept). Only the accepted list feeds the write-backs below. (A kept unused prefetch was admitted
+  // above, not reverted: a kept unit on the device stays there.)
+  // dg_no_admit: nothing was admitted, no boundary evicts (placement changes only through rounds / make_resident)
+  const bool select = !c_.no_admit;
+  const bool want_score = select && c_.scored && (!c_.scored_auto || rows > 1);
+  // A layer this token did not export (begin_token's run) was never served or ranked: it is ranked here from its
+  // unchanged history (the bounded selector only needs it closed), so every list is this token's as after a full one.
+  for (uint32_t g = 0; c_.scored && g < gated(); ++g)
+    if (!run_[g]) {
+      if (c_.boundary_score) sc_[g].list_epoch = epoch_;
+      else rank_layer(g);
+    }
   if (probe_) probe_();
   const size_t base = free_slots_.size() + pending_writebacks();
   victims_.clear();
+  size_t got = 0;  // accepted victims: write-backs (victims_) and three-tier / inclusive drops (no copy)
   bool short_blocks = false;
   auto eligible = [&](uint32_t k) {
     const Entry& x = e_[k];
-    return x.home == Home::Device && !(x.wb_pending && mut_ != kReevictPending) &&
-           !(!keep_mask.empty() && keep_mask[k] && mut_ != kIgnoreKeep);
+    return x.home == Home::Device && !(x.wb_pending && mut_ != kReevictPending) && !kept(k);
   };
   auto accept = [&](uint32_t k) {
+    Entry& x = e_[k];
+    if (x.backed || (free_blocks_.empty() && !drop_host_lru() && c_.disk_tier)) {
+      // a clean copy (its block is its home again) or, three-tier with no block to free, its file: no copy
+      if (x.backed) ++st_.inclusive_drops;
+      else ++st_.disk_discards;
+      unlink(k);
+      --on_device_;
+      free_slots_.push_back(x.slot);
+      to_lower(k);
+      table_[k] = -1;
+      ++st_.evicted;
+      ++lc_[gated_of(k)].evicted;
+      ++got;
+      return true;
+    }
     if (free_blocks_.empty()) {
       ++st_.evict_short;
       short_blocks = true;
       return false;
     }
-    Entry& x = e_[k];
     const int32_t b = free_blocks_.back();
     free_blocks_.pop_back();
     unlink(k);
@@ -794,9 +1206,9 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     x.wb_pending = true;
     table_[k] = -1;
     victims_.push_back(k);
+    ++got;
     return true;
   };
-  const bool want_score = c_.scored && (!c_.scored_auto || rows > 1);
   bool by_score = want_score;
   for (uint32_t g = 0; by_score && g < gated(); ++g) by_score = sc_[g].list_epoch == epoch_;
   if (want_score && !by_score) ++st_.score_fallbacks;  // invalid score metadata: this boundary uses the recency order
@@ -805,27 +1217,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     // score / epochs / stamp. At the boundary score only eligible keys and retain the needed smallest candidates.
     const auto start = std::chrono::steady_clock::now();
     const size_t need = c_.spare_target > base ? c_.spare_target - base : 0;
-    auto less = [this](const ScoreCand& a, const ScoreCand& b) { return cand_less(a, b); };
-    select_heap_.clear();
-    for (uint32_t g = 0; need && g < gated(); ++g) {
-      uint64_t D = 0;
-      for (uint32_t r : sc_[g].cur) D += sc_[g].rowsum[r];
-      ++st_.score_layers;
-      for (uint32_t u = 0; u < units(g); ++u) {
-        if (!eligible(base_[g] + u)) continue;
-        ++st_.score_candidates;
-        const ScoreCand cd = score_candidate(g, u, D, select_heap_.size() == need ? &select_heap_.front() : nullptr);
-        if (select_heap_.size() < need) {
-          select_heap_.push_back(cd);
-          std::push_heap(select_heap_.begin(), select_heap_.end(), less);
-        } else if (less(cd, select_heap_.front())) {
-          std::pop_heap(select_heap_.begin(), select_heap_.end(), less);
-          select_heap_.back() = cd;
-          std::push_heap(select_heap_.begin(), select_heap_.end(), less);
-        }
-      }
-    }
-    std::sort_heap(select_heap_.begin(), select_heap_.end(), less);
+    select_scored(need, eligible, true);
     for (const ScoreCand& cd : select_heap_) {
       if (!accept(cd.key)) break;
       ++st_.scored_victims;
@@ -842,7 +1234,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       if (!sc_[g].list.empty()) heap_.push_back(g);
     }
     std::make_heap(heap_.begin(), heap_.end(), after);
-    while (!heap_.empty() && base + victims_.size() < c_.spare_target) {
+    while (!heap_.empty() && base + got < c_.spare_target) {
       std::pop_heap(heap_.begin(), heap_.end(), after);
       const uint32_t g = heap_.back();
       const uint32_t k = head(g).key;
@@ -852,14 +1244,14 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       if (!accept(k)) break;
       ++st_.scored_victims;
     }
-  } else {
-    for (uint32_t k = tail_; k != kNone && base + victims_.size() < c_.spare_target;) {
+  } else if (select) {
+    for (uint32_t k = tail_; k != kNone && base + got < c_.spare_target;) {
       const uint32_t prev = e_[k].prev;
       if (eligible(k) && !accept(k)) break;
       k = prev;
     }
   }
-  if (pressure_ && pressure_recent_ && !short_blocks) {  // the most recently used too (they come back soon)
+  if (select && pressure_ && pressure_recent_ && !short_blocks) {  // the most recently used too (they come back soon)
     uint32_t n = 0;
     for (uint32_t k = head_; k != kNone && n < pressure_recent_;) {
       const uint32_t next = e_[k].next;
@@ -971,6 +1363,7 @@ void DgCore::score_history(uint32_t g) {
 // stamp) and tagged with this epoch. A layer's union, epochs and stamps are final here: each layer is served once per
 // token, its prefetches and resurrections come before its use, collection and admission never push.
 void DgCore::score_layer(uint32_t g) {
+  enter();
   if (!c_.scored) return;
   LayerScore& l = sc_[g];
   if (l.served != epoch_) return;  // not served this token: no list (the boundary falls back and counts it)
@@ -983,6 +1376,11 @@ void DgCore::score_layer(uint32_t g) {
     l.list_epoch = epoch_;
     return;
   }
+  rank_layer(g);
+}
+
+void DgCore::rank_layer(uint32_t g) {
+  LayerScore& l = sc_[g];
   const auto t0 = std::chrono::steady_clock::now();
   const uint32_t n = units(g);
   std::vector<uint32_t> scratch;  // kNoUnionSave: whatever the shared scratch holds now (in range)
@@ -1010,6 +1408,33 @@ void DgCore::score_layer(uint32_t g) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
 }
 
+// The bounded selection (the boundary's, and make_resident's under scoring): the `need` smallest eligible candidates of
+// every gated layer by the public total order, ascending in select_heap_. The same victims as the per-layer lists +
+// merge: a layer's candidates are scored from its current union, epochs and stamps.
+void DgCore::select_scored(size_t need, const std::function<bool(uint32_t)>& eligible, bool count) {
+  auto less = [this](const ScoreCand& a, const ScoreCand& b) { return cand_less(a, b); };
+  select_heap_.clear();
+  for (uint32_t g = 0; need && g < gated(); ++g) {
+    uint64_t D = 0;
+    for (uint32_t r : sc_[g].cur) D += sc_[g].rowsum[r];
+    if (count) ++st_.score_layers;
+    for (uint32_t u = 0; u < units(g); ++u) {
+      if (!eligible(base_[g] + u)) continue;
+      if (count) ++st_.score_candidates;
+      const ScoreCand cd = score_candidate(g, u, D, select_heap_.size() == need ? &select_heap_.front() : nullptr);
+      if (select_heap_.size() < need) {
+        select_heap_.push_back(cd);
+        std::push_heap(select_heap_.begin(), select_heap_.end(), less);
+      } else if (less(cd, select_heap_.front())) {
+        std::pop_heap(select_heap_.begin(), select_heap_.end(), less);
+        select_heap_.back() = cd;
+        std::push_heap(select_heap_.begin(), select_heap_.end(), less);
+      }
+    }
+  }
+  std::sort_heap(select_heap_.begin(), select_heap_.end(), less);
+}
+
 DgCore::ScoreCand DgCore::score_candidate(uint32_t g, uint32_t u, uint64_t D, const ScoreCand* cutoff) const {
   const LayerScore& l = sc_[g];
   const Entry& x = e_[base_[g] + u];
@@ -1026,6 +1451,7 @@ DgCore::ScoreCand DgCore::score_candidate(uint32_t g, uint32_t u, uint64_t D, co
 }
 
 void DgCore::set_policy(uint32_t policy) {
+  drain_pending();  // drain point: between tokens, the policy (everything settled)
   require(policy <= 2, SS_E_INVALID, "device-gated: policy must be LRU, SCORED or SCORED_AUTO");
   require(!policy || !sc_.empty(), SS_E_INVALID, "device-gated: scoring must be provisioned at open");
   drain();
@@ -1039,6 +1465,7 @@ void DgCore::set_policy(uint32_t policy) {
 }
 
 void DgCore::load_profile(const void* data, uint64_t len, const std::string& identity) {
+  drain_pending();  // drain point: open only
   require(c_.scored, SS_E_INVALID, "device-gated: a score profile needs policy SCORED");
   const DgProfileView v = dg_profile_check(data, len, c_.n_units, identity);
   const unsigned char* p = v.cells;
@@ -1095,6 +1522,7 @@ void DgCore::reset_score() {
 }
 
 void DgCore::set_winpf(const DgWinpf& w) {
+  drain_pending();  // drain point: a setting (between tokens)
   if (!rate_set_ || w.copy_gbps != wp_.copy_gbps) {  // a learned rate survives phase toggles with the same seed rate
     rate_gbps_ = w.copy_gbps;
     rate_set_ = true;
@@ -1103,13 +1531,17 @@ void DgCore::set_winpf(const DgWinpf& w) {
 }
 
 void DgCore::observe_copy(double unit_ms) {
+  drain_pending();  // drain point: a setting (between tokens)
   if (!(unit_ms > 0) || !unit_bytes_) return;
   const double g = double(unit_bytes_) / (unit_ms * 1e6);
   if (g < 1 || g > 200) return;  // a stamp that cannot be a copy
   rate_gbps_ = 0.9 * rate_gbps_ + 0.1 * g;
 }
 
+// Drain point: the start (a public entry point). issue_prior's file reads stay in flight into the token (they end
+// when their layer is demanded, or at a drain of everything).
 void DgCore::window_hint(const int32_t* symbols, const float* weights, uint32_t rows) {
+  enter();
   stamp_room("window_hint");
   ++st_.winpf_hints;
   st_.winpf_hint_rows += rows;
@@ -1155,6 +1587,7 @@ void DgCore::issue_prior() {
     for (const Cand& x : pcand_) {
       if (issued >= wp_.prior_cap || 1.0f - x.votes < wp_.prior_pmin - 1e-6f) break;
       if (on_device_or_coming(g, x.unit)) continue;
+      if (!c_.disk_prefetch && e_[key(g, x.unit)].home == Home::File) continue;  // demand only (three-tier)
       // the copy-engine budget of the window: every byte already queued (write-backs submitted and not collected:
       // conservative) comes first on a FIFO engine; a resurrection (Evicting) copies nothing
       if (e_[key(g, x.unit)].home != Home::Evicting && outstanding_ + prior_bytes_ + unit_bytes_ > budget) {
@@ -1174,6 +1607,7 @@ void DgCore::issue_prior() {
 }
 
 uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
+  drain_pending();  // drain point: between tokens (copies, then an upload)
   // winpf: prior prefetches issued between tokens are Coming with their entries already in the mirror; their bytes
   // land before the upload below publishes the mirror
   stamp_room("ss_seed");
@@ -1187,6 +1621,7 @@ uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
     const int32_t slot = free_slots_.back();
     free_slots_.pop_back();
     t_->h2d(DgTransport::kDem, slot, x.block);
+    hunlink(k);
     free_blocks_.push_back(x.block);
     x.block = -1;
     x.slot = slot;
@@ -1200,7 +1635,601 @@ uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
   return n;
 }
 
+// ss_dg_make_resident (dg_core.hpp). Every refusal comes before any action; the rest is synchronous: every copy landed
+// and the table is uploaded when it returns. A victim's slot is taken only after its write-back landed (kD2h synced), a
+// copy's source block is freed only after kDem is synced, a staging buffer is reused only after its last copy's event.
+DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint32_t>& ids,
+                                             const std::vector<uint32_t>& other_kept) {
+  const auto t0 = std::chrono::steady_clock::now();
+  require(!reset_failed_, SS_E_BACKEND,
+          "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
+  require(g < gated(), SS_E_INVALID, "ss_dg_make_resident: gated layer out of range");
+  std::vector<uint8_t> want(keys_, 0), other(keys_, 0);
+  for (uint32_t u : ids) {
+    require(u < units(g), SS_E_INVALID, "ss_dg_make_resident: id out of range");
+    require(!want[key(g, u)], SS_E_INVALID, "ss_dg_make_resident: duplicate id " + std::to_string(u));
+    want[key(g, u)] = 1;
+  }
+  size_t n_other = 0;
+  for (uint32_t k : other_kept)  // (g's own current keep included: protected until the call succeeded)
+    if (k < keys_ && !other[k] && !want[k]) {
+      other[k] = 1;
+      ++n_other;
+    }
+  // capacity: the kept units of every layer leave the spare target free for the boundaries
+  const uint64_t cap = uint64_t(c_.persistent_slots) - c_.spare_target;
+  require(ids.size() + n_other <= cap, SS_E_CAPACITY,
+          "ss_dg_make_resident: " + std::to_string(ids.size()) + " units of gated layer " + std::to_string(g) + " + " +
+              std::to_string(n_other) + " other kept units + the spare target " + std::to_string(c_.spare_target) +
+              " exceed the " + std::to_string(c_.persistent_slots) + " persistent slots");
+  // the slots it can use: free ones, the ones write-backs in flight will free, eligible victims (prior prefetches still
+  // coming and the other layers' kept units are not)
+  size_t need = 0, eligible_n = 0, evicting = 0, discarded = 0;
+  for (uint32_t k = 0; k < keys_; ++k) {
+    const Entry& x = e_[k];
+    require(x.home != Home::Bank, SS_E_BACKEND, "ss_dg_make_resident: a bank unit between tokens");
+    if (x.home == Home::Evicting) ++evicting;
+    if (want[k]) need += x.home != Home::Device && x.home != Home::Coming ? 1u : 0u;
+    else if (x.home == Home::Device && !other[k]) ++eligible_n;
+  }
+  for (const Writeback& w : wbs_) discarded += w.discard ? 1u : 0u;
+  const size_t free_after = free_slots_.size() + evicting;
+  require(need <= free_after + eligible_n, SS_E_CAPACITY,
+          "ss_dg_make_resident: " + std::to_string(need) + " units to copy in, " + std::to_string(free_after) +
+              " free slots and " + std::to_string(eligible_n) +
+              " evictable units (the rest hold other layers' kept units or prefetches in flight)");
+  require(c_.disk_tier || need <= free_after || free_after + free_blocks_.size() + discarded > 0, SS_E_CAPACITY,
+          "ss_dg_make_resident: no free slot and no free pinned block to start the write-backs");
+  stamp_room("ss_dg_make_resident");
+
+  // drain point: everything settled (reads, copies, deferred and recorded write-backs collected); a device failure
+  // here poisons the core (nothing of this call changed yet)
+  try {
+    drain();
+    for (const Writeback& w : wbs_) t_->event_sync(w.done);
+    collect();
+    require(wbs_.empty(), SS_E_BACKEND, "ss_dg_make_resident: write-backs not collected");
+  } catch (...) {
+    reset_failed_ = true;
+    throw;
+  }
+  ResidentResult r;
+  res_victims_.clear();
+  std::vector<uint32_t> in;  // the units to copy in, in the caller's order
+  for (uint32_t u : ids) {
+    const uint32_t k = key(g, u);
+    Entry& x = e_[k];
+    if (x.home == Home::Coming) {  // a prior prefetch (its copy landed: kPf synced): admitted now, never reverted
+      x.home = Home::Device;
+      x.via_prefetch = false;
+      x.pf_kind = 0;
+      x.pf_late = false;
+      if (x.pf_done) {
+        event_pool_.push_back(x.pf_done);
+        x.pf_done = nullptr;
+      }
+      if (x.block >= 0) {
+        free_blocks_.push_back(x.block);
+        x.block = -1;
+      }
+    } else if (x.home != Home::Device) {
+      in.push_back(k);
+    }
+  }
+  auto eligible = [&](uint32_t k) {
+    const Entry& x = e_[k];
+    return x.home == Home::Device && !x.wb_pending && !want[k] && !other[k];
+  };
+  std::vector<uint32_t> victims;
+  const size_t n_vict = in.size() > free_slots_.size() ? in.size() - free_slots_.size() : 0;
+  if (n_vict && c_.scored) {
+    select_scored(n_vict, eligible, false);
+    for (const ScoreCand& cd : select_heap_) victims.push_back(cd.key);
+  } else {
+    for (uint32_t k = tail_; k != kNone && victims.size() < n_vict; k = e_[k].prev)
+      if (eligible(k)) victims.push_back(k);
+  }
+  require(victims.size() == n_vict, SS_E_BACKEND, "ss_dg_make_resident: fewer victims than the capacity check counted");
+
+  std::vector<uint8_t> hold = want;  // never dropped to a file here: the units to copy in, this call's write-backs
+  // Transactions: a copy changes no home until the transport accepted it (the slot back to the free list and the
+  // mirror entry back to -1 otherwise: the source keeps its home and its block); a source block is released, and a
+  // written-back victim's slot reused, only after the stream that reads it was synced.
+  std::vector<int32_t> released;  // source blocks of committed copies on kDem (free once kDem is synced)
+  std::vector<int32_t> wb;        // slots of committed write-backs on kD2h (free once kD2h is synced)
+  struct Read {
+    uint32_t key;
+    int32_t slot, stage;
+    void* handle;
+  };
+  std::deque<Read> reads;  // file reads in flight, oldest first, each in its own staging buffer
+  const size_t depth = c_.disk_tier ? std::max<size_t>(1, std::min<size_t>(std::max<uint32_t>(c_.disk_queue, 1),
+                                                                          c_.disk_staging))
+                                    : 1;
+  bool io_error = false;  // the failure was a file read's: the device is fine, the cache is re-established
+  auto commit = [&](uint32_t k, int32_t slot) {
+    Entry& x = e_[k];
+    x.home = Home::Device;
+    x.slot = slot;
+    x.block = -1;
+    push_front(k);  // the most recent
+    ++on_device_;
+    ++r.copied;
+  };
+  auto transfer = [&](uint32_t k, int32_t slot, int32_t src) {  // the copy and the entry, or nothing owned changes
+    try {
+      copy_in(DgTransport::kDem, k, slot, src);
+    } catch (...) {
+      table_[k] = -1;
+      free_slots_.push_back(slot);
+      throw;
+    }
+  };
+  auto flush_dem = [&] {
+    t_->sync(DgTransport::kDem);
+    free_blocks_.insert(free_blocks_.end(), released.begin(), released.end());
+    released.clear();
+  };
+  auto flush_d2h = [&] {
+    if (wb.empty()) return;
+    t_->sync(DgTransport::kD2h);
+    free_slots_.insert(free_slots_.end(), wb.begin(), wb.end());
+    wb.clear();
+  };
+  auto end_read = [&] {
+    const Read rd = reads.front();
+    reads.pop_front();
+    try {
+      t_->read_unit_end(rd.handle);
+    } catch (...) {
+      io_error = true;
+      free_slots_.push_back(rd.slot);
+      throw;
+    }
+    transfer(rd.key, rd.slot, rd.stage);
+    --on_file_;
+    commit(rd.key, rd.slot);
+    void*& ev = stage_ev_[uint32_t(rd.stage) - c_.blocks];  // the staging buffer is reusable once this copy landed
+    if (!ev) ev = event();
+    t_->record(ev, DgTransport::kDem);
+  };
+  auto account = [&] {
+    st_.resident_units += r.copied;
+    st_.resident_evicted += r.evicted;
+    st_.resident_bytes += uint64_t(r.copied) * unit_bytes_;
+    st_.resident_ns += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  };
+  try {
+    size_t next = 0, vi = 0;
+    while (next < in.size()) {
+      // no free slot: evict the next victims (as many as the remaining units need and the blocks allow)
+      const bool evict = free_slots_.empty();
+      while (evict && vi < victims.size() && free_slots_.size() + wb.size() < in.size() - next) {
+        const uint32_t v = victims[vi];
+        Entry& x = e_[v];
+        if (!x.backed && free_blocks_.empty() && !released.empty()) {  // the blocks of the copies already enqueued
+          flush_dem();
+          continue;
+        }
+        if (!x.backed && free_blocks_.empty() && !c_.disk_tier) break;  // (two-tier: progress is guaranteed above)
+        // a clean copy (its block is its home again) or, three-tier with no block to free, its file: no copy
+        const bool no_copy = x.backed || (free_blocks_.empty() && !drop_host_lru(&hold, false));
+        int32_t b = -1;
+        if (!no_copy) {
+          b = free_blocks_.back();
+          t_->d2h(x.slot, b);  // the dirty unit's only copy: written back before its slot is reused
+          free_blocks_.pop_back();
+        }
+        ++vi;
+        res_victims_.push_back(v);
+        ++r.evicted;
+        unlink(v);
+        --on_device_;
+        table_[v] = -1;
+        if (no_copy) {
+          free_slots_.push_back(x.slot);
+          to_lower(v);
+          continue;
+        }
+        wb.push_back(x.slot);
+        x.home = Home::Host;
+        x.slot = -1;
+        x.block = b;
+        hpush(v);
+        hold[v] = 1;
+      }
+      flush_d2h();
+      require(!free_slots_.empty(), SS_E_BACKEND, "ss_dg_make_resident: no slot for a unit");
+      const int32_t slot = free_slots_.back();
+      free_slots_.pop_back();
+      const uint32_t k = in[next];
+      Entry& x = e_[k];
+      if (x.home == Home::Host) {
+        const int32_t b = x.block;
+        transfer(k, slot, b);
+        ++next;
+        hunlink(k);
+        released.push_back(b);
+        commit(k, slot);
+        continue;
+      }
+      // its file, through the next staging buffer (its last copy landed first)
+      try {
+        if (reads.size() >= depth) end_read();
+        const uint32_t i = stage_next_;
+        stage_next_ = (i + 1) % c_.disk_staging;
+        if (stage_ev_[i] && !t_->done(stage_ev_[i])) t_->event_sync(stage_ev_[i]);
+        const int32_t stage = int32_t(c_.blocks + i);
+        void* h = nullptr;
+        try {
+          h = t_->read_unit_begin(k, stage);
+        } catch (...) {
+          io_error = true;
+          throw;
+        }
+        reads.push_back({k, slot, stage, h});
+        ++next;
+      } catch (...) {
+        free_slots_.push_back(slot);
+        throw;
+      }
+    }
+    while (!reads.empty()) end_read();
+    flush_d2h();
+    flush_dem();
+    t_->upload_table(table_.data(), keys_);  // (syncs kDem) every entry, the victims' -1 included
+  } catch (...) {
+    // reads not ended give their slots back (their keys never changed home); the units moved so far stay
+    for (const Read& rd : reads) {
+      try {
+        t_->read_unit_end(rd.handle);
+      } catch (...) {
+      }
+      free_slots_.push_back(rd.slot);
+    }
+    reads.clear();
+    bool ok = false;
+    if (io_error) {  // the device is fine: what was enqueued lands, the table goes up
+      try {
+        flush_d2h();
+        flush_dem();
+        t_->upload_table(table_.data(), keys_);
+        ok = true;
+      } catch (...) {
+      }
+    }
+    if (!ok) {
+      // a device failure (or one while re-establishing): nothing more is enqueued. The host records stay one
+      // consistent ownership (every slot, block and event held once), but what the device holds is unknown: the core
+      // is poisoned, and so is its context.
+      reset_failed_ = true;
+      free_slots_.insert(free_slots_.end(), wb.begin(), wb.end());
+      wb.clear();
+      free_blocks_.insert(free_blocks_.end(), released.begin(), released.end());
+      released.clear();
+    }
+    account();
+    throw;
+  }
+  account();
+  return r;
+}
+
+// ss_dg_round (dg_core.hpp, docs/design.md §3.10). Every move is synchronous: its copy and its stream synced before the
+// home changes, so a cancellation, a read failure or a device failure finds every unit in exactly one home.
+DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_keys) {
+  const auto t0 = std::chrono::steady_clock::now();
+  last_round_ = DgRoundOut{};
+  require(!reset_failed_, SS_E_BACKEND,
+          "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
+  require(std::isfinite(in.decay) && in.decay >= 0 && in.decay <= 1, SS_E_INVALID, "ss_dg_round: decay must be 0..1");
+  require(std::isfinite(in.hysteresis) && in.hysteresis >= 1 && in.hysteresis <= 1e6, SS_E_INVALID,
+          "ss_dg_round: hysteresis must be 1..1e6");
+  require(in.flags == 0, SS_E_INVALID, "ss_dg_round: unknown flags");
+  std::vector<uint8_t> kept(keys_, 0);
+  size_t n_kept = 0;
+  for (uint32_t k : kept_keys)
+    if (k < keys_ && !kept[k]) {
+      kept[k] = 1;
+      ++n_kept;
+    }
+  for (uint32_t k = 0; k < keys_; ++k)
+    require(e_[k].home != Home::Bank, SS_E_BACKEND, "ss_dg_round: a bank unit between tokens");
+  stamp_room("ss_dg_round");
+  round_cancel_.store(false, std::memory_order_release);
+  // drain point: everything settled (reads, copies, deferred and recorded write-backs collected); a device failure
+  // here poisons the core (nothing of this call changed yet)
+  try {
+    drain();
+    for (const Writeback& w : wbs_) t_->event_sync(w.done);
+    collect();
+    require(wbs_.empty(), SS_E_BACKEND, "ss_dg_round: write-backs not collected");
+  } catch (...) {
+    reset_failed_ = true;
+    throw;
+  }
+  for (uint32_t k = 0; k < keys_; ++k) {  // the decayed counts
+    rs_[k] = in.decay * rs_[k] + double(rhits_[k]);
+    rhits_[k] = 0;
+  }
+
+  DgRoundOut r;
+  const uint64_t ub = unit_bytes_;
+  uint64_t spent = 0;
+  uint32_t moved = 0;
+  auto fits = [&](uint64_t b) { return !in.budget_bytes || (spent <= in.budget_bytes && b <= in.budget_bytes - spent); };
+  auto cancelled = [&] {
+    if (round_cancel_.load(std::memory_order_acquire)) r.cancelled = 1;
+    return r.cancelled != 0;
+  };
+  auto boundary = [&] {  // a unit boundary: the cancellation check (the test probe runs first)
+    if (round_probe_) round_probe_(moved);
+    return cancelled();
+  };
+  // tie-breaks: the recency positions (least recent first) of the device units and of the pinned homes
+  std::vector<uint32_t> rank(keys_, 0), hrank(keys_, 0);
+  {
+    uint32_t i = 0;
+    for (uint32_t k = tail_; k != kNone; k = e_[k].prev) rank[k] = i++;
+  }
+  auto hotter = [&](uint32_t a, uint32_t b) { return rs_[a] != rs_[b] ? rs_[a] > rs_[b] : a < b; };
+  auto colder_dev = [&](uint32_t a, uint32_t b) {
+    if (rs_[a] != rs_[b]) return rs_[a] < rs_[b];
+    return rank[a] != rank[b] ? rank[a] < rank[b] : a < b;
+  };
+  auto colder_host = [&](uint32_t a, uint32_t b) {
+    if (rs_[a] != rs_[b]) return rs_[a] < rs_[b];
+    return hrank[a] != hrank[b] ? hrank[a] < hrank[b] : a < b;
+  };
+  std::vector<uint32_t> dev, host, file;
+  size_t n_coming = 0;
+  for (uint32_t k = 0; k < keys_; ++k) {
+    const Entry& x = e_[k];
+    if (x.home == Home::Coming) ++n_coming;
+    if (kept[k] || x.wb_pending) continue;  // never moved
+    if (x.home == Home::Device) dev.push_back(k);
+    else if (x.home == Home::Host) host.push_back(k);
+    else if (x.home == Home::File) file.push_back(k);
+  }
+  std::sort(dev.begin(), dev.end(), colder_dev);
+  std::sort(host.begin(), host.end(), hotter);
+  std::sort(file.begin(), file.end(), hotter);
+  // the device's share of the rank: persistent slots - spares - kept units (- units coming from a prior prefetch)
+  int64_t room = int64_t(c_.persistent_slots) - int64_t(c_.spare_target) - int64_t(n_kept) - int64_t(n_coming) -
+                 int64_t(dev.size());
+  const DgTransport::Stream ws = c_.wb_on_d2h ? DgTransport::kD2h : DgTransport::kDem;
+
+  struct Rd {
+    uint32_t key;
+    int32_t block;
+    void* handle;
+  };
+  std::deque<Rd> reads;  // (b) file reads in flight, oldest first, each into its own block
+  bool io_error = false;
+  auto account = [&] {
+    r.ns = uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    ++st_.round_count;
+    st_.round_units += uint64_t(r.promoted_to_device) + r.promoted_to_pinned + r.demoted_from_device + r.dropped_to_file;
+    st_.round_bytes += r.bytes_read + r.bytes_h2d + r.bytes_written_back;
+    st_.round_ns += r.ns;
+    st_.round_cancelled += r.cancelled;
+    last_round_ = r;
+  };
+  // A pinned unit's copy into `slot` (owned by the caller): committed once the copy and its entry were accepted and
+  // kDem synced; a cancellation seen then drops it (the slot freed, the entry back to -1, the unit keeps its block).
+  auto promote = [&](uint32_t k, int32_t slot) {
+    Entry& x = e_[k];
+    const int32_t b = x.block;
+    try {
+      copy_in(DgTransport::kDem, k, slot, b);
+      t_->sync(DgTransport::kDem);
+    } catch (...) {
+      table_[k] = -1;
+      free_slots_.push_back(slot);
+      throw;
+    }
+    spent += ub;
+    r.bytes_h2d += ub;
+    if (cancelled()) {
+      table_[k] = -1;
+      free_slots_.push_back(slot);
+      return false;
+    }
+    hunlink(k);
+    free_blocks_.push_back(b);  // (kDem synced: the copy that read it landed)
+    x.block = -1;
+    x.slot = slot;
+    x.home = Home::Device;
+    push_front(k);  // the most recent
+    ++on_device_;
+    ++r.promoted_to_device;
+    return true;
+  };
+  // A block for a dirty device unit's write-back: a free one, else (three-tier) the coldest pinned unit's, dropped to
+  // its file (never `except`, the unit being promoted). -1: none.
+  size_t hback = host.size();
+  auto wb_block = [&](uint32_t except) -> int32_t {
+    if (!free_blocks_.empty()) {
+      const int32_t b = free_blocks_.back();
+      free_blocks_.pop_back();
+      return b;
+    }
+    if (!c_.disk_tier) return -1;
+    while (hback > 0) {
+      const uint32_t p = host[--hback];
+      Entry& y = e_[p];
+      if (p == except || y.home != Home::Host) continue;
+      hunlink(p);
+      const int32_t b = y.block;
+      y.block = -1;
+      y.home = Home::File;
+      ++on_file_;
+      ++r.dropped_to_file;
+      return b;
+    }
+    return -1;
+  };
+  auto end_read = [&] {
+    const Rd rd = reads.front();
+    reads.pop_front();
+    try {
+      t_->read_unit_end(rd.handle);
+    } catch (...) {
+      io_error = true;
+      free_blocks_.push_back(rd.block);
+      throw;
+    }
+    r.bytes_read += ub;
+    if (cancelled()) {  // dropped: the block is free again, the unit stays in its file
+      free_blocks_.push_back(rd.block);
+      return;
+    }
+    Entry& x = e_[rd.key];
+    --on_file_;
+    x.home = Home::Host;
+    x.block = rd.block;
+    hpush(rd.key);  // the most recently homed
+    ++r.promoted_to_pinned;
+  };
+  try {
+    // (a) pinned -> device
+    size_t j = 0;
+    for (size_t i = 0; i < host.size() && moved < in.max_units; ++i) {
+      const uint32_t c = host[i];
+      if (!(rs_[c] > 0)) break;
+      if (e_[c].home != Home::Host) continue;  // (dropped to its file for a write-back block)
+      if (boundary()) break;
+      if (room > 0 && free_slots_.size() > c_.spare_target) {  // the device holds less than its share
+        if (!fits(ub)) break;
+        const int32_t slot = free_slots_.back();
+        free_slots_.pop_back();
+        if (!promote(c, slot)) break;
+        --room;
+        ++moved;
+        continue;
+      }
+      if (j >= dev.size()) break;
+      const uint32_t v = dev[j];
+      if (!(rs_[c] > in.hysteresis * rs_[v])) break;
+      Entry& y = e_[v];
+      if (!fits(ub + (y.backed ? 0 : ub))) break;
+      const int32_t slot = y.slot;
+      if (y.backed) {  // a clean copy: its block is its home again, no write
+        unlink(v);
+        --on_device_;
+        table_[v] = -1;
+        to_lower(v);
+      } else {
+        const int32_t b = wb_block(c);
+        if (b < 0) break;
+        try {
+          if (ws == DgTransport::kD2h) {
+            t_->d2h(slot, b);
+          } else {
+            for (uint32_t p = 0; p < t_->parts(); ++p) t_->d2h_part(DgTransport::kDem, slot, b, p);
+          }
+          t_->sync(ws);
+        } catch (...) {
+          free_blocks_.push_back(b);  // the unit keeps its slot (its only copy)
+          throw;
+        }
+        unlink(v);
+        --on_device_;
+        table_[v] = -1;
+        y.home = Home::Host;
+        y.slot = -1;
+        y.block = b;
+        hpush(v);
+        spent += ub;
+        r.bytes_written_back += ub;
+      }
+      ++j;
+      ++r.demoted_from_device;
+      if (!promote(c, slot)) break;  // (cancelled: the demoted unit's slot is free)
+      ++moved;
+    }
+    // (b) three-tier: file -> pinned, in place of the coldest pinned units
+    if (c_.disk_tier && !r.cancelled) {
+      std::vector<uint32_t> pinned;
+      for (uint32_t k = 0; k < keys_; ++k)
+        if (e_[k].home == Home::Host && !kept[k] && !e_[k].wb_pending) pinned.push_back(k);
+      uint32_t hi = 0;
+      for (uint32_t k = htail_; k != kNone; k = e_[k].hprev) hrank[k] = hi++;  // after (a)'s pushes
+      std::sort(pinned.begin(), pinned.end(), colder_host);
+      const size_t depth = std::max<uint32_t>(c_.disk_queue, 1);
+      size_t pv = 0;
+      for (size_t i = 0; i < file.size() && moved < in.max_units && pv < pinned.size(); ++i) {
+        const uint32_t c = file[i];
+        if (!(rs_[c] > 0)) break;
+        if (e_[c].home != Home::File) continue;
+        if (boundary()) break;
+        const uint32_t p = pinned[pv];
+        if (!(rs_[c] > in.hysteresis * rs_[p])) break;
+        if (!fits(ub)) break;
+        if (reads.size() >= depth) end_read();
+        if (r.cancelled) break;
+        ++pv;
+        Entry& y = e_[p];  // dropped to its file (no copy): its block is quiescent
+        hunlink(p);
+        const int32_t b = y.block;
+        y.block = -1;
+        y.home = Home::File;
+        ++on_file_;
+        ++r.dropped_to_file;
+        void* h = nullptr;
+        try {
+          h = t_->read_unit_begin(c, b);
+        } catch (...) {
+          io_error = true;
+          free_blocks_.push_back(b);
+          throw;
+        }
+        reads.push_back({c, b, h});
+        spent += ub;
+        ++moved;
+      }
+      while (!reads.empty()) end_read();
+    }
+    t_->upload_table(table_.data(), keys_);  // (syncs kDem) every entry, the demoted units' -1 included
+  } catch (...) {
+    for (const Rd& rd : reads) {  // reads not ended: their blocks free again, their units still in their files
+      try {
+        t_->read_unit_end(rd.handle);
+      } catch (...) {
+      }
+      free_blocks_.push_back(rd.block);
+    }
+    reads.clear();
+    bool ok = false;
+    if (io_error) {  // the device is fine (every copy was synced): the table goes up
+      try {
+        t_->upload_table(table_.data(), keys_);
+        ok = true;
+      } catch (...) {
+      }
+    }
+    if (!ok) reset_failed_ = true;  // a device failure: the host records are one ownership, the device unknown
+    account();
+    throw;
+  }
+  account();
+  return r;
+}
+
+void DgCore::seed_round_counts(const std::vector<uint32_t>& keys, const std::vector<float>& counts) {
+  require(keys.size() == counts.size(), SS_E_INVALID, "ss_dg_round_seed_counts: keys and counts differ in length");
+  for (size_t i = 0; i < keys.size(); ++i) {
+    require(keys[i] < keys_, SS_E_INVALID, "ss_dg_round_seed_counts: unit out of range");
+    require(std::isfinite(counts[i]) && counts[i] >= 0, SS_E_INVALID,
+            "ss_dg_round_seed_counts: counts must be finite and >= 0");
+  }
+  for (size_t i = 0; i < keys.size(); ++i) rs_[keys[i]] = double(counts[i]);
+}
+
 void DgCore::drain() {
+  drain_pending();  // drain point: a public entry point (between tokens)
   while (!deferred_.empty()) finish_deferred_front();
   t_->sync(DgTransport::kDem);
   t_->sync(DgTransport::kPf);
@@ -1211,7 +2240,8 @@ bool DgCore::same_open_state(const DgCore& b) const {
   auto cfg = [](const DgConfig& c) {
     return std::tie(c.n_units, c.persistent_slots, c.bank_slots, c.blocks, c.spare_target, c.prefetch_reserve,
                     c.prefetch_reserve_auto, c.prefetch_per_layer, c.prefetch_per_token, c.wb_defer, c.wb_on_d2h,
-                    c.wb_layer_bytes, c.wb_max_outstanding);
+                    c.wb_layer_bytes, c.wb_max_outstanding, c.disk_tier, c.disk_prefetch, c.home_blocks,
+                    c.disk_staging, c.inclusive, c.disk_queue);
   };
   auto wp = [](const DgWinpf& w) {
     return std::tie(w.enable, w.prior_layers, w.prior_cap, w.prior_pmin, w.l1_cap, w.l1_min_votes, w.l1_pmin,
@@ -1219,9 +2249,13 @@ bool DgCore::same_open_state(const DgCore& b) const {
   };
   auto entry = [](const Entry& x) {
     return std::tie(x.home, x.slot, x.block, x.prev, x.next, x.in_list, x.wb_pending, x.via_prefetch, x.used,
-                    x.pf_kind, x.pf_late, x.pf_bucket, x.demand_epoch, x.lru_stamp);
+                    x.pf_kind, x.pf_late, x.pf_bucket, x.demand_epoch, x.lru_stamp, x.backed, x.in_hlist, x.hprev,
+                    x.hnext);
   };
   if (cfg(c_) != cfg(b.c_) || wp(wp_) != wp(b.wp_) || e_.size() != b.e_.size()) return false;
+  if (std::tie(hhead_, htail_, on_host_, on_file_, backed_) !=
+      std::tie(b.hhead_, b.htail_, b.on_host_, b.on_file_, b.backed_))
+    return false;
   for (size_t k = 0; k < e_.size(); ++k)
     if (entry(e_[k]) != entry(b.e_[k])) return false;
   if (std::tie(table_, free_slots_, free_blocks_, head_, tail_, on_device_, bank_key_, pf_layer_, pf_token_,
@@ -1246,13 +2280,16 @@ bool DgCore::same_open_state(const DgCore& b) const {
         std::tie(sc_[g].T, sc_[g].rowsum, sc_[g].cnt, sc_[g].prev, sc_[g].served, sc_[g].list_epoch) !=
             std::tie(b.sc_[g].T, b.sc_[g].rowsum, b.sc_[g].cnt, b.sc_[g].prev, b.sc_[g].served, b.sc_[g].list_epoch))
       return false;
-  return wbs_.empty() && b.wbs_.empty() && deferred_.empty() && b.deferred_.empty() &&
+  if (rs_ != b.rs_ || rhits_ != b.rhits_ || c_.no_admit != b.c_.no_admit) return false;
+  return wbs_.empty() && b.wbs_.empty() && deferred_.empty() && b.deferred_.empty() && pending_.empty() &&
+         b.pending_.empty() &&
          prior_.layers == b.prior_.layers && prior_.k == b.prior_.k && prior_.row == b.prior_.row &&
          prior_.unit == b.prior_.unit && prior_.p == b.prior_.p;
 }
 
 void DgCore::reset_open() {
-  require(!reset_failed_, SS_E_BACKEND, "device-gated: reset failed; close the poisoned context");
+  require(!reset_failed_, SS_E_BACKEND,
+          "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
   require(open_e_.size() == keys_, SS_E_INVALID, "device-gated: reset before place");
   try {
     drain();
@@ -1271,23 +2308,40 @@ void DgCore::reset_open() {
         x.pf_done = nullptr;
       }
     }
-    const size_t P = c_.persistent_slots, N = P + c_.blocks, stage = N;
+    for (void* ev : stage_ev_)  // three-tier: every staging copy landed (Coming keys from files have no block)
+      if (ev) t_->event_sync(ev);
+    // Coming keys fetched from their file have no source block: their persistent slot is their only copy now (they
+    // were drained), so they take part as device keys; clean copies are dropped (the open holds none).
+    const size_t P = c_.persistent_slots, N = P + c_.blocks, stage = N, file = N + 1;
     std::vector<size_t> current(keys_), target(keys_);
-    std::vector<uint32_t> occupant(N + 1, kNone), wanted(N, kNone);
+    std::vector<uint32_t> occupant(N + 2, kNone), wanted(N + 2, kNone);
     for (uint32_t k = 0; k < keys_; ++k) {
       const Entry& x = e_[k];
       require(x.home != Home::Evicting, SS_E_BACKEND, "device-gated: reset left an evicting key");
-      current[k] = x.home == Home::Device ? size_t(x.slot) : P + size_t(x.block);
+      // (a bank slot is not a persistent location: a bank key read from its file goes back to its file)
+      const bool on_slot = x.home == Home::Device || (x.block < 0 && x.home == Home::Coming);
+      const bool from_file = x.home == Home::File || (x.block < 0 && x.home == Home::Bank);
+      current[k] = from_file ? file : on_slot ? size_t(x.slot) : P + size_t(x.block);
       const Entry& o = open_e_[k];
-      target[k] = o.home == Home::Device ? size_t(o.slot) : P + size_t(o.block);
-      occupant[current[k]] = k;
-      wanted[target[k]] = k;
+      target[k] = o.home == Home::File ? file : o.home == Home::Device ? size_t(o.slot) : P + size_t(o.block);
+      if (current[k] != file) occupant[current[k]] = k;
+      if (target[k] != file) wanted[target[k]] = k;
     }
+    for (uint32_t k = 0; k < keys_; ++k)  // a key going back to its file vacates its location (no copy)
+      if (target[k] == file && current[k] != file) {
+        occupant[current[k]] = kNone;
+        current[k] = file;
+      }
     auto block = [&](size_t loc) { return loc == stage ? -1 : int32_t(loc - P); };
     auto move = [&](uint32_t k, size_t dst) {
       const size_t src = current[k];
-      require(occupant[dst] == kNone, SS_E_BACKEND, "device-gated: reset overwrote a live source");
-      if (src < P && dst < P) t_->d2d(int32_t(src), int32_t(dst));
+      require(dst < file && occupant[dst] == kNone, SS_E_BACKEND, "device-gated: reset overwrote a live source");
+      if (src == file && dst < P) {  // read into the reset staging buffer, then to the slot
+        t_->read_unit(k, -1);
+        t_->h2d(DgTransport::kDem, int32_t(dst), -1);
+        t_->sync(DgTransport::kDem);
+      } else if (src == file) t_->read_unit(k, block(dst));
+      else if (src < P && dst < P) t_->d2d(int32_t(src), int32_t(dst));
       else if (src < P) {
         t_->d2h(int32_t(src), block(dst));
         t_->sync(DgTransport::kD2h);
@@ -1295,14 +2349,15 @@ void DgCore::reset_open() {
         t_->h2d(DgTransport::kDem, int32_t(dst), block(src));
         t_->sync(DgTransport::kDem);
       } else t_->h2h(block(src), block(dst));
-      occupant[src] = kNone;
+      if (src != file) occupant[src] = kNone;
       occupant[dst] = k;
       current[k] = dst;
     };
     // Paths first: fill each target hole from its current source, propagating the hole. Each move fixes one key.
+    // (A key read from its file ends its path: nothing was vacated.)
     for (size_t loc = 0; loc < N; ++loc) {
       size_t hole = loc;
-      while (occupant[hole] == kNone && wanted[hole] != kNone) {
+      while (hole < N && occupant[hole] == kNone && wanted[hole] != kNone) {
         const uint32_t k = wanted[hole];
         const size_t next = current[k];
         move(k, hole);
@@ -1313,6 +2368,7 @@ void DgCore::reset_open() {
     // dedicated host staging buffer, rotate into the hole, then close the cycle. Never overwrite an unread source.
     for (uint32_t k = 0; k < keys_; ++k) {
       if (current[k] == target[k]) continue;
+      require(current[k] != file, SS_E_BACKEND, "device-gated: reset left a file read behind");
       size_t hole = current[k];
       move(k, stage);
       while (hole != target[k]) {
@@ -1335,6 +2391,12 @@ void DgCore::reset_open() {
     head_ = open_head_;
     tail_ = open_tail_;
     on_device_ = open_on_device_;
+    hhead_ = open_hhead_;
+    htail_ = open_htail_;
+    on_host_ = open_on_host_;
+    on_file_ = open_on_file_;
+    backed_ = 0;
+    stage_next_ = 0;
     coming_.clear();
     banked_.clear();
     std::fill(bank_key_.begin(), bank_key_.end(), kNone);
@@ -1347,6 +2409,7 @@ void DgCore::reset_open() {
     pred_.clear();
     pred_layer_ = kNone;
     std::fill(layer_missed_.begin(), layer_missed_.end(), uint8_t(0));
+    std::fill(run_.begin(), run_.end(), uint8_t(1));
     pressure_ = false;
     pressure_free_ = pressure_recent_ = demand_free_used_ = 0;
     prev_evict_ = 0;
@@ -1358,6 +2421,8 @@ void DgCore::reset_open() {
     std::fill(std::begin(bkt_n_), std::end(bkt_n_), 0);
     std::fill(std::begin(bkt_hit_), std::end(bkt_hit_), 0);
     explore_ = 0;
+    std::fill(rs_.begin(), rs_.end(), 0.0);  // placement rounds: the counts start over (seed them again)
+    std::fill(rhits_.begin(), rhits_.end(), 0u);
     win_sym_.clear();
     win_w_.clear();
     prior_bytes_ = 0;
@@ -1379,18 +2444,21 @@ uint32_t DgCore::abandon_writebacks() noexcept {
 }
 
 void DgCore::set_pressure(uint32_t free_per_token, uint32_t evict_recent) {
+  drain_pending();  // drain point: a setting (between tokens)
   pressure_ = free_per_token != 0 || evict_recent != 0;
   pressure_free_ = free_per_token;
   pressure_recent_ = evict_recent;
 }
 
 void DgCore::set_spare_target(uint32_t n) {
+  drain_pending();  // drain point: a setting (between tokens)
   require(n <= c_.persistent_slots, SS_E_INVALID, "device-gated: spare target above the persistent slots");
   c_.spare_target = n;
   if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, n / 4);  // cache.cpp:171
 }
 
 void DgCore::set_prefetch_budget(uint32_t per_layer, uint32_t per_token) {
+  drain_pending();  // drain point: a setting (between tokens)
   c_.prefetch_per_layer = per_layer;
   c_.prefetch_per_token = per_token;
 }
@@ -1406,30 +2474,45 @@ void DgCore::check() const {
       if (all_events_[i] == ev) return int64_t(i);
     return -1;
   };
-  uint32_t listed = 0, dev = 0;
+  uint32_t listed = 0, dev = 0, hosts = 0, files = 0, backed = 0, hlisted = 0;
   for (uint32_t k = 0; k < keys_; ++k) {
     const Entry& x = e_[k];
+    if (x.backed && x.home != Home::Device) broken("a clean copy of a key not on the device");
+    if (x.in_hlist != (c_.disk_tier && x.home == Home::Host)) broken("the pinned recency list != the pinned homes");
+    hlisted += x.in_hlist ? 1u : 0u;
     switch (x.home) {
       case Home::Host:
         take(block_used, x.block, "host block");
+        ++hosts;
         if (table_[k] != -1) broken("a host key is mapped");
         if (x.in_list) broken("a host key is in the recency list");
+        break;
+      case Home::File:
+        ++files;
+        if (!c_.disk_tier) broken("a file home without the disk tier");
+        if (x.slot != -1 || x.block != -1 || table_[k] != -1 || x.in_list || x.wb_pending || x.pf_done)
+          broken("a file home holds a slot, a block, an entry or a copy");
         break;
       case Home::Device:
         take(slot_used, x.slot, "device slot");
         ++dev;
         if (table_[k] != x.slot) broken("table != device slot");
-        if (x.block != -1) broken("a device key holds a block");
+        if (x.backed) {
+          take(block_used, x.block, "clean copy block");
+          ++backed;
+        } else if (x.block != -1) {
+          broken("a device key holds a block");
+        }
         break;
       case Home::Coming:
         take(slot_used, x.slot, "coming slot");
-        take(block_used, x.block, "coming source block");
+        if (x.block >= 0 || !c_.disk_tier) take(block_used, x.block, "coming source block");
         ++dev;
         if (table_[k] != x.slot) broken("table != coming slot");
         break;
       case Home::Bank:
         take(slot_used, x.slot, "bank slot");
-        take(block_used, x.block, "bank home block");
+        if (x.block >= 0 || !c_.disk_tier) take(block_used, x.block, "bank home block");
         if (uint32_t(x.slot) < bank_first_) broken("a bank key outside the banks");
         if (table_[k] != x.slot) broken("table != bank slot");
         if (x.in_list) broken("a bank key is in the recency list");
@@ -1490,12 +2573,34 @@ void DgCore::check() const {
     if (e_[k].home == Home::Evicting && !live_of[k]) broken("an evicting key without a live write-back");
   }
   if (post_ready_ev_) take(ev_used, ev_index(post_ready_ev_), "post-ready event");
+  // reads in flight: each a Coming / Bank key on its slot, mapped in the mirror, without a prefetch event yet, on its
+  // own staging buffer
+  std::vector<uint8_t> stage_used(c_.disk_staging, 0);
+  for (const Pending& p : pending_) {
+    const Entry& x = e_[p.key];
+    if ((x.home != Home::Coming && x.home != Home::Bank) || x.slot != p.slot || x.block != -1 || x.pf_done ||
+        table_[p.key] != p.slot || p.bank != (x.home == Home::Bank) || p.prefetch != x.via_prefetch)
+      broken("a file read in flight does not match its key");
+    take(stage_used, int64_t(p.stage) - int64_t(c_.blocks), "a staging buffer with two reads in flight");
+    // collect / force_free_slot / eviction never touch it: no write-back record of its key or slot (the slot itself is
+    // held once: slot_used above), and a staging buffer is never in a free list
+    if (x.wb_pending) broken("a key read from its file with a write-back record");
+    for (const Writeback& w : wbs_)
+      if (w.key == p.key || w.slot == p.slot) broken("a write-back record on a file read in flight");
+    for (const Deferred& d : deferred_)
+      if (d.key == p.key || d.slot == p.slot) broken("a deferred write-back on a file read in flight");
+  }
+  for (int32_t b : free_blocks_)
+    if (b < 0 || uint32_t(b) >= c_.blocks) broken("a staging buffer in the free blocks");
+  if (pending_.size() > std::max<uint32_t>(c_.disk_queue, 1)) broken("more file reads in flight than the queue depth");
   for (int32_t s : free_slots_) {
     if (uint32_t(s) >= bank_first_) broken("a bank slot in the free list");
     take(slot_used, s, "free slot");
   }
   for (int32_t b : free_blocks_) take(block_used, b, "free block");
   for (void* ev : event_pool_) take(ev_used, ev_index(ev), "pooled event");
+  for (void* ev : stage_ev_)
+    if (ev) take(ev_used, ev_index(ev), "staging event");
   for (uint32_t b = 0; b < c_.blocks; ++b)
     if (!block_used[b]) broken("a host block is lost");
   for (uint32_t s = 0; s < bank_first_; ++s)
@@ -1503,6 +2608,16 @@ void DgCore::check() const {
   for (size_t i = 0; i < ev_used.size(); ++i)
     if (!ev_used[i]) broken("an event is lost");
   if (dev != on_device_ || listed != on_device_) broken("device count / recency list");
+  if (hosts != on_host_ || files != on_file_ || backed != backed_ || backed_ > c_.inclusive)
+    broken("pinned / file / clean-copy counts");
+  if (c_.disk_tier) {  // the pinned recency list: every Host key once, links consistent
+    uint32_t n = 0, prev = kNone;
+    for (uint32_t k = hhead_; k != kNone; k = e_[k].hnext) {
+      if (++n > keys_ || e_[k].home != Home::Host || e_[k].hprev != prev) broken("the pinned recency list");
+      prev = k;
+    }
+    if (n != hlisted || prev != htail_) broken("the pinned recency list's length / tail");
+  }
   if (c_.scored) {  // stamps strictly decrease from the head; every row sum / ring count equals its recount
     uint64_t last = UINT64_MAX;
     for (uint32_t k = head_; k != kNone; k = e_[k].next) {

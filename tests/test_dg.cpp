@@ -5,7 +5,9 @@
 // bytes and that no copy lands in a slot while a layer reads it. check() runs after every service step. Each
 // mutation of the core must be caught.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -17,6 +19,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "check.hpp"
@@ -43,7 +46,7 @@ class Scripted final : public DgTransport {
   struct Ev {
     uint64_t recorded = 0, completed = 0;
   };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H };
+  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read };
   struct Op {
     Kind kind;
     int32_t a = 0, b = 0;
@@ -60,10 +63,21 @@ class Scripted final : public DgTransport {
         rng_(seed), v_(v) {}
 
   // ---- DgTransport ----
-  void h2d(Stream s, int32_t slot, int32_t block) override { if (move_faults_) fault("h2d"); push(s, {H2D, slot, block}); }
+  void h2d(Stream s, int32_t slot, int32_t block) override {
+    if (on_h2d_) on_h2d_();
+    kind_fault(kFH2D);
+    if (move_faults_) fault("h2d");
+    for (const Pend& r : in_flight_)
+      if (r.block == block) v_->set("a copy from block " + std::to_string(block) + " before its file read ended");
+    push(s, {H2D, slot, block});
+  }
   void d2d(int32_t src, int32_t dst) override { fault("d2d"); push(kDem, {D2D, src, dst}); sync(kDem); }
   void h2h(int32_t src, int32_t dst) override { fault("h2h"); push(kDem, {H2H, src, dst}); sync(kDem); }
-  void d2h(int32_t slot, int32_t block) override { if (move_faults_) fault("d2h"); push(kD2h, {D2H, slot, block}); }
+  void d2h(int32_t slot, int32_t block) override {
+    kind_fault(kFD2H);
+    if (move_faults_) fault("d2h");
+    push(kD2h, {D2H, slot, block});
+  }
   void d2h_part(Stream s, int32_t slot, int32_t block, uint32_t part) override {
     if (part >= parts_) v_->set("a write-back part out of range");
     fault("d2h_part");
@@ -71,10 +85,72 @@ class Scripted final : public DgTransport {
     o.key = part;
     push(s, std::move(o));
   }
+  // three-tier: the file read lands at once; no queued copy may still read or write that block
+  void read_unit(uint32_t key, int32_t block) override {
+    if (fail_read_at_ > 0 && --fail_read_at_ == 0) ts::fail(SS_E_IO, "injected read failure");
+    read_target(block);
+    issued_.push_back(Read);
+    trace_.push_back({-1, int64_t(Read), int64_t(key), block, 0});
+    fill_block(block, int32_t(key));
+    ++reads_;
+  }
+  // Asynchronous reads (set_async_reads): a begun read lands at a random later moment (its own random stream: the
+  // scheduler's and the routes' draws are unchanged), in any order, at the latest when it is ended. A copy from a block
+  // whose read was not ended yet, a second read into a block in flight, or a read ended twice is a violation. A failed
+  // read (fail_read) lands garbage and throws at its end.
+  void* read_unit_begin(uint32_t key, int32_t block) override {
+    if (!async_) return DgTransport::read_unit_begin(key, block);
+    read_target(block);
+    for (const Pend& r : in_flight_)
+      if (r.block == block) v_->set("two file reads in flight into block " + std::to_string(block));
+    const bool fails = fail_read_at_ > 0 && --fail_read_at_ == 0;
+    issued_.push_back(Read);
+    trace_.push_back({-1, int64_t(Read), int64_t(key), block, 0});
+    in_flight_.push_back({++read_id_, key, block, false, fails});
+    max_in_flight_ = std::max<uint64_t>(max_in_flight_, in_flight_.size());
+    land_some();
+    return reinterpret_cast<void*>(uintptr_t(read_id_));
+  }
+  bool read_unit_done(void* h) override {
+    if (!async_) return true;
+    land_some();
+    const uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(h));
+    for (const Pend& r : in_flight_)
+      if (r.id == id) return r.landed;
+    v_->set("a finished-read query of no read in flight");
+    return true;
+  }
+  uint64_t read_unit_end(void* h) override {
+    if (!async_) return 0;
+    land_some();
+    const uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(h));
+    auto it = std::find_if(in_flight_.begin(), in_flight_.end(), [&](const Pend& r) { return r.id == id; });
+    if (it == in_flight_.end()) {
+      v_->set("a file read ended twice, or never begun");
+      return 0;
+    }
+    if (it != in_flight_.begin()) ++out_of_order_;  // (the core ends the oldest first: the reads landed in any order)
+    land(*it);
+    const bool fails = it->fails;
+    in_flight_.erase(it);
+    if (fails) ts::fail(SS_E_IO, "injected read failure");
+    return 1000;
+  }
+  void set_async_reads(bool on, uint64_t seed) {
+    async_ = on;
+    read_rng_.seed(seed);
+  }
+  void fail_read(int n) { fail_read_at_ = n; }  // the n-th later read fails (0 = off)
+  void set_eager(bool on) { eager_ = on; }      // every operation runs as soon as it can (no scheduler draws)
+  size_t reads_in_flight() const { return in_flight_.size(); }
+  uint64_t max_in_flight() const { return max_in_flight_; }
+  uint64_t landed_out_of_order() const { return landed_ooo_; }
+  uint64_t reads() const { return reads_; }
   uint32_t parts() const override { return parts_; }
   // unequal parts, as the real gate / up / down (the last one larger)
   uint64_t part_bytes(uint32_t part) const override { return part + 1 == parts_ ? 4096 : 2048; }
   void write_entry(Stream s, uint32_t key, int32_t v) override {
+    kind_fault(kFEntry);
     Op o{Entry, v};
     o.key = key;
     push(s, std::move(o));
@@ -87,6 +163,7 @@ class Scripted final : public DgTransport {
   }
   void event_destroy(void*) override {}
   void record(void* ev, Stream s) override {
+    kind_fault(kFRecord);
     fault("record");
     Ev* e = static_cast<Ev*>(ev);
     Op o{Record};
@@ -106,6 +183,7 @@ class Scripted final : public DgTransport {
     return e->completed >= e->recorded;
   }
   void event_sync(void* ev) override {
+    kind_fault(kFEventSync);
     while (!done(ev))
       if (!step()) {
         v_->set("event_sync: deadlock");
@@ -113,6 +191,7 @@ class Scripted final : public DgTransport {
       }
   }
   void sync(Stream s) override {
+    kind_fault(kFSync);
     while (!q_[s].empty())
       if (!step()) {
         v_->set("sync: deadlock");
@@ -120,6 +199,7 @@ class Scripted final : public DgTransport {
       }
   }
   void upload_table(const int32_t* table, uint32_t n) override {
+    kind_fault(kFUpload);
     if (move_faults_) fault("upload_table");
     Op o{Upload};
     o.table.assign(table, table + n);
@@ -135,10 +215,17 @@ class Scripted final : public DgTransport {
   }
   // Completes one runnable operation of a random stream; false if none can run.
   bool step() {
+    land_some();
     int cand[3], n = 0;
     for (int s = 0; s < 3; ++s)
       if (runnable(s)) cand[n++] = s;
     if (!n) return false;
+    if (eager_) {
+      Op o = std::move(q_[cand[0]].front());
+      q_[cand[0]].pop_front();
+      run(o);
+      return true;
+    }
     int s = cand[rng_() % unsigned(n)];
     // slow write-backs: a D2H waits behind the H2D streams most of the time (resurrections, pending at boundaries)
     if (slow_d2h_ && s == kD2h && n > 1 && rng_() % 8 != 0) s = cand[rng_() % unsigned(n - 1)];
@@ -192,10 +279,57 @@ class Scripted final : public DgTransport {
   // Fault injection: the n-th later call of d2h_part / event_create / record throws (as a failed CUDA call), 0 = off.
   void fail_after(int n) { fail_at_ = n; }
   void fail_reset_after(int n) { fail_at_ = n; move_faults_ = true; }
+  // Per-kind fault injection: the n-th later call of that kind throws SS_E_BACKEND (0 = off); fired() says it did.
+  enum FaultKind { kFH2D, kFD2H, kFEntry, kFRecord, kFEventSync, kFSync, kFUpload, kFaultKinds };
+  void fail_kind(FaultKind k, int n) {
+    kind_ = k;
+    kind_at_ = n;
+    kind_fired_ = false;
+  }
+  bool kind_fired() const { return kind_fired_; }
+  bool read_failure_pending() const { return fail_read_at_ > 0; }  // fail_read's failure has not fired yet
+  void set_on_h2d(std::function<void()> f) { on_h2d_ = std::move(f); }  // called at every h2d (before it is queued)
 
  private:
+  struct Pend {
+    uint64_t id;
+    uint32_t key;
+    int32_t block;
+    bool landed, fails;
+  };
   void fault(const char* what) {
     if (fail_at_ > 0 && --fail_at_ == 0) ts::fail(SS_E_BACKEND, std::string("injected failure: ") + what);
+  }
+  void kind_fault(FaultKind k) {
+    if (kind_at_ > 0 && k == kind_ && --kind_at_ == 0) {
+      kind_fired_ = true;
+      ts::fail(SS_E_BACKEND, "injected failure of kind " + std::to_string(int(k)));
+    }
+  }
+  std::function<void()> on_h2d_;
+  FaultKind kind_ = kFH2D;
+  int kind_at_ = 0;
+  bool kind_fired_ = false;
+  // no queued copy may still read or write a block a file read lands in
+  void read_target(int32_t block) {
+    for (const auto& q : q_)
+      for (const Op& o : q)
+        if (((o.kind == H2D || o.kind == D2H || o.kind == D2HPart) && o.b == block) ||
+            (o.kind == H2H && (o.a == block || o.b == block)))
+          v_->set("a file read overwrote block " + std::to_string(block) + " while a copy still used it");
+  }
+  void land(Pend& r) {
+    if (r.landed) return;
+    r.landed = true;
+    fill_block(r.block, r.fails ? -3 : int32_t(r.key));
+    if (!r.fails) ++reads_;
+  }
+  void land_some() {  // each read in flight lands now with probability 1/3, any of them first
+    for (size_t i = 0; i < in_flight_.size(); ++i)
+      if (!in_flight_[i].landed && read_rng_() % 3 == 0) {
+        for (size_t j = 0; j < i; ++j) landed_ooo_ += in_flight_[j].landed ? 0 : 1;
+        land(in_flight_[i]);
+      }
   }
   void push(Stream s, Op o) {
     issued_.push_back(o.kind);
@@ -203,6 +337,9 @@ class Scripted final : public DgTransport {
     for (int32_t value : o.table) trace_.back().push_back(value);
     if (o.kind == D2H || o.kind == D2HPart) wb_slots_.push_back(o.a);
     q_[s].push_back(std::move(o));
+    if (eager_)
+      while (step()) {
+      }
   }
   void run(const Op& o) {
     switch (o.kind) {
@@ -237,6 +374,8 @@ class Scripted final : public DgTransport {
       case Upload:
         table_ = o.table;
         break;
+      case Read:
+        break;
     }
   }
 
@@ -253,6 +392,12 @@ class Scripted final : public DgTransport {
   bool held_[3] = {false, false, false};
   bool move_faults_ = false;
   int fail_at_ = 0;
+  uint64_t reads_ = 0;
+  bool async_ = false, eager_ = false;
+  int fail_read_at_ = 0;
+  std::deque<Pend> in_flight_;
+  uint64_t read_id_ = 0, max_in_flight_ = 0, out_of_order_ = 0, landed_ooo_ = 0;
+  std::mt19937_64 read_rng_{1};
   int32_t staging_ = -1;
   std::mt19937_64 rng_;
   Violation* v_;
@@ -283,7 +428,27 @@ struct Shape {
   bool boundary_score = false;
   bool scored_auto = false;
   uint32_t auto_rows = 6;  // 0 alternates R1 and R6
+  // three-tier: `disk` non-resident keys start file-homed (a random set), staging buffers, prefetch of file keys;
+  // inclusive = the clean-copy share (its blocks come out of host_spares)
+  uint32_t disk = 0, staging = 3;
+  bool disk_tier = false, disk_prefetch = false;
+  uint32_t inclusive = 0;
+  // overlapped file reads: the core's queue depth (1 = synchronous), the transport's reads asynchronous (landing out
+  // of order), an eager device (every operation runs at once: timing-free, for the depth comparisons)
+  uint32_t queue = 16;
+  bool async_reads = false, eager = false;
+  // kept-resident layers (make_resident): episodes between tokens (a layer or part of one made resident and held, or a
+  // held one released; their own random stream), a held layer never exported and its kept slots read in every layer;
+  // skip = 1 in skip layers of a token are not exported (rows 0)
+  bool resident = false;
+  uint32_t skip = 0;
 };
+
+// What the resident runs exercised (their coverage).
+struct ResidentCoverage {
+  uint64_t calls = 0, refusals = 0, released = 0, copied = 0, evicted = 0, skipped_layers = 0, held_reads = 0;
+};
+ResidentCoverage g_res;
 
 // Scored eviction's exhaustive boundary oracle (design scored.md 8.3, 8.5, 10): its own history (transition counts
 // saturating at 2^32 - 1, the last 16 unions, demand epochs) from the routes the run serves, row sums and ring counts
@@ -347,6 +512,7 @@ struct Oracle {
     return wt * P + wf * ((c << 16) / 16) + wr * ((uint64_t(1) << 16) / (1 + epoch - epoch_of[k]));
   }
   // by_lru: the fallback order (recency tail first)
+  bool disk_tier = false;
   Expect boundary(const DgCore& c, const std::vector<uint32_t>& keep, uint32_t pressure_recent, bool by_lru) const {
     Expect x;
     x.armed = true;
@@ -373,28 +539,47 @@ struct Oracle {
       return a.s != b.s ? a.s < b.s : a.ep != b.ep ? a.ep < b.ep : a.st < b.st;
     });
     const size_t base_n = c.free_slots() + c.pending_writebacks();
-    size_t blocks = c.free_blocks();
-    for (const C& a : all) {
-      if (base_n + x.victims.size() >= c.spare_target()) break;
+    size_t blocks = c.free_blocks(), hosts = c.host_units(), got = 0;
+    std::vector<uint32_t> taken;
+    // a clean copy is dropped (no block); else a free block, else (three-tier) a pinned home dropped to its file, else
+    // (three-tier) the victim itself to its file; a two-tier victim without a block stops the acceptance
+    auto take = [&](uint32_t k) {
+      if (c.backed(k)) {  // its block becomes a pinned home (three-tier: droppable from now on)
+        taken.push_back(k);
+        ++got;
+        if (disk_tier) ++hosts;
+        return true;
+      }
+      if (!blocks && disk_tier && hosts) {
+        --hosts;
+        ++blocks;
+      }
+      if (!blocks && disk_tier) {
+        taken.push_back(k);
+        ++got;
+        return true;
+      }
       if (!blocks) {
         x.short_blocks = true;
-        break;
+        return false;
       }
       --blocks;
-      x.victims.push_back(a.k);
+      taken.push_back(k);
+      x.victims.push_back(k);
+      ++got;
+      return true;
+    };
+    for (const C& a : all) {
+      if (base_n + got >= c.spare_target()) break;
+      if (!take(a.k)) break;
     }
     if (pressure_recent && !x.short_blocks) {
       std::sort(all.begin(), all.end(), [](const C& a, const C& b) { return a.st > b.st; });
       uint32_t n = 0;
       for (const C& a : all) {
         if (n >= pressure_recent) break;
-        if (std::find(x.victims.begin(), x.victims.end(), a.k) != x.victims.end()) continue;
-        if (!blocks) {
-          x.short_blocks = true;
-          break;
-        }
-        --blocks;
-        x.victims.push_back(a.k);
+        if (std::find(taken.begin(), taken.end(), a.k) != taken.end()) continue;
+        if (!take(a.k)) break;
         ++n;
       }
     }
@@ -415,6 +600,10 @@ struct Outcome {
   ts::DgStats st;
   bool threw = false;
   std::vector<std::vector<uint32_t>> victims;
+  // the end state: the core's homes (home, slot, block per key) and table, the device's table and slot contents
+  std::vector<int64_t> homes;
+  std::vector<int32_t> table, device_table, slots;
+  uint64_t max_in_flight = 0, landed_out_of_order = 0;
 };
 
 std::vector<uint64_t> counters(const ts::DgStats& s) { return {s.tokens, s.lookups, s.misses, s.covered, s.fetched, s.prefetched, s.prefetch_used, s.resurrected, s.bank_serves, s.collected_mid, s.evicted, s.evict_short, s.writebacks_done, s.stalled, s.pred_invalid, s.covered_waits, s.predicted, s.predicted_true, s.miss_layers, s.wb_deferred, s.wb_cancelled, s.wb_forced, s.wb_boundary_flushed, s.wb_issued_bytes, s.wb_completed_bytes, s.wb_cancelled_bytes, s.wb_boundary_flushed_bytes, s.winpf_hints, s.winpf_hint_rows, s.prior_issued, s.prior_used, s.prior_late, s.prior_reverted, s.l1_candidates, s.l1_issued, s.l1_used, s.l1_late, s.l1_reverted, s.l1_priced_out, s.l1_skipped_ahead, s.prior_budget_stops}; }
@@ -424,25 +613,26 @@ void verify_bytes(DgCore& core, Scripted& t) {
   for (uint32_t k = 0; k < core.keys(); ++k) {
     CHECK_EQ(t.entry(k), core.table()[k]);
     if (core.home(k) == DgCore::Home::Device) CHECK_EQ(t.slot_holds(core.slot_of(k)), int32_t(k));
-    else {
+    else if (core.home(k) != DgCore::Home::File) {
       CHECK(core.home(k) == DgCore::Home::Host);
       CHECK_EQ(t.block_holds(core.block_of(k)), int32_t(k));
     }
+    CHECK(!core.backed(k));  // the open state holds no clean copy
   }
 }
 
 uint64_t reset_d2d = 0, reset_h2h = 0, reset_staging = 0;
 
 void reset_compare(DgCore& core, Scripted& t, const DgConfig& c, const std::vector<uint32_t>& order,
-                   Violation& v, uint32_t seq) {
+                   Violation& v, uint32_t seq, const std::vector<uint8_t>* disk = nullptr) {
   Violation fv;
-  Scripted ft(core.keys(), c.persistent_slots + 2 * c.bank_slots, c.blocks, core.gated(), 901, &fv);
+  Scripted ft(core.keys(), c.persistent_slots + 2 * c.bank_slots, c.blocks + c.disk_staging, core.gated(), 901, &fv);
   DgCore fresh(c, &ft);
-  fresh.place(order);
+  fresh.place(order, disk);
   fresh.set_prior(ts::DgPrior(core.prior()));
   for (uint32_t k = 0; k < fresh.keys(); ++k) {
     if (fresh.slot_of(k) >= 0) ft.fill_slot(fresh.slot_of(k), int32_t(k));
-    else ft.fill_block(fresh.block_of(k), int32_t(k));
+    else if (fresh.block_of(k) >= 0) ft.fill_block(fresh.block_of(k), int32_t(k));
   }
   ft.set_table(fresh.table());
   const auto before = counters(core.stats());
@@ -464,7 +654,7 @@ void reset_compare(DgCore& core, Scripted& t, const DgConfig& c, const std::vect
   CHECK(core.same_open_state(fresh));
   for (auto op : t.issued())
     CHECK(op != Scripted::H2D && op != Scripted::D2H && op != Scripted::D2HPart &&
-          op != Scripted::D2D && op != Scripted::H2H);
+          op != Scripted::D2D && op != Scripted::H2H && op != Scripted::Read);
 
   // Equal scripted scheduler/completion/ahead choices, independent of the randomized prefix. Compare issue
   // arguments (not opaque event handles or the lifetime sequence domain) and every deterministic counter delta.
@@ -519,7 +709,13 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.n_units = sh.units;
   c.persistent_slots = sh.residents + sh.spare;
   c.bank_slots = sh.bank;
-  c.blocks = keys - sh.residents + sh.host_spares;
+  c.blocks = keys - sh.residents - sh.disk + sh.host_spares;
+  c.disk_tier = sh.disk_tier || sh.disk > 0;
+  c.disk_prefetch = sh.disk_prefetch;
+  c.home_blocks = c.disk_tier ? keys - sh.residents - sh.disk : 0;
+  c.disk_staging = c.disk_tier ? sh.staging : 0;
+  c.inclusive = sh.inclusive;
+  c.disk_queue = sh.queue;
   c.spare_target = sh.spare;
   c.prefetch_reserve = std::min(24u, sh.spare / 4);
   c.prefetch_per_layer = sh.pf_layer;
@@ -531,18 +727,41 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.scored = sh.scored;
   c.boundary_score = sh.boundary_score;
   c.scored_auto = sh.scored_auto;
-  Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks, G, seed, &v);
+  Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks + c.disk_staging, G, seed, &v);
   t.set_slow_d2h(sh.slow_d2h);
+  t.set_async_reads(sh.async_reads, seed * 31u + 7u);
+  t.set_eager(sh.eager);
   Oracle orc(sh.units);
+  orc.disk_tier = c.disk_tier;
+  std::vector<uint8_t> disk;  // three-tier: the plan's file tier, `sh.disk` random non-resident keys
   std::mt19937_64 vr(seed * 1000003u + 17u);  // scored runs: keep lists and targets (not the scheduler's stream)
   std::vector<uint32_t> keep;
+  std::mt19937_64 kr(seed * 2654435761u + 5u);  // resident / skip runs: episodes and skipped layers
+  std::vector<std::vector<uint32_t>> held(G);    // per gated layer: its make_resident set (keys), empty = none
+  std::vector<std::vector<int32_t>> held_slot(G);
+  uint32_t seq_ctr = 0;
   try {
     DgCore core(c, &t);
     core.set_mutation(mutation);
     core.set_pressure(sh.pressure_free, sh.pressure_recent);
     std::vector<uint32_t> res;
     for (uint32_t k = 0; k < sh.residents; ++k) res.push_back((k * 7919u) % keys);
-    core.place(res);
+    if (c.disk_tier) {
+      disk.assign(keys, 0);
+      std::vector<uint8_t> is_res(keys, 0);
+      for (uint32_t k : res) is_res[k] = 1;
+      std::vector<uint32_t> rest;
+      for (uint32_t k = 0; k < keys; ++k)
+        if (!is_res[k]) rest.push_back(k);
+      std::mt19937_64 dr(seed * 7u + 3u);
+      std::shuffle(rest.begin(), rest.end(), dr);
+      for (uint32_t i = 0; i < sh.disk && i < rest.size(); ++i) disk[rest[i]] = 1;
+      std::vector<uint32_t> order = res;  // the priority list names every key (as the context's)
+      for (uint32_t k = 0; k < keys; ++k) order.push_back(k);
+      res = order;
+    }
+    core.place(res, c.disk_tier ? &disk : nullptr);
+    if (c.disk_tier && core.file_units() != sh.disk) v.set("place: file homes != the plan's disk units");
     for (uint32_t k = 0; k < keys; ++k) {  // the open path's fill
       if (core.slot_of(k) >= 0) t.fill_slot(core.slot_of(k), int32_t(k));
       if (core.block_of(k) >= 0) t.fill_block(core.block_of(k), int32_t(k));
@@ -604,8 +823,106 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
       }
     };
     if (sh.winpf) hint();
+    // every unit at rest holds its bytes; a held (kept) unit is on the device in the slot it was given
+    auto verify_homes = [&](const char* when) {
+      for (uint32_t k = 0; k < keys && v.what.empty(); ++k) {
+        const DgCore::Home h = core.home(k);
+        if (h == DgCore::Home::Coming) continue;
+        if (h == DgCore::Home::File) {
+          if (t.entry(k) != -1) v.set(std::string("a file home is mapped ") + when);
+          continue;
+        }
+        const bool on_slot = h == DgCore::Home::Device || h == DgCore::Home::Evicting;
+        const int32_t holds = on_slot ? t.slot_holds(core.slot_of(k)) : t.block_holds(core.block_of(k));
+        if (holds != int32_t(k)) v.set("unit " + std::to_string(k) + " lost its bytes " + when);
+        if (core.backed(k) && t.block_holds(core.block_of(k)) != int32_t(k))
+          v.set("unit " + std::to_string(k) + ": its clean copy lost its bytes " + when);
+        if (t.entry(k) != core.table()[k]) v.set(std::string("device table != host mirror ") + when);
+      }
+      for (uint32_t g = 0; g < G; ++g)
+        for (size_t i = 0; i < held[g].size(); ++i) {
+          const uint32_t k = held[g][i];
+          if (core.home(k) != DgCore::Home::Device || core.slot_of(k) != held_slot[g][i] ||
+              t.entry(k) != held_slot[g][i])
+            v.set(std::string("a held unit moved or left the device ") + when);
+        }
+    };
+    // between tokens: release a held layer, or make a layer (or part of one) resident; a refusal changes nothing
+    auto episode = [&] {
+      std::vector<uint32_t> hl;
+      for (uint32_t g = 0; g < G; ++g)
+        if (!held[g].empty()) hl.push_back(g);
+      if (!hl.empty() && kr() % 2 == 0) {
+        const uint32_t g = hl[kr() % hl.size()];
+        held[g].clear();
+        held_slot[g].clear();
+        ++g_res.released;
+        return;
+      }
+      const uint32_t g = uint32_t(kr() % G);
+      std::vector<uint32_t> ids;
+      for (uint32_t u = 0; u < sh.units[g]; ++u)
+        if (kr() % 2 == 0 || kr() % 3 != 0) ids.push_back(u);
+      if (kr() % 2 == 0) {  // the whole layer
+        ids.clear();
+        for (uint32_t u = 0; u < sh.units[g]; ++u) ids.push_back(u);
+      }
+      std::shuffle(ids.begin(), ids.end(), kr);
+      std::vector<uint32_t> other;
+      for (uint32_t h = 0; h < G; ++h)
+        if (h != g) other.insert(other.end(), held[h].begin(), held[h].end());
+      std::vector<int64_t> homes0;
+      for (uint32_t k = 0; k < keys; ++k) homes0.insert(homes0.end(), {int64_t(core.home(k)), core.slot_of(k), core.block_of(k)});
+      const std::vector<int32_t> table0 = core.table();
+      const auto st0 = counters(core.stats());
+      const ts::DgStats s0 = core.stats();
+      const uint32_t fs0 = core.free_slots(), fb0 = core.free_blocks(), in_flight0 = core.reads_in_flight();
+      t.clear_issued();
+      try {
+        core.make_resident(g, ids, other);
+      } catch (const ts::Error& e) {
+        if (e.status() != SS_E_CAPACITY) throw;
+        std::vector<int64_t> homes1;
+        for (uint32_t k = 0; k < keys; ++k) homes1.insert(homes1.end(), {int64_t(core.home(k)), core.slot_of(k), core.block_of(k)});
+        if (!t.issued().empty() || homes1 != homes0 || core.table() != table0 || counters(core.stats()) != st0 ||
+            core.free_slots() != fs0 || core.free_blocks() != fb0 || core.stats().resident_units != s0.resident_units)
+          v.set("a refused make_resident changed something");
+        core.check();
+        ++g_res.refusals;
+        return;
+      }
+      core.check();
+      const ts::DgStats& s1 = core.stats();
+      // its copies count only in the resident fields (the write-backs it collected were decode's: not compared)
+      if (s1.tokens != s0.tokens || s1.lookups != s0.lookups || s1.misses != s0.misses || s1.fetched != s0.fetched ||
+          s1.prefetched != s0.prefetched || s1.evicted != s0.evicted || s1.bank_serves != s0.bank_serves ||
+          s1.disk_reads - s0.disk_reads != in_flight0 || s1.disk_drops != s0.disk_drops ||
+          s1.disk_discards != s0.disk_discards ||
+          s1.inclusive_drops != s0.inclusive_drops || s1.resurrected != s0.resurrected)
+        v.set("make_resident counted outside its resident fields");
+      if (s1.resident_evicted - s0.resident_evicted != core.resident_victims().size())
+        v.set("make_resident: resident_evicted != its victims");
+      if (s1.resident_bytes - s0.resident_bytes != (s1.resident_units - s0.resident_units) * 8192)
+        v.set("make_resident: resident_bytes != its units x the unit bytes");
+      g_res.copied += s1.resident_units - s0.resident_units;
+      g_res.evicted += core.resident_victims().size();
+      for (uint32_t k : core.resident_victims()) {
+        if (std::find(other.begin(), other.end(), k) != other.end()) v.set("make_resident evicted a kept unit");
+        if (core.gated_of(k) == g && std::find(ids.begin(), ids.end(), k - core.key(g, 0)) != ids.end())
+          v.set("make_resident evicted a unit it was asked for");
+      }
+      held[g].clear();
+      held_slot[g].clear();
+      for (uint32_t u : ids) {
+        const uint32_t k = core.key(g, u);
+        held[g].push_back(k);
+        held_slot[g].push_back(core.slot_of(k));
+      }
+      ++g_res.calls;
+      verify_homes("after make_resident");
+    };
     for (int tok = 1; tok <= tokens && v.what.empty(); ++tok) {
-      const uint32_t seq = uint32_t(tok);
+      const uint32_t seq = ++seq_ctr;
       if (reset) {
         core.set_spare_target(uint32_t(rng() % (sh.spare + 1)));
         core.set_prefetch_budget(uint32_t(rng() % 7), uint32_t(rng() % 25));
@@ -623,10 +940,35 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         }
         for (uint32_t i = 0, n = uint32_t(vr() % 6); i < n; ++i) keep.push_back(uint32_t(vr() % keys));
       }
-      core.begin_token(seq);
+      if (sh.resident && kr() % 3 == 0) episode();
+      std::vector<uint8_t> runm(G, 1);  // the exported layers: not a held one, nor a skipped one
+      std::set<int32_t> held_slots;
+      for (uint32_t g = 0; g < G; ++g) {
+        if (!held[g].empty() || (sh.skip && kr() % sh.skip == 0)) runm[g] = 0;
+        g_res.skipped_layers += held[g].empty() && !runm[g];
+        keep.insert(keep.end(), held[g].begin(), held[g].end());
+        held_slots.insert(held_slot[g].begin(), held_slot[g].end());
+      }
+      core.begin_token(seq, &runm);
       orc.begin();
       std::vector<uint32_t> pred;
       for (uint32_t g = 0; g < G && v.what.empty(); ++g) {
+        if (!runm[g]) {  // not exported: no service; the held units are read through the table (no wait)
+          pred.clear();
+          const uint32_t rd0 = t.ready(g);
+          for (const auto& hk : held)
+            for (uint32_t k : hk) {
+              const int32_t s = t.entry(k);
+              if (s < 0 || t.slot_holds(s) != int32_t(k)) v.set("a held unit read wrong bytes");
+              ++g_res.held_reads;
+            }
+          t.begin_read(held_slots);
+          t.steps(jitter);
+          t.end_read();
+          if (t.ready(g) != rd0) v.set("a layer not exported got a ready");
+          continue;
+        }
+        core.poll_reads();  // the service's wait for the export: finished prefetch reads get their copies now
         // export: the ids, the miss bits from the published table; a hit's slot must already hold its bytes
         const uint32_t n = sh.winpf ? win_rows * sh.top_k : 1 + uint32_t(rng() % sh.max_ids);
         std::vector<uint32_t> ids(n);
@@ -646,18 +988,20 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         t.steps(jitter);
         // the prediction for g + 1 (from the graph), served after the demand
         pred.clear();
-        if (sh.winpf && g + 1 < G) {  // rows x K ranked ids, the device ran ahead now and then
+        if (sh.winpf && g + 1 < G && runm[g + 1]) {  // rows x K ranked ids, the device ran ahead now and then
           for (uint32_t i = 0; i < win_rows * sh.predict_k; ++i) pred.push_back(pick(g + 1));
           core.serve_prediction(g + 1, pred.data(), uint32_t(pred.size()), n, rng() % 8 == 0);
           core.check();
-        } else if (sh.predict && g + 1 < G) {
+        } else if (sh.predict && g + 1 < G && runm[g + 1]) {
           for (uint32_t i = 0; i < sh.predict; ++i) pred.push_back(pick(g + 1));
           core.serve_prediction(g + 1, pred.data(), uint32_t(pred.size()));
           core.check();
         }
         // the deferred write-back slice, after the ready and the prefetches; cut short now and then (the device ran
         // ahead: the next export was already seen). Never called without a deferred record (no draw without defer).
-        core.issue_writebacks(g, [&] { return rng() % 4 == 0; });
+        bool later = false;  // (the service slices write-backs only while a later layer is exported)
+        for (uint32_t h = g + 1; h < G; ++h) later = later || runm[h];
+        if (later || g + 1 >= G) core.issue_writebacks(g, [&] { return rng() % 4 == 0; });
         core.check();
         core.score_layer(g);  // scored eviction: layer g ranked after its write-back slice (nothing under LRU)
         if (sh.scored)
@@ -670,7 +1014,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
               break;
             }
         // read: every routed unit through the table; the slots stay read until the layer ends
-        std::set<int32_t> reading;
+        std::set<int32_t> reading = held_slots;
         for (uint32_t id : ids) {
           const uint32_t k = core.key(g, id);
           const int32_t s = t.entry(k);
@@ -742,21 +1086,37 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
       }
       core.check();
       t.steps(jitter);
+      if (sh.resident) verify_homes("after the boundary");
       // every home holds its unit's bytes (a write-back in flight: the slot is authoritative)
       for (uint32_t k = 0; k < keys && v.what.empty(); ++k) {
         const DgCore::Home h = core.home(k);
         const bool on_slot = h == DgCore::Home::Device || h == DgCore::Home::Evicting;
         if (h == DgCore::Home::Coming) continue;  // a prior prefetch in flight: its slot fills on kPf
+        if (h == DgCore::Home::File) {  // three-tier: nothing to hold, nothing mapped
+          if (t.entry(k) != -1) v.set("a file home is mapped after the boundary");
+          continue;
+        }
         const int32_t holds = on_slot ? t.slot_holds(core.slot_of(k)) : t.block_holds(core.block_of(k));
         if (holds != int32_t(k)) v.set("unit " + std::to_string(k) + " lost its bytes at a boundary");
+        if (core.backed(k) && t.block_holds(core.block_of(k)) != int32_t(k))
+          v.set("unit " + std::to_string(k) + ": its clean copy lost its bytes");
         if (t.entry(k) != core.table()[k] && h != DgCore::Home::Coming)
           v.set("device table != host mirror after the boundary");
       }
       if (sh.winpf) hint();  // the next window's prior prefetches, before its export reads the table
     }
-    if (reset) reset_compare(core, t, c, res, v, uint32_t(tokens));
+    if (reset) reset_compare(core, t, c, res, v, seq_ctr, c.disk_tier ? &disk : nullptr);
+    if (c.disk_tier) core.drain();  // (the last window's prior reads in flight: copied before the end state is taken)
     t.drain_all();
     out.st = core.stats();
+    for (uint32_t k = 0; k < keys; ++k) {
+      out.homes.insert(out.homes.end(), {int64_t(core.home(k)), core.slot_of(k), core.block_of(k)});
+      out.device_table.push_back(t.entry(k));
+    }
+    out.table = core.table();
+    for (uint32_t s = 0; s < c.persistent_slots + 2 * sh.bank; ++s) out.slots.push_back(t.slot_holds(int32_t(s)));
+    out.max_in_flight = t.max_in_flight();
+    out.landed_out_of_order = t.landed_out_of_order();
   } catch (const ts::Error& e) {
     out.threw = true;
     v.set(std::string("exception: ") + e.what());
@@ -3127,5 +3487,1760 @@ TEST(dg_scored_replay_w1) {
     CHECK_EQ(r.misses_core[0], 402375ull);
     CHECK_EQ(r.misses_port[1], 378245ull);  // 7.6521
     CHECK_EQ(r.misses_core[1], 378245ull);
+  }
+}
+
+// ---- three-tier placement (ss.h SS_DG_DISK_TIER): file homes, pinned-unit drops, the inclusive share ----
+namespace {
+
+Shape disk_shape(uint32_t disk, uint32_t host_spares) {
+  Shape s{{64, 64, 48, 64}, 100, 24, 8, host_spares, 8};
+  s.disk = disk;
+  return s;
+}
+const Shape kDisk = disk_shape(60, 8);
+const Shape kDiskTiny = [] {  // 10 pinned homes, 2 spare blocks: victims are dropped to their files too
+  Shape s = disk_shape(130, 2);
+  s.pressure_free = 2;
+  s.pressure_recent = 6;
+  return s;
+}();
+const Shape kDiskPredict = [] {  // predictions read file units too (disk_prefetch), pressure, staging of 2
+  Shape s = disk_shape(60, 8);
+  s.predict = 6;
+  s.disk_prefetch = true;
+  s.pressure_free = 1;
+  s.pressure_recent = 6;
+  s.staging = 2;
+  return s;
+}();
+const Shape kDiskDefer = [] {
+  Shape s = disk_shape(80, 6);
+  s.defer = true;
+  s.slow_d2h = true;
+  s.predict = 4;
+  return s;
+}();
+const Shape kDiskWinpf = [] {
+  Shape s = winpf_shape(true, true, true, 1500);
+  s.disk = 50;
+  s.disk_prefetch = true;
+  return s;
+}();
+const Shape kDiskScored = [] {
+  Shape s = disk_shape(70, 8);
+  s.scored = true;
+  s.boundary_score = true;
+  s.scored_auto = true;
+  s.auto_rows = 0;
+  s.vary = true;
+  s.predict = 4;
+  return s;
+}();
+const Shape kInclusive = [] {  // two-tier with clean copies (out of 24 spare blocks)
+  Shape s{{64, 64, 48, 64}, 120, 24, 8, 24, 8};
+  s.inclusive = 12;
+  s.predict = 4;
+  return s;
+}();
+const Shape kDiskInclusive = [] {
+  Shape s = disk_shape(60, 20);
+  s.inclusive = 12;
+  s.predict = 4;
+  s.defer = true;
+  return s;
+}();
+const Shape kDiskZero = [] {  // no pinned homes, 1 spare block, slow write-backs: victims dropped to their files
+  Shape s = disk_shape(140, 1);
+  s.slow_d2h = true;
+  s.defer = true;
+  s.pressure_free = 2;
+  s.pressure_recent = 6;
+  return s;
+}();
+const Shape* const kTierShapes[] = {&kDisk, &kDiskTiny, &kDiskPredict, &kDiskDefer, &kDiskWinpf,
+                                    &kDiskScored, &kInclusive, &kDiskInclusive, &kDiskZero};
+
+}  // namespace
+
+// Each shape three ways: the default queue depth (16) with the synchronous transport read, the depth 16 with reads
+// that land late and out of order, and depth 1 (the synchronous reads).
+Shape with_reads(const Shape& base, int how) {
+  Shape s = base;
+  s.async_reads = how == 1;
+  s.queue = how == 2 ? 1 : 16;
+  return s;
+}
+
+TEST(dg_three_tier_runs) {
+  ts::DgStats sum{};
+  uint64_t reads = 0, overlapped = 0, max_in_flight = 0, ooo = 0, carried = 0, carried_bytes = 0, read_bytes = 0;
+  for (const Shape* base : kTierShapes)
+    for (int how = 0; how < 3; ++how)
+    for (uint64_t seed = 1; seed <= 12; ++seed) {
+      const Shape sh = with_reads(*base, how);
+      Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+      if (!o.violation.empty())
+        std::printf("  seed %llu (reads %d): %s\n", (unsigned long long)seed, how, o.violation.c_str());
+      CHECK(o.violation.empty());
+      if (how == 2) CHECK_EQ(o.st.disk_overlapped + o.st.disk_carried, 0ull);
+      overlapped += o.st.disk_overlapped;
+      carried += o.st.disk_carried;
+      carried_bytes += o.st.disk_carried_bytes;
+      read_bytes += o.st.disk_read_bytes;
+      max_in_flight = std::max(max_in_flight, o.max_in_flight);
+      ooo += o.landed_out_of_order;
+      for (auto f : {&ts::DgStats::disk_reads, &ts::DgStats::disk_read_bytes, &ts::DgStats::disk_stage_waits,
+                     &ts::DgStats::disk_drops, &ts::DgStats::disk_discards, &ts::DgStats::inclusive_kept,
+                     &ts::DgStats::inclusive_drops, &ts::DgStats::bank_serves, &ts::DgStats::resurrected,
+                     &ts::DgStats::prefetched, &ts::DgStats::evict_short, &ts::DgStats::l1_reverted})
+        sum.*f += o.st.*f;
+      reads += o.st.disk_reads;
+    }
+  std::printf("  disk reads %llu (stage waits %llu), pinned drops %llu, victim discards %llu, clean copies kept %llu "
+              "dropped %llu, banks %llu, resurrections %llu, prefetched %llu, short %llu, l1 reverted %llu\n",
+              (unsigned long long)sum.disk_reads, (unsigned long long)sum.disk_stage_waits,
+              (unsigned long long)sum.disk_drops, (unsigned long long)sum.disk_discards,
+              (unsigned long long)sum.inclusive_kept, (unsigned long long)sum.inclusive_drops,
+              (unsigned long long)sum.bank_serves, (unsigned long long)sum.resurrected,
+              (unsigned long long)sum.prefetched, (unsigned long long)sum.evict_short,
+              (unsigned long long)sum.l1_reverted);
+  std::printf("  overlapped reads %llu, most in flight %llu, landed out of order %llu; prefetch reads carried across "
+              "calls %llu (%llu of %llu bytes read)\n",
+              (unsigned long long)overlapped, (unsigned long long)max_in_flight, (unsigned long long)ooo,
+              (unsigned long long)carried, (unsigned long long)carried_bytes, (unsigned long long)read_bytes);
+  CHECK(overlapped > 0);
+  CHECK(carried > 0);
+  CHECK(max_in_flight > 1);
+  CHECK(ooo > 0);
+  CHECK(sum.disk_reads > 0);
+  CHECK(sum.disk_stage_waits > 0);
+  CHECK(sum.disk_drops > 0);
+  CHECK(sum.disk_discards > 0);
+  CHECK(sum.inclusive_kept > 0);
+  CHECK(sum.inclusive_drops > 0);
+  CHECK(sum.bank_serves > 0);
+  CHECK(sum.l1_reverted > 0);
+}
+
+// Disk units arrive on demand only unless disk_prefetch: a prediction of a file home issues nothing.
+TEST(dg_three_tier_demand_only) {
+  Shape sh = kDiskPredict;
+  sh.disk_prefetch = false;
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    Outcome o = run(sh, 30, seed, DgCore::kNoMutation);
+    CHECK(o.violation.empty());
+  }
+  Violation v;
+  Scripted t(40, 12 + 2 * 4, 30 + 2, 2, 5, &v);
+  DgConfig c;
+  c.n_units = {20, 20};
+  c.persistent_slots = 12;
+  c.bank_slots = 4;
+  c.blocks = 30;
+  c.spare_target = 4;
+  c.disk_tier = true;
+  c.home_blocks = 28;
+  c.disk_staging = 2;
+  DgCore core(c, &t);
+  std::vector<uint8_t> disk(40, 0);
+  disk[25] = disk[26] = 1;  // gated layer 1, units 5 and 6
+  std::vector<uint32_t> order;
+  for (uint32_t k = 0; k < 40; ++k) order.push_back(k);
+  core.place(order, &disk);
+  // 40 keys - 8 device (12 slots - 4 spares) - 28 pinned homes = 4 file homes: the 2 disk keys, then 2 by priority
+  CHECK_EQ(core.file_units(), 4u);
+  CHECK(core.home(25) == DgCore::Home::File && core.home(26) == DgCore::Home::File);
+  core.begin_token(1);
+  const uint32_t id = 0;
+  core.serve(0, &id, 1, 1);
+  const uint32_t pred[2] = {5, 6};
+  core.serve_prediction(1, pred, 2);
+  CHECK_EQ(core.stats().prefetched, 0ull);
+  CHECK_EQ(core.stats().disk_reads, 0ull);
+  core.serve(1, pred, 2, 3);  // the demand reads both
+  CHECK_EQ(core.stats().disk_reads, 2ull);
+  core.end_token({});
+  core.check();
+  CHECK(core.home(25) == DgCore::Home::Device && core.block_of(25) == -1);
+  t.drain_all();
+  CHECK(v.what.empty());
+}
+
+TEST(dg_three_tier_mutations_caught) {
+  const struct {
+    int m;
+    const char* name;
+  } muts[] = {{DgCore::kEntryBeforeCopy, "entry before copy"},
+              {DgCore::kNoCover, "no cover wait"},
+              {DgCore::kNoBankUnpublish, "bank alias not unpublished"},
+              {DgCore::kEarlyWritebackBlock, "write-back block reused early"},
+              {DgCore::kStageNoWait, "staging buffer reused before its copy"}};
+  for (const auto& mu : muts) {
+    int caught = 0, runs = 0;
+    for (const Shape* base : kTierShapes)
+      for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 12; ++seed) {
+        ++runs;
+        if (!run(with_reads(*base, how), 40, seed, mu.m).violation.empty()) ++caught;
+      }
+    std::printf("  %-38s caught in %d/%d runs\n", mu.name, caught, runs);
+    CHECK(caught > 0);
+  }
+}
+
+TEST(dg_three_tier_reset_open) {
+  for (const Shape* base : kTierShapes)
+    for (uint64_t seed = 1; seed <= 10; ++seed) {
+      Outcome o = run(with_reads(*base, int(seed % 3)), 1 + int(seed % 19), 700 + seed, DgCore::kNoMutation, 6, true);
+      if (!o.violation.empty()) std::printf("  reset seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+    }
+}
+
+// The disk tier switched on with no file unit and blocks for every victim is the two-tier cache: the same victims,
+// copies and counters on the same seeds (the engine turns it on only when its plan has disk units).
+TEST(dg_three_tier_full_coverage_is_today) {
+  for (const Shape* base : {&kWarm, &kPredict, &kSlowWriteback}) {
+    Shape a = *base;
+    a.host_spares = 200;  // never short of a block
+    Shape b = a;
+    b.disk_tier = true;
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+      Outcome x = run(a, 30, seed, DgCore::kNoMutation), y = run(b, 30, seed, DgCore::kNoMutation);
+      CHECK(x.violation.empty() && y.violation.empty());
+      CHECK(x.victims == y.victims);
+      CHECK(counters(x.st) == counters(y.st));
+      CHECK_EQ(y.st.disk_reads + y.st.disk_drops + y.st.disk_discards, 0ull);
+    }
+  }
+}
+
+// Overlapped file misses are exact: on a timing-free device, depth 16 with reads landing out of order and depth 1 (the
+// synchronous reads) end with the same homes, table, device table and slot contents, the same victims at every
+// boundary (each also checked against the oracle inside run) and the same counters, except what the export observed:
+// a prefetch whose read is still in flight is not published yet, so the export sees a miss that its cover serves (no
+// copy more, the same slot and entry).
+ts::DgStats placement(ts::DgStats s) {
+  s.lookups = s.misses = s.covered = s.covered_waits = s.miss_layers = s.prior_late = s.l1_late = 0;
+  return s;
+}
+
+TEST(dg_three_tier_queue_depth_is_exact) {
+  uint64_t overlapped = 0, compared = 0;
+  for (const Shape* base : kTierShapes)
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+      Shape a = *base;
+      a.eager = true;
+      a.queue = 1;
+      Shape b = a;
+      b.queue = 16;
+      b.async_reads = true;
+      const Outcome x = run(a, 30, seed, DgCore::kNoMutation, 0), y = run(b, 30, seed, DgCore::kNoMutation, 0);
+      if (!x.violation.empty() || !y.violation.empty())
+        std::printf("  seed %llu: %s / %s\n", (unsigned long long)seed, x.violation.c_str(), y.violation.c_str());
+      CHECK(x.violation.empty() && y.violation.empty());
+      CHECK(x.victims == y.victims);
+      CHECK(counters(placement(x.st)) == counters(placement(y.st)));
+      CHECK(x.homes == y.homes);
+      CHECK(x.table == y.table);
+      CHECK(x.device_table == y.device_table);
+      CHECK(x.slots == y.slots);
+      for (auto f : {&ts::DgStats::disk_reads, &ts::DgStats::disk_read_bytes, &ts::DgStats::disk_drops,
+                     &ts::DgStats::disk_discards, &ts::DgStats::inclusive_kept, &ts::DgStats::inclusive_drops})
+        CHECK_EQ(x.st.*f, y.st.*f);
+      CHECK_EQ(x.st.disk_overlapped, 0ull);
+      overlapped += y.st.disk_overlapped;
+      ++compared;
+    }
+  std::printf("  %llu runs compared, %llu reads overlapped at depth 16\n", (unsigned long long)compared,
+              (unsigned long long)overlapped);
+  CHECK(overlapped > 0);
+}
+
+// A failed file read surfaces where its read is ended: at the drain (here the layer's ready) with the reads in flight,
+// in the fetch itself with synchronous reads. Either way the failed key is back in its file, its slot free, the other
+// misses complete, and the core stays consistent and usable.
+namespace {
+struct ReadErrorRig {
+  Violation v;
+  Scripted t{40, 12 + 2 * 4, 30 + 4, 2, 5, &v};
+  DgConfig c;
+  std::unique_ptr<DgCore> core;
+  explicit ReadErrorRig(uint32_t queue, bool async, bool disk_prefetch = false, uint32_t ndisk = 4) {
+    c.n_units = {20, 20};
+    c.persistent_slots = 12;
+    c.bank_slots = 4;
+    c.blocks = 30;
+    c.spare_target = 4;
+    c.disk_tier = true;
+    c.home_blocks = 32 - ndisk;
+    c.disk_staging = 4;
+    c.disk_queue = queue;
+    c.disk_prefetch = disk_prefetch;
+    core = std::make_unique<DgCore>(c, &t);
+    std::vector<uint8_t> disk(40, 0);
+    for (uint32_t k = 25; k < 25 + ndisk; ++k) disk[k] = 1;  // gated layer 1, units 5..
+    std::vector<uint32_t> order;
+    for (uint32_t k = 0; k < 40; ++k) order.push_back(k);
+    core->place(order, &disk);
+    for (uint32_t k = 0; k < 40; ++k) {
+      if (core->slot_of(k) >= 0) t.fill_slot(core->slot_of(k), int32_t(k));
+      if (core->block_of(k) >= 0) t.fill_block(core->block_of(k), int32_t(k));
+    }
+    t.set_table(core->table());
+    t.set_async_reads(async, 77);
+    core->begin_token(1);
+  }
+};
+}  // namespace
+
+TEST(dg_three_tier_read_error) {
+  {  // depth 16, reads in flight: the second of three fails, at the drain before the layer's ready
+    ReadErrorRig r(16, true);
+    DgCore& core = *r.core;
+    CHECK_EQ(core.file_units(), 4u);
+    const uint32_t free0 = core.free_slots();
+    r.t.fail_read(2);
+    CHECK(core.fetch(1, 5, false));
+    CHECK(core.fetch(1, 6, false));
+    CHECK(core.fetch(1, 7, false));
+    CHECK_EQ(core.reads_in_flight(), 3u);
+    CHECK_EQ(r.t.reads_in_flight(), 3u);
+    core.check();
+    bool threw = false;
+    try {
+      core.signal(1);
+    } catch (const ts::Error& e) {
+      threw = e.status() == SS_E_IO;
+    }
+    CHECK(threw);
+    CHECK_EQ(core.reads_in_flight(), 0u);
+    CHECK_EQ(r.t.reads_in_flight(), 0u);
+    core.check();
+    CHECK(core.home(26) == DgCore::Home::File && core.table()[26] == -1);
+    CHECK_EQ(core.free_slots(), free0 - 2);
+    CHECK_EQ(core.file_units(), 2u);
+    CHECK_EQ(core.stats().fetched, 2ull);
+    CHECK_EQ(core.stats().disk_reads, 2ull);
+    r.t.sync(DgTransport::kDem);
+    for (uint32_t k : {25u, 27u}) {
+      CHECK(core.home(k) == DgCore::Home::Coming);
+      CHECK_EQ(r.t.entry(k), core.slot_of(k));
+      CHECK_EQ(r.t.slot_holds(core.slot_of(k)), int32_t(k));
+    }
+    CHECK_EQ(r.t.entry(26), -1);
+    core.signal(1);  // usable: the ready goes now; the failed unit is fetched again from its file
+    const uint32_t id = 6;
+    core.serve(1, &id, 1, 1);
+    r.t.sync(DgTransport::kDem);
+    CHECK_EQ(r.t.slot_holds(core.slot_of(26)), 26);
+    core.end_token({});
+    core.check();
+    r.t.drain_all();
+    for (uint32_t k = 0; k < 40; ++k) CHECK_EQ(r.t.entry(k), core.table()[k]);
+    CHECK(r.v.what.empty());
+  }
+  {  // depth 16, the error from serve_demand: its fetches begun every read, the drain before the ready throws
+    ReadErrorRig r(16, true);
+    r.t.fail_read(1);
+    const uint32_t ids[3] = {5, 6, 7};
+    bool threw = false;
+    try {
+      r.core->serve_demand(1, ids, 3, 7);
+    } catch (const ts::Error& e) {
+      threw = e.status() == SS_E_IO;
+    }
+    CHECK(threw);
+    r.core->check();
+    CHECK(r.core->home(25) == DgCore::Home::File);
+    CHECK(r.core->home(26) == DgCore::Home::Coming && r.core->home(27) == DgCore::Home::Coming);
+    r.t.drain_all();
+    CHECK(r.v.what.empty());
+  }
+  {  // depth 1, synchronous reads: the failing fetch throws itself and gives its slot back
+    ReadErrorRig r(1, false);
+    DgCore& core = *r.core;
+    const uint32_t free0 = core.free_slots();
+    CHECK(core.fetch(1, 5, false));
+    r.t.fail_read(1);
+    bool threw = false;
+    try {
+      core.fetch(1, 6, false);
+    } catch (const ts::Error& e) {
+      threw = e.status() == SS_E_IO;
+    }
+    CHECK(threw);
+    core.check();
+    CHECK(core.home(26) == DgCore::Home::File);
+    CHECK_EQ(core.free_slots(), free0 - 1);
+    CHECK_EQ(core.reads_in_flight(), 0u);
+    CHECK(core.fetch(1, 6, false));
+    core.signal(1);
+    core.end_token({});
+    core.check();
+    r.t.drain_all();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// Prefetch file reads stay in flight across calls: issued by the prediction for layer 1, they are still in flight
+// through layer 0's write-back slice, ranking and use, and end at layer 1's demand: a covered key's at its cover, the
+// others' before the ready; every copy and entry of layer 1 is enqueued before its ready. A fetch of a key whose read
+// is in flight ends it; the boundary ends the rest.
+TEST(dg_three_tier_prefetch_reads_carried) {
+  ReadErrorRig r(16, true, true, 8);
+  DgCore& core = *r.core;
+  const uint32_t id0 = 0;
+  core.serve(0, &id0, 1, r.t.entry(0) < 0 ? 1 : 0);
+  const uint32_t pred[3] = {5, 6, 7};
+  core.serve_prediction(1, pred, 3);
+  CHECK_EQ(core.stats().prefetched, 3ull);
+  CHECK_EQ(core.reads_in_flight(), 3u);
+  core.issue_writebacks(0);
+  core.score_layer(0);
+  core.use(0, 0, false);
+  core.check();
+  CHECK_EQ(core.reads_in_flight(), 3u);  // still in flight: nothing needed them
+  for (uint32_t k : {25u, 26u, 27u}) CHECK_EQ(r.t.entry(k), -1);  // not published before their copies
+  r.t.clear_issued();
+  const uint32_t ids[2] = {6, 8};  // 6 was prefetched (covered), 8 is a demand miss
+  core.serve(1, ids, 2, 3);
+  CHECK_EQ(core.reads_in_flight(), 0u);
+  CHECK_EQ(core.stats().disk_carried, 3ull);
+  CHECK_EQ(core.stats().disk_carried_bytes, 3 * (2048ull + 2048 + 4096));
+  CHECK_EQ(core.stats().covered_waits, 1ull);
+  // the ready of layer 1 after every copy and entry of its units
+  const auto& tr = r.t.trace();
+  size_t ready = tr.size();
+  for (size_t i = 0; i < tr.size(); ++i)
+    if (tr[i][1] == Scripted::Ready && tr[i][2] == 1) ready = i;
+  CHECK(ready < tr.size());
+  for (uint32_t k : {25u, 26u, 27u, 28u}) {
+    bool copied = false, entry = false;
+    for (size_t i = 0; i < ready; ++i) {
+      copied = copied || (tr[i][1] == Scripted::H2D && tr[i][2] == core.slot_of(k));
+      entry = entry || (tr[i][1] == Scripted::Entry && tr[i][4] == int64_t(k));
+    }
+    CHECK(copied && entry);
+  }
+  r.t.sync(DgTransport::kDem);
+  r.t.sync(DgTransport::kPf);
+  for (uint32_t k : {25u, 26u, 27u, 28u}) CHECK_EQ(r.t.slot_holds(core.slot_of(k)), int32_t(k));
+  core.end_token({});
+  core.check();
+  r.t.drain_all();  // the boundary's write-backs land: their slots are free for the next prefetches
+  // a fetch of a key whose read is in flight ends it (and only up to it)
+  core.begin_token(2);
+  core.serve(0, &id0, 1, r.t.entry(0) < 0 ? 1 : 0);
+  const uint32_t pred2[2] = {9, 10};
+  core.serve_prediction(1, pred2, 2);
+  CHECK_EQ(core.reads_in_flight(), 2u);
+  CHECK(!core.fetch(1, 9, true));
+  CHECK_EQ(core.reads_in_flight(), 1u);
+  core.end_token({});  // the boundary ends the last one
+  CHECK_EQ(core.reads_in_flight(), 0u);
+  core.check();
+  r.t.drain_all();
+  for (uint32_t k = 0; k < 40; ++k) CHECK_EQ(r.t.entry(k), core.table()[k]);
+  CHECK(r.v.what.empty());
+  // scripted runs with predictions / window priors reading file units, reads landing late and out of order
+  for (const Shape* base : {&kDiskPredict, &kDiskWinpf}) {
+    const Outcome o = run(with_reads(*base, 1), 40, 1, DgCore::kNoMutation);
+    CHECK(o.violation.empty());
+    CHECK(o.st.disk_carried > 0);
+    std::printf("  %s, 40 tokens: %llu file reads (%llu bytes; %llu prefetched units), %llu begun with another in "
+                "flight, %llu prefetch reads carried across calls (%llu bytes)\n",
+                base == &kDiskPredict ? "predictions" : "window priors", (unsigned long long)o.st.disk_reads,
+                (unsigned long long)o.st.disk_read_bytes, (unsigned long long)o.st.prefetched,
+                (unsigned long long)o.st.disk_overlapped, (unsigned long long)o.st.disk_carried,
+                (unsigned long long)o.st.disk_carried_bytes);
+  }
+}
+
+// Pressure mode (as production launches it): every demand miss collects, a demand without a free slot forces a
+// deferred write-back, past the per-token free share misses go to the banks. None of these ends the reads in flight
+// any more (they touch no key, slot, staging buffer or event a read holds), so the misses of a layer still overlap.
+// On a timing-free device depth 1 and depth 16 (reads landing late and out of order) end identical; on the random
+// device every run holds its invariants with reads overlapping.
+namespace {
+Shape pressure_shape(bool defer) {
+  Shape s{{64, 64, 48, 64}, 40, 16, 8, 8, 8};  // a small arena: 40 residents + 16 spares for 240 units
+  s.disk = 150;
+  s.staging = 8;
+  s.pressure_free = 8;
+  s.pressure_recent = 8;
+  s.defer = defer;
+  s.slow_d2h = defer;
+  s.predict = defer ? 0 : 4;
+  s.disk_prefetch = !defer;
+  return s;
+}
+}  // namespace
+
+TEST(dg_three_tier_pressure_overlap) {
+  uint64_t overlapped = 0, most = 0, collects = 0, forced = 0, banks = 0, misses = 0, compared = 0;
+  for (bool defer : {true, false})
+    for (uint64_t seed = 1; seed <= 8; ++seed) {
+      Shape a = pressure_shape(defer);
+      a.eager = true;
+      a.queue = 1;
+      Shape b = a;
+      b.queue = 16;
+      b.async_reads = true;
+      const Outcome x = run(a, 30, seed, DgCore::kNoMutation, 0), y = run(b, 30, seed, DgCore::kNoMutation, 0);
+      if (!x.violation.empty() || !y.violation.empty())
+        std::printf("  seed %llu: %s / %s\n", (unsigned long long)seed, x.violation.c_str(), y.violation.c_str());
+      CHECK(x.violation.empty() && y.violation.empty());
+      CHECK(x.victims == y.victims);
+      CHECK(counters(placement(x.st)) == counters(placement(y.st)));
+      CHECK(x.homes == y.homes);
+      CHECK(x.table == y.table);
+      CHECK(x.device_table == y.device_table);
+      CHECK(x.slots == y.slots);
+      for (auto f : {&ts::DgStats::disk_reads, &ts::DgStats::disk_read_bytes, &ts::DgStats::disk_drops,
+                     &ts::DgStats::disk_discards, &ts::DgStats::wb_forced, &ts::DgStats::collected_mid})
+        CHECK_EQ(x.st.*f, y.st.*f);
+      CHECK_EQ(x.st.disk_overlapped, 0ull);
+      CHECK_EQ(x.st.disk_max_in_flight, 1ull);
+      ++compared;
+      // the random device, the same shape at depth 16 with late reads
+      Shape r = pressure_shape(defer);
+      r.async_reads = true;
+      const Outcome z = run(r, 40, seed, DgCore::kNoMutation);
+      if (!z.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, z.violation.c_str());
+      CHECK(z.violation.empty());
+      for (const Outcome* o : {&y, &z}) {
+        overlapped += o->st.disk_overlapped;
+        most = std::max(most, o->st.disk_max_in_flight);
+        collects += o->st.collected_mid;
+        forced += o->st.wb_forced;
+        banks += o->st.bank_serves;
+        misses += o->st.fetched;
+      }
+    }
+  std::printf("  pressure: %llu runs compared; depth 16: %llu demand fetches, %llu reads begun with another in flight, "
+              "at most %llu in flight; mid-token collects %llu, forced write-backs %llu, bank serves %llu\n",
+              (unsigned long long)compared, (unsigned long long)misses, (unsigned long long)overlapped,
+              (unsigned long long)most, (unsigned long long)collects, (unsigned long long)forced,
+              (unsigned long long)banks);
+  CHECK(overlapped > 0);
+  CHECK(most > 1);
+  CHECK(forced > 0);
+  CHECK(banks > 0);
+}
+
+// ---- kept-resident layers (ss_dg_make_resident) and steps that leave gated layers unexported ----
+namespace {
+
+// A small core under the scripted device: gated layers of `units`, the first `residents` keys on the device (or the
+// given priority order), `spares` spare slots (the target), `host_spares` spare blocks. Three-tier when `disk` names
+// file-homed keys (home_blocks pinned homes); `inclusive` clean copies.
+struct ResRig {
+  Violation v;
+  DgConfig c;
+  std::unique_ptr<Scripted> t;
+  std::unique_ptr<DgCore> core;
+  uint32_t seq = 0, keys = 0, G = 0;
+  std::mt19937_64 rng{11};
+  ResRig(const std::vector<uint32_t>& units, uint32_t residents, uint32_t spares, uint32_t host_spares,
+         bool scored = false, const std::vector<uint8_t>* disk = nullptr, uint32_t home_blocks = 0,
+         uint64_t seed = 7, uint32_t inclusive = 0, const std::function<void(DgConfig&)>& tweak = nullptr) {
+    for (uint32_t u : units) keys += u;
+    G = uint32_t(units.size());
+    c.n_units = units;
+    c.persistent_slots = residents + spares;
+    c.bank_slots = 8;
+    c.spare_target = spares;
+    c.prefetch_reserve = 0;
+    c.scored = scored;
+    c.max_ids = 8;
+    c.inclusive = inclusive;
+    if (disk) {
+      c.disk_tier = true;
+      c.home_blocks = home_blocks;
+      c.blocks = home_blocks + host_spares;
+      c.disk_staging = 2;
+      c.disk_queue = 2;
+    } else {
+      c.blocks = keys - residents + host_spares;
+    }
+    if (tweak) tweak(c);
+    t = std::make_unique<Scripted>(keys, c.persistent_slots + 2 * c.bank_slots, c.blocks + c.disk_staging, G, seed, &v);
+    core = std::make_unique<DgCore>(c, t.get());
+    std::vector<uint32_t> order;
+    for (uint32_t k = 0; k < (disk ? keys : residents); ++k) order.push_back(k);
+    core->place(order, disk);
+    for (uint32_t k = 0; k < keys; ++k) {
+      if (core->slot_of(k) >= 0) t->fill_slot(core->slot_of(k), int32_t(k));
+      if (core->block_of(k) >= 0) t->fill_block(core->block_of(k), int32_t(k));
+    }
+    t->set_table(core->table());
+    core->check();
+  }
+  std::vector<uint32_t> layer(uint32_t g) const {
+    std::vector<uint32_t> out;
+    for (uint32_t u = 0; u < core->units(g); ++u) out.push_back(u);
+    return out;
+  }
+  std::vector<uint32_t> keys_of(uint32_t g, const std::vector<uint32_t>& ids) const {
+    std::vector<uint32_t> out;
+    for (uint32_t u : ids) out.push_back(core->key(g, u));
+    return out;
+  }
+  // One token: the layers with run[g] export ids[g] (miss bits from the device table), are served (ranked when
+  // scored), waited for and read; every key of `held` is read in every layer, its slot under the read throughout.
+  // Returns the units the token read (the bytes of each slot).
+  std::vector<int32_t> token(const std::vector<std::vector<uint32_t>>& ids, const std::vector<uint8_t>& run,
+                             const std::vector<uint32_t>& keep, const std::vector<uint32_t>& held = {}) {
+    ++seq;
+    core->begin_token(seq, &run);
+    std::vector<int32_t> out;
+    for (uint32_t g = 0; g < G; ++g) {
+      std::set<int32_t> reading;
+      std::vector<std::pair<int32_t, int32_t>> read;  // (slot, the unit it must hold while read)
+      for (uint32_t k : held) {
+        const int32_t s = t->entry(k);
+        if (s < 0 || t->slot_holds(s) != int32_t(k)) v.set("a held unit read wrong bytes");
+        else reading.insert(s), read.push_back({s, int32_t(k)});
+        out.push_back(s < 0 ? -1 : t->slot_holds(s));
+      }
+      if (run[g]) {
+        uint64_t m = 0;
+        for (size_t i = 0; i < ids[g].size(); ++i)
+          if (t->entry(core->key(g, ids[g][i])) < 0) m |= 1ull << i;
+        t->steps(4);
+        core->serve(g, ids[g].data(), uint32_t(ids[g].size()), m);
+        core->score_layer(g);
+        if (m)
+          while (int32_t(t->ready(g) - seq) < 0)
+            if (!t->step()) {
+              v.set("ready never came");
+              break;
+            }
+        for (uint32_t id : ids[g]) {
+          const uint32_t k = core->key(g, id);
+          const int32_t s = t->entry(k);
+          if (s < 0 || t->slot_holds(s) != int32_t(k)) v.set("layer " + std::to_string(g) + " read wrong bytes");
+          else reading.insert(s), read.push_back({s, int32_t(k)});
+          out.push_back(s < 0 ? -1 : t->slot_holds(s));
+        }
+      }
+      t->begin_read(reading);
+      t->steps(4);
+      for (const auto& sk : read)
+        if (t->slot_holds(sk.first) != sk.second) v.set("a slot changed while read");
+      t->end_read();
+    }
+    core->end_token(keep);
+    core->check();
+    t->steps(8);
+    return out;
+  }
+  std::vector<std::vector<uint32_t>> routes(uint32_t n) {
+    std::vector<std::vector<uint32_t>> r(G);
+    for (uint32_t g = 0; g < G; ++g)
+      for (uint32_t i = 0; i < n; ++i) r[g].push_back(uint32_t(rng() % core->units(g)));
+    return r;
+  }
+  // every unit at rest holds its bytes in its home, the device table equals the mirror
+  void verify() {
+    t->drain_all();
+    core->check();
+    for (uint32_t k = 0; k < keys; ++k) {
+      CHECK_EQ(t->entry(k), core->table()[k]);
+      const DgCore::Home h = core->home(k);
+      if (h == DgCore::Home::Device || h == DgCore::Home::Evicting) CHECK_EQ(t->slot_holds(core->slot_of(k)), int32_t(k));
+      else if (h == DgCore::Home::Host) CHECK_EQ(t->block_holds(core->block_of(k)), int32_t(k));
+      if (core->backed(k)) CHECK_EQ(t->block_holds(core->block_of(k)), int32_t(k));
+    }
+  }
+  std::vector<int64_t> state() const {
+    std::vector<int64_t> s;
+    for (uint32_t k = 0; k < keys; ++k)
+      s.insert(s.end(), {int64_t(core->home(k)), core->slot_of(k), core->block_of(k), int64_t(core->lru_stamp(k))});
+    s.insert(s.end(), core->table().begin(), core->table().end());
+    s.insert(s.end(), {int64_t(core->free_slots()), int64_t(core->free_blocks()), int64_t(core->on_device())});
+    for (uint64_t x : counters(core->stats())) s.push_back(int64_t(x));
+    s.push_back(int64_t(core->stats().resident_units));
+    return s;
+  }
+};
+
+std::vector<uint8_t> all_run(uint32_t G) { return std::vector<uint8_t>(G, 1); }
+
+// The counters of decode's own work (make_resident may only complete the write-backs and reads already in flight:
+// writebacks_done / wb_*_bytes / disk_read* are not among them).
+std::vector<uint64_t> decode_counts(const ts::DgStats& s) {
+  return {s.tokens, s.lookups, s.misses, s.covered, s.fetched, s.prefetched, s.prefetch_used, s.resurrected,
+          s.bank_serves, s.collected_mid, s.evicted, s.evict_short, s.stalled, s.pred_invalid, s.covered_waits,
+          s.predicted, s.predicted_true, s.miss_layers, s.wb_deferred, s.wb_cancelled, s.wb_forced,
+          s.wb_boundary_flushed, s.disk_drops, s.disk_discards, s.inclusive_kept, s.inclusive_drops, s.disk_stage_waits,
+          s.score_layers, s.score_candidates, s.scored_victims, s.score_fallbacks};
+}
+
+Shape with_resident(const Shape& base, bool resident, uint32_t skip) {
+  Shape s = base;
+  s.resident = resident;
+  s.skip = skip;
+  return s;
+}
+
+}  // namespace
+
+// A whole layer made resident where it fits: every unit on the device with its file bytes, kept, its entries
+// published; a step that exports no layer reads the kept slots through the table; after the release the next decode
+// tokens read exactly what a cache that never made the layer resident reads (only the placement differs).
+TEST(dg_resident_full_layer) {
+  ResRig a({16, 16, 16}, 20, 8, 8), b({16, 16, 16}, 20, 8, 8);
+  for (int tok = 0; tok < 6; ++tok) {  // warm both the same way
+    const auto r = a.routes(4);
+    b.rng = a.rng;
+    CHECK(a.token(r, all_run(3), {}) == b.token(r, all_run(3), {}));
+  }
+  a.verify();
+  const uint32_t g = 1;
+  uint32_t on_dev = 0;
+  for (uint32_t u = 0; u < 16; ++u) on_dev += a.core->home(a.core->key(g, u)) == DgCore::Home::Device;
+  const auto before = decode_counts(a.core->stats());
+  const DgCore::ResidentResult res = a.core->make_resident(g, a.layer(g), {});
+  CHECK_EQ(res.copied, 16u - on_dev);
+  CHECK_EQ(a.core->stats().resident_units, uint64_t(16 - on_dev));
+  CHECK_EQ(a.core->stats().resident_bytes, uint64_t(16 - on_dev) * 8192u);
+  CHECK_EQ(a.core->stats().resident_evicted, uint64_t(res.evicted));
+  CHECK(decode_counts(a.core->stats()) == before);  // nothing counted as a miss, fetch, prefetch or eviction
+  std::vector<int32_t> slots;
+  for (uint32_t u = 0; u < 16; ++u) {
+    const uint32_t k = a.core->key(g, u);
+    CHECK(a.core->home(k) == DgCore::Home::Device);
+    CHECK_EQ(a.t->entry(k), a.core->slot_of(k));  // published when the call returned (no stream left to run)
+    CHECK_EQ(a.t->slot_holds(a.core->slot_of(k)), int32_t(k));
+    slots.push_back(a.core->slot_of(k));
+  }
+  a.verify();
+  // the prefill step: no layer exported, the kept units read through the table; the boundary keeps them in place
+  const auto kept = a.keys_of(g, a.layer(g));
+  const uint64_t lookups = a.core->stats().lookups;
+  const uint32_t ready1 = a.t->ready(g);
+  const auto out = a.token(a.routes(1), {0, 0, 0}, kept, kept);
+  CHECK_EQ(out.size(), size_t(3 * 16));
+  CHECK_EQ(a.core->stats().lookups, lookups);
+  CHECK_EQ(a.t->ready(g), ready1);
+  for (uint32_t u = 0; u < 16; ++u) CHECK_EQ(a.core->slot_of(a.core->key(g, u)), slots[u]);
+  a.token(a.routes(1), {0, 0, 0}, kept, kept);  // held for several steps: still in place
+  for (uint32_t u = 0; u < 16; ++u) CHECK_EQ(a.core->slot_of(a.core->key(g, u)), slots[u]);
+  a.verify();
+  CHECK(a.v.what.empty());
+  // released: the same decode tokens read the same bytes as the cache that never did any of this
+  for (int tok = 0; tok < 12; ++tok) {
+    const auto r = a.routes(5);
+    b.rng = a.rng;
+    const auto x = a.token(r, all_run(3), {}), y = b.token(r, all_run(3), {});
+    CHECK(x == y);
+  }
+  a.verify();
+  b.verify();
+  if (!a.v.what.empty() || !b.v.what.empty()) std::printf("  %s / %s\n", a.v.what.c_str(), b.v.what.c_str());
+  CHECK(a.v.what.empty() && b.v.what.empty());
+}
+
+// Several layers held at once; a call over the capacity is refused before anything changes (homes, slots, blocks,
+// recency, table, counters, no device operation); replacing a layer's set counts it once.
+TEST(dg_resident_several_layers_and_capacity) {
+  ResRig r({16, 16, 16}, 32, 8, 8);  // 40 persistent slots, target 8: 32 units may be kept
+  for (int tok = 0; tok < 4; ++tok) r.token(r.routes(4), all_run(3), {});
+  r.core->make_resident(0, r.layer(0), {});
+  const auto k0 = r.keys_of(0, r.layer(0));
+  r.core->make_resident(1, r.layer(1), k0);
+  auto k1 = r.keys_of(1, r.layer(1));
+  std::vector<uint32_t> both = k0;
+  both.insert(both.end(), k1.begin(), k1.end());
+  for (uint32_t k : both) CHECK(r.core->home(k) == DgCore::Home::Device);
+  r.verify();
+  r.t->drain_all();
+  auto refused = [&](uint32_t g, const std::vector<uint32_t>& ids, const std::vector<uint32_t>& other) {
+    const auto s0 = r.state();
+    r.t->clear_issued();
+    bool cap = false;
+    try {
+      r.core->make_resident(g, ids, other);
+    } catch (const ts::Error& e) {
+      cap = e.status() == SS_E_CAPACITY;
+    }
+    CHECK(cap);
+    CHECK(r.t->issued().empty());
+    CHECK(r.state() == s0);
+    r.core->check();
+  };
+  refused(2, r.layer(2), both);  // 16 + 32 + 8 > 40
+  refused(2, {5}, both);         // 1 + 32 + 8 > 40
+  // invalid arguments are refused too, before anything changes
+  for (const std::vector<uint32_t>& bad : {std::vector<uint32_t>{3, 3}, std::vector<uint32_t>{16}}) {
+    bool inv = false;
+    try {
+      r.core->make_resident(2, bad, {});
+    } catch (const ts::Error& e) {
+      inv = e.status() == SS_E_INVALID;
+    }
+    CHECK(inv);
+  }
+  // layer 1 again with fewer units: its old set does not count (replaced); then layer 2's part fits
+  r.core->make_resident(1, {0, 1, 2, 3}, k0);
+  k1 = r.keys_of(1, {0, 1, 2, 3});
+  std::vector<uint32_t> other = k0;
+  other.insert(other.end(), k1.begin(), k1.end());
+  std::vector<uint32_t> part;
+  for (uint32_t u = 0; u < 12; ++u) part.push_back(u);
+  r.core->make_resident(2, part, other);
+  const auto k2 = r.keys_of(2, part);
+  std::vector<uint32_t> all = other;
+  all.insert(all.end(), k2.begin(), k2.end());
+  for (uint32_t k : all) CHECK(r.core->home(k) == DgCore::Home::Device);
+  // three layers held: a step exports none of them and reads only the kept units
+  r.token(r.routes(1), {0, 0, 0}, all, all);
+  r.verify();
+  for (uint32_t k : all) CHECK(r.core->home(k) == DgCore::Home::Device);
+  // two-tier with no free slot and no free block to start the write-backs: refused, nothing changed
+  ResRig z({8, 8}, 8, 0, 0);
+  const auto s0 = z.state();
+  bool cap = false;
+  try {
+    z.core->make_resident(1, z.layer(1), {});
+  } catch (const ts::Error& e) {
+    cap = e.status() == SS_E_CAPACITY;
+  }
+  CHECK(cap);
+  CHECK(z.state() == s0);
+  CHECK(r.v.what.empty() && z.v.what.empty());
+}
+
+// LRU: the victims are the least recent device units that no layer keeps and the call does not want, written back
+// into free blocks (two-tier) with every byte where its home says; kept units of other layers stay.
+TEST(dg_resident_eviction_lru) {
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    ResRig r({24, 24, 24}, 30, 6, 6, false, nullptr, 0, seed);
+    r.rng.seed(seed);
+    for (int tok = 0; tok < 10; ++tok) r.token(r.routes(5), all_run(3), {});
+    const std::vector<uint32_t> keep0 = r.keys_of(0, {0, 1, 2, 3});  // 24 + 4 + 6 <= 36
+    std::vector<uint8_t> want(r.keys, 0), other(r.keys, 0);
+    for (uint32_t k : keep0) other[k] = 1;
+    for (uint32_t k : r.keys_of(2, r.layer(2))) want[k] = 1;
+    // the expected victims: after the drain every write-back is collected (its slot free); then the recency tail
+    size_t need = 0, free_after = r.core->free_slots();
+    for (uint32_t k = 0; k < r.keys; ++k) {
+      free_after += r.core->home(k) == DgCore::Home::Evicting;
+      need += want[k] && r.core->home(k) != DgCore::Home::Device;
+    }
+    std::vector<uint32_t> expect, rec = r.core->residency();
+    for (size_t i = rec.size(); i-- > 0 && expect.size() + free_after < need;)
+      if (!want[rec[i]] && !other[rec[i]]) expect.push_back(rec[i]);
+    r.core->make_resident(2, r.layer(2), keep0);
+    CHECK(r.core->resident_victims() == expect);
+    CHECK(!expect.empty());
+    for (uint32_t k : keep0)
+      if (r.core->home(k) == DgCore::Home::Device) CHECK(std::find(expect.begin(), expect.end(), k) == expect.end());
+    for (uint32_t k : expect) CHECK(r.core->home(k) == DgCore::Home::Host);  // written back
+    r.verify();
+    // dirty victims come back through a demand with their bytes
+    std::vector<std::vector<uint32_t>> back(3);
+    for (uint32_t k : expect) {
+      const uint32_t g = r.core->gated_of(k);
+      if (back[g].size() < 4) back[g].push_back(k - r.core->key(g, 0));
+    }
+    for (auto& b : back)
+      if (b.empty()) b.push_back(0);
+    auto keep = r.keys_of(2, r.layer(2));
+    keep.insert(keep.end(), keep0.begin(), keep0.end());
+    r.token(back, {1, 1, 0}, keep, r.keys_of(2, r.layer(2)));
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// Scored: the victims are the eligible units in the boundary's order (score, demand epoch, recency stamp), from the
+// oracle's own history.
+TEST(dg_resident_eviction_scored) {
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    ResRig r({24, 24, 24}, 30, 6, 6, true, nullptr, 0, seed);
+    r.rng.seed(seed * 3);
+    Oracle orc({24, 24, 24});
+    for (int tok = 0; tok < 12; ++tok) {
+      const auto rt = r.routes(5);
+      orc.begin();
+      for (uint32_t g = 0; g < 3; ++g) orc.serve(g, rt[g].data(), uint32_t(rt[g].size()));
+      r.token(rt, all_run(3), {});
+    }
+    const std::vector<uint32_t> keep0 = r.keys_of(0, {1, 3, 5});
+    std::vector<uint8_t> want(r.keys, 0), other(r.keys, 0);
+    for (uint32_t k : keep0) other[k] = 1;
+    for (uint32_t k : r.keys_of(1, r.layer(1))) want[k] = 1;
+    size_t need = 0, free_after = r.core->free_slots();
+    struct C {
+      uint64_t s, ep, st;
+      uint32_t k;
+    };
+    std::vector<C> all;
+    for (uint32_t k = 0; k < r.keys; ++k) {
+      free_after += r.core->home(k) == DgCore::Home::Evicting;
+      need += want[k] && r.core->home(k) != DgCore::Home::Device;
+      if (r.core->home(k) == DgCore::Home::Device && !want[k] && !other[k])
+        all.push_back({orc.score(k), orc.epoch_of[k], r.core->lru_stamp(k), k});
+    }
+    std::sort(all.begin(), all.end(), [](const C& a, const C& b) {
+      return a.s != b.s ? a.s < b.s : a.ep != b.ep ? a.ep < b.ep : a.st < b.st;
+    });
+    std::vector<uint32_t> expect;
+    for (size_t i = 0; i < all.size() && expect.size() + free_after < need; ++i) expect.push_back(all[i].k);
+    const uint64_t layers = r.core->stats().score_layers;
+    r.core->make_resident(1, r.layer(1), keep0);
+    CHECK(r.core->resident_victims() == expect);
+    CHECK(!expect.empty());
+    CHECK_EQ(r.core->stats().score_layers, layers);  // ranked outside the boundary's counters
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// Three-tier: units copied in from their pinned blocks and their files (through the staging buffers, reads in flight
+// together); victims written back into blocks freed by those copies or by pinned units dropped to their files, else
+// dropped to their files themselves; a clean copy goes back to its block. A failed read leaves the cache consistent.
+TEST(dg_resident_three_tier) {
+  uint64_t written_back = 0, to_file = 0, reads = 0, io_failures = 0;
+  for (uint64_t seed = 1; seed <= 8; ++seed)
+    for (int fail = 0; fail < 2; ++fail) {
+      // 72 keys: 24 resident, 4 pinned homes (+ 0 or 1 spare block), the rest file-homed
+      std::vector<uint8_t> disk(72, 0);
+      for (uint32_t k = 24 + 4; k < 72; ++k) disk[k] = 1;
+      ResRig r({24, 24, 24}, 24, 4, seed % 2, false, &disk, 4, seed);
+      r.t->set_async_reads(seed % 3 != 0, seed);
+      r.rng.seed(seed);
+      for (int tok = 0; tok < 6; ++tok) r.token(r.routes(3), all_run(3), {});
+      r.verify();
+      // a failure case makes a layer with file units resident (layers 1 and 2): its read must fail, observed
+      const uint32_t g = fail ? 1 + uint32_t(seed % 2) : uint32_t(seed % 3);
+      const uint64_t reads0 = r.t->reads(), drops0 = r.core->stats().disk_drops;
+      if (fail) {
+        r.t->fail_read(1);
+        bool io = false;
+        try {
+          r.core->make_resident(g, r.layer(g), {});
+        } catch (const ts::Error& e) {
+          io = e.status() == SS_E_IO;
+        }
+        CHECK(io);
+        CHECK(!r.t->read_failure_pending());  // the injected read failure fired
+        CHECK(!r.core->poisoned());           // a read failure: the device is fine, the cache re-established
+        r.t->fail_read(0);
+        r.verify();  // consistent: what moved before the failure holds its bytes
+        ++io_failures;
+      }
+      r.core->make_resident(g, r.layer(g), {});
+      reads += r.t->reads() - reads0;
+      CHECK_EQ(r.core->stats().disk_drops, drops0);  // counted only in the resident fields
+      for (uint32_t u = 0; u < 24; ++u) {
+        const uint32_t k = r.core->key(g, u);
+        CHECK(r.core->home(k) == DgCore::Home::Device);
+        CHECK_EQ(r.t->slot_holds(r.core->slot_of(k)), int32_t(k));
+      }
+      for (uint32_t k : r.core->resident_victims()) {
+        written_back += r.core->home(k) == DgCore::Home::Host;
+        to_file += r.core->home(k) == DgCore::Home::File;
+      }
+      r.verify();
+      const auto kept = r.keys_of(g, r.layer(g));
+      std::vector<uint8_t> run = all_run(3);
+      run[g] = 0;
+      for (int tok = 0; tok < 4; ++tok) r.token(r.routes(3), run, kept, kept);  // other layers decode around it
+      r.verify();
+      for (int tok = 0; tok < 4; ++tok) r.token(r.routes(3), all_run(3), {});  // released
+      r.verify();
+      if (!r.v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r.v.what.c_str());
+      CHECK(r.v.what.empty());
+    }
+  std::printf("  file reads %llu, victims written back %llu, victims dropped to their files %llu\n",
+              (unsigned long long)reads, (unsigned long long)written_back, (unsigned long long)to_file);
+  CHECK(reads > 0);
+  CHECK(written_back > 0);
+  CHECK_EQ(io_failures, 8ull);
+  CHECK(to_file > 0);
+}
+
+// A clean copy (inclusive share) goes back to its block without a write-back.
+TEST(dg_resident_clean_copy_victims) {
+  ResRig r({16, 16, 16}, 20, 8, 12, false, nullptr, 0, 3, 8);
+  for (uint32_t tok = 0; tok < 3; ++tok) {  // misses of layer 2, admitted with their clean copies
+    std::vector<std::vector<uint32_t>> ids = {{0}, {0}, {3 * tok, 3 * tok + 1, 3 * tok + 2}};
+    r.token(ids, {0, 0, 1}, {});
+  }
+  for (int tok = 0; tok < 2; ++tok) r.token({r.layer(0), {}, {}}, {1, 0, 0}, {});  // layer 0 the most recent
+  CHECK(r.core->backed_units() > 0);
+  std::vector<uint8_t> was_backed(r.keys, 0);
+  for (uint32_t k = 0; k < r.keys; ++k) was_backed[k] = r.core->backed(k);
+  r.core->make_resident(1, r.layer(1), {});
+  uint32_t clean = 0;
+  for (uint32_t k : r.core->resident_victims()) {
+    CHECK(r.core->home(k) == DgCore::Home::Host);
+    clean += was_backed[k];
+  }
+  CHECK(clean > 0);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// rows_per_layer[h] == 0: the layer is not served (no lookups, misses, ready, recency), its score history is untouched
+// (cells, row sums), the boundary still ranks it (no fallback), and its units age as unrouted ones.
+TEST(dg_skip_layers_untouched) {
+  for (bool scored : {false, true}) {
+    ResRig r({16, 16, 16}, 20, 6, 6, scored);
+    for (int tok = 0; tok < 5; ++tok) r.token(r.routes(4), all_run(3), {});
+    const std::vector<ts::DgLayerCounts> lc0 = r.core->layer_counts();
+    std::vector<uint32_t> cells0;
+    std::vector<uint64_t> sums0;
+    for (uint32_t a = 0; scored && a < 16; ++a) {
+      sums0.push_back(r.core->score_rowsum(1, a));
+      for (uint32_t b = 0; b < 16; ++b) cells0.push_back(r.core->score_cell(1, a, b));
+    }
+    const uint32_t ready0 = r.t->ready(1);
+    const uint64_t fb0 = r.core->stats().score_fallbacks;
+    for (int tok = 0; tok < 6; ++tok) r.token(r.routes(4), {1, 0, 1}, {});
+    const auto& lc1 = r.core->layer_counts();
+    CHECK_EQ(lc1[1].lookups, lc0[1].lookups);
+    CHECK_EQ(lc1[1].misses, lc0[1].misses);
+    CHECK_EQ(lc1[1].fetched, lc0[1].fetched);
+    CHECK(lc1[0].lookups > lc0[0].lookups && lc1[2].lookups > lc0[2].lookups);
+    CHECK_EQ(r.t->ready(1), ready0);
+    for (uint32_t a = 0; scored && a < 16; ++a) {
+      CHECK_EQ(r.core->score_rowsum(1, a), sums0[a]);
+      for (uint32_t b = 0; b < 16; ++b) CHECK_EQ(r.core->score_cell(1, a, b), cells0[size_t(a) * 16 + b]);
+    }
+    CHECK_EQ(r.core->stats().score_fallbacks, fb0);
+    // a step exporting nothing at all, then every layer again
+    r.token(r.routes(1), {0, 0, 0}, {});
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(4), all_run(3), {});
+    CHECK_EQ(r.core->stats().score_fallbacks, fb0);
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The randomized model with resident episodes and skipped layers on every shape: the device model reads exact bytes
+// at every layer (held units in every layer), the oracles' victims at every boundary, held units never move.
+TEST(dg_resident_runs) {
+  g_res = ResidentCoverage{};
+  std::vector<Shape> shapes;
+  for (const Shape* sh : kShapes) shapes.push_back(*sh);
+  for (const Shape* sh : kTierShapes) shapes.push_back(with_reads(*sh, 1));
+  for (const Shape& sh : scored_shapes()) shapes.push_back(sh);
+  int runs = 0;
+  for (const Shape& base : shapes)
+    for (int mode = 0; mode < 2; ++mode)
+      for (uint64_t seed = 1; seed <= 3; ++seed) {
+        const Shape sh = with_resident(base, mode == 0, mode == 0 ? 5 : 3);
+        Outcome o = run(sh, 30, seed, DgCore::kNoMutation);
+        ++runs;
+        if (!o.violation.empty())
+          std::printf("  shape %zu mode %d seed %llu: %s\n", size_t(&base - shapes.data()), mode,
+                      (unsigned long long)seed, o.violation.c_str());
+        CHECK(o.violation.empty());
+      }
+  std::printf("  %d runs: make_resident %llu (refused %llu, released %llu), units copied in %llu, victims %llu; "
+              "layers skipped %llu, held units read %llu\n",
+              runs, (unsigned long long)g_res.calls, (unsigned long long)g_res.refusals,
+              (unsigned long long)g_res.released, (unsigned long long)g_res.copied, (unsigned long long)g_res.evicted,
+              (unsigned long long)g_res.skipped_layers, (unsigned long long)g_res.held_reads);
+  CHECK(g_res.calls > 0 && g_res.refusals > 0 && g_res.released > 0);
+  CHECK(g_res.copied > 0 && g_res.evicted > 0 && g_res.skipped_layers > 0 && g_res.held_reads > 0);
+}
+
+// The boundary ignoring the keep list (a held unit evicted, its slot reused) is caught by the held reads.
+TEST(dg_resident_ignored_keep_caught) {
+  int caught = 0;
+  for (uint64_t seed = 1; seed <= 6; ++seed)
+    caught += !run(with_resident(kPressure, true, 0), 30, seed, DgCore::kIgnoreKeep).violation.empty();
+  std::printf("  ignored keep caught in %d/6 runs\n", caught);
+  CHECK(caught > 0);
+}
+
+// Device failures inside make_resident: an H2D copy, a write-back, an entry publication, an event record, an event or
+// stream synchronize, the table upload, each injected at every call of its kind in turn (until the call has no more of
+// them). Every injected failure must be observed (the call fails with SS_E_BACKEND only through it), the core is then
+// poisoned (no token starts) and its host records stay one consistent ownership: no source block freed while a unit
+// still names it as its home, no slot lost, no event lost (check()).
+TEST(dg_resident_device_failures) {
+  const char* names[Scripted::kFaultKinds] = {"h2d", "d2h", "entry", "record", "event_sync", "sync", "upload"};
+  uint64_t fired[Scripted::kFaultKinds] = {};
+  uint64_t attempts = 0;
+  for (int tier = 0; tier < 2; ++tier)
+    for (int k = 0; k < Scripted::kFaultKinds; ++k)
+      for (int n = 1; n <= 500; ++n) {
+        // two-tier: pinned sources and dirty victims; three-tier: file reads through staging events, drops to files
+        std::vector<uint8_t> disk(72, 0);
+        for (uint32_t key = 24 + 4; key < 72; ++key) disk[key] = 1;
+        std::unique_ptr<ResRig> r = tier ? std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1u, false,
+                                                                    &disk, 4, 5)
+                                         : std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6, false,
+                                                                    nullptr, 0, 5);
+        if (tier) r->t->set_async_reads(true, 5);
+        r->rng.seed(5);
+        for (int tok = 0; tok < 6; ++tok) r->token(r->routes(3), all_run(3), {});
+        r->verify();
+        r->t->fail_kind(Scripted::FaultKind(k), n);
+        bool threw = false;
+        ss_status st = SS_OK;
+        try {
+          r->core->make_resident(2, r->layer(2), {});
+        } catch (const ts::Error& e) {
+          threw = true;
+          st = e.status();
+        }
+        const bool f = r->t->kind_fired();
+        r->t->fail_kind(Scripted::kFH2D, 0);
+        if (!threw) {  // past the call's last operation of this kind (none at all: a kind the other tier covers)
+          CHECK(!f);
+          break;
+        }
+        ++attempts;
+        CHECK(f);  // it failed through the injection only
+        CHECK_EQ(int(st), int(SS_E_BACKEND));
+        CHECK(r->core->poisoned());
+        r->core->check();
+        bool refused = false;
+        try {
+          r->core->begin_token(r->seq + 1);
+        } catch (const ts::Error& e) {
+          refused = e.status() == SS_E_BACKEND;
+        }
+        CHECK(refused);
+        ++fired[k];
+      }
+  std::printf("  %llu injected device failures:", (unsigned long long)attempts);
+  for (int k = 0; k < Scripted::kFaultKinds; ++k) std::printf(" %s %llu", names[k], (unsigned long long)fired[k]);
+  std::printf("\n");
+  for (int k = 0; k < Scripted::kFaultKinds; ++k) CHECK(fired[k] > 0);
+}
+
+// A failed replacement of g's set (a file read failing after evictions under slot pressure) leaves g's current set as
+// it was: its units were protected during the call (the context passes every keep, g's own included), so the next step,
+// which does not export g, reads every one of them in its slot. The capacity counts that set too.
+TEST(dg_resident_failed_replacement_keeps_old_set) {
+  uint64_t evicted = 0;
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    std::vector<uint8_t> disk(72, 0);
+    for (uint32_t k = 24 + 4; k < 72; ++k) disk[k] = 1;
+    ResRig r({24, 24, 24}, 24, 4, 1, seed % 2 == 0, &disk, 4, seed);
+    r.t->set_async_reads(seed % 3 != 0, seed);
+    r.rng.seed(seed);
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(3), all_run(3), {});
+    std::vector<uint32_t> a, b;
+    for (uint32_t u = 0; u < 12; ++u) a.push_back(u), b.push_back(u + 12);
+    r.core->make_resident(1, a, {});
+    const auto ka = r.keys_of(1, a);
+    std::vector<int32_t> slots;
+    for (uint32_t k : ka) slots.push_back(r.core->slot_of(k));
+    for (int tok = 0; tok < 6; ++tok) r.token(r.routes(3), {1, 0, 1}, ka, ka);  // held: g's set ages under decode
+    // the capacity counts g's current set: b (12) + a (12, protected) = 24 = 28 - 4 fits; with one more kept unit of
+    // another layer it does not: refused, nothing changed
+    {
+      std::vector<uint32_t> other = ka;
+      other.push_back(r.core->key(0, 0));
+      const auto st0 = r.state();
+      r.t->clear_issued();
+      bool cap = false;
+      try {
+        r.core->make_resident(1, b, other);
+      } catch (const ts::Error& e) {
+        cap = e.status() == SS_E_CAPACITY;
+      }
+      CHECK(cap);
+      CHECK(r.t->issued().empty());
+      CHECK(r.state() == st0);
+    }
+    // the failing replacement: b (file units) with a protected; a read fails after the evictions began
+    const uint64_t ev0 = r.core->stats().resident_evicted;
+    r.t->fail_read(3);
+    bool io = false;
+    try {
+      r.core->make_resident(1, b, ka);
+    } catch (const ts::Error& e) {
+      io = e.status() == SS_E_IO;
+    }
+    CHECK(io);
+    CHECK(!r.t->read_failure_pending());
+    CHECK(!r.core->poisoned());
+    r.t->fail_read(0);
+    evicted += r.core->stats().resident_evicted - ev0;
+    for (size_t i = 0; i < ka.size(); ++i) {
+      CHECK(r.core->home(ka[i]) == DgCore::Home::Device);
+      CHECK_EQ(r.core->slot_of(ka[i]), slots[i]);
+      CHECK_EQ(r.t->entry(ka[i]), slots[i]);
+    }
+    r.token(r.routes(3), {1, 0, 1}, ka, ka);  // at once: g not exported, its old set read through the table
+    r.verify();
+    if (!r.v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r.v.what.c_str());
+    CHECK(r.v.what.empty());
+  }
+  std::printf("  victims evicted before the failed reads: %llu\n", (unsigned long long)evicted);
+  CHECK(evicted > 0);
+}
+
+// ---- placement rounds (ss_dg_round) and no-admission misses (dg_no_admit) ----
+namespace {
+
+ts::DgRoundIn round_in(uint32_t max_units = 96, uint64_t budget = 0, double hysteresis = 1.25, double decay = 0.85) {
+  ts::DgRoundIn in;
+  in.max_units = max_units;
+  in.budget_bytes = budget;
+  in.hysteresis = hysteresis;
+  in.decay = decay;
+  return in;
+}
+
+void seed_counts(DgCore& core, const std::vector<std::pair<uint32_t, float>>& kv) {
+  std::vector<uint32_t> keys;
+  std::vector<float> counts;
+  for (const auto& p : kv) keys.push_back(p.first), counts.push_back(p.second);
+  core.seed_round_counts(keys, counts);
+}
+
+// Every key's placement: home, slot, block.
+std::vector<int64_t> homes(const DgCore& core) {
+  std::vector<int64_t> s;
+  for (uint32_t k = 0; k < core.keys(); ++k)
+    s.insert(s.end(), {int64_t(core.home(k)), core.slot_of(k), core.block_of(k)});
+  return s;
+}
+
+// Two layers of 16: keys 0..7 on the device (key 0 most recent), 4 spares, 4 spare blocks; counts: device keys 0, 1
+// at 9 and 2..7 at 1, pinned keys 20..27 at 10.
+std::unique_ptr<ResRig> seeded_rig(const std::function<void(DgConfig&)>& tweak = nullptr, uint32_t inclusive = 0) {
+  auto r = std::make_unique<ResRig>(std::vector<uint32_t>{16, 16}, 8, 4, inclusive ? inclusive + 4 : 4, false, nullptr,
+                                    0, 7, inclusive, tweak);
+  std::vector<std::pair<uint32_t, float>> kv = {{0, 9.f}, {1, 9.f}};
+  for (uint32_t k = 2; k < 8; ++k) kv.push_back({k, 1.f});
+  for (uint32_t k = 20; k < 28; ++k) kv.push_back({k, 10.f});
+  seed_counts(*r->core, kv);
+  return r;
+}
+
+// Routes with a hot set: per gated layer `n_hot` ids from hot[g], then `n_cold` random ones.
+std::vector<std::vector<uint32_t>> skewed(ResRig& r, const std::vector<std::vector<uint32_t>>& hot, uint32_t n_hot,
+                                          uint32_t n_cold) {
+  std::vector<std::vector<uint32_t>> ids(r.G);
+  for (uint32_t g = 0; g < r.G; ++g) {
+    for (uint32_t i = 0; i < n_hot; ++i) ids[g].push_back(hot[g][r.rng() % hot[g].size()]);
+    for (uint32_t i = 0; i < n_cold; ++i) ids[g].push_back(uint32_t(r.rng() % r.core->units(g)));
+  }
+  return ids;
+}
+
+std::vector<uint8_t> disk_flags(uint32_t keys, uint32_t pinned_from, uint32_t file_from) {
+  std::vector<uint8_t> d(keys, 0);
+  for (uint32_t k = std::max(pinned_from, file_from); k < keys; ++k) d[k] = 1;
+  return d;
+}
+
+}  // namespace
+
+// The rank: the hottest pinned units replace the coldest device units when their count is above hysteresis x theirs
+// (the device units at 9 stay against candidates at 10: within 1.25x), every moved unit's bytes in its new home, the
+// table published; decay alone (no exports) moves nothing; max_units and budget_bytes bound the moves; kept units
+// never move; a device below its share takes the hottest into its free slots first.
+TEST(dg_round_rank_hysteresis_limits) {
+  {
+    auto r = seeded_rig();
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK_EQ(res.promoted_to_device, 6u);
+    CHECK_EQ(res.demoted_from_device, 6u);
+    CHECK_EQ(res.promoted_to_pinned + res.dropped_to_file + res.cancelled, 0u);
+    CHECK_EQ(res.bytes_h2d, 6u * 8192u);
+    CHECK_EQ(res.bytes_written_back, 6u * 8192u);
+    CHECK_EQ(res.bytes_read, 0u);
+    for (uint32_t k = 20; k < 26; ++k) CHECK(r->core->home(k) == DgCore::Home::Device);
+    for (uint32_t k = 26; k < 28; ++k) CHECK(r->core->home(k) == DgCore::Home::Host);
+    for (uint32_t k = 0; k < 2; ++k) CHECK(r->core->home(k) == DgCore::Home::Device);
+    for (uint32_t k = 2; k < 8; ++k) CHECK(r->core->home(k) == DgCore::Home::Host);
+    for (uint32_t k = 0; k < r->keys; ++k) CHECK_EQ(r->t->entry(k), r->core->table()[k]);  // uploaded at return
+    r->verify();
+    const ts::DgStats& s = r->core->stats();
+    CHECK_EQ(s.round_count, 1u);
+    CHECK_EQ(s.round_units, 12u);
+    CHECK_EQ(s.round_bytes, 12u * 8192u);
+    CHECK_EQ(s.evicted + s.fetched + s.writebacks_done + s.resident_units, 0u);  // counted only as a round
+    // no exports since: every count decays alike, nothing churns
+    const auto before = homes(*r->core);
+    const ts::DgRoundOut res2 = r->core->round(round_in(), {});
+    CHECK_EQ(res2.promoted_to_device + res2.demoted_from_device, 0u);
+    CHECK(homes(*r->core) == before);
+    CHECK(std::fabs(r->core->round_count(20) - 10.0 * 0.85 * 0.85) < 1e-9);
+    CHECK(r->v.what.empty());
+  }
+  {  // max_units: the two hottest (ties by key) replace the two least recent of the coldest
+    auto r = seeded_rig();
+    const ts::DgRoundOut res = r->core->round(round_in(2), {});
+    CHECK_EQ(res.promoted_to_device, 2u);
+    CHECK(r->core->home(20) == DgCore::Home::Device && r->core->home(21) == DgCore::Home::Device);
+    CHECK(r->core->home(22) == DgCore::Home::Host);
+    CHECK(r->core->home(7) == DgCore::Home::Host && r->core->home(6) == DgCore::Home::Host);
+    CHECK(r->core->home(5) == DgCore::Home::Device);
+    r->verify();
+  }
+  {  // budget: a swap costs its H2D + its write-back (16 KiB); 40000 bytes take two
+    auto r = seeded_rig();
+    const ts::DgRoundOut res = r->core->round(round_in(96, 40000), {});
+    CHECK_EQ(res.promoted_to_device, 2u);
+    CHECK(res.bytes_h2d + res.bytes_written_back <= 40000u);
+    r->verify();
+  }
+  {  // kept units never move (a cold device unit, a hot pinned one); the kept count leaves the device's share
+    auto r = seeded_rig();
+    const int32_t slot7 = r->core->slot_of(7), block20 = r->core->block_of(20);
+    const ts::DgRoundOut res = r->core->round(round_in(), {7, 20});
+    CHECK_EQ(res.promoted_to_device, 5u);
+    CHECK_EQ(r->core->slot_of(7), slot7);
+    CHECK(r->core->home(20) == DgCore::Home::Host && r->core->block_of(20) == block20);
+    r->verify();
+  }
+  {  // a device below its share (spare target 4 -> 2): two free slots first, then the swaps
+    auto r = seeded_rig();
+    r->core->set_spare_target(2);
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK_EQ(res.promoted_to_device, 8u);
+    CHECK_EQ(res.demoted_from_device, 6u);
+    CHECK_EQ(r->core->free_slots(), 2u);
+    r->verify();
+  }
+  {  // clean copies (inclusive): a demoted device unit goes back to its block, no write
+    auto r = seeded_rig(nullptr, 8);
+    for (uint32_t tok = 0; tok < 3; ++tok) {  // misses of layer 1 admitted with their clean copies
+      std::vector<std::vector<uint32_t>> ids = {{0}, {8 + tok}};
+      r->token(ids, {0, 1}, {});
+    }
+    uint32_t backed = 0;
+    for (uint32_t k = 0; k < r->keys; ++k) backed += r->core->backed(k);
+    CHECK(backed > 0);
+    // the backed units coldest (their export since: 1), the other units of the open placement warmer (5 -> 4.25)
+    for (uint32_t k = 0; k < 8; ++k) seed_counts(*r->core, {{k, 5.f}});
+    for (uint32_t k = 24; k < 27; ++k) seed_counts(*r->core, {{k, 0.f}});
+    const uint64_t wb0 = r->core->stats().round_bytes;
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK(res.demoted_from_device > 0);
+    CHECK(res.bytes_written_back < uint64_t(res.demoted_from_device) * 8192u);  // the clean ones wrote nothing
+    CHECK_EQ(r->core->stats().round_bytes - wb0, res.bytes_h2d + res.bytes_written_back);
+    r->verify();
+    CHECK(r->v.what.empty());
+  }
+}
+
+// Three-tier: (a) pinned -> device with write-backs into the free block and then the promoted units' blocks; (b) the
+// hottest file units read into the blocks of the coldest pinned units (dropped to their files), the reads overlapped.
+TEST(dg_round_three_tier) {
+  for (int async = 0; async < 2; ++async) {
+    const auto disk = disk_flags(72, 24, 28);
+    ResRig r({24, 24, 24}, 24, 4, 1, false, &disk, 4, 3);
+    r.t->set_async_reads(async != 0, 3);
+    std::vector<std::pair<uint32_t, float>> kv;
+    for (uint32_t k = 0; k < 24; ++k) kv.push_back({k, 1.f});
+    kv.push_back({24, 15.f});
+    kv.push_back({25, 15.f});
+    for (uint32_t k = 40; k < 44; ++k) kv.push_back({k, 20.f});
+    seed_counts(*r.core, kv);
+    const uint64_t reads0 = r.t->reads();
+    const ts::DgRoundOut res = r.core->round(round_in(), {});
+    CHECK_EQ(res.promoted_to_device, 2u);
+    CHECK_EQ(res.demoted_from_device, 2u);
+    CHECK_EQ(res.promoted_to_pinned, 4u);
+    CHECK_EQ(res.dropped_to_file, 4u);  // 26, 27 (count 0), then the two demoted units (count 1)
+    CHECK_EQ(res.bytes_read, 4u * 8192u);
+    CHECK_EQ(r.t->reads() - reads0, 4u);
+    CHECK(r.core->home(24) == DgCore::Home::Device && r.core->home(25) == DgCore::Home::Device);
+    CHECK(r.core->home(26) == DgCore::Home::File && r.core->home(27) == DgCore::Home::File);
+    for (uint32_t k = 40; k < 44; ++k) CHECK(r.core->home(k) == DgCore::Home::Host);
+    CHECK_EQ(r.core->stats().disk_reads, 0u);  // counted only as a round
+    r.verify();
+    // the next round promotes the new pinned units to the device (their 20 against the device's 1)
+    const ts::DgRoundOut res2 = r.core->round(round_in(), {});
+    CHECK_EQ(res2.promoted_to_device, 4u);
+    for (uint32_t k = 40; k < 44; ++k) CHECK(r.core->home(k) == DgCore::Home::Device);
+    r.verify();
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(3), all_run(3), {});
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The oracle: a cache with rounds between its tokens (random counts, limits and keep lists; deferred, recorded and
+// in-flight write-backs, both write-back streams, clean copies, three-tier with overlapped reads) reads exactly what a
+// cache without rounds reads: only placement differs. Kept units never move in a round.
+TEST(dg_round_outputs_equal_without_rounds) {
+  uint64_t promoted = 0, demoted = 0, pinned = 0, rounds = 0;
+  for (uint64_t seed = 1; seed <= 12; ++seed) {
+    const bool three = seed % 2 == 0;
+    const auto tweak = [seed](DgConfig& c) {
+      c.wb_defer = seed % 3 != 0;
+      c.wb_on_d2h = seed % 4 < 2;
+    };
+    const auto disk = disk_flags(72, 24, 28);
+    const uint32_t incl = !three && seed % 3 == 1 ? 3u : 0u;
+    std::unique_ptr<ResRig> a, b;
+    if (three) {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 2, seed % 5 == 0, &disk, 4, seed, 0u, tweak);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 2, seed % 5 == 0, &disk, 4, seed, 0u, tweak);
+      a->t->set_async_reads(seed % 3 != 1, seed);
+      b->t->set_async_reads(seed % 3 != 1, seed);
+    } else {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6 + incl, seed % 5 == 0, nullptr, 0, seed,
+                                   incl, tweak);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6 + incl, seed % 5 == 0, nullptr, 0, seed,
+                                   incl, tweak);
+    }
+    std::vector<std::vector<uint32_t>> hot(3);
+    for (uint32_t g = 0; g < 3; ++g)
+      for (uint32_t i = 0; i < 6; ++i) hot[g].push_back(uint32_t((7 * i + 5 * g + seed) % 24));
+    std::mt19937_64 rr(seed * 31);
+    for (int tok = 0; tok < 36; ++tok) {
+      std::vector<uint32_t> keep;
+      if (tok % 7 == 3) keep = {a->core->key(0, uint32_t(rr() % 24)), a->core->key(2, uint32_t(rr() % 24))};
+      const auto ids = skewed(*a, hot, 3, 2);
+      b->rng = a->rng;
+      const auto x = a->token(ids, all_run(3), keep), y = b->token(ids, all_run(3), keep);
+      CHECK(x == y);
+      if (tok % 3 == 2) {
+        if (tok % 9 == 2) {  // random counts: forces moves the exports alone would not
+          for (uint32_t k = 0; k < a->keys; ++k)
+            if (rr() % 3 == 0) seed_counts(*a->core, {{k, float(rr() % 40)}});
+        }
+        std::vector<int64_t> before;
+        for (uint32_t k : keep) before.insert(before.end(), {int64_t(a->core->home(k)), a->core->slot_of(k), a->core->block_of(k)});
+        const ts::DgRoundOut res =
+            a->core->round(round_in(uint32_t(rr() % 12), rr() % 2 ? 0 : 8192u * (1 + rr() % 10),
+                                    1.0 + double(rr() % 4) / 4, double(rr() % 5) / 4), keep);
+        std::vector<int64_t> after;
+        for (uint32_t k : keep) after.insert(after.end(), {int64_t(a->core->home(k)), a->core->slot_of(k), a->core->block_of(k)});
+        CHECK(before == after);
+        promoted += res.promoted_to_device;
+        demoted += res.demoted_from_device;
+        pinned += res.promoted_to_pinned;
+        ++rounds;
+        a->verify();
+      }
+    }
+    a->verify();
+    b->verify();
+    if (!a->v.what.empty() || !b->v.what.empty())
+      std::printf("  seed %llu: %s / %s\n", (unsigned long long)seed, a->v.what.c_str(), b->v.what.c_str());
+    CHECK(a->v.what.empty() && b->v.what.empty());
+  }
+  std::printf("  %llu rounds: promoted to the device %llu, demoted %llu, file -> pinned %llu\n",
+              (unsigned long long)rounds, (unsigned long long)promoted, (unsigned long long)demoted,
+              (unsigned long long)pinned);
+  CHECK(promoted > 0 && demoted > 0 && pinned > 0);
+}
+
+// Device failures inside a round (an H2D, a write-back, an entry, an event record, an event / stream synchronize, the
+// upload; deferred write-backs left by the last boundary give the drain records and waits), each injected at every
+// call of its kind in turn: observed, SS_E_BACKEND, the core poisoned, its host records one consistent ownership. A
+// file read failure: SS_E_IO, consistent (verify), not poisoned, and the next round completes.
+TEST(dg_round_failures) {
+  const char* names[Scripted::kFaultKinds] = {"h2d", "d2h", "entry", "record", "event_sync", "sync", "upload"};
+  uint64_t fired[Scripted::kFaultKinds] = {};
+  uint64_t attempts = 0;
+  const auto disk = disk_flags(72, 24, 28);
+  auto make = [&](int tier) {
+    const auto tweak = [](DgConfig& c) {
+      c.wb_defer = true;
+      c.wb_on_d2h = true;
+    };
+    std::unique_ptr<ResRig> r = tier ? std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1u, false,
+                                                                &disk, 4, 5, 0u, tweak)
+                                     : std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6, false,
+                                                                nullptr, 0, 5, 0u, tweak);
+    if (tier) r->t->set_async_reads(true, 5);
+    r->rng.seed(5);
+    for (int tok = 0; tok < 6; ++tok) r->token(r->routes(3), all_run(3), {});
+    for (uint32_t k = 0; k < r->keys; ++k)  // the units off the device hot, the device cold
+      seed_counts(*r->core, {{k, r->core->home(k) == DgCore::Home::Device ? 1.f : float(10 + k % 7)}});
+    return r;
+  };
+  for (int tier = 0; tier < 2; ++tier)
+    for (int k = 0; k < Scripted::kFaultKinds; ++k)
+      for (int n = 1; n <= 500; ++n) {
+        auto r = make(tier);
+        r->t->fail_kind(Scripted::FaultKind(k), n);
+        bool threw = false;
+        ss_status st = SS_OK;
+        try {
+          r->core->round(round_in(), {});
+        } catch (const ts::Error& e) {
+          threw = true;
+          st = e.status();
+        }
+        const bool f = r->t->kind_fired();
+        r->t->fail_kind(Scripted::kFH2D, 0);
+        if (!threw) {
+          CHECK(!f);
+          break;
+        }
+        ++attempts;
+        CHECK(f);
+        CHECK_EQ(int(st), int(SS_E_BACKEND));
+        CHECK(r->core->poisoned());
+        r->core->check();
+        bool refused = false;
+        try {
+          r->core->begin_token(r->seq + 1);
+        } catch (const ts::Error& e) {
+          refused = e.status() == SS_E_BACKEND;
+        }
+        CHECK(refused);
+        ++fired[k];
+      }
+  std::printf("  %llu injected device failures:", (unsigned long long)attempts);
+  for (int k = 0; k < Scripted::kFaultKinds; ++k) std::printf(" %s %llu", names[k], (unsigned long long)fired[k]);
+  std::printf("\n");
+  for (int k = 0; k < Scripted::kFaultKinds; ++k) CHECK(fired[k] > 0);
+  // file read failures: the first read, a later one with others in flight
+  uint64_t io = 0;
+  for (int which = 1; which <= 3; ++which) {
+    auto r = make(1);
+    r->t->set_async_reads(which != 1, 9);
+    r->t->fail_read(which);
+    bool got = false;
+    try {
+      r->core->round(round_in(), {});
+    } catch (const ts::Error& e) {
+      got = e.status() == SS_E_IO;
+    }
+    CHECK(got);
+    CHECK(!r->t->read_failure_pending());
+    CHECK(!r->core->poisoned());
+    r->t->fail_read(0);
+    r->verify();
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK(res.promoted_to_pinned > 0 || res.promoted_to_device > 0);
+    r->verify();
+    for (int tok = 0; tok < 3; ++tok) r->token(r->routes(3), all_run(3), {});
+    r->verify();
+    CHECK(r->v.what.empty());
+    io += got;
+  }
+  CHECK_EQ(io, 3u);
+}
+
+// ss_dg_round_cancel from another thread: at a unit boundary (the round stops there), during a copy (the copy is
+// dropped: its source keeps its home, its entry is -1 again), during the file reads (the reads in flight are ended and
+// dropped). Every case: cancelled = 1, consistent, nothing half moved; a later round completes.
+TEST(dg_round_cancel_from_thread) {
+  auto cancel_now = [](DgCore* core) {
+    std::thread th([core] { core->cancel_round(); });
+    th.join();
+  };
+  {  // at a unit boundary
+    auto r = seeded_rig();
+    DgCore* core = r->core.get();
+    r->core->set_round_probe([&](uint32_t moved) {
+      if (moved == 2) cancel_now(core);
+    });
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    CHECK_EQ(res.cancelled, 1u);
+    CHECK_EQ(res.promoted_to_device, 2u);
+    CHECK_EQ(res.demoted_from_device, 2u);
+    CHECK_EQ(r->core->stats().round_cancelled, 1u);
+    r->verify();
+    r->core->set_round_probe(nullptr);
+    const ts::DgRoundOut res2 = r->core->round(round_in(), {});
+    CHECK_EQ(res2.cancelled, 0u);
+    CHECK_EQ(res2.promoted_to_device, 4u);
+    for (uint32_t k = 20; k < 26; ++k) CHECK(r->core->home(k) == DgCore::Home::Device);
+    r->verify();
+  }
+  {  // during the third promotion's copy
+    auto r = seeded_rig();
+    DgCore* core = r->core.get();
+    int h2d = 0;
+    r->t->set_on_h2d([&] {
+      if (++h2d == 3) cancel_now(core);
+    });
+    const int32_t block22 = r->core->block_of(22);
+    const uint32_t free0 = r->core->free_slots();
+    const ts::DgRoundOut res = r->core->round(round_in(), {});
+    r->t->set_on_h2d(nullptr);
+    CHECK_EQ(res.cancelled, 1u);
+    CHECK_EQ(res.promoted_to_device, 2u);
+    CHECK_EQ(res.demoted_from_device, 3u);  // the third victim's write-back was complete: its slot is free now
+    CHECK(r->core->home(22) == DgCore::Home::Host && r->core->block_of(22) == block22);
+    CHECK_EQ(r->t->entry(22), -1);
+    CHECK_EQ(r->core->free_slots(), free0 + 1);
+    r->verify();
+    const ts::DgRoundOut res2 = r->core->round(round_in(), {});
+    CHECK_EQ(res2.cancelled, 0u);
+    CHECK(r->core->home(22) == DgCore::Home::Device);
+    r->verify();
+    CHECK(r->v.what.empty());
+  }
+  for (int async = 0; async < 2; ++async) {  // three-tier, during the file reads
+    const auto disk = disk_flags(72, 24, 28);
+    ResRig r({24, 24, 24}, 24, 4, 1, false, &disk, 4, 3);
+    r.t->set_async_reads(async != 0, 3);
+    std::vector<std::pair<uint32_t, float>> kv;
+    for (uint32_t k = 40; k < 46; ++k) kv.push_back({k, 20.f});
+    seed_counts(*r.core, kv);
+    DgCore* core = r.core.get();
+    r.core->set_round_probe([&](uint32_t moved) {
+      if (moved == 3) cancel_now(core);
+    });
+    const ts::DgRoundOut res = r.core->round(round_in(), {});
+    CHECK_EQ(res.cancelled, 1u);
+    CHECK(res.promoted_to_pinned <= 3u);
+    CHECK_EQ(res.dropped_to_file, 3u);
+    r.verify();
+    for (uint32_t k = 40; k < 46; ++k)
+      CHECK(r.core->home(k) == DgCore::Home::File || r.core->home(k) == DgCore::Home::Host);
+    r.core->set_round_probe(nullptr);
+    const ts::DgRoundOut res2 = r.core->round(round_in(), {});
+    CHECK_EQ(res2.cancelled, 0u);
+    CHECK(res2.promoted_to_pinned > 0);
+    r.verify();
+    for (int tok = 0; tok < 3; ++tok) r.token(r.routes(3), all_run(3), {});
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The counts: every export of a unit since the last round (unique ids of an exported layer, not of an unexported one),
+// s = decay x s + hits; seeded counts drive the first round's ranking; bad seeds change nothing.
+TEST(dg_round_counts_and_seeds) {
+  ResRig r({16, 16}, 8, 4, 4);
+  r.token({{9, 9, 10}, {3}}, {1, 1}, {});
+  r.token({{9}, {4}}, {1, 0}, {});  // layer 1 not exported
+  CHECK_EQ(r.core->round_hits(9), 2u);
+  CHECK_EQ(r.core->round_hits(10), 1u);
+  CHECK_EQ(r.core->round_hits(16 + 3), 1u);
+  CHECK_EQ(r.core->round_hits(16 + 4), 0u);
+  r.core->round(round_in(0), {});  // max_units 0: only the counts
+  CHECK(r.core->round_count(9) == 2.0 && r.core->round_count(10) == 1.0);
+  CHECK_EQ(r.core->round_hits(9), 0u);
+  r.token({{9}, {3}}, {1, 1}, {});
+  r.core->round(round_in(0, 0, 1.25, 0.5), {});
+  CHECK(r.core->round_count(9) == 2.0);  // 0.5 x 2 + 1
+  // seeds: two opposite profiles promote opposite ends of the pinned units
+  for (int dir = 0; dir < 2; ++dir) {
+    ResRig q({16, 16}, 8, 4, 4);
+    std::vector<std::pair<uint32_t, float>> kv;
+    for (uint32_t k = 8; k < 32; ++k) kv.push_back({k, float(dir ? k : 40 - k)});
+    seed_counts(*q.core, kv);
+    q.core->round(round_in(3), {});
+    for (uint32_t i = 0; i < 3; ++i) CHECK(q.core->home(dir ? 31 - i : 8 + i) == DgCore::Home::Device);
+    q.verify();
+  }
+  const double c9 = r.core->round_count(9);
+  for (const auto& bad : std::vector<std::pair<uint32_t, float>>{{9, -1.f}, {9, NAN}, {999, 1.f}}) {
+    bool refused = false;
+    try {
+      seed_counts(*r.core, {{10, 5.f}, bad});
+    } catch (const ts::Error& e) {
+      refused = e.status() == SS_E_INVALID;
+    }
+    CHECK(refused);
+    CHECK(r.core->round_count(9) == c9 && r.core->round_count(10) != 5.0);  // nothing set
+  }
+  bool refused = false;
+  try {
+    ts::DgRoundIn in = round_in();
+    in.decay = 1.5;
+    r.core->round(in, {});
+  } catch (const ts::Error& e) {
+    refused = e.status() == SS_E_INVALID;
+  }
+  CHECK(refused);
+  CHECK(r.v.what.empty());
+}
+
+// dg_no_admit: every demand miss is served through a bank slot (the bytes the cache without it reads), released at
+// the boundary with every home unchanged (no admission, no prefetch, no eviction); too few bank slots are refused at
+// construction; with rounds the placement converges to the hot set and the misses fall.
+TEST(dg_no_admit_bank_serves) {
+  const auto no_admit = [](DgConfig& c) { c.no_admit = true; };
+  for (int three = 0; three < 2; ++three) {
+    const auto disk = disk_flags(72, 24, 28);
+    std::unique_ptr<ResRig> a, b;
+    if (three) {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1, false, &disk, 4, 2, 0u, no_admit);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1, false, &disk, 4, 2);
+      a->t->set_async_reads(true, 2);
+      b->t->set_async_reads(true, 2);
+    } else {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6, false, nullptr, 0, 2, 0u, no_admit);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 30, 6, 6, false, nullptr, 0, 2);
+    }
+    const auto open = homes(*a->core);
+    const uint64_t reads0 = a->t->reads();
+    for (int tok = 0; tok < 16; ++tok) {
+      const auto ids = a->routes(6);
+      b->rng = a->rng;
+      CHECK(a->token(ids, all_run(3), {}) == b->token(ids, all_run(3), {}));
+      CHECK(homes(*a->core) == open);  // (a pinned home's recency order may change, never a home)
+    }
+    const ts::DgStats& s = a->core->stats();
+    CHECK(s.misses > 0);
+    CHECK_EQ(s.bank_serves, s.fetched);
+    CHECK_EQ(s.prefetched + s.evicted + s.resurrected, 0u);
+    if (three) CHECK(a->t->reads() > reads0);  // file units served through staging -> bank
+    // a prefetch does nothing
+    a->core->begin_token(++a->seq);
+    CHECK(!a->core->fetch(0, 23, true));
+    a->core->end_token({});
+    a->verify();
+    b->verify();
+    CHECK(a->v.what.empty() && b->v.what.empty());
+  }
+  {  // refused: fewer bank slots per bank than a layer's distinct misses
+    bool refused = false;
+    std::string what;
+    try {
+      ResRig r({16, 16}, 8, 4, 4, false, nullptr, 0, 7, 0u, [](DgConfig& c) {
+        c.no_admit = true;
+        c.bank_slots = 4;
+      });
+    } catch (const ts::Error& e) {
+      refused = e.status() == SS_E_CAPACITY;
+      what = e.what();
+    }
+    CHECK(refused);
+    CHECK(what.find("needs 8 bank slots") != std::string::npos);
+  }
+  // with rounds: the hot set moves onto the device (three-tier: file -> pinned -> device) and the misses fall
+  for (int three = 0; three < 2; ++three) {
+    const auto disk = disk_flags(72, 24, 28);
+    std::unique_ptr<ResRig> a, b;
+    if (three) {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1, false, &disk, 4, 4, 0u, no_admit);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 24, 4, 1, false, &disk, 4, 4);
+    } else {
+      a = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 12, 4, 4, false, nullptr, 0, 4, 0u, no_admit);
+      b = std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 12, 4, 4, false, nullptr, 0, 4);
+    }
+    std::vector<std::vector<uint32_t>> hot(3);  // four units per layer, none on the device at open
+    for (uint32_t g = 0; g < 3; ++g)
+      for (uint32_t i = 0; i < 4; ++i) hot[g].push_back(20 - i);
+    uint64_t early = 0, late = 0;
+    for (int tok = 0; tok < 40; ++tok) {
+      const auto ids = skewed(*a, hot, 4, tok % 4 == 0 ? 1 : 0);
+      b->rng = a->rng;
+      const uint64_t m0 = a->core->stats().misses;
+      CHECK(a->token(ids, all_run(3), {}) == b->token(ids, all_run(3), {}));
+      const uint64_t m = a->core->stats().misses - m0;
+      if (tok < 4) early += m;
+      if (tok >= 32 && tok % 4 != 0) late += m;
+      if (tok % 2 == 1) a->core->round(round_in(), {});
+      a->verify();
+    }
+    for (uint32_t g = 0; g < 3; ++g)
+      for (uint32_t u : hot[g]) CHECK(a->core->home(a->core->key(g, u)) == DgCore::Home::Device);
+    std::printf("  %s: misses in the first 4 tokens %llu, in the hot-only tokens of the last 8 %llu\n",
+                three ? "three-tier" : "two-tier", (unsigned long long)early, (unsigned long long)late);
+    CHECK(early > 0);
+    CHECK_EQ(late, 0u);
+    b->verify();
+    CHECK(a->v.what.empty() && b->v.what.empty());
   }
 }

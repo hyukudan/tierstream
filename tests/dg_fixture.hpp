@@ -125,4 +125,19 @@ inline void dg_options(ss_options& o, uint32_t max_ids, ss_backend_kind be) {
   o.staging_bytes = 64 * 1024;
 }
 
+// The production configuration of the GLM prefill tests: SCORED_AUTO (the context always uses the bounded boundary
+// selection) and three-tier placement with mixed sources: of the units the tiers leave pinned, every other one becomes
+// file-only (dg_disk_tier, 4 staging buffers, 4 reads in flight).
+inline void dg_production_options(ss_options& o) {
+  o.policy = SS_POLICY_SCORED_AUTO;
+  o.dg_disk_tier = 1;
+  o.dg_disk_staging = 4;
+  o.dg_disk_queue = 4;
+}
+inline void dg_production_tiers(std::vector<uint8_t>& tiers) {
+  size_t i = 0;
+  for (auto& t : tiers)
+    if (t == SS_TIER_PINNED && i++ % 2) t = SS_TIER_DISK;
+}
+
 }  // namespace tstest

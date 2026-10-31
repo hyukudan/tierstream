@@ -95,5 +95,62 @@ ss_status ts_mfile_preadv(ss_mfile* f, const ss_mfile_io* ios, uint32_t n) { ret
 ss_status ts_mfile_get_counters(const ss_mfile* f, ss_mfile_counters* out) { return ss_mfile_get_counters(f, out); }
 const char* ts_mfile_location_path(const ss_mfile* f, int loc) { return ss_mfile_location_path(f, loc); }
 const char* ts_mfile_open_report(const ss_mfile* f) { return ss_mfile_open_report(f); }
+ss_status ts_mfile_location_info(const ss_mfile* f, uint32_t loc, ss_mfile_location* out) { return ss_mfile_location_info(f, loc, out); }
+void ts_budget_in_defaults_sized(ss_budget_in* in, uint32_t size) { ss_budget_in_defaults_sized(in, size); }
+ss_status ts_budget_plan(const ss_budget_in* in, ss_budget_out* out) { return ss_budget_plan(in, out); }
+size_t ts_budget_plan_json(const ss_budget_in* in, const ss_budget_out* out, char* buf, size_t len) { return ss_budget_plan_json(in, out, buf, len); }
+ss_status ts_budget_ledger_create(uint64_t vram_total_bytes, uint64_t ram_total_bytes, ss_budget_ledger** out) { return ss_budget_ledger_create(vram_total_bytes, ram_total_bytes, out); }
+void ts_budget_ledger_free(ss_budget_ledger* l) { ss_budget_ledger_free(l); }
+ss_status ts_budget_ledger_add(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes) { return ss_budget_ledger_add(l, kind, name, bytes); }
+ss_status ts_budget_ledger_sub(ss_budget_ledger* l, ss_budget_kind kind, const char* name, uint64_t bytes) { return ss_budget_ledger_sub(l, kind, name, bytes); }
+ss_status ts_budget_ledger_observe_device(ss_budget_ledger* l, uint64_t measured_used_bytes) { return ss_budget_ledger_observe_device(l, measured_used_bytes); }
+ss_status ts_budget_ledger_stats(const ss_budget_ledger* l, ss_budget_stats* out) { return ss_budget_ledger_stats(l, out); }
+ss_status ts_budget_ledger_observe(ss_budget_ledger* l, const char* stage, uint64_t device_used_bytes, uint64_t host_used_bytes) { return ss_budget_ledger_observe(l, stage, device_used_bytes, host_used_bytes); }
+int ts_budget_ledger_within_caps(const ss_budget_ledger* l) { return ss_budget_ledger_within_caps(l); }
+ss_status ts_dg_make_resident(ss_ctx* c, int g, const int32_t* ids, int n) { return ss_dg_make_resident(c, g, ids, n); }
+void ts_dg_round_defaults_sized(ss_dg_round_params* p, uint32_t size) { ss_dg_round_defaults_sized(p, size); }
+ss_status ts_dg_round_sized(ss_ctx* c, const ss_dg_round_params* p, ss_dg_round_result* out, uint32_t size) { return ss_dg_round_sized(c, p, out, size); }
+ss_status ts_dg_round_cancel(ss_ctx* c) { return ss_dg_round_cancel(c); }
+ss_status ts_dg_round_seed_counts(ss_ctx* c, const ss_dg_unit* units, const float* counts, uint32_t n) { return ss_dg_round_seed_counts(c, units, counts, n); }
+void ts_devprof_detect_opts_defaults_sized(ss_devprof_detect_opts* o, uint32_t size) { ss_devprof_detect_opts_defaults_sized(o, size); }
+ss_status ts_devprof_detect(const ss_devprof_detect_opts* o, ss_devprof** out) { return ss_devprof_detect(o, out); }
+ss_status ts_devprof_from_json(const char* text, size_t len, ss_devprof** out) { return ss_devprof_from_json(text, len, out); }
+ss_status ts_devprof_merge_json(ss_devprof* p, const char* text, size_t len, const char* origin) { return ss_devprof_merge_json(p, text, len, origin); }
+void ts_devprof_free(ss_devprof* p) { ss_devprof_free(p); }
+ss_status ts_devprof_to_json(const ss_devprof* p, char** out, size_t* len) { return ss_devprof_to_json(p, out, len); }
+ss_status ts_devprof_hash(const ss_devprof* p, char out[17]) { return ss_devprof_hash(p, out); }
+ss_status ts_devprof_probe_report(const ss_devprof* p, const char* host, char** out, size_t* len) { return ss_devprof_probe_report(p, host, out, len); }
+ss_status ts_devprof_get(const ss_devprof* p, ss_devprof_info* out) { return ss_devprof_get(p, out); }
+ss_status ts_devprof_limit(const ss_devprof* p, const char* key, uint64_t* value) { return ss_devprof_limit(p, key, value); }
+ss_status ts_devprof_get_device(const ss_devprof* p, uint32_t i, ss_devprof_device* out) { return ss_devprof_get_device(p, i, out); }
+ss_status ts_devprof_budget(const ss_devprof* p, uint32_t device, ss_budget_in* in) { return ss_devprof_budget(p, device, in); }
+void ts_devprof_topology_in_defaults_sized(ss_devprof_topology_in* in, uint32_t size) { ss_devprof_topology_in_defaults_sized(in, size); }
+ss_status ts_devprof_topology(const ss_devprof* const* profiles, uint32_t n_profiles, const ss_devprof_topology_in* in, ss_devprof_topology_out* out) { return ss_devprof_topology(profiles, n_profiles, in, out); }
+void ts_devprof_piece_in_defaults_sized(ss_devprof_piece_in* in, uint32_t size) { ss_devprof_piece_in_defaults_sized(in, size); }
+ss_status ts_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* in, uint32_t* rows) { return ss_devprof_piece_rows(p, in, rows); }
+void ts_pack_options_defaults_sized(ss_pack_options* o, uint32_t size) { ss_pack_options_defaults_sized(o, size); }
+ss_status ts_pack_open(const char* dir, const ss_pack_options* opt, ss_pack** out) { return ss_pack_open(dir, opt, out); }
+void ts_pack_close(ss_pack* p) { ss_pack_close(p); }
+uint64_t ts_pack_records(const ss_pack* p) { return ss_pack_records(p); }
+ss_status ts_pack_entry_at_sized(const ss_pack* p, uint64_t index, ss_pack_entry* out, uint32_t size) { return ss_pack_entry_at_sized(p, index, out, size); }
+ss_status ts_pack_find_sized(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out, uint32_t size) { return ss_pack_find_sized(p, layer, expert, name, out, size); }
+ss_status ts_pack_segment_at(const ss_pack* p, uint64_t record, uint32_t k, ss_pack_segment* out) { return ss_pack_segment_at(p, record, k, out); }
+ss_status ts_pack_unit_find(const ss_pack* p, int layer, int expert, ss_pack_unit* out) { return ss_pack_unit_find(p, layer, expert, out); }
+ss_status ts_pack_read(ss_pack* p, uint64_t record, uint32_t row0, uint32_t row1, void* dst) { return ss_pack_read(p, record, row0, row1, dst); }
+ss_status ts_pack_readv(ss_pack* p, const ss_pack_read_req* reads, uint32_t n) { return ss_pack_readv(p, reads, n); }
+ss_status ts_pack_read_unit(ss_pack* p, int layer, int expert, void* dst) { return ss_pack_read_unit(p, layer, expert, dst); }
+ss_status ts_pack_dg_descriptor(ss_pack* p, const char* base_json, size_t len, char** out_json, size_t* out_len) { return ss_pack_dg_descriptor(p, base_json, len, out_json, out_len); }
+uint32_t ts_pack_files(const ss_pack* p) { return ss_pack_files(p); }
+int ts_pack_has_layout(const ss_pack* p, const char* layout) { return ss_pack_has_layout(p, layout); }
+ss_status ts_pack_file_identity(const ss_pack* p, uint32_t file, ss_file_identity* out) { return ss_pack_file_identity(p, file, out); }
+ss_status ts_pack_info_json(const ss_pack* p, char** out_json, size_t* out_len) { return ss_pack_info_json(p, out_json, out_len); }
+ss_status ts_pack_verify_full(ss_pack* p, char** out_json, size_t* out_len) { return ss_pack_verify_full(p, out_json, out_len); }
+ss_status ts_pack_writer_begin(const char* dir, const char* meta_json, size_t len, ss_pack_writer** out) { return ss_pack_writer_begin(dir, meta_json, len, out); }
+ss_status ts_pack_writer_record_begin(ss_pack_writer* w, const ss_pack_record_spec* r) { return ss_pack_writer_record_begin(w, r); }
+ss_status ts_pack_writer_record_write(ss_pack_writer* w, const void* data, uint64_t n) { return ss_pack_writer_record_write(w, data, n); }
+ss_status ts_pack_writer_record_end(ss_pack_writer* w) { return ss_pack_writer_record_end(w); }
+ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, const void* data) { return ss_pack_writer_add(w, r, data); }
+ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256) { return ss_pack_writer_finish(w, manifest_sha256); }
+void ts_pack_writer_abort(ss_pack_writer* w) { ss_pack_writer_abort(w); }
 
 }  // extern "C"

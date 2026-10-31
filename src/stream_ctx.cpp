@@ -6,6 +6,7 @@
 #include <cstring>
 #include <set>
 
+#include "budget.hpp"
 #include "errors.hpp"
 #include "xxh64.hpp"
 
@@ -82,6 +83,7 @@ void Ctx::init() {
     case SS_BACKEND_HIP: be_ = make_hip_backend(o_.device); break;
     default: fail(SS_E_INVALID, "open: unknown backend");
   }
+  be_ = budget_backend(std::move(be_), o_.budget);  // whole-device budgets: every allocation charged (NULL: none)
   if (!o_.reader_threads) o_.reader_threads = 2;
   if (!o_.staging_buffers) o_.staging_buffers = 4;
   if (!o_.staging_bytes) o_.staging_bytes = uint64_t(256) << 20;
@@ -91,7 +93,10 @@ void Ctx::init() {
   require(o_.staging_bytes >= 4 * max_align, SS_E_INVALID, "open: staging_bytes must be >= 4 x the source alignment");
   o_.staging_bytes = round_up(o_.staging_bytes, max_align);
 
-  for (const auto& s : d_.sources) files_.push_back(open_source(s.path, o_));
+  for (size_t i = 0; i < d_.sources.size(); ++i)
+    files_.push_back(open_source(d_.sources[i].path, o_, expected_source_identity(o_, i)));
+  o_.source_identity_n = 0;  // read only during ss_open
+  o_.source_identities = nullptr;
 
   // Staging ring (pinned host): file reads land here, then go to the device (non-unified) or to the slot.
   for (uint32_t i = 0; i < o_.staging_buffers; ++i) {

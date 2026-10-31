@@ -185,8 +185,9 @@ struct Rig {
 
   // tweak: changes the options before ss_open; open_st: receives ss_open's status instead of requiring SS_OK.
   Rig(const std::string& tag, int resident, uint32_t dyn, uint32_t max_ids, uint32_t timeout_ms = 10000,
-      bool hooks = true, const std::function<void(ss_options&)>& tweak = {}, ss_status* open_st = nullptr, bool hashes = false)
-      : m(tag), n(max_ids) {
+      bool hooks = true, const std::function<void(ss_options&)>& tweak = {}, ss_status* open_st = nullptr, bool hashes = false,
+      int units = 64, const std::function<void(std::vector<uint8_t>&)>& tier_tweak = {})
+      : m(tag, 6, units), n(max_ids) {
     // load the test's own kernels now: a first launch inside a gated step (lazy module loading) would wait for the
     // step's spinning wait kernel, which waits for the service: a stall until the wait deadline (dgts-t3)
     cudaFuncAttributes fa;
@@ -203,6 +204,7 @@ struct Rig {
     CHECK_OK(ss_desc_from_json(m.json.data(), m.json.size(), &d));
     sstest::dg_budget(b, m, dyn, max_ids);
     std::vector<uint8_t> t = m.tiers(resident);
+    if (tier_tweak) tier_tweak(t);
     CHECK_OK(ss_plan_from_tiers(d, &b, t.data(), t.size(), &p));
     sstest::dg_options(o, max_ids, SS_BACKEND_CUDA);
     o.dg_wait_timeout_ms = timeout_ms;
@@ -1850,3 +1852,115 @@ TEST(dg_cuda_scored_profile) {
     CHECK(std::string(ss_last_error()).find("identity mismatch") != std::string::npos);
   }
 }
+
+// Kept-resident layers through the real context (the GLM prefill sequence on a 6 x 288 synthetic model, one PRO run):
+// per layer g, ss_dg_make_resident(g, all 288) -> ss_begin(rows: only g) with no export at all, every one of the 288
+// read through ss_dg_slot and checksummed -> ss_dg_keep(g, NULL, 0) -> an all-layer decode token (graph-free). Then
+// two layers held at once (one whole, one part) through 30 decode tokens of the other layers, their kept ids read and
+// checksummed every token, their slots unchanged; released; decode. Also: the capacity refusal, ss_dg_stats.resident_*.
+// Two configurations: the defaults (LRU, two-tier), and production (sstest::dg_production: SCORED_AUTO with the
+// context's bounded selection, three-tier with mixed pinned and file-only units; the held steps close R6 windows).
+//   ts-test-dg-cuda --only dg_cuda_make_resident_prefill
+//   ts-test-dg-cuda --only dg_cuda_make_resident_prefill_production
+void make_resident_prefill(const char* tag, bool production) {
+  Rig r(tag, 64, 16, 8, 10000, true,
+        [&](ss_options& o) {
+          if (production) sstest::dg_production_options(o);
+        },
+        nullptr, false, 288, [&](std::vector<uint8_t>& t) {
+          if (production) sstest::dg_production_tiers(t);
+        });  // 384 residents + 96 spares: 288 may be kept
+  if (!r.c) return;
+  const int G = r.m.G, U = r.m.U;
+  int32_t* ids_dev = nullptr;
+  unsigned long long* sums_dev = nullptr;
+  std::vector<int32_t> ids(static_cast<size_t>(U));
+  std::vector<unsigned long long> sums(static_cast<size_t>(U));
+  CU(cudaMalloc(&ids_dev, size_t(U) * 4));
+  CU(cudaMalloc(&sums_dev, size_t(U) * 8));
+  // one step that exports nothing: begin, checksums of `list` of each held layer through ss_dg_slot, end
+  auto held_step = [&](const std::vector<uint32_t>& rows, const std::vector<std::pair<int, std::vector<int32_t>>>& held,
+                       int* wrong) {
+    CHECK_OK(ss_begin(r.c, rows.data(), G));
+    CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
+    std::vector<std::vector<unsigned long long>> out;
+    for (const auto& h : held) {
+      CU(cudaMemcpyAsync(ids_dev, h.second.data(), h.second.size() * 4, cudaMemcpyHostToDevice, r.s));
+      CU(cudaMemsetAsync(sums_dev, 0, h.second.size() * 8, r.s));
+      checksum<<<unsigned(h.second.size()), 128, 0, r.s>>>(r.v, uint32_t(h.first), ids_dev, sums_dev);
+      CU(cudaMemcpyAsync(sums.data(), sums_dev, h.second.size() * 8, cudaMemcpyDeviceToHost, r.s));
+      CU(cudaStreamSynchronize(r.s));
+      for (size_t i = 0; i < h.second.size(); ++i)
+        if (sums[i] != r.want[size_t(h.first)][size_t(h.second[i])]) ++*wrong;
+    }
+    CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+    CHECK_OK(production ? ss_dg_end_rows(r.c, 6) : ss_end(r.c));
+    CU(cudaStreamSynchronize(r.s));
+  };
+  for (int i = 0; i < U; ++i) ids[size_t(i)] = i;
+  int wrong = 0;
+  Tally decode;
+  for (int t = 0; t < 4; ++t) decode.add(r.token(false, false));
+  for (int g = 0; g < G; ++g) {
+    CHECK_OK(ss_dg_make_resident(r.c, g, ids.data(), U));
+    std::vector<uint32_t> rows(size_t(G), 0);
+    rows[size_t(g)] = 512;  // the prefill rows of g; g holds its set: nothing is exported
+    held_step(rows, {{g, ids}}, &wrong);
+    CHECK_OK(ss_dg_keep(r.c, g, nullptr, 0));
+    decode.add(r.token(false, false));
+  }
+  ss_dg_stats x = r.stats();
+  CHECK(x.resident_units > 0);
+  CHECK_EQ(x.resident_bytes, x.resident_units * r.m.unit());
+  // capacity: 288 kept + 289 more cannot fit; nothing changes
+  CHECK_OK(ss_dg_make_resident(r.c, 0, ids.data(), U));
+  CHECK_EQ(int(ss_dg_make_resident(r.c, 1, ids.data(), U)), int(SS_E_CAPACITY));
+  // two layers held at once (0 whole, 1 a part), prolonged: the other layers decode (exports only for 2..5)
+  std::vector<int32_t> part(ids.begin(), ids.begin() + 64);
+  CHECK_OK(ss_dg_make_resident(r.c, 1, part.data(), int(part.size())));
+  for (int t = 0; t < 30; ++t) {
+    // decode of layers 2..5 and the held ones read in the same step
+    for (int g = 0; g < G; ++g)
+      for (uint32_t i = 0; i < r.n; ++i) r.ids_host[size_t(g) * r.n + i] = int32_t(r.pick(g));
+    const size_t cells = size_t(G) * r.n;
+    CU(cudaMemcpyAsync(r.ids_dev, r.ids_host, cells * 4, cudaMemcpyHostToDevice, r.s));
+    CU(cudaMemsetAsync(r.sums_dev, 0, cells * 8, r.s));
+    CHECK_OK(ss_begin(r.c, nullptr, 0));  // layers 0 and 1 hold sets: not exported whatever their rows
+    CHECK_OK(ss_dg_enqueue_begin(r.c, r.s));
+    CU(cudaMemcpyAsync(ids_dev, ids.data(), size_t(U) * 4, cudaMemcpyHostToDevice, r.s));
+    CU(cudaMemsetAsync(sums_dev, 0, size_t(U) * 8, r.s));
+    checksum<<<unsigned(U), 128, 0, r.s>>>(r.v, 0u, ids_dev, sums_dev);  // layer 0: all 288, no wait
+    for (int g = 2; g < G; ++g) {
+      CHECK_OK(ss_dg_enqueue_export(r.c, g, r.ids_dev + size_t(g) * r.n, int(r.n), 0, r.s));
+      CHECK_OK(ss_dg_enqueue_wait(r.c, g, r.s));
+      checksum<<<r.n, 128, 0, r.s>>>(r.v, uint32_t(g), r.ids_dev + size_t(g) * r.n, r.sums_dev + size_t(g) * r.n);
+    }
+    CHECK_OK(ss_dg_enqueue_end(r.c, r.s));
+    CHECK_OK(ss_end(r.c));
+    CU(cudaMemcpyAsync(sums.data(), sums_dev, size_t(U) * 8, cudaMemcpyDeviceToHost, r.s));
+    CU(cudaMemcpyAsync(r.sums_host, r.sums_dev, cells * 8, cudaMemcpyDeviceToHost, r.s));
+    CU(cudaStreamSynchronize(r.s));
+    for (int i = 0; i < U; ++i)
+      if (sums[size_t(i)] != r.want[0][size_t(i)]) ++wrong;
+    for (int g = 2; g < G; ++g)
+      for (uint32_t i = 0; i < r.n; ++i)
+        if (r.sums_host[size_t(g) * r.n + i] != r.want[size_t(g)][size_t(r.ids_host[size_t(g) * r.n + i])]) ++wrong;
+  }
+  held_step(std::vector<uint32_t>(size_t(G), 0), {{0, ids}, {1, part}}, &wrong);
+  CHECK_OK(ss_dg_keep(r.c, 0, nullptr, 0));
+  CHECK_OK(ss_dg_keep(r.c, 1, nullptr, 0));
+  for (int t = 0; t < 6; ++t) decode.add(r.token(false, false));
+  x = r.stats();
+  print(tag, x);
+  std::printf("  resident units %llu (%llu bytes), victims %llu; wrong checksums %d, decode wrong %d failed %d\n",
+              (unsigned long long)x.resident_units, (unsigned long long)x.resident_bytes,
+              (unsigned long long)x.resident_evicted, wrong, decode.wrong, decode.failed);
+  CHECK_EQ(wrong, 0);
+  CHECK_EQ(decode.wrong, 0);
+  CHECK_EQ(decode.failed, 0);
+  (void)cudaFree(ids_dev);
+  (void)cudaFree(sums_dev);
+}
+
+TEST(dg_cuda_make_resident_prefill) { make_resident_prefill("mkres", false); }
+TEST(dg_cuda_make_resident_prefill_production) { make_resident_prefill("mkresp", true); }

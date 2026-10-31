@@ -1,0 +1,1 @@
+{"class":"generic-cuda","evidence":"","limits":{},"margins":{"device_reserve_bytes":2147483648,"host_floor_bytes":8589934592},"match":{"api":"cuda","arch":"","memory_max_bytes":0,"memory_min_bytes":0,"name_contains":""},"mem_gbps":null,"schema":"strix/device-class-v1","unified":false}

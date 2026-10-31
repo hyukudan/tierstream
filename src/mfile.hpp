@@ -34,6 +34,7 @@ class MFile {
   ~MFile();
 
   uint64_t size() const;
+  uint64_t chunk_bytes() const;  // the stripe chunk grid (a read crossing it is planned as two pieces)
   bool multi() const;
   bool direct() const;
   // Aligned contract: offset, n and dst multiples of kAlign; a read may extend past EOF to the aligned end.
@@ -43,6 +44,9 @@ class MFile {
   std::string location_path(int loc) const;
   int locations() const;
   std::string reasons() const;  // why secondary locations were disabled at open (empty when none)
+  // What location loc holds (ss_mfile_location_info); sized: copies min(out->struct_size, sizeof) bytes.
+  void location_info(int loc, ss_mfile_location* out) const;
+  FileIdentity primary_identity() const;
 
   // test hook: make reads of location loc fail (1 = error, 2 = short read, 3 = corrupt bytes) after `after` reads
   void test_inject(int loc, int kind, uint64_t after);

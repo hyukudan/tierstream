@@ -98,5 +98,59 @@ ss.h-sha256 eeba12d0c1cf4eec69f89ae4c69b7265b03c99e5d9b9712283fc94f18413d8e9
 # auto + multidisk (additive: multi-location C API and appended weight options on top of auto; all existing declarations unchanged)
 ss.h-sha256 f73260fbaa5c8000b3e6f3bc0325c1ef3dd33ba4593d591304ce6095cb986ec9
 
-# auto + multidisk + wb-stream default (comment only: dg_wb_stream documents its new ss_options_defaults value 1; no declaration or layout changed)
-ss.h-sha256 640047bfdae32083a49d12b010166e4133add6ad25a96a3e007b313c4525f037
+# three-tier (additive: appended ss_options dg_disk_* / dg_inclusive_blocks and ss_dg_stats disk/inclusive fields, SS_DG_DISK_TIER; existing declarations unchanged)
+ss.h-sha256 2cab6e1e366c5ce43da65523ada8ef6e07e14a1aa9baac0d19ccd79ef748fef8
+
+# three-tier overlapped reads (additive: appended ss_options dg_disk_queue + reserved4, ss_dg_stats disk_wait_ns; existing declarations unchanged)
+ss.h-sha256 10ea31e74c1345e6a4d3e7482ebb68083f97c811f5eb8beaca860881555f54ca
+
+# three-tier prefetch reads in flight across calls (comments only: dg_disk_prefetch / dg_disk_queue wording; no declaration changed)
+ss.h-sha256 e9b66e3be5d0dd4d7c684a27eb28415e97fad653f7efd51bf3b6992e5eadd490
+
+# bound opens (additive: ss_file_identity, appended ss_options source_identity_n / reserved5 / source_identities, ss_mfile_location and ss_mfile_location_info; existing declarations unchanged)
+ss.h-sha256 c60ab4770fa8d2ca39254918e12cdb84cbde42bf1d6a5d95c5909ece5a2cd27d
+
+# three-tier overlapped reads feature macro (additive: SS_DG_DISK_QUEUE)
+ss.h-sha256 93d2195c78c7efba4d296a2758eda1b59eaee187cb2ef9cc472cfb2094b538e1
+
+# three-tier overlap receipts (additive: appended ss_dg_stats disk_overlapped / disk_max_in_flight / disk_carried / disk_carried_bytes, SS_DG_DISK_RECEIPTS)
+ss.h-sha256 91e3bbee7ebaf60e45ea8b009681287087dd7c0e8c89bf60f289c162dafca2c2
+
+# three-tier overlapped reads off by default (comment only: dg_disk_queue 0 = 1)
+ss.h-sha256 ec5f9dfd30199a144ebe2fe3b0329fa14240e9d77bc713e0de567b055a37d431
+
+# whole-device budgets (additive: appended ss_options.budget, ss_budget_in / ss_budget_out / ss_budget_plan, the ss_budget_ledger API and SS_BUDGET*; existing declarations unchanged)
+ss.h-sha256 0319c6d58851f6e0acee219cb6b6c1938a93c6ceef9921497598fd4fbb848a93
+
+# whole-device budgets: margins under the caps (additive: appended ss_budget_in.vram_margin_bytes / ram_margin_bytes, SS_BUDGET_MARGINS; existing declarations unchanged)
+ss.h-sha256 060aa9f70f9046f268e74a8fd05b7e1f8d977ba3f0cfdf7cd37ceb18945fc011
+
+# whole-device budgets: plan JSON (additive: ss_budget_plan_json, appended ss_budget_out.device_room_bytes / host_cap_units / device_capped / host_capped, SS_BUDGET_JSON; existing declarations unchanged)
+ss.h-sha256 ef6c7e1888e28f67ba6e04437ea6cc6bed8538fe9f6e6a707e1a6beddb320bd7
+
+# whole-device budgets: measured peaks against the caps (additive: ss_budget_ledger_observe / ss_budget_ledger_within_caps, appended ss_budget_stats fields, SS_BUDGET_OBSERVE / SS_BUDGET_NO_SAMPLE; existing declarations unchanged)
+ss.h-sha256 440913c1ca5a94c8ecf1da3ea1bc52b2ceaaab927ba4b5b0276f113f2b6fc918
+
+# budgets: contexts charge their own allocations only (comment only)
+ss.h-sha256 c54222e9e07caacafe4943e26ad74e1c2a245681b75ff5c7a9cb53019d2b1db9
+
+# kept-resident layers (additive: ss_dg_make_resident, SS_DG_MAKE_RESIDENT, appended ss_dg_stats resident_units / resident_evicted / resident_bytes / resident_ns)
+ss.h-sha256 854e33dad5dcaf28cdb64ed83b618560e145ba13d75e60f8cbfdbe41c406bd25
+
+# kept-resident layers, failure contract (comments only: ss_dg_make_resident protects g's current keep until success and counts it in the capacity; a device failure poisons)
+ss.h-sha256 944019297e7b7bf218c4177ece3ef74a9058746958ecab29f1d8e670df69cf77
+
+# placement rounds (additive: ss_dg_round_params, ss_dg_round_result, ss_dg_round_defaults_sized, ss_dg_round_sized, ss_dg_round_cancel, ss_dg_round_seed_counts, SS_DG_ROUNDS, appended ss_options dg_no_admit / reserved6, appended ss_dg_stats round_count / round_units / round_bytes / round_ns / round_cancelled)
+ss.h-sha256 03f531454f14fc5970adaf8d15475fd13179758c4906c235a35c5dad8e91f255
+
+# device profiles (additive: ss_devprof, ss_devprof_detect_opts, ss_devprof_info, ss_devprof_device, ss_devprof_topology_in / _out, ss_devprof_piece_in, ss_devprof_detect_opts_defaults_sized, ss_devprof_detect, ss_devprof_from_json, ss_devprof_merge_json, ss_devprof_free, ss_devprof_to_json, ss_devprof_hash, ss_devprof_probe_report, ss_devprof_get, ss_devprof_limit, ss_devprof_get_device, ss_devprof_budget, ss_devprof_topology_in_defaults_sized, ss_devprof_topology, ss_devprof_piece_in_defaults_sized, ss_devprof_piece_rows, SS_DEVPROF*, SS_BUDGET_UNIFIED, appended ss_budget_in unified / reserved1)
+ss.h-sha256 ecad58ebece16abb497ca313481c310445bcccf8bbbb1edf522e1612816a05db
+
+# device profiles, review fixes (comments only: unified profiles refuse pre-unified ss_budget_in, measured links for pairs, piece alignment / exhaustion, class re-derivation, ignored override metadata)
+ss.h-sha256 63ce8c2af74b2f9ef6ad216ab29e26548bd3af09715170d7d8c8aa92b1a4af2b
+
+# indexed prepared pack tierstream/pack-v1 (additive: ss_pack_* reader, ss_pack_writer_* writer, ss_pack_options / ss_pack_entry / ss_pack_segment / ss_pack_unit / ss_pack_read_req / ss_pack_record_spec, ss_pack_verify, SS_HAVE_PACK; replaced, not appended, by its review fixes before release: ss_pack_read_req.struct_size first, sized ss_pack_record_spec, comments)
+ss.h-sha256 93233cb622d076fabfc95751d99ab8b7e9a327c668ce2610ca800ac5ac4f9824
+
+# public main write-back stream default (#7) on top of the release tip (comment only: dg_wb_stream default 1)
+ss.h-sha256 7263a29b3e9b15fa0ad0e5987db55394082be0d0a98268f95539c46fc071dc6a

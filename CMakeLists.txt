@@ -38,6 +38,13 @@ add_library(tierstream STATIC
   src/sha256.cpp
   src/desc.cpp
   src/plan.cpp
+  src/budget.cpp
+  src/devprof.cpp
+  src/devprof_class.cpp
+  src/devprof_plan.cpp
+  src/devprof_linux.cpp
+  src/devprof_hip.cpp
+  src/devprof_cuda.cpp
   src/recipe.cpp
   src/recipe_resolve.cpp
   src/recipe_run.cpp
@@ -46,6 +53,8 @@ add_library(tierstream STATIC
   src/raw_file.cpp
   src/stripe_manifest.cpp
   src/mfile.cpp
+  src/pack.cpp
+  src/pack_capi.cpp
   src/backend_cpu.cpp
   src/dg_core.cpp
   src/dg_prior.cpp
@@ -59,6 +68,7 @@ add_library(tierstream STATIC
   src/ts_api.cpp)
 target_include_directories(tierstream PUBLIC include PRIVATE src)
 target_link_libraries(tierstream PUBLIC Threads::Threads)
+target_link_libraries(tierstream PUBLIC ${CMAKE_DL_LIBS})  # device profiles load HIP / CUDA / NVML at run time
 if(WIN32)
   target_link_libraries(tierstream PUBLIC avrt winmm bcrypt)  # service thread boost and incremental SHA-256
 endif()
@@ -168,9 +178,28 @@ foreach(name ts-recipe ss-recipe)
   target_link_libraries(${name} PRIVATE tierstream)
 endforeach()
 
+add_executable(ts-devprof tools/ts_devprof.cpp)
+target_link_libraries(ts-devprof PRIVATE tierstream)
+add_executable(ts-pack tools/ts_pack.cpp)
+target_include_directories(ts-pack PRIVATE src)
+target_link_libraries(ts-pack PRIVATE tierstream)
+
 add_executable(ts-stripe tools/ts_stripe.cpp)
 target_include_directories(ts-stripe PRIVATE src)
 target_link_libraries(ts-stripe PRIVATE tierstream)
+
+# Read microbenchmark (NVMe -> host through ss_mfile); the CUDA build adds ts-vram-bench (-> pinned -> device) from
+# the same source.
+add_executable(ts-read-bench tools/ts_vram_bench.cpp)
+target_compile_definitions(ts-read-bench PRIVATE TS_TOOL_NAME="ts-read-bench")
+target_include_directories(ts-read-bench PRIVATE src)
+target_link_libraries(ts-read-bench PRIVATE tierstream)
+if(TS_CUDA)
+  add_executable(ts-vram-bench tools/ts_vram_bench.cpp)
+  target_compile_definitions(ts-vram-bench PRIVATE TS_TOOL_NAME="ts-vram-bench" TS_VRAM_CUDA=1)
+  target_include_directories(ts-vram-bench PRIVATE src)
+  target_link_libraries(ts-vram-bench PRIVATE tierstream CUDA::cudart)
+endif()
 
 if(TS_TESTS)
   enable_testing()
@@ -182,6 +211,11 @@ if(TS_TESTS)
   target_link_libraries(ts-test-stripe PRIVATE tierstream)
   add_test(NAME stripe-tool COMMAND ts-test-stripe ${CMAKE_CURRENT_BINARY_DIR}/stripe-tool-test $<TARGET_FILE:ts-stripe>)
   set_tests_properties(stripe-tool PROPERTIES TIMEOUT 30)
+  add_executable(ts-test-read-bench tests/test_read_bench.cpp)
+  target_include_directories(ts-test-read-bench PRIVATE src)
+  target_link_libraries(ts-test-read-bench PRIVATE tierstream)
+  add_test(NAME read-bench COMMAND ts-test-read-bench $<TARGET_FILE:ts-read-bench>)
+  set_tests_properties(read-bench PROPERTIES TIMEOUT 60)
   foreach(t core runtime recipe exclusive readahead snapshot mfile source-file)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
@@ -197,13 +231,26 @@ if(TS_TESTS)
   add_test(NAME mfile COMMAND ts-test-mfile)
   add_test(NAME source-file COMMAND ts-test-source-file)
   set_tests_properties(source-file PROPERTIES TIMEOUT 30)
-  foreach(t dg dg-service dg-open dg-load)
+  add_executable(ts-test-pack tests/test_pack.cpp)
+  target_include_directories(ts-test-pack PRIVATE src)
+  target_link_libraries(ts-test-pack PRIVATE tierstream)
+  add_test(NAME pack COMMAND ts-test-pack ${CMAKE_CURRENT_BINARY_DIR}/pack-test $<TARGET_FILE:ts-pack>
+           $<TARGET_FILE:ts-stripe>)
+  set_tests_properties(pack PROPERTIES TIMEOUT 120)
+  foreach(t dg dg-service dg-open dg-load budget devprof devprof-linux devprof-cuda)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
     target_include_directories(ts-test-${t} PRIVATE src)
     target_link_libraries(ts-test-${t} PRIVATE tierstream)
     add_test(NAME ${t} COMMAND ts-test-${t})
   endforeach()
+
+  set_tests_properties(devprof PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})  # reads profiles/*.json
+  add_test(NAME devprof-tool COMMAND ts-devprof --root ${CMAKE_CURRENT_SOURCE_DIR}/profiles --no-runtime --no-env
+                                     --no-cache --budget)
+  set_tests_properties(devprof-tool PROPERTIES WILL_FAIL ON)  # no device under that root: refused, rc 1
+  add_test(NAME devprof-tool-usage COMMAND ts-devprof --bogus)
+  set_tests_properties(devprof-tool-usage PROPERTIES PASS_REGULAR_EXPRESSION "unknown argument --bogus")
 
   add_executable(ts-test-capi tests/test_capi.c)
   target_link_libraries(ts-test-capi PRIVATE tierstream)
