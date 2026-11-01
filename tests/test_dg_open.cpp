@@ -456,3 +456,22 @@ TEST(dg_no_admit_and_rounds_abi_cpu) {
   const float one = 1.f;
   CHECK_EQ(int(ss_dg_round_seed_counts(nullptr, &u, &one, 1)), int(SS_E_INVALID));
 }
+
+// dg_clean_evict: 0 or 1 (no effect without dg_disk_tier: accepted there too), appended after dg_no_admit's padding;
+// an older struct (without it) reads 0; the runtime setter on no context.
+TEST(dg_clean_evict_abi_cpu) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_clean_evict = 2; }), SS_E_INVALID, "dg_clean_evict must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_clean_evict = 1; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B&, O& o, T&) {
+           o.struct_size = uint32_t(offsetof(ss_options, dg_clean_evict));
+           o.dg_clean_evict = 7;  // beyond an older caller's struct: never read
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  static_assert(offsetof(ss_options, dg_clean_evict) == offsetof(ss_options, reserved6) + 4, "appended");
+  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved7) + 4, "the struct's end");
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_clean_evict, 0u);
+  CHECK_EQ(int(ss_dg_set_clean_evict(nullptr, 1)), int(SS_E_INVALID));
+}

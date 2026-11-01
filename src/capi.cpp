@@ -176,6 +176,7 @@ void clear_reserved(ss_options& o) {
   o.reserved4 = 0;
   o.reserved5 = 0;
   o.reserved6 = 0;
+  o.reserved7 = 0;
 }
 void clear_reserved(ss_mfile_options&) {}
 void clear_reserved(ss_budget_in& b) { b.reserved0 = 0; }
@@ -1005,6 +1006,9 @@ ss_status ss_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* to
 }
 ss_status ss_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_sched").set_sched(wb_defer, flush_ready); });
+}
+ss_status ss_dg_set_clean_evict(ss_ctx* c, uint32_t on) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_clean_evict").set_clean_evict(on); });
 }
 ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
                             uint32_t prefetch_per_token) {

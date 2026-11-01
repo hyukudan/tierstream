@@ -489,6 +489,18 @@ class CudaDgCtx final : public DgCtx {
     }
   }
 
+  void set_clean_evict(uint32_t on) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_set_clean_evict: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_set_clean_evict: poisoned context");
+    require(on <= 1, SS_E_INVALID, "ss_dg_set_clean_evict: on is 0 or 1");
+    try {
+      core_->set_clean_evict(on != 0);
+    } catch (...) {
+      poisoned_ = true;
+      throw;
+    }
+  }
+
   void set_policy(ss_policy policy) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_set_policy: between tokens only");
     require(!poisoned_, SS_E_BACKEND, "ss_dg_set_policy: poisoned context");
@@ -860,6 +872,13 @@ class CudaDgCtx final : public DgCtx {
     out->round_bytes = a.round_bytes;
     out->round_ns = a.round_ns;
     out->round_cancelled = a.round_cancelled;
+    out->clean_drops = a.clean_drops;
+    out->clean_drop_bytes = a.clean_drop_bytes;
+    out->mkres_file_reads = a.mkres_file_reads;
+    out->mkres_file_bytes = a.mkres_file_bytes;
+    out->mkres_read_ns = a.mkres_read_ns;
+    out->mkres_h2d_bytes = a.mkres_h2d_bytes;
+    out->mkres_wb_bytes = a.mkres_wb_bytes;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
@@ -1072,6 +1091,13 @@ class CudaDgCtx final : public DgCtx {
     d.round_bytes = a.round_bytes - b.round_bytes;
     d.round_ns = a.round_ns - b.round_ns;
     d.round_cancelled = a.round_cancelled - b.round_cancelled;
+    d.clean_drops = a.clean_drops - b.clean_drops;
+    d.clean_drop_bytes = a.clean_drop_bytes - b.clean_drop_bytes;
+    d.mkres_file_reads = a.mkres_file_reads - b.mkres_file_reads;
+    d.mkres_file_bytes = a.mkres_file_bytes - b.mkres_file_bytes;
+    d.mkres_read_ns = a.mkres_read_ns - b.mkres_read_ns;
+    d.mkres_h2d_bytes = a.mkres_h2d_bytes - b.mkres_h2d_bytes;
+    d.mkres_wb_bytes = a.mkres_wb_bytes - b.mkres_wb_bytes;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1198,6 +1224,11 @@ class CudaDgCtx final : public DgCtx {
         {"resident_evicted", s.resident_evicted},
         {"resident_bytes", s.resident_bytes},
         {"resident_ns", s.resident_ns},
+        {"mkres_file_reads", s.mkres_file_reads},
+        {"mkres_file_bytes", s.mkres_file_bytes},
+        {"mkres_read_ns", s.mkres_read_ns},
+        {"mkres_h2d_bytes", s.mkres_h2d_bytes},
+        {"mkres_wb_bytes", s.mkres_wb_bytes},
         {"round_count", s.round_count},
         {"round_units", s.round_units},
         {"round_bytes", s.round_bytes},
@@ -1221,6 +1252,8 @@ class CudaDgCtx final : public DgCtx {
           {"disk_wait_ns", s.disk_wait_ns}, {"disk_overlapped", s.disk_overlapped},
           {"disk_carried", s.disk_carried}, {"disk_carried_bytes", s.disk_carried_bytes},
           {"disk_max_in_flight", s.disk_max_in_flight}, {"unit_subread_bytes", x_.unit_subread},
+          {"clean_drops", s.clean_drops}, {"clean_drop_bytes", s.clean_drop_bytes},
+          {"clean_evict", uint64_t(core_->clean_evict())},
           {"disk_queue", uint64_t(x_.disk_queue)},
           {"disk_units_open", uint64_t(x_.F)}, {"staging", uint64_t(x_.S)}, {"inclusive_blocks", uint64_t(x_.I)}};
       for (const auto& f : tf) tt[f.first] = Json::number(f.second);
@@ -1517,6 +1550,7 @@ class CudaDgCtx final : public DgCtx {
     c.inclusive = x_.I;
     c.disk_queue = x_.disk_queue;
     c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
+    c.clean_evict = o_.dg_clean_evict != 0;  // (no effect without dg_disk_tier)
     if (x_.disk_tier) {
       // (the gated layer from the layout's bases: the pool's threads never touch the core)
       transport_->pool_reader = [this](uint32_t reader, uint32_t key, char* dst) {

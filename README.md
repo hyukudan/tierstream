@@ -231,6 +231,16 @@ engine's own cache, then receive maintainer approval.
       replica, 80 GiB of VRAM slots plus ~63 GiB of RAM blocks would hold all 142.4 GiB of experts, with no file read
       after open. The shipped pending recipe's actual budget still leaves 5.8 GiB on NVMe.
 
+**Clean eviction for read-only units (`dg_clean_evict`, opt-in).** Expert weights never change, so their file always
+holds the same bytes. With `dg_clean_evict = 1` (or `ss_dg_set_clean_evict` between tokens), a unit leaving the device
+when no pinned block is free goes straight back to its file: no device-to-host copy, and no pinned unit is pushed out
+to make room. This stops the "evict, write back, re-read" loop when a model's working set is larger than VRAM + pinned
+RAM (for example a whole-layer prefill on a small card). Counted in `ss_dg_stats.clean_drops` / `clean_drop_bytes`.
+
+**`ss_dg_make_resident` reads in flight.** Up to `min(dg_disk_queue, dg_disk_staging)` file reads run together and are
+finished as they complete; the copied units still become the most recent in the order given, so placement does not
+depend on read timing. Its own reads, bytes, wait time, host-to-device and write-back bytes are in `ss_dg_stats.mkres_*`.
+
 ### Fetching ahead
 
 - **Certain prefetch** (`ss_prefetch_layer`): layer-by-layer prefill knows it needs layer L+1 next, so that layer is

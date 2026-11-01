@@ -345,6 +345,14 @@ typedef struct ss_options {
    * guard. 0 (default) = misses are admitted as before. */
   uint32_t dg_no_admit;
   uint32_t reserved6;  /* explicit padding (never read) */
+  /* appended, three-tier clean eviction (SS_DG_CLEAN_EVICT below): 1 = a device victim that needs a pinned block while
+   * none is free goes to its file (no device-to-host copy: the file holds its bytes, a later miss reads them back
+   * hash-checked) instead of the least recently homed pinned unit being dropped to its file for its block; with a free
+   * block the victim is written back as before. Boundary victims, ss_dg_make_resident's and ss_dg_round's alike; kept
+   * and held units are never victims. 0 (default) = as before. No effect without dg_disk_tier. Also settable between
+   * tokens (ss_dg_set_clean_evict). */
+  uint32_t dg_clean_evict;
+  uint32_t reserved7;  /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -712,6 +720,17 @@ typedef struct ss_dg_stats {
    * open then adds a notice to the stats JSON); CUDA_MODULE_LOADING=EAGER avoids it. Not reset by ss_stats_reset. */
   uint32_t cuda_module_loading;
   uint32_t reserved1; /* explicit padding (never read) */
+  /* appended, clean eviction (SS_DG_CLEAN_EVICT; 0 when off): device victims dropped to their file without a copy
+   * because no pinned block was free, and their bytes (the boundary's also count in disk_discards, ss_dg_make_resident's
+   * and ss_dg_round's in their own counters) */
+  uint64_t clean_drops, clean_drop_bytes;
+  /* appended, ss_dg_make_resident's own transfers (SS_DG_MKRES_STATS; also in resident_* only, nowhere else):
+   * mkres_file_reads / mkres_file_bytes = file reads of file-homed units it copied in (up to dg_disk_queue in flight);
+   * mkres_read_ns = its wall time in those reads (beginning them, and waiting for them to finish: with dg_disk_queue
+   * <= 1 each read runs inside its begin); mkres_h2d_bytes = the bytes it copied host-to-device (pinned block or
+   * staging buffer -> slot, = resident_bytes); mkres_wb_bytes = the bytes its victims' write-backs copied
+   * device-to-host */
+  uint64_t mkres_file_reads, mkres_file_bytes, mkres_read_ns, mkres_h2d_bytes, mkres_wb_bytes;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1168,8 +1187,10 @@ SS_API int ss_budget_ledger_within_caps(const ss_budget_ledger* l);
    units of g already on the device stay, the others take free slots, else evict device units no layer keeps in the
    policy's order (LRU: least recent first; SCORED / SCORED_AUTO: the boundary's score order) with the boundary's
    lower-tier rules (a clean copy back to its block, a write-back into a free pinned block, three-tier: a pinned unit
-   dropped to its file for that block, else the victim to its file), and copies the rest in from their pinned blocks or
-   files (synchronously). Counted only in ss_dg_stats.resident_*. A held set is never exported: the next steps leave g
+   dropped to its file for that block, else the victim to its file; with dg_clean_evict the victim goes to its file
+   instead of displacing a pinned unit), and copies the rest in from their pinned blocks or files (up to
+   min(dg_disk_queue, dg_disk_staging) file reads in flight, ended as they finish; the copied units become the most
+   recent in the order of ids). Counted in ss_dg_stats.resident_* and mkres_*. A held set is never exported: the next steps leave g
    out of the export / wait sequence (rows ignored) and read its kept ids through ss_dg_slot (any other id reads the
    guard and fails the token). Release it (ss_dg_keep(c, g, NULL, 0)) before g is exported again. Usage per layer:
    make_resident(g, all units), one step exporting no other layer (rows_per_layer[h] = 0 for h != g), release; several
@@ -1522,6 +1543,15 @@ SS_API ss_status ss_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec
 /* Publishes the pack; manifest_sha256 (65 bytes, may be NULL) receives the pin. The writer is freed either way. */
 SS_API ss_status ss_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256);
 SS_API void ss_pack_writer_abort(ss_pack_writer* w);
+
+/* Three-tier clean eviction (ss_options.dg_clean_evict, ss_dg_stats.clean_drops / clean_drop_bytes). Between tokens
+ * (the state rules of ss_dg_set_sched; refused inside a token with SS_E_INVALID): on = 0 or 1, from the next victim
+ * on; ss_dg_reset_open restores the open's setting. Placement only: the same bytes. */
+#define SS_DG_CLEAN_EVICT 1
+SS_API ss_status ss_dg_set_clean_evict(ss_ctx* c, uint32_t on);
+/* ss_dg_stats.mkres_file_reads / mkres_file_bytes / mkres_read_ns / mkres_h2d_bytes / mkres_wb_bytes exist; the file
+ * reads of ss_dg_make_resident run up to dg_disk_queue in flight (the finished ones end first, in any order) */
+#define SS_DG_MKRES_STATS 1
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <exception>
 #include <tuple>
+#include <unordered_map>
 
 #include "dg_proto.hpp"
 #include "dg_score.hpp"
@@ -1201,10 +1202,12 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   };
   auto accept = [&](uint32_t k) {
     Entry& x = e_[k];
-    if (x.backed || (free_blocks_.empty() && !drop_host_lru() && c_.disk_tier)) {
+    const bool clean = !x.backed && clean_now();  // dg_clean_evict: no free block, no pinned unit dropped for one
+    if (x.backed || clean || (free_blocks_.empty() && !drop_host_lru() && c_.disk_tier)) {
       // a clean copy (its block is its home again) or, three-tier with no block to free, its file: no copy
       if (x.backed) ++st_.inclusive_drops;
       else ++st_.disk_discards;
+      if (clean) count_clean();
       unlink(k);
       --on_device_;
       free_slots_.push_back(x.slot);
@@ -1770,12 +1773,25 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
                                                                           c_.disk_staging))
                                     : 1;
   bool io_error = false;  // the failure was a file read's: the device is fine, the cache is re-established
+  // Recency: the committed units become the most recent in the order of `in` on every exit, whatever order their
+  // reads ended in (the placement after the call does not depend on read timing).
+  struct Recent {
+    DgCore* core;
+    const std::vector<uint32_t>& order;
+    std::vector<uint8_t> done;
+    ~Recent() {
+      for (size_t i = 0; i < order.size(); ++i)
+        if (done[i]) core->push_front(order[i]);
+    }
+  } recent{this, in, std::vector<uint8_t>(in.size(), 0)};
+  std::unordered_map<uint32_t, size_t> in_pos;
+  for (size_t i = 0; i < in.size(); ++i) in_pos.emplace(in[i], i);
   auto commit = [&](uint32_t k, int32_t slot) {
     Entry& x = e_[k];
     x.home = Home::Device;
     x.slot = slot;
     x.block = -1;
-    push_front(k);  // the most recent
+    recent.done[in_pos.at(k)] = 1;  // the most recent, at the call's exit
     ++on_device_;
     ++r.copied;
   };
@@ -1799,19 +1815,29 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
     free_slots_.insert(free_slots_.end(), wb.begin(), wb.end());
     wb.clear();
   };
-  auto end_read = [&] {
-    const Read rd = reads.front();
-    reads.pop_front();
+  uint64_t n_read = 0, n_wb = 0, read_ns = 0;  // (the mkres_* stats, also after a failure)
+  auto timed = [&](const std::chrono::steady_clock::time_point& a) {
+    read_ns += uint64_t(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - a).count());
+  };
+  // Ends reads[i] (each read is independent: its own key, slot and staging buffer) and enqueues its copy and entry.
+  auto end_read = [&](size_t i) {
+    const Read rd = reads[i];
+    reads.erase(reads.begin() + std::ptrdiff_t(i));
+    const auto ta = std::chrono::steady_clock::now();
     try {
       t_->read_unit_end(rd.handle);
     } catch (...) {
+      timed(ta);
       io_error = true;
       free_slots_.push_back(rd.slot);
       throw;
     }
+    timed(ta);
     transfer(rd.key, rd.slot, rd.stage);
     --on_file_;
     commit(rd.key, rd.slot);
+    ++n_read;  // committed reads only
     void*& ev = stage_ev_[uint32_t(rd.stage) - c_.blocks];  // the staging buffer is reusable once this copy landed
     if (!ev) ev = event();
     t_->record(ev, DgTransport::kDem);
@@ -1820,6 +1846,11 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
     st_.resident_units += r.copied;
     st_.resident_evicted += r.evicted;
     st_.resident_bytes += uint64_t(r.copied) * unit_bytes_;
+    st_.mkres_file_reads += n_read;
+    st_.mkres_file_bytes += n_read * unit_bytes_;
+    st_.mkres_read_ns += read_ns;
+    st_.mkres_h2d_bytes += uint64_t(r.copied) * unit_bytes_;
+    st_.mkres_wb_bytes += n_wb * unit_bytes_;
     st_.resident_ns += uint64_t(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
   };
@@ -1836,13 +1867,17 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
           continue;
         }
         if (!x.backed && free_blocks_.empty() && !c_.disk_tier) break;  // (two-tier: progress is guaranteed above)
-        // a clean copy (its block is its home again) or, three-tier with no block to free, its file: no copy
-        const bool no_copy = x.backed || (free_blocks_.empty() && !drop_host_lru(&hold, false));
+        // a clean copy (its block is its home again) or, three-tier with no block to free (dg_clean_evict: none free),
+        // its file: no copy
+        const bool clean = !x.backed && clean_now();
+        const bool no_copy = x.backed || clean || (free_blocks_.empty() && !drop_host_lru(&hold, false));
+        if (clean) count_clean();
         int32_t b = -1;
         if (!no_copy) {
           b = free_blocks_.back();
           t_->d2h(x.slot, b);  // the dirty unit's only copy: written back before its slot is reused
           free_blocks_.pop_back();
+          ++n_wb;
         }
         ++vi;
         res_victims_.push_back(v);
@@ -1877,20 +1912,35 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
         commit(k, slot);
         continue;
       }
-      // its file, through the next staging buffer (its last copy landed first)
+      // its file, through the next staging buffer (its last copy landed first). The queue depth: the reads that
+      // already finished end first (any position), then the oldest; a read still holding the next staging buffer ends
+      // before the buffer is reused (only after out-of-order ends: in order, depth <= staging never meets one).
       try {
-        if (reads.size() >= depth) end_read();
+        if (reads.size() >= depth)
+          for (size_t j = 0; j < reads.size();) {
+            if (t_->read_unit_done(reads[j].handle)) end_read(j);
+            else ++j;
+          }
+        if (reads.size() >= depth) end_read(0);
         const uint32_t i = stage_next_;
         stage_next_ = (i + 1) % c_.disk_staging;
-        if (stage_ev_[i] && !t_->done(stage_ev_[i])) t_->event_sync(stage_ev_[i]);
         const int32_t stage = int32_t(c_.blocks + i);
+        for (size_t j = 0; j < reads.size(); ++j)
+          if (reads[j].stage == stage) {
+            end_read(j);
+            break;
+          }
+        if (stage_ev_[i] && !t_->done(stage_ev_[i])) t_->event_sync(stage_ev_[i]);
         void* h = nullptr;
+        const auto tb = std::chrono::steady_clock::now();
         try {
           h = t_->read_unit_begin(k, stage);
         } catch (...) {
+          timed(tb);
           io_error = true;
           throw;
         }
+        timed(tb);
         reads.push_back({k, slot, stage, h});
         ++next;
       } catch (...) {
@@ -1898,7 +1948,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
         throw;
       }
     }
-    while (!reads.empty()) end_read();
+    while (!reads.empty()) end_read(0);
     flush_d2h();
     flush_dem();
     t_->upload_table(table_.data(), keys_);  // (syncs kDem) every entry, the victims' -1 included
@@ -2143,13 +2193,15 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
       const uint32_t v = dev[j];
       if (!(rs_[c] > in.hysteresis * rs_[v])) break;
       Entry& y = e_[v];
-      if (!fits(ub + (y.backed ? 0 : ub))) break;
+      const bool clean = !y.backed && clean_now();  // dg_clean_evict: no free block, to its file (no write)
+      if (!fits(ub + (y.backed || clean ? 0 : ub))) break;
       const int32_t slot = y.slot;
-      if (y.backed) {  // a clean copy: its block is its home again, no write
+      if (y.backed || clean) {  // a clean copy: its block is its home again, no write (dg_clean_evict: its file)
         unlink(v);
         --on_device_;
         table_[v] = -1;
         to_lower(v);
+        if (clean) count_clean();
       } else {
         const int32_t b = wb_block(c);
         if (b < 0) break;
@@ -2270,7 +2322,7 @@ bool DgCore::same_open_state(const DgCore& b) const {
     return std::tie(c.n_units, c.persistent_slots, c.bank_slots, c.blocks, c.spare_target, c.prefetch_reserve,
                     c.prefetch_reserve_auto, c.prefetch_per_layer, c.prefetch_per_token, c.wb_defer, c.wb_on_d2h,
                     c.wb_layer_bytes, c.wb_max_outstanding, c.disk_tier, c.disk_prefetch, c.home_blocks,
-                    c.disk_staging, c.inclusive, c.disk_queue);
+                    c.disk_staging, c.inclusive, c.disk_queue, c.clean_evict);
   };
   auto wp = [](const DgWinpf& w) {
     return std::tie(w.enable, w.prior_layers, w.prior_cap, w.prior_pmin, w.l1_cap, w.l1_min_votes, w.l1_pmin,
@@ -2484,6 +2536,11 @@ void DgCore::set_spare_target(uint32_t n) {
   require(n <= c_.persistent_slots, SS_E_INVALID, "device-gated: spare target above the persistent slots");
   c_.spare_target = n;
   if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, n / 4);  // cache.cpp:171
+}
+
+void DgCore::set_clean_evict(bool on) {
+  drain_pending();  // drain point: a setting (between tokens)
+  c_.clean_evict = on;
 }
 
 void DgCore::set_prefetch_budget(uint32_t per_layer, uint32_t per_token) {

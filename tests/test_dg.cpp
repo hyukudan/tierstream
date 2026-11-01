@@ -450,6 +450,8 @@ struct Shape {
   uint32_t disk = 0, staging = 3;
   bool disk_tier = false, disk_prefetch = false;
   uint32_t inclusive = 0;
+  // dg_clean_evict at open; toggle_clean: flipped between random tokens (set_clean_evict)
+  bool clean = false, toggle_clean = false;
   // overlapped file reads: the core's queue depth (1 = synchronous), the transport's reads asynchronous (landing out
   // of order), an eager device (every operation runs at once: timing-free, for the depth comparisons)
   uint32_t queue = 16;
@@ -558,13 +560,19 @@ struct Oracle {
     const size_t base_n = c.free_slots() + c.pending_writebacks();
     size_t blocks = c.free_blocks(), hosts = c.host_units(), got = 0;
     std::vector<uint32_t> taken;
-    // a clean copy is dropped (no block); else a free block, else (three-tier) a pinned home dropped to its file, else
-    // (three-tier) the victim itself to its file; a two-tier victim without a block stops the acceptance
+    // a clean copy is dropped (no block); else a free block, else (three-tier, dg_clean_evict) the victim to its file,
+    // else (three-tier) a pinned home dropped to its file, else (three-tier) the victim itself to its file; a two-tier
+    // victim without a block stops the acceptance
     auto take = [&](uint32_t k) {
       if (c.backed(k)) {  // its block becomes a pinned home (three-tier: droppable from now on)
         taken.push_back(k);
         ++got;
         if (disk_tier) ++hosts;
+        return true;
+      }
+      if (!blocks && disk_tier && c.clean_evict()) {
+        taken.push_back(k);
+        ++got;
         return true;
       }
       if (!blocks && disk_tier && hosts) {
@@ -733,6 +741,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.disk_staging = c.disk_tier ? sh.staging : 0;
   c.inclusive = sh.inclusive;
   c.disk_queue = sh.queue;
+  c.clean_evict = sh.clean;
   c.spare_target = sh.spare;
   c.prefetch_reserve = std::min(24u, sh.spare / 4);
   c.prefetch_per_layer = sh.pf_layer;
@@ -949,6 +958,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         core.set_wb_defer(!core.wb_defer());
         core.check();
       }
+      if (sh.toggle_clean && kr() % 3 == 0) core.set_clean_evict(!core.clean_evict());
       keep.clear();
       if (sh.vary) {
         if (vr() % 4 == 0) {
@@ -5454,4 +5464,417 @@ TEST(dg_no_admit_bank_serves) {
     b->verify();
     CHECK(a->v.what.empty() && b->v.what.empty());
   }
+}
+
+// ---- three-tier clean eviction (dg_clean_evict) ----
+namespace {
+
+// Per key: the home before a call and after it, counted by transition (pinned: a pinned home, or a write-back victim
+// that became one when collected).
+struct HomeMoves {
+  uint32_t device_to_file = 0, pinned_to_file = 0;
+};
+std::vector<DgCore::Home> home_list(const DgCore& core) {
+  std::vector<DgCore::Home> h(core.keys());
+  for (uint32_t k = 0; k < core.keys(); ++k) h[k] = core.home(k);
+  return h;
+}
+HomeMoves moves(const std::vector<DgCore::Home>& h0, const DgCore& core) {
+  HomeMoves m;
+  for (uint32_t k = 0; k < core.keys(); ++k) {
+    const DgCore::Home a = h0[k], b = core.home(k);
+    m.device_to_file += a == DgCore::Home::Device && b == DgCore::Home::File;
+    m.pinned_to_file += (a == DgCore::Home::Host || a == DgCore::Home::Evicting) && b == DgCore::Home::File;
+  }
+  return m;
+}
+size_t count_kind(const Scripted& t, Scripted::Kind k) {
+  return size_t(std::count(t.issued().begin(), t.issued().end(), k));
+}
+void clean_on(DgConfig& c) { c.clean_evict = true; }
+std::function<void(DgConfig&)> clean_tweak(bool on) { return on ? std::function<void(DgConfig&)>(clean_on) : nullptr; }
+
+}  // namespace
+
+// The randomized model on every three-tier shape (synchronous, overlapped and depth-1 reads; some with make_resident
+// episodes and held layers, some flipping the setting between tokens) with clean eviction: every read exact, every
+// invariant, the oracle's victims at every boundary (a victim without a free block goes to its file, no pinned unit is
+// dropped for it). Open with it on and never flipped: no pinned unit is ever dropped by a boundary.
+TEST(dg_clean_evict_runs) {
+  uint64_t clean = 0, discards = 0, runs = 0;
+  for (const Shape* base : kTierShapes)
+    for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 6; ++seed) {
+        Shape sh = with_reads(*base, how);
+        sh.clean = true;
+        sh.toggle_clean = seed % 2 == 0;
+        if (seed % 3 == 0) sh = with_resident(sh, true, 3);
+        const Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+        ++runs;
+        if (!o.violation.empty())
+          std::printf("  shape %zu reads %d seed %llu: %s\n", size_t(&base - kTierShapes), how,
+                      (unsigned long long)seed, o.violation.c_str());
+        CHECK(o.violation.empty());
+        CHECK_EQ(o.st.clean_drop_bytes, o.st.clean_drops * 8192u);
+        if (!sh.toggle_clean) CHECK_EQ(o.st.disk_drops, 0u);
+        if (!sh.resident) CHECK(o.st.clean_drops <= o.st.disk_discards);  // (a boundary's are discards too)
+        CHECK(o.st.evicted >= o.st.wb_cancelled + o.st.inclusive_drops + o.st.disk_discards);
+        clean += o.st.clean_drops;
+        discards += o.st.disk_discards;
+      }
+  std::printf("  %llu runs: clean drops %llu, victim discards %llu\n", (unsigned long long)runs,
+              (unsigned long long)clean, (unsigned long long)discards);
+  CHECK(clean > 0);
+}
+
+// Pinned blocks exhausted (every block a pinned home, or one spare): the same routes through a cache without the
+// setting and one with it. Without: victims written back while a pinned unit is dropped to its file for each block.
+// With: a victim without a free block goes to its file (no device-to-host copy, counted), no pinned unit ever leaves
+// for its file, a victim with a free block (the blocks the boundary's admissions freed) is still written back; every
+// read is exact in both, kept units never move, and a dropped unit demanded later is read from its file with its bytes.
+TEST(dg_clean_evict_boundary) {
+  const auto disk = disk_flags(72, 24, 28);
+  uint64_t off_wb = 0, off_drops = 0, on_wb = 0, on_clean = 0, reread = 0;
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    const uint32_t spare_blocks = seed % 2;  // 0: every block a pinned home; 1: one spare block
+    ResRig off({24, 24, 24}, 24, 4, spare_blocks, false, &disk, 4, seed);
+    ResRig on({24, 24, 24}, 24, 4, spare_blocks, false, &disk, 4, seed, 0u, clean_tweak(true));
+    off.t->set_async_reads(seed % 3 != 0, seed);
+    on.t->set_async_reads(seed % 3 != 0, seed);
+    off.rng.seed(seed);
+    std::vector<uint32_t> dropped;
+    for (int tok = 0; tok < 24; ++tok) {
+      const auto ids = off.routes(3);
+      std::vector<uint32_t> keep;  // a few device units of layer 0 kept (never victims)
+      for (uint32_t u = 0; u < 24 && keep.size() < 3; ++u)
+        if (on.core->home(on.core->key(0, u)) == DgCore::Home::Device &&
+            off.core->home(off.core->key(0, u)) == DgCore::Home::Device)
+          keep.push_back(on.core->key(0, u));
+      const auto h_off = home_list(*off.core), h_on = home_list(*on.core);
+      const ts::DgStats s_off = off.core->stats(), s_on = on.core->stats();
+      off.t->clear_issued();
+      on.t->clear_issued();
+      CHECK(off.token(ids, all_run(3), keep) == on.token(ids, all_run(3), keep));
+      const HomeMoves m_off = moves(h_off, *off.core), m_on = moves(h_on, *on.core);
+      const ts::DgStats& a = off.core->stats();
+      const ts::DgStats& b = on.core->stats();
+      for (uint32_t k : keep)
+        CHECK(off.core->home(k) == DgCore::Home::Device && on.core->home(k) == DgCore::Home::Device);
+      // without: no clean drop; each write-back is one D2H, each pinned unit dropped is a disk drop
+      CHECK_EQ(a.clean_drops, 0u);
+      CHECK_EQ(count_kind(*off.t, Scripted::D2H), off.core->last_victims().size());
+      CHECK_EQ(uint64_t(m_off.pinned_to_file), a.disk_drops - s_off.disk_drops);
+      // with: no pinned unit to its file; the victims without a block went to theirs, no copy for them
+      CHECK_EQ(m_on.pinned_to_file, 0u);
+      CHECK_EQ(b.disk_drops, 0u);
+      CHECK_EQ(uint64_t(m_on.device_to_file), b.clean_drops - s_on.clean_drops);
+      CHECK_EQ(b.clean_drop_bytes - s_on.clean_drop_bytes, uint64_t(m_on.device_to_file) * 8192u);
+      CHECK_EQ(b.disk_discards - s_on.disk_discards, b.clean_drops - s_on.clean_drops);
+      CHECK_EQ(count_kind(*on.t, Scripted::D2H), on.core->last_victims().size());
+      CHECK_EQ(b.evicted - s_on.evicted, on.core->last_victims().size() + (b.clean_drops - s_on.clean_drops));
+      if (on.core->free_blocks() > 0) CHECK_EQ(b.clean_drops, s_on.clean_drops);  // a block was free: written back
+      off_wb += off.core->last_victims().size();
+      off_drops += m_off.pinned_to_file;
+      on_wb += on.core->last_victims().size();
+      on_clean += m_on.device_to_file;
+      for (uint32_t k = 0; k < on.keys; ++k)
+        if (h_on[k] == DgCore::Home::Device && on.core->home(k) == DgCore::Home::File) dropped.push_back(k);
+    }
+    on.verify();
+    off.verify();
+    // a dropped unit demanded again: read from its file (hash-checked in the context; here its bytes are checked)
+    for (uint32_t k : dropped) {
+      if (on.core->home(k) != DgCore::Home::File) continue;
+      const uint32_t g = on.core->gated_of(k), u = k - on.core->key(g, 0);
+      std::vector<std::vector<uint32_t>> ids(3, std::vector<uint32_t>{0});
+      ids[g] = {u};
+      const uint64_t reads0 = on.core->stats().disk_reads;
+      const auto out = on.token(ids, all_run(3), {});
+      CHECK(std::find(out.begin(), out.end(), int32_t(k)) != out.end());
+      CHECK(on.core->stats().disk_reads > reads0);
+      CHECK(on.core->home(k) == DgCore::Home::Device);
+      ++reread;
+      break;
+    }
+    on.verify();
+    if (!on.v.what.empty() || !off.v.what.empty())
+      std::printf("  seed %llu: %s %s\n", (unsigned long long)seed, off.v.what.c_str(), on.v.what.c_str());
+    CHECK(on.v.what.empty() && off.v.what.empty());
+  }
+  std::printf("  without: %llu write-backs, %llu pinned units dropped for them; with: %llu write-backs, %llu clean "
+              "drops, %llu dropped units read back\n", (unsigned long long)off_wb, (unsigned long long)off_drops,
+              (unsigned long long)on_wb, (unsigned long long)on_clean, (unsigned long long)reread);
+  CHECK(off_wb > 0 && off_drops > 0);
+  CHECK(on_wb > 0);  // the boundary's admissions freed blocks: those victims were written back
+  CHECK(on_clean > 0);
+  CHECK(on_wb < off_wb);
+  CHECK(reread > 0);
+}
+
+// With a free block for every victim the setting changes nothing: the same placement, counters, bytes and device work,
+// token by token, as without it (the spare blocks cover every non-device unit).
+TEST(dg_clean_evict_free_blocks_unchanged) {
+  const auto disk = disk_flags(72, 24, 28);
+  for (uint64_t seed = 1; seed <= 4; ++seed) {
+    ResRig off({24, 24, 24}, 24, 4, 48, false, &disk, 4, seed);
+    ResRig on({24, 24, 24}, 24, 4, 48, false, &disk, 4, seed, 0u, clean_tweak(true));
+    off.rng.seed(seed);
+    for (int tok = 0; tok < 20; ++tok) {
+      const auto ids = off.routes(3);
+      off.t->clear_issued();
+      on.t->clear_issued();
+      CHECK(off.token(ids, all_run(3), {}) == on.token(ids, all_run(3), {}));
+      CHECK(off.state() == on.state());
+      CHECK(off.t->issued() == on.t->issued());
+    }
+    CHECK(off.core->stats().evicted > 0);
+    CHECK_EQ(on.core->stats().clean_drops, 0u);
+    on.verify();
+    CHECK(on.v.what.empty() && off.v.what.empty());
+  }
+}
+
+// make_resident with the setting, pinned blocks exhausted: its victims without a free block go to their files (no
+// copy), no pinned unit leaves for its file, the other layers' kept units stay in their slots, and the held layer
+// never moves while the other layers decode around it. Without it, pinned units are dropped for its write-backs.
+TEST(dg_clean_evict_make_resident) {
+  const auto disk = disk_flags(72, 24, 28);
+  uint64_t clean = 0, off_drops = 0, wb = 0;
+  for (uint64_t seed = 1; seed <= 6; ++seed)
+    for (int on = 0; on < 2; ++on) {
+      ResRig r({24, 24, 24}, 24, 4, 0, false, &disk, 4, seed, 0u, clean_tweak(on != 0));
+      r.t->set_async_reads(seed % 2 == 0, seed);
+      r.rng.seed(seed);
+      for (int tok = 0; tok < 6; ++tok) r.token(r.routes(3), all_run(3), {});
+      std::vector<uint32_t> other;  // two device units of layer 0, kept by another layer's set
+      for (uint32_t u = 0; u < 24 && other.size() < 2; ++u)
+        if (r.core->home(r.core->key(0, u)) == DgCore::Home::Device) other.push_back(r.core->key(0, u));
+      std::vector<int32_t> other_slots;
+      for (uint32_t k : other) other_slots.push_back(r.core->slot_of(k));
+      const uint32_t g = 1 + uint32_t(seed % 2);
+      std::vector<uint32_t> ids;  // 22 of its 24 units: 22 + the 2 kept + the spare target 4 = the 28 slots
+      for (uint32_t u = 0; u < 22; ++u) ids.push_back(u);
+      const auto h0 = home_list(*r.core);
+      const ts::DgStats s0 = r.core->stats();
+      r.t->clear_issued();
+      r.core->make_resident(g, ids, other);
+      const ts::DgStats& s = r.core->stats();
+      uint32_t lower_file = 0, lower_host = 0;
+      for (uint32_t k : r.core->resident_victims()) {
+        lower_file += r.core->home(k) == DgCore::Home::File;
+        lower_host += r.core->home(k) == DgCore::Home::Host;
+      }
+      const uint32_t pinned_dropped = moves(h0, *r.core).pinned_to_file;
+      CHECK_EQ(lower_file + lower_host, uint32_t(r.core->resident_victims().size()));
+      CHECK_EQ(count_kind(*r.t, Scripted::D2H), size_t(lower_host));
+      if (on) {
+        CHECK_EQ(pinned_dropped, 0u);
+        CHECK_EQ(s.clean_drops - s0.clean_drops, uint64_t(lower_file));
+        clean += lower_file;
+        wb += lower_host;
+      } else {
+        CHECK_EQ(s.clean_drops, 0u);
+        off_drops += pinned_dropped;
+      }
+      CHECK_EQ(s.disk_drops, s0.disk_drops);  // counted only in the resident fields
+      CHECK_EQ(s.disk_discards, s0.disk_discards);
+      for (size_t i = 0; i < other.size(); ++i) {
+        CHECK(r.core->home(other[i]) == DgCore::Home::Device);
+        CHECK_EQ(r.core->slot_of(other[i]), other_slots[i]);
+      }
+      for (uint32_t u : ids) CHECK(r.core->home(r.core->key(g, u)) == DgCore::Home::Device);
+      r.verify();
+      const auto held = r.keys_of(g, ids);
+      std::vector<int32_t> held_slots;
+      for (uint32_t k : held) held_slots.push_back(r.core->slot_of(k));
+      std::vector<uint8_t> run = all_run(3);
+      run[g] = 0;
+      for (int tok = 0; tok < 6; ++tok) r.token(r.routes(3), run, held, held);  // the other layers decode around it
+      for (size_t i = 0; i < held.size(); ++i) CHECK_EQ(r.core->slot_of(held[i]), held_slots[i]);
+      r.verify();
+      if (!r.v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r.v.what.c_str());
+      CHECK(r.v.what.empty());
+    }
+  std::printf("  make_resident victims: %llu dropped clean, %llu written back (with); %llu pinned units dropped "
+              "(without)\n", (unsigned long long)clean, (unsigned long long)wb, (unsigned long long)off_drops);
+  CHECK(clean > 0);
+  CHECK(off_drops > 0);
+}
+
+// A round with the setting and no free block: the first demoted unit goes to its file (no write-back) instead of the
+// coldest pinned unit (here a candidate itself) being dropped for it; the later ones take the blocks the promoted units
+// freed. Without it, the first swap drops a pinned candidate.
+TEST(dg_clean_evict_round) {
+  const auto disk = disk_flags(72, 24, 28);
+  for (int on = 0; on < 2; ++on) {
+    ResRig r({24, 24, 24}, 24, 4, 0, false, &disk, 4, 3, 0u, clean_tweak(on != 0));
+    std::vector<std::pair<uint32_t, float>> kv;
+    for (uint32_t k = 0; k < 24; ++k) kv.push_back({k, 1.f});
+    for (uint32_t k = 24; k < 28; ++k) kv.push_back({k, 15.f});
+    seed_counts(*r.core, kv);
+    r.t->clear_issued();
+    const ts::DgRoundOut res = r.core->round(round_in(), {});
+    const ts::DgStats& s = r.core->stats();
+    if (on) {
+      CHECK_EQ(res.promoted_to_device, 4u);
+      CHECK_EQ(res.demoted_from_device, 4u);
+      CHECK_EQ(res.dropped_to_file, 0u);
+      CHECK_EQ(res.bytes_written_back, 3u * 8192u);
+      CHECK_EQ(s.clean_drops, 1u);
+      CHECK_EQ(s.clean_drop_bytes, 8192u);
+      CHECK_EQ(r.core->file_units(), 45u);  // 44 + the clean drop
+      for (uint32_t k = 24; k < 28; ++k) CHECK(r.core->home(k) == DgCore::Home::Device);
+    } else {
+      CHECK_EQ(res.promoted_to_device, 3u);
+      CHECK_EQ(res.dropped_to_file, 1u);
+      CHECK_EQ(res.bytes_written_back, 3u * 8192u);
+      CHECK_EQ(s.clean_drops, 0u);
+    }
+    r.verify();
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(3), all_run(3), {});
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// At runtime: set between tokens it applies from the next victim on; reset_open restores the open's setting.
+TEST(dg_clean_evict_runtime_setting) {
+  const auto disk = disk_flags(72, 24, 28);
+  ResRig r({24, 24, 24}, 24, 4, 0, false, &disk, 4, 5);
+  r.rng.seed(5);
+  for (int tok = 0; tok < 8; ++tok) r.token(r.routes(3), all_run(3), {});
+  CHECK(!r.core->clean_evict());
+  CHECK(r.core->stats().disk_drops > 0);
+  CHECK_EQ(r.core->stats().clean_drops, 0u);
+  r.core->set_clean_evict(true);
+  CHECK(r.core->clean_evict());
+  const uint64_t drops0 = r.core->stats().disk_drops;
+  for (int tok = 0; tok < 8; ++tok) r.token(r.routes(3), all_run(3), {});
+  CHECK_EQ(r.core->stats().disk_drops, drops0);
+  CHECK(r.core->stats().clean_drops > 0);
+  r.verify();
+  r.core->reset_open();
+  CHECK(!r.core->clean_evict());
+  for (int tok = 0; tok < 8; ++tok) r.token(r.routes(3), all_run(3), {});
+  CHECK(r.core->stats().disk_drops > drops0);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// ---- make_resident's overlapped file reads (dg_disk_queue) and its own counters ----
+namespace {
+
+std::function<void(DgConfig&)> read_depth(uint32_t queue, bool clean = false) {
+  return [queue, clean](DgConfig& c) {
+    c.disk_queue = queue;
+    c.disk_staging = 4;
+    c.clean_evict = clean;
+  };
+}
+std::vector<uint64_t> mkres_counts(const ts::DgStats& s) {
+  return {s.resident_units, s.resident_evicted, s.resident_bytes, s.mkres_file_reads, s.mkres_file_bytes,
+          s.mkres_h2d_bytes, s.mkres_wb_bytes, s.clean_drops, s.clean_drop_bytes};
+}
+
+}  // namespace
+
+// A layer made resident from pinned blocks and files with one read at a time and with four in flight (reads landing
+// late and out of order): the same placement, table, victims, bytes and counters; depth 1 ends its reads in the order
+// it began them, depth 4 keeps more than one in flight and ends the finished ones first. The counters: one file read
+// per file-homed unit, every unit's copy in, every written-back victim's copy out. Decode then reads the same bytes.
+TEST(dg_resident_reads_overlapped) {
+  const auto disk = disk_flags(72, 24, 28);
+  uint64_t most = 0, reordered = 0;
+  for (uint64_t seed = 1; seed <= 8; ++seed) {
+    const bool clean = seed % 4 >= 2;
+    ResRig a({24, 24, 24}, 24, 4, uint32_t(seed % 2), false, &disk, 4, seed, 0u, read_depth(1, clean));
+    ResRig b({24, 24, 24}, 24, 4, uint32_t(seed % 2), false, &disk, 4, seed, 0u, read_depth(4, clean));
+    a.t->set_async_reads(seed % 3 != 0, seed);
+    b.t->set_async_reads(true, seed);
+    const uint32_t g = 1 + uint32_t(seed % 2);
+    std::vector<uint32_t> file_keys;  // in the order make_resident begins their reads (the ids' order)
+    for (uint32_t u = 0; u < 24; ++u)
+      if (a.core->home(a.core->key(g, u)) == DgCore::Home::File) file_keys.push_back(a.core->key(g, u));
+    a.core->make_resident(g, a.layer(g), {});
+    b.core->make_resident(g, b.layer(g), {});
+    CHECK(homes(*a.core) == homes(*b.core));
+    CHECK(a.core->table() == b.core->table());
+    CHECK(a.core->resident_victims() == b.core->resident_victims());
+    CHECK(mkres_counts(a.core->stats()) == mkres_counts(b.core->stats()));
+    const ts::DgStats& s = b.core->stats();
+    uint64_t written_back = 0;
+    for (uint32_t k : b.core->resident_victims()) written_back += b.core->home(k) == DgCore::Home::Host;
+    CHECK_EQ(s.mkres_file_reads, uint64_t(file_keys.size()));
+    CHECK_EQ(s.mkres_file_bytes, uint64_t(file_keys.size()) * 8192u);
+    CHECK_EQ(s.mkres_h2d_bytes, s.resident_bytes);
+    CHECK_EQ(s.mkres_h2d_bytes, 24u * 8192u);
+    CHECK_EQ(s.mkres_wb_bytes, written_back * 8192u);
+    CHECK_EQ(s.disk_reads + s.disk_read_bytes + s.evicted + s.writebacks_done, 0u);  // counted only as make_resident
+    CHECK(a.t->max_in_flight() <= 1);
+    if (seed % 3 != 0) CHECK(a.t->ended() == file_keys);  // depth 1: in the order begun
+    CHECK(b.t->max_in_flight() > 1 && b.t->max_in_flight() <= 4);
+    CHECK(std::is_permutation(b.t->ended().begin(), b.t->ended().end(), file_keys.begin(), file_keys.end()));
+    most = std::max(most, b.t->max_in_flight());
+    reordered += b.t->ended() != file_keys;
+    a.verify();
+    b.verify();
+    a.rng.seed(seed);
+    for (int tok = 0; tok < 4; ++tok) {
+      const auto ids = a.routes(3);
+      CHECK(a.token(ids, all_run(3), {}) == b.token(ids, all_run(3), {}));
+    }
+    a.verify();
+    b.verify();
+    if (!a.v.what.empty() || !b.v.what.empty())
+      std::printf("  seed %llu: %s %s\n", (unsigned long long)seed, a.v.what.c_str(), b.v.what.c_str());
+    CHECK(a.v.what.empty() && b.v.what.empty());
+  }
+  std::printf("  depth 4: most in flight %llu, out-of-order ends in %llu/8 calls\n", (unsigned long long)most,
+              (unsigned long long)reordered);
+  CHECK(reordered > 0);
+}
+
+// A read failing with others in flight (the first, a middle and a late one): SS_E_IO, not poisoned; the failed unit
+// is still file-homed, every other unit of the layer is either on the device with its bytes (its read ended and its
+// copy committed) or still in its file (its read ended without a copy, or never begun), the counters count the
+// committed reads only; the call then completes.
+TEST(dg_resident_read_failure_overlapped) {
+  for (uint64_t seed = 1; seed <= 4; ++seed)
+    for (int at : {1, 3, 7}) {
+      const auto disk = disk_flags(72, 24, 28);
+      ResRig r({24, 24, 24}, 24, 4, 0, false, &disk, 4, seed, 0u, read_depth(4, seed % 2 == 0));
+      r.t->set_async_reads(true, seed);
+      const uint32_t g = 2;  // every unit file-homed: the reads begin in the ids' order
+      r.t->fail_read(at);
+      bool io = false;
+      try {
+        r.core->make_resident(g, r.layer(g), {});
+      } catch (const ts::Error& e) {
+        io = e.status() == SS_E_IO;
+      }
+      CHECK(io);
+      CHECK(!r.t->read_failure_pending());
+      CHECK(!r.core->poisoned());
+      r.t->fail_read(0);
+      CHECK(r.core->home(r.core->key(g, uint32_t(at - 1))) == DgCore::Home::File);
+      uint64_t on_device = 0;
+      for (uint32_t u = 0; u < 24; ++u) {
+        const DgCore::Home h = r.core->home(r.core->key(g, u));
+        CHECK(h == DgCore::Home::Device || h == DgCore::Home::File);
+        on_device += h == DgCore::Home::Device;
+      }
+      CHECK_EQ(r.core->stats().mkres_file_reads, on_device);
+      CHECK_EQ(r.core->stats().resident_units, on_device);
+      CHECK_EQ(r.t->reads_in_flight(), 0u);
+      r.verify();
+      r.core->make_resident(g, r.layer(g), {});
+      for (uint32_t u = 0; u < 24; ++u) CHECK(r.core->home(r.core->key(g, u)) == DgCore::Home::Device);
+      CHECK_EQ(r.core->stats().mkres_file_reads, 24u);
+      r.verify();
+      r.rng.seed(seed);
+      for (int tok = 0; tok < 3; ++tok) r.token(r.routes(3), all_run(3), {});
+      r.verify();
+      if (!r.v.what.empty()) std::printf("  seed %llu at %d: %s\n", (unsigned long long)seed, at, r.v.what.c_str());
+      CHECK(r.v.what.empty());
+    }
 }

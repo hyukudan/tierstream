@@ -110,6 +110,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_disk_staging > 256) refuse(SS_E_INVALID, "dg_disk_staging must be 0..256");
   if (o.dg_disk_queue > 64) refuse(SS_E_INVALID, "dg_disk_queue must be 0..64");
   if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
+  if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
 
   DgLayout x;
   x.B = o.dg_max_ids;
