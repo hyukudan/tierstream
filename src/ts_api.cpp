@@ -152,5 +152,6 @@ ss_status ts_pack_writer_record_end(ss_pack_writer* w) { return ss_pack_writer_r
 ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, const void* data) { return ss_pack_writer_add(w, r, data); }
 ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256) { return ss_pack_writer_finish(w, manifest_sha256); }
 void ts_pack_writer_abort(ss_pack_writer* w) { ss_pack_writer_abort(w); }
+ss_status ts_dg_set_clean_evict(ss_ctx* c, uint32_t on) { return ss_dg_set_clean_evict(c, on); }
 
 }  // extern "C"

@@ -68,6 +68,7 @@ class DgCtx {
   // 1 = skip the ready wait, 2 = ss_end skips the completion edge), and stopping the service now.
   virtual void set_budgets(uint32_t spare_target, uint32_t per_layer, uint32_t per_token) = 0;
   virtual void set_sched(uint32_t wb_defer, uint32_t flush_ready) = 0;
+  virtual void set_clean_evict(uint32_t on) = 0;
   virtual uint32_t residency(ss_dg_unit* out, uint32_t cap) = 0;
   // Window prefetch (ss.h: Window prefetch), between tokens.
   virtual void winpf_set(const DgWinpf& w) = 0;

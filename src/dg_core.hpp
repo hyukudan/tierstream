@@ -134,6 +134,10 @@ struct DgConfig {
   // boundary, its home unchanged; no prefetch is issued and no boundary evicts. Placement changes only through rounds,
   // make_resident and seed. Needs bank_slots >= max_ids (a layer's distinct misses).
   bool no_admit = false;
+  // dg_clean_evict (three-tier only: no effect without disk_tier): a device victim that would need a block while none
+  // is free goes to its file (no copy: the file holds its bytes) instead of a pinned unit being dropped to its file to
+  // free one; with a free block it is written back as before. Placement only (boundary, make_resident, rounds).
+  bool clean_evict = false;
 };
 
 struct DgStats {
@@ -185,6 +189,14 @@ struct DgStats {
   // they moved (file reads + H2D + write-backs), their host time, rounds that stopped at a cancellation. Their copies,
   // reads and write-backs count nowhere else.
   uint64_t round_count = 0, round_units = 0, round_bytes = 0, round_ns = 0, round_cancelled = 0;
+  // dg_clean_evict: device victims dropped to their file without a copy because no block was free, and their bytes:
+  // the boundary's (also counted in disk_discards and evicted), make_resident's and rounds' (also in their own
+  // resident_evicted / round_units, nowhere else)
+  uint64_t clean_drops = 0, clean_drop_bytes = 0;
+  // make_resident's own transfers (in resident_* only, as above): file reads ended and their bytes, its wall time in
+  // the reads' begin / end calls (a synchronous read is all begin), the bytes it copied host-to-device (pinned or
+  // staging -> slot: resident_bytes), the bytes its victims' write-backs copied device-to-host
+  uint64_t mkres_file_reads = 0, mkres_file_bytes = 0, mkres_read_ns = 0, mkres_h2d_bytes = 0, mkres_wb_bytes = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -343,7 +355,9 @@ class DgCore {
   // policy's order (LRU: the recency tail; scored / auto: the boundary's score order) with the boundary's lower-tier
   // rules (a clean copy back to its block, a write-back into a free block, three-tier: a pinned unit dropped to its
   // file for that block, else the victim to its file), then copy in from the pinned block or the file (a staging
-  // buffer), new units most recent. No clean copy is kept. Counted only in the resident_* stats. Transactional per
+  // buffer: up to disk_queue reads in flight, bounded by disk_staging; the finished ones end first, in any order, then
+  // the oldest; a staging buffer is reused only after the read holding it ended), new units most recent. No clean copy
+  // is kept. Counted only in the resident_* and mkres_* stats. Transactional per
   // copy: a home changes only after its copy and entry were accepted, a source block / victim slot is freed only after
   // its stream was synced. A read failure (the device fine) re-establishes the cache (the units moved so far stay, the
   // table uploaded); any device failure poisons the core (poisoned(): every token, reset and make_resident refused)
@@ -394,6 +408,9 @@ class DgCore {
   // written at shutdown seeds the next open's placement).
   std::vector<uint32_t> residency() const;
   bool wb_defer() const { return c_.wb_defer; }
+  // Between tokens: dg_clean_evict at runtime (from the next victim on; reset_open restores the open's setting).
+  void set_clean_evict(bool on);
+  bool clean_evict() const { return c_.clean_evict; }
   bool reset_failed() const { return reset_failed_; }
   // A reset or a make_resident failed on the device: the core refuses every token, reset and make_resident.
   bool poisoned() const { return reset_failed_; }
@@ -562,6 +579,12 @@ class DgCore {
   void to_lower(uint32_t k);
   // skip (make_resident): keys never dropped; count = false: not counted in disk_drops
   bool drop_host_lru(const std::vector<uint8_t>* skip = nullptr, bool count = true);
+  // dg_clean_evict: a device victim without a free block goes to its file (three-tier), no pinned unit displaced
+  bool clean_now() const { return c_.clean_evict && c_.disk_tier && free_blocks_.empty(); }
+  void count_clean() {
+    ++st_.clean_drops;
+    st_.clean_drop_bytes += unit_bytes_;
+  }
   int32_t take_stage();
   void score_history(uint32_t g);           // scored: serve_use's history update of layer g (union saved first)
   void rank_layer(uint32_t g);              // scored: score_layer's ranking (the public reference lists)

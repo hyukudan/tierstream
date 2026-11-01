@@ -461,7 +461,9 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK(ss::dg_module_loading_notice(1, 3).empty());
   CHECK(ss::dg_module_loading_notice(0, 3).empty());
   CHECK_EQ(offsetof(ss_dg_stats, cuda_module_loading), offsetof(ss_dg_stats, round_cancelled) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, reserved1) + 4);
+  CHECK_EQ(offsetof(ss_dg_stats, clean_drops), offsetof(ss_dg_stats, reserved1) + 4);
+  CHECK_EQ(offsetof(ss_dg_stats, mkres_file_reads), offsetof(ss_dg_stats, clean_drop_bytes) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, mkres_wb_bytes) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

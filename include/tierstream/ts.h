@@ -131,12 +131,14 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DEVPROF_NO_RUNTIME SS_DEVPROF_NO_RUNTIME
 #define TS_DEVPROF_SCHEMA SS_DEVPROF_SCHEMA
 #define TS_DG_AUTO_EVICT SS_DG_AUTO_EVICT
+#define TS_DG_CLEAN_EVICT SS_DG_CLEAN_EVICT
 #define TS_DG_DISK_QUEUE SS_DG_DISK_QUEUE
 #define TS_DG_DISK_RECEIPTS SS_DG_DISK_RECEIPTS
 #define TS_DG_DISK_TIER SS_DG_DISK_TIER
 #define TS_DG_MAKE_RESIDENT SS_DG_MAKE_RESIDENT
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
+#define TS_DG_MKRES_STATS SS_DG_MKRES_STATS
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
 #define TS_DG_RESET_OPEN SS_DG_RESET_OPEN
 #define TS_DG_RESIDENCY SS_DG_RESIDENCY
@@ -306,6 +308,7 @@ TS_API ss_status ts_pack_writer_record_end(ss_pack_writer* w);
 TS_API ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, const void* data);
 TS_API ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256);
 TS_API void ts_pack_writer_abort(ss_pack_writer* w);
+TS_API ss_status ts_dg_set_clean_evict(ss_ctx* c, uint32_t on);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }

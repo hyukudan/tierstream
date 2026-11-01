@@ -373,8 +373,11 @@ Several layers may be held at once when the arena has room. Normal decode tokens
   (score, demand epoch, stamp) under SCORED and SCORED_AUTO. A victim goes down one tier with the boundary's rules: a
   clean copy back to its block; a write-back into a free block (synchronous, before its slot is reused), a block of a
   copy already made from a pinned home once the demand stream is synced, three-tier a pinned unit dropped to its file
-  for that block, else the victim itself dropped to its file. The units are copied in from their pinned blocks, or read
-  from their files into the staging buffers (up to `dg_disk_queue` reads in flight) and copied from there; new units are
+  for that block (`dg_clean_evict`: the victim itself, see 3.11), else the victim itself dropped to its file. The units
+  are copied in from their pinned blocks, or read from their files into the staging buffers (up to `dg_disk_queue`
+  reads in flight, bounded by `dg_disk_staging`; at the depth the reads that finished end first, in any order, then the
+  oldest; a staging buffer is reused only after the read holding it ended and its copy landed) and copied from there;
+  with `dg_disk_queue` <= 1 each read runs inside its begin and they end in order, as before; new units are
   the most recent; no clean copy is kept. The table is uploaded before the call returns. Placement only: every slot
   receives its unit's file bytes, so outputs are those of any other placement.
 - **Failures.** Each transfer is a transaction: a unit's home changes only after its copy and its entry were
@@ -399,7 +402,9 @@ Several layers may be held at once when the arena has room. Normal decode tokens
   of the last step that exported it; the service checks a later export against that value and `ss_begin` checks every
   flag against it, so a stray export of an unannounced layer is a desync (the context is poisoned).
 - **Counters.** The call's copies count only in `ss_dg_stats.resident_units`, `resident_evicted`, `resident_bytes` and
-  `resident_ns` (also in the stats JSON); misses, fetches, prefetches, evictions, write-backs and file reads are
+  `resident_ns`, and its own transfers in `mkres_file_reads` / `mkres_file_bytes` (its file reads), `mkres_read_ns`
+  (its wall time beginning and waiting for them), `mkres_h2d_bytes` (copied in) and `mkres_wb_bytes` (its victims'
+  write-backs), all also in the stats JSON; misses, fetches, prefetches, evictions, write-backs and file reads are
   decode's. Work it completes at its drain (write-backs and reads already in flight) is counted as before.
 - **Gates (CPU).** The randomized core runs (every LRU, scored, deferred, window-prefetch and three-tier shape) add
   make_resident episodes, held layers read in every layer of every step, and randomly unexported layers; the device
@@ -478,6 +483,29 @@ between tokens, within a budget the engine chooses.
   Cancellation from another thread at a unit boundary, during a copy and during the file reads. `dg_no_admit`: misses
   served with the exact bytes through bank slots, homes unchanged after every boundary, the refusal, and with rounds
   the hot set converging onto the device (no misses on hot-only tokens).
+
+### 3.11 Device-gated three-tier clean eviction
+
+Gated units are read-only: a unit's file always holds the bytes its slot holds (every file read is hash-checked). In
+three-tier mode a device victim that needs a pinned block while none is free normally drops the least recently homed
+pinned unit to its file and writes the victim back into its block. When a pass makes more units resident than device
+plus pinned hold (a prefill making every layer resident in turn), that is an LRU scan: each write-back displaces
+exactly the pinned unit a coming layer needs, so it is read back from its file moments later, and every eviction costs
+a device-to-host copy as well.
+
+- **The setting.** `ss_options.dg_clean_evict = 1` (default 0; no effect without `dg_disk_tier`), or between tokens
+  `ss_dg_set_clean_evict(c, on)` (the state rules of `ss_dg_set_sched`, refused inside a token; `ss_dg_reset_open`
+  restores the open's value). With it, a device victim without a free block goes to its file (no copy) and no pinned
+  unit is displaced; with a free block it is still written back (the RAM copy is cheap to keep). Clean copies
+  (inclusive share) still go back to their block.
+- **Where.** Every path that homes a device victim lower: the boundary's acceptance (also for the pressure override;
+  deferred write-backs are chosen there, so the forced path only finishes them), `ss_dg_make_resident`'s victims
+  (after the blocks of the copies already made from pinned homes were freed, as before) and a round's demoted units
+  (phase a). Which units are victims is unchanged: kept and held units, units with a write-back in flight and coming
+  prefetches never are. Bank serves, reverted prefetches and file reads are unaffected (they never needed a block).
+- **Counters.** `ss_dg_stats.clean_drops` / `clean_drop_bytes` (stats JSON `three_tier`, with `clean_evict`); a
+  boundary's clean drop is also a `disk_discards` eviction (no write-back), make_resident's and rounds' count in their
+  own counters. A later miss of a dropped unit reads it from its file through the usual hash-checked path.
 
 ## 4. Sources and the copy path
 

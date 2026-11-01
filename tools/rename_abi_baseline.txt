@@ -160,3 +160,12 @@ ss.h-sha256 db3e05d3614c9768ee625ff415491777851b1cd4a3ceb6c68b5ff372a6f68c2d
 
 # exact I/O serialization fixes (additive: appended ss_dg_stats cuda_module_loading / reserved1; comments: bounce buffers pageable per file reader, each three-tier read ends on its own)
 ss.h-sha256 f15eb1f777bfb7d2ef58fce966743b7c2540e3fde884fd2deb4cfe2ec8acf6a5
+
+# three-tier clean eviction (additive: appended ss_options dg_clean_evict / reserved7, appended ss_dg_stats clean_drops / clean_drop_bytes, ss_dg_set_clean_evict, SS_DG_CLEAN_EVICT)
+ss.h-sha256 52eb41c95ac9827be3dda07e08355856668a4b15ff1a0b4f641ee845d15803fb
+
+# make_resident overlapped file reads (additive: appended ss_dg_stats mkres_file_reads / mkres_file_bytes / mkres_read_ns / mkres_h2d_bytes / mkres_wb_bytes, SS_DG_MKRES_STATS)
+ss.h-sha256 a09d2571a5765f0fe67fa76b8defb41fd3314d0c862bc5ff4c2ddd196915be75
+
+# make_resident review notes (comments only: dg_clean_evict victims, reads in flight, recency in the order of ids, mkres_* counters)
+ss.h-sha256 ab75735553eba14d4f520754defe2fa5feca4962a66d836d8eb37e22f3a39cae
