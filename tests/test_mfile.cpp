@@ -78,7 +78,8 @@ struct Fixture {
   std::string old_cache;
   std::vector<char> bytes;
   StripeManifest manifest;
-  Fixture() {
+  // chunk: the stripe chunk size (the stripe holds the odd chunks)
+  explicit Fixture(uint64_t chunk = C) {
     static std::atomic<unsigned> serial{0};
     root = fs::current_path() / ("mfile-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
                                  "-" + std::to_string(serial.fetch_add(1)));
@@ -102,23 +103,23 @@ struct Fixture {
       bytes[i] = char(r);
     }
     put(primary, bytes.data(), bytes.size());
-    manifest.chunk_bytes = C;
+    manifest.chunk_bytes = chunk;
     manifest.primary_basename = primary.filename().u8string();
     manifest.primary_size = bytes.size();
     manifest.primary_sha256 = sha256_file(primary.u8string());
     manifest.data_name = "stripe.data";
     std::ofstream data(secondary / manifest.data_name, std::ios::binary);
-    std::vector<char> slot(size_t(C), 0);
-    for (uint64_t chunk = 1; chunk < 40; chunk += 2) {
-      uint64_t n = std::min(C, uint64_t(bytes.size()) - chunk * C);
+    std::vector<char> slot(size_t(chunk), 0);
+    for (uint64_t k = 1; k * chunk < bytes.size(); k += 2) {
+      uint64_t n = std::min(chunk, uint64_t(bytes.size()) - k * chunk);
       std::fill(slot.begin(), slot.end(), char(0));
-      std::memcpy(slot.data(), bytes.data() + chunk * C, size_t(n));
-      manifest.runs.push_back({chunk, 1, manifest.hashes.size()});
+      std::memcpy(slot.data(), bytes.data() + k * chunk, size_t(n));
+      manifest.runs.push_back({k, 1, manifest.hashes.size()});
       manifest.hashes.push_back(xxh64(slot.data(), size_t(n)));
-      data.write(slot.data(), std::streamsize(C));
+      data.write(slot.data(), std::streamsize(chunk));
     }
     data.close();
-    manifest.data_size = manifest.hashes.size() * C;
+    manifest.data_size = manifest.hashes.size() * chunk;
     publish();
   }
   ~Fixture() {
@@ -142,8 +143,12 @@ struct Fixture {
     return o;
   }
   // stripe = true: every request may use the stripe (the failure-path tests read single chunks from it)
-  std::shared_ptr<MFile> open(int verify = SS_MFILE_VERIFY_ALWAYS, bool direct = true, bool stripe = true) const {
-    auto f = MFile::open(primary.u8string(), secondary.u8string(), options(verify, direct));
+  // legacy: the routing before balanced routing
+  std::shared_ptr<MFile> open(int verify = SS_MFILE_VERIFY_ALWAYS, bool direct = true, bool stripe = true,
+                              bool legacy = false) const {
+    auto o = options(verify, direct);
+    o.legacy_routing = legacy;
+    auto f = MFile::open(primary.u8string(), secondary.u8string(), o);
     f->test_prefer_stripe(stripe);
     return f;
   }
@@ -409,33 +414,37 @@ TEST(mfile_consecutive_chunks_to_unaligned_eof) {
 
 TEST(mfile_size_rule_routing) {
   // the primary holds every byte: requests under 8 MiB and short batches read the primary only; large requests and
-  // batches of at least 64 scattered reads also use the stripe; bytes are the primary's either way
-  Fixture t;
-  auto f = t.open(SS_MFILE_VERIFY_ALWAYS, true, false);
-  auto base = counters(*f);
-  CHECK(t.equal(*f, C, C));
-  CHECK(t.equal(*f, 0, 7 * C));
-  auto small = counters(*f);
-  CHECK_EQ(small.bytes[1], base.bytes[1]);
-  CHECK(t.equal(*f, 0, 8 * C));
-  auto large = counters(*f);
-  CHECK_EQ(large.bytes[1] - small.bytes[1], uint64_t(4 * C));
-  CHECK_EQ(large.bytes[0] - small.bytes[0], uint64_t(4 * C));
-  std::vector<std::unique_ptr<Buffer>> pages;  // Buffer owns raw aligned memory: never copied
-  std::vector<ss_mfile_io> ios;
-  // 64 pages on stripe chunks (odd chunks, 4 KiB apart inside them)
-  for (int i = 0; i < 64; ++i) pages.push_back(std::make_unique<Buffer>(4096));
-  for (int i = 0; i < 64; ++i) ios.push_back({pages[size_t(i)]->p, uint64_t(2 * (i % 19) + 1) * C + uint64_t(i / 19) * 4096, 4096});
-  f->preadv(ios.data(), 63);
-  auto short_batch = counters(*f);
-  CHECK_EQ(short_batch.bytes[1], large.bytes[1]);
-  f->preadv(ios.data(), 64);
-  auto batch = counters(*f);
-  CHECK_EQ(batch.bytes[1] - short_batch.bytes[1], uint64_t(32 * 4096));
-  CHECK_EQ(batch.bytes[0] - short_batch.bytes[0], uint64_t(32 * 4096));
-  for (int i = 0; i < 64; ++i)
-    CHECK(std::memcmp(pages[size_t(i)]->p, t.bytes.data() + uint64_t(2 * (i % 19) + 1) * C + uint64_t(i / 19) * 4096, 4096) == 0);
-  CHECK_EQ(batch.fallback_bytes, uint64_t(0));
+  // batches of at least 64 scattered reads also use the stripe; bytes are the primary's either way. Balanced routing
+  // also sends medium requests within one stripe location's chunks there (its own tests), so it reads small ones here.
+  for (bool legacy : {true, false}) {
+    Fixture t;
+    auto f = t.open(SS_MFILE_VERIFY_ALWAYS, true, false, legacy);
+    auto base = counters(*f);
+    CHECK(t.equal(*f, C, legacy ? C : C - 4096));
+    CHECK(t.equal(*f, 0, 7 * C));
+    auto small = counters(*f);
+    CHECK_EQ(small.bytes[1], base.bytes[1]);
+    CHECK(t.equal(*f, 0, 8 * C));
+    auto large = counters(*f);
+    CHECK_EQ(large.bytes[1] - small.bytes[1], uint64_t(4 * C));
+    CHECK_EQ(large.bytes[0] - small.bytes[0], uint64_t(4 * C));
+    std::vector<std::unique_ptr<Buffer>> pages;  // Buffer owns raw aligned memory: never copied
+    std::vector<ss_mfile_io> ios;
+    // 64 pages on stripe chunks (odd chunks, 4 KiB apart inside them)
+    for (int i = 0; i < 64; ++i) pages.push_back(std::make_unique<Buffer>(4096));
+    for (int i = 0; i < 64; ++i) ios.push_back({pages[size_t(i)]->p, uint64_t(2 * (i % 19) + 1) * C + uint64_t(i / 19) * 4096, 4096});
+    f->preadv(ios.data(), 63);
+    auto short_batch = counters(*f);
+    CHECK_EQ(short_batch.bytes[1], large.bytes[1]);
+    f->preadv(ios.data(), 64);
+    auto batch = counters(*f);
+    CHECK_EQ(batch.bytes[1] - short_batch.bytes[1], uint64_t(32 * 4096));
+    CHECK_EQ(batch.bytes[0] - short_batch.bytes[0], uint64_t(32 * 4096));
+    for (int i = 0; i < 64; ++i)
+      CHECK(std::memcmp(pages[size_t(i)]->p, t.bytes.data() + uint64_t(2 * (i % 19) + 1) * C + uint64_t(i / 19) * 4096, 4096) == 0);
+    CHECK_EQ(batch.fallback_bytes, uint64_t(0));
+    for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+  }
 }
 
 TEST(mfile_adaptive_shares_turn_a_slow_stripe_off) {
@@ -660,11 +669,11 @@ TEST(mfile_concurrent_reads_and_injection) {
   CHECK(t.equal(*f, 0, 8 * C));
 }
 
-TEST(mfile_medium_reads_balance_only_under_load) {
-  // a whole-chunk read below the split size is never split; alone it reads the primary, and while other reads are in
-  // flight it may go whole to the stripe copy of its chunk
+TEST(mfile_legacy_medium_reads_balance_only_under_load) {
+  // the legacy routing: a whole-chunk read below the split size is never split; alone it reads the primary, and while
+  // other reads are in flight it may go whole to the stripe copy of its chunk
   Fixture t;
-  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false, true);
   CHECK(t.equal(*f, 1 * C, C));
   CHECK_EQ(counters(*f).bytes[1], uint64_t(0));
   std::atomic<bool> start{false};
@@ -684,11 +693,11 @@ TEST(mfile_medium_reads_balance_only_under_load) {
   CHECK_EQ(c.fallback_bytes, uint64_t(0));
 }
 
-TEST(mfile_medium_reads_idle_stay_on_primary_and_batches_balance) {
-  // an isolated medium read reads the primary even after the stripe was measured faster; the medium ios of one preadv
-  // are balanced against each other and the bytes in flight
+TEST(mfile_legacy_medium_reads_idle_stay_on_primary_and_batches_balance) {
+  // the legacy routing: an isolated medium read reads the primary even after the stripe was measured faster; the
+  // medium ios of one preadv are balanced against each other and the bytes in flight
   Fixture t;
-  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false, true);
   f->test_delay(0, 3000);  // a slow primary: concurrent reads teach a higher stripe share
   std::vector<std::thread> threads;
   for (unsigned id = 0; id < 8; ++id)
@@ -706,6 +715,198 @@ TEST(mfile_medium_reads_idle_stay_on_primary_and_batches_balance) {
   CHECK(counters(*f).bytes[1] > trained);  // the second whole-chunk io went to the stripe
   for (int i = 0; i < 3; ++i)
     CHECK(std::memcmp(buf + size_t(i) * C, t.bytes.data() + size_t(2 * i + 1) * C, size_t(C)) == 0);
+}
+
+TEST(mfile_balanced_idle_medium_reads_take_turns) {
+  // balanced routing: with nothing in flight, the primary and the stripe location take turns
+  // (an idle medium read does not always read the primary); the bytes are the primary's, nothing stays in flight
+  Fixture t;
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  for (int i = 0; i < 4; ++i) CHECK(t.equal(*f, uint64_t(2 * i + 1) * C, C));
+  auto c = counters(*f);
+  CHECK_EQ(c.bytes[0], uint64_t(2 * C));
+  CHECK_EQ(c.bytes[1], uint64_t(2 * C));
+  CHECK(t.equal(*f, 2 * C, C));  // a chunk only the primary holds
+  CHECK_EQ(counters(*f).bytes[0], uint64_t(3 * C));
+  for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+}
+
+TEST(mfile_balanced_slow_location_gets_fewer) {
+  // concurrent medium and small reads: each medium read goes whole to the location with fewer bytes in flight, so a
+  // slow drive, whose queue empties later, serves the smaller part (the delay hook slows run(), so these are preads);
+  // exact bytes
+  for (int slow : {0, 1}) {
+    Fixture t;
+    auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+    f->test_delay(slow, 5000);  // 5 ms more per piece on the slow location
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (unsigned id = 0; id < 8; ++id) threads.emplace_back([&, id] {
+      while (!start.load()) std::this_thread::yield();
+      try {
+        for (int i = 0; i < 24; ++i) {
+          const uint64_t a = uint64_t(2 * ((id + i) % 19) + 1) * C, b = uint64_t(2 * ((id + i + 7) % 19) + 1) * C;
+          if (!t.equal(*f, a, C) || !t.equal(*f, b + 8192, 4096)) failures.fetch_add(1);
+        }
+      } catch (...) { failures.fetch_add(1); }
+    });
+    start.store(true);
+    for (auto& thread : threads) thread.join();
+    CHECK_EQ(failures.load(), 0);
+    const auto c = counters(*f);
+    CHECK_EQ(c.fallback_bytes, uint64_t(0));
+    CHECK(c.bytes[1 - slow] > c.bytes[slow]);
+    CHECK(c.bytes[1] % C == 0);  // whole medium reads only: the small ones read the primary
+    for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+  }
+}
+
+TEST(mfile_balanced_stripe_errors_fall_back_and_release) {
+  // a failing stripe location under balanced routing: its medium reads fall back to the primary (the same bytes), it is
+  // disabled after three errors, and every byte reserved in flight is released, also when a call is refused
+  for (bool batch : {false, true}) {
+    Fixture t;
+    auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+    f->test_inject(1, 1, 0);
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (unsigned id = 0; id < 4; ++id) threads.emplace_back([&, id] {
+      try {
+        Buffer mem(size_t(2 * C));
+        for (int i = 0; i < 10; ++i) {
+          const uint64_t a = uint64_t(2 * ((id + i) % 19) + 1) * C, b = uint64_t(2 * ((id + i + 5) % 19) + 1) * C;
+          if (batch) {
+            ss_mfile_io ios[] = {{mem.p, a, C}, {mem.p + C, b, C}};
+            f->preadv(ios, 2);
+            if (std::memcmp(mem.p, t.bytes.data() + a, size_t(C)) != 0 ||
+                std::memcmp(mem.p + C, t.bytes.data() + b, size_t(C)) != 0) failures.fetch_add(1);
+          } else if (!t.equal(*f, a, C)) failures.fetch_add(1);
+        }
+      } catch (...) { failures.fetch_add(1); }
+    });
+    for (auto& thread : threads) thread.join();
+    CHECK_EQ(failures.load(), 0);
+    const auto c = counters(*f);
+    CHECK(c.disabled_mask & 2);
+    CHECK(c.fallback_bytes >= 3 * C);
+    CHECK_EQ(c.bytes[1], uint64_t(0));
+    for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+    Buffer mem(size_t(2 * C));
+    ss_mfile_io bad[] = {{mem.p, C, C}, {mem.p + C, 4097, 4096}};
+    CHECK_EQ(status([&] { f->preadv(bad, 2); }), int(SS_E_INVALID));
+    for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+  }
+}
+
+TEST(mfile_route_legacy_switch) {
+  // STRIX_MFILE_ROUTE_LEGACY=1 (read at open, any case) restores the legacy routing (idle medium reads read the
+  // primary), 0 keeps balanced routing and another value refuses the open; sessions of the two routings are never shared
+  Fixture t;
+  struct Reset {
+    ~Reset() { env("STRIX_MFILE_ROUTE_LEGACY", ""); }
+  } reset;
+  env("STRIX_MFILE_ROUTE_LEGACY", "On");
+  auto legacy = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options(SS_MFILE_VERIFY_CACHED));
+  env("STRIX_MFILE_ROUTE_LEGACY", "FALSE");
+  auto balanced = MFile::open(t.primary.u8string(), t.secondary.u8string(), t.options(SS_MFILE_VERIFY_CACHED));
+  env("STRIX_MFILE_ROUTE_LEGACY", "maybe");
+  CHECK_EQ(status([&] { MFile::open(t.primary.u8string(), "", t.options(SS_MFILE_VERIFY_CACHED)); }),
+           int(SS_E_INVALID));
+  env("STRIX_MFILE_ROUTE_LEGACY", "");
+  CHECK(legacy.get() != balanced.get());
+  auto option = t.options(SS_MFILE_VERIFY_CACHED);
+  option.legacy_routing = true;
+  CHECK(MFile::open(t.primary.u8string(), t.secondary.u8string(), option).get() == legacy.get());
+  for (int i = 0; i < 4; ++i) {
+    CHECK(t.equal(*legacy, uint64_t(2 * i + 1) * C, C));
+    CHECK(t.equal(*balanced, uint64_t(2 * i + 1) * C, C));
+  }
+  CHECK_EQ(counters(*legacy).bytes[1], uint64_t(0));
+  CHECK_EQ(counters(*balanced).bytes[1], uint64_t(2 * C));
+}
+
+TEST(mfile_slow_stripe_switched_off_under_small_reads) {
+  // record pages in flight on the primary do not change a large request's load class: a slow stripe is still
+  // switched off (after which it serves nothing more), and the pages keep their bytes
+  Fixture t;
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  std::atomic<bool> stop{false};
+  std::atomic<int> failures{0};
+  std::thread pages([&] {
+    for (uint64_t i = 0; !stop.load(); ++i)
+      if (!t.equal(*f, (i % (38 * C / 4096)) * 4096, 4096)) failures.fetch_add(1);
+  });
+  struct Join {
+    std::atomic<bool>& stop;
+    std::thread& thread;
+    ~Join() { stop.store(true); thread.join(); }
+  } join{stop, pages};
+  f->test_delay(1, 30000);
+  for (int i = 0; i < 40; ++i) CHECK(t.equal(*f, uint64_t(i % 4) * 8 * C, 8 * C));
+  CHECK(f->test_split_off());
+  auto off = counters(*f);
+  for (int i = 0; i < 8; ++i) CHECK(t.equal(*f, 0, 8 * C));
+  CHECK_EQ(counters(*f).bytes[1], off.bytes[1]);
+  CHECK_EQ(failures.load(), 0);
+}
+
+TEST(mfile_load_classes_keep_splitting_on_a_busy_primary) {
+  // the prefill case: a primary-only baseline measured alone, then large requests while the primary is busy with
+  // other reads (held bytes in flight, and a slower primary) and the stripe is healthy. The legacy routing compares
+  // the loaded split requests with the idle baseline and switches splitting off; balanced routing compares them only
+  // with primary-only requests of the same load, which are slower still, and keeps splitting on
+  for (bool legacy : {true, false}) {
+    Fixture t;
+    auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false, legacy);
+    for (int i = 0; i < 16; ++i) CHECK(t.equal(*f, uint64_t(i % 4) * 8 * C, 8 * C));  // the 16th: the primary alone
+    f->test_hold(0, int64_t(64 * C));  // other reads in flight on the primary
+    f->test_delay(0, 5000);
+    for (int i = 0; i < 40; ++i) CHECK(t.equal(*f, uint64_t(i % 4) * 8 * C, 8 * C));
+    CHECK_EQ(f->test_split_off(), legacy);
+    f->test_hold(0, -int64_t(64 * C));
+    for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
+    CHECK_EQ(counters(*f).fallback_bytes, uint64_t(0));
+  }
+}
+
+TEST(mfile_balanced_mixed_pages_and_parts) {
+  // a decode-like mix on two equally fast locations: record pages (always the primary) and ~3 MB parts inside 4 MiB
+  // chunks. The parts on the stripe's chunks go to the location with fewer bytes in flight, so they split about
+  // evenly although the primary also serves every page; exact bytes, nothing left in flight. Both locations are mock drives of one speed: the test files
+  // share one disk, whose throughput would follow whichever location happens to have more reads queued
+  Fixture t(4 * C);
+  auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+  f->test_delay(0, 1500);
+  f->test_delay(1, 1500);
+  std::atomic<bool> start{false};
+  std::atomic<int> failures{0};
+  std::atomic<uint64_t> page_bytes{0};
+  const uint64_t part = 3 * C;
+  std::vector<std::thread> threads;
+  for (unsigned id = 0; id < 16; ++id) threads.emplace_back([&, id] {
+    while (!start.load()) std::this_thread::yield();
+    try {
+      for (int i = 0; i < 32; ++i) {
+        if (id % 2) {
+          const uint64_t off = (uint64_t(id) * 7919 + uint64_t(i) * 104729) % (38 * C / 4096) * 4096;
+          if (!t.equal(*f, off, 4096)) failures.fetch_add(1);
+          page_bytes.fetch_add(4096);
+        } else {
+          const uint64_t chunk = 2 * ((id / 2 + uint64_t(i)) % 4) + 1;  // odd chunks 1..7 (the stripe's)
+          if (!t.equal(*f, chunk * 4 * C + uint64_t(i % 2) * C, part)) failures.fetch_add(1);
+        }
+      }
+    } catch (...) { failures.fetch_add(1); }
+  });
+  start.store(true);
+  for (auto& thread : threads) thread.join();
+  CHECK_EQ(failures.load(), 0);
+  const auto c = counters(*f);
+  const uint64_t parts = 8 * 32 * part, on_primary = c.bytes[0] - page_bytes.load();
+  CHECK_EQ(on_primary + c.bytes[1], parts);
+  CHECK(c.bytes[1] >= parts / 4 && c.bytes[1] <= parts * 3 / 4);
+  for (int l = 0; l < 2; ++l) CHECK_EQ(f->test_inflight(l), uint64_t(0));
 }
 
 TEST(mfile_open_validates_options_without_stripes) {

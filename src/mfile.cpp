@@ -1,6 +1,7 @@
 #include "mfile.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -154,6 +155,19 @@ void finish(std::vector<std::future<void>>& jobs, std::exception_ptr error = {})
   if (error) std::rethrow_exception(error);
 }
 
+// STRIX_MFILE_ROUTE_LEGACY, read at each open (any case): 1 / true / on restores the routing before balanced routing;
+// 0 / false / off, unset or empty keeps balanced routing; anything else refuses the open (SS_E_INVALID).
+bool legacy_routing_env() {
+  const char* v = std::getenv("STRIX_MFILE_ROUTE_LEGACY");
+  if (!v || !*v) return false;
+  std::string s = v;
+  for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+  if (s == "1" || s == "true" || s == "on") return true;
+  require(s == "0" || s == "false" || s == "off", SS_E_INVALID,
+          "mfile: invalid STRIX_MFILE_ROUTE_LEGACY (use 0, 1, false, true, off or on, in any case)");
+  return false;
+}
+
 int strictness(int mode) { return mode == SS_MFILE_VERIFY_ALWAYS ? 2 : mode == SS_MFILE_VERIFY_CACHED ? 1 : 0; }
 
 std::string id_text(const FileIdentity& id) {
@@ -197,8 +211,9 @@ constexpr uint64_t kSubRead = uint64_t(4) << 20;
 // (a decode step's 24-48 Engram pages) are latency bound: a split batch waits for the slower drive's page, so they stay
 // on the primary, which serves them as single-drive reading always did.
 constexpr uint64_t kSplitBytes = uint64_t(8) << 20;
-// Requests of kBalanceBytes up to kSplitBytes are never split, but while other requests are in flight a request whose
-// chunks all have a stripe copy on one location goes whole to the less loaded of the primary and that location.
+// Requests of kBalanceBytes up to kSplitBytes are never split, but a request whose chunks all have a stripe copy on one
+// location goes whole to whichever of the primary and that location has fewer bytes in flight (balanced routing; the
+// legacy routing: only while other requests are in flight, to the less loaded by the large-request shares).
 constexpr uint64_t kBalanceBytes = uint64_t(1) << 20;
 constexpr uint32_t kSplitBatch = 64;
 
@@ -212,10 +227,17 @@ struct MFile::Impl {
     std::atomic<bool> enabled{false};
     std::atomic<uint32_t> errors{0};
     std::atomic<uint64_t> bytes{0}, reads{0}, busy_ns{0}, serving{0};
-    uint64_t inflight = 0;  // bytes of large requests planned onto this location and not finished (under plan_mu)
+    // Bytes planned onto this location and not finished (under plan_mu): every request in balanced routing, medium and
+    // large requests in the legacy routing.
+    uint64_t inflight = 0;
+    uint64_t turn = 0;  // balanced routing, under plan_mu: equal bytes in flight take turns
     std::mutex injection_mu;
     int injection = 0;
     uint64_t after = 0;
+    // test hook (a mock drive): every piece of at least 1 MiB run() serves from here takes delay_us per MiB longer, one
+    // piece at a time
+    std::atomic<uint64_t> delay_us{0};
+    std::mutex delay_mu;
     bool manifest_absent = false;
     std::shared_ptr<Pool> pool;
     int fault() {
@@ -228,6 +250,7 @@ struct MFile::Impl {
     size_t loc;
     uint64_t logical, phys, bytes;
     char* dst;
+    size_t flight = SIZE_MAX;  // its entry in the call's Flight (SIZE_MAX: not reserved)
   };
   Options options;
   uint64_t size = 0, chunk = uint64_t(16) << 20;
@@ -239,17 +262,26 @@ struct MFile::Impl {
   std::unique_ptr<std::atomic<uint8_t>[]> states;
   std::atomic<uint64_t> fallback{0}, demoted{0}, verify_fail{0}, read_errors{0}, verified{0}, verify_ns{0};
   std::atomic<bool> prefer_stripe{false};  // test hook
-  std::atomic<uint64_t> delay_loc{0}, delay_us{0};  // test hook: extra time per piece served by one location
 
   // Adaptive shares of large requests (kSplitBytes and up). Each location's share follows its measured throughput
   // (its bytes of a request over the time until its last piece of that request finished); every kSingleEvery-th large
   // request reads the primary alone, so a fresh single-drive baseline is always known, and while split requests measure
   // slower than that baseline, splitting stays off for kSplitOff large requests (then it is tried again).
+  // Balanced routing compares split and primary-only requests only within one load class (the bytes other reads had in
+  // flight when the request was planned: under a quarter of its size, so record pages count as none, under its size,
+  // under four times its size, more), so a primary-only sample taken alone is never held against split requests that
+  // queued behind other reads.
   static constexpr uint64_t kSingleEvery = 16, kSplitOff = 64;
+  static constexpr size_t kLoadClasses = 4;
   std::mutex share_mu, plan_mu;
   std::vector<double> rate;           // bytes per ns per location (EWMA)
   double split_rate = 0, single_rate = 0;  // whole large requests, split / primary only (EWMA, bytes per ns)
   uint64_t large = 0, split_samples = 0, split_off_until = 0;
+  struct LoadClass {
+    double split_rate = 0, single_rate = 0;
+    uint64_t split_samples = 0;
+  } classes[kLoadClasses];            // balanced routing (under share_mu)
+  bool legacy = false;                // options.legacy_routing
   struct Route {
     bool split = false;
     std::vector<double> share;  // per location, sums to 1 over the locations with a measured rate
@@ -261,7 +293,8 @@ struct MFile::Impl {
   }
 
   bool reusable(const Options& o) const {
-    if (options.drive_readers != o.drive_readers || strictness(options.verify_mode) < strictness(o.verify_mode) ||
+    if (options.drive_readers != o.drive_readers || options.legacy_routing != o.legacy_routing ||
+        strictness(options.verify_mode) < strictness(o.verify_mode) ||
         (!o.primary_sha256.empty() && o.primary_sha256 != bound_digest)) return false;
     try {
       for (const auto& loc : locs) {
@@ -354,7 +387,11 @@ struct MFile::Impl {
   }
 
   size_t run(const Piece& p) {
-    if (uint64_t d = delay_us.load(); d && delay_loc.load() == p.loc) std::this_thread::sleep_for(std::chrono::microseconds(d));
+    // (pieces under 1 MiB are not delayed: a sleep of a few microseconds takes a whole timer tick on Windows)
+    if (uint64_t d = p.bytes >= kBalanceBytes ? locs[p.loc]->delay_us.load() : 0) {
+      std::lock_guard<std::mutex> lock(locs[p.loc]->delay_mu);
+      std::this_thread::sleep_for(std::chrono::microseconds(d * p.bytes >> 20));
+    }
     if (!p.loc) { primary_read(p); return 0; }
     if (!use_secondary(p)) { fallback_read(p); return 0; }
     Loc& loc = *locs[p.loc];
@@ -426,6 +463,58 @@ struct MFile::Impl {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
   }
 
+  // plan_mu held: p's bytes are in flight on its location.
+  void reserve_locked(const Piece& p) {
+    Loc& l = *locs[p.loc];
+    l.inflight += p.bytes;
+  }
+
+  // plan_mu held: p (reserved) finished.
+  void release_locked(const Piece& p) { locs[p.loc]->inflight -= p.bytes; }
+
+  // The in-flight bytes of one call's pieces: reserved as they are planned (plan_mu held), each released when it
+  // finished (balanced routing; the legacy routing releases them all when the call ends, as before), and whatever is
+  // still reserved when the call ends, on every path (errors, exceptions, fallback). Every job of the call has been
+  // waited for before the destructor runs.
+  struct Flight {
+    Impl& f;
+    std::vector<Piece> pieces;  // as reserved: the location planned, even when a fallback read the primary
+    std::vector<uint8_t> done;  // 1: released (or not yet reserved)
+    explicit Flight(Impl& impl) : f(impl) {}
+    Flight(const Flight&) = delete;
+    Flight& operator=(const Flight&) = delete;
+    // plan_mu held: reserves p and records its entry in p.flight
+    void add_locked(Piece& p) {
+      p.flight = pieces.size();
+      pieces.push_back(p);
+      done.push_back(1);
+      f.reserve_locked(p);
+      done.back() = 0;
+    }
+    // A piece's job finished (the second argument, the location that read it, is not needed for the release).
+    void finished(const Piece& p, size_t) {
+      if (f.legacy || p.flight == SIZE_MAX) return;
+      std::lock_guard<std::mutex> lock(f.plan_mu);
+      f.release_locked(pieces[p.flight]);
+      done[p.flight] = 1;
+    }
+    // Several pieces finished together, released under one lock: (p.flight, the location that read it).
+    void finished(const std::vector<std::pair<size_t, size_t>>& batch) {
+      if (f.legacy || batch.empty()) return;
+      std::lock_guard<std::mutex> lock(f.plan_mu);
+      for (const auto& b : batch) {
+        f.release_locked(pieces[b.first]);
+        done[b.first] = 1;
+      }
+    }
+    ~Flight() {
+      if (pieces.empty()) return;
+      std::lock_guard<std::mutex> lock(f.plan_mu);
+      for (size_t i = 0; i < done.size(); ++i)
+        if (!done[i]) f.release_locked(pieces[i]);
+    }
+  };
+
   // The current shares without counting a large request.
   Route route_large_shares() {
     std::lock_guard<std::mutex> lock(share_mu);
@@ -451,8 +540,9 @@ struct MFile::Impl {
     return r;
   }
 
+  // load: the request's load class (balanced routing)
   void learn_large(const Route& r, uint64_t bytes, int64_t t0, const std::vector<Piece>& pieces,
-                   const std::vector<int64_t>& done_at, const std::vector<size_t>& served_by) {
+                   const std::vector<int64_t>& done_at, const std::vector<size_t>& served_by, size_t load) {
     int64_t end = t0;
     std::vector<uint64_t> loc_bytes(locs.size(), 0);
     std::vector<int64_t> loc_end(locs.size(), t0);
@@ -467,6 +557,20 @@ struct MFile::Impl {
     for (size_t l = 0; l < locs.size(); ++l)
       if (loc_bytes[l] && loc_end[l] > t0) ewma(rate[l], double(loc_bytes[l]) / double(loc_end[l] - t0));
     double whole = double(bytes) / double(end - t0);
+    if (!legacy) {
+      LoadClass& c = classes[load];
+      if (!r.split) {
+        ewma(c.single_rate, whole);
+        return;
+      }
+      ewma(c.split_rate, whole);
+      if (++c.split_samples >= 4 && c.single_rate > 0 && c.split_rate < 0.98 * c.single_rate) {
+        split_off_until = large + kSplitOff;
+        c.split_rate = 0;
+        c.split_samples = 0;
+      }
+      return;
+    }
     if (!r.split) {
       ewma(single_rate, whole);
       return;
@@ -479,54 +583,73 @@ struct MFile::Impl {
     }
   }
 
-  // A medium request (kBalanceBytes..kSplitBytes): one location serves all of it. It goes to the stripe location only
-  // when other reads are in flight on the primary or that location, every chunk it touches is served from there, and
-  // that location's in-flight bytes per share are lower than the primary's; with nothing in flight it reads the
-  // primary, exactly as before. Appends the pieces and reserves their in-flight bytes; plan_mu must be held.
+  // Balanced routing counts small reads in flight only while a stripe location serves chunks (as MFile::multi()).
+  bool track_small() const {
+    if (legacy) return false;
+    for (size_t l = 1; l < locs.size(); ++l)
+      if (locs[l]->enabled.load() && locs[l]->serving.load()) return true;
+    return false;
+  }
+
+  // Balanced routing, plan_mu held: a medium request, every chunk of which loc (a stripe location) serves, goes to
+  // whichever of the primary and loc has fewer bytes in flight (every read counted); with those equal (two idle
+  // locations) the two take turns. Across concurrent calls a faster drive empties its queue sooner and so takes more
+  // requests by itself (weighting by a measured drive rate fed back on itself: the location that got less traffic
+  // measured slower and then got still less). Within one call (a batch's medium ios, or one caller's reads one at a
+  // time) the turns split evenly whatever the speeds, so a location whose large-request share (learned from split
+  // requests, not from this rule) is under half the primary's gets nothing here.
+  bool stripe_first_locked(size_t loc, const Route& r) {
+    if (r.share.size() > loc && r.share[loc] < 0.5 * r.share[0]) return false;
+    const uint64_t q0 = locs[0]->inflight, ql = locs[loc]->inflight;
+    if (q0 != ql) return ql < q0;
+    return (locs[loc]->turn++ & 1) != 0;
+  }
+
+  // A medium request (kBalanceBytes..kSplitBytes): one location serves all of it, the primary or, when every chunk it
+  // touches is served from one stripe location, possibly that location. Balanced routing: stripe_first_locked. The
+  // legacy routing: the stripe location only when other reads are in flight on the primary or that location and that
+  // location's in-flight bytes per share are lower than the primary's; with nothing in flight the primary. Appends
+  // the pieces (the caller reserves them); plan_mu must be held.
   uint64_t plan_balanced(void* dst, uint64_t n, uint64_t off, std::vector<Piece>& out, const Route& r) {
     std::vector<Piece> pieces;
     uint64_t got = plan(dst, n, off, pieces, true);
     size_t loc = pieces.empty() ? 0 : pieces.front().loc;
     for (const Piece& p : pieces) if (p.loc != loc) loc = 0;
-    bool stripe = loc && locs[0]->inflight + locs[loc]->inflight > 0 && r.share[loc] > 0 &&
-                  (r.share[0] <= 0 || double(locs[loc]->inflight + n) / r.share[loc] <
-                                          double(locs[0]->inflight + n) / r.share[0]);
+    bool stripe = loc && (legacy ? locs[0]->inflight + locs[loc]->inflight > 0 && r.share[loc] > 0 &&
+                                       (r.share[0] <= 0 || double(locs[loc]->inflight + n) / r.share[loc] <
+                                                               double(locs[0]->inflight + n) / r.share[0])
+                                 : stripe_first_locked(loc, r));
     if (!stripe) {
       pieces.clear();
       got = plan(dst, n, off, pieces, false);
     }
-    for (const Piece& p : pieces) {
-      locs[p.loc]->inflight += p.bytes;
-      out.push_back(p);
-    }
+    out.insert(out.end(), pieces.begin(), pieces.end());
     return got;
   }
 
   uint64_t read_balanced(void* dst, uint64_t n, uint64_t off) {
     Route r = route_large_shares();
+    Flight flight(*this);
     std::vector<Piece> pieces;
     uint64_t got;
     {
       std::lock_guard<std::mutex> lock(plan_mu);
       got = plan_balanced(dst, n, off, pieces, r);
+      flight.pieces.reserve(pieces.size());
+      flight.done.reserve(pieces.size());
+      for (Piece& p : pieces) flight.add_locked(p);
     }
-    struct Release {
-      Impl& f;
-      const std::vector<Piece>& pieces;
-      ~Release() {
-        std::lock_guard<std::mutex> lock(f.plan_mu);
-        for (const Piece& p : pieces) f.locs[p.loc]->inflight -= p.bytes;
-      }
-    } release{*this, pieces};
     if (pieces.size() != 1) {
-      parallel(pieces);
+      parallel(pieces, &flight);
       return got;
     }
-    // a single-location read also measures its location: its share follows it like a large request's
     int64_t t0 = now_ns();
     size_t served = run(pieces.front());
     int64_t t1 = now_ns();
-    if (t1 > t0) {
+    flight.finished(pieces.front(), served);
+    // the legacy routing: a single-location read also measures its location; its share follows it like a large
+    // request's (balanced routing: the drive rates measure it, and the shares follow large requests only)
+    if (legacy && t1 > t0) {
       std::lock_guard<std::mutex> lock(share_mu);
       double sample = double(pieces.front().bytes) / double(t1 - t0);
       rate[served] = rate[served] > 0 ? rate[served] * 0.75 + sample * 0.25 : sample;
@@ -534,24 +657,40 @@ struct MFile::Impl {
     return got;
   }
 
+  // A small request (under kBalanceBytes): read from the primary (or as the test hook routes it); balanced routing
+  // counts its bytes in flight.
+  uint64_t read_small(void* dst, uint64_t n, uint64_t off) {
+    Flight flight(*this);
+    std::vector<Piece> pieces;
+    uint64_t got = plan(dst, n, off, pieces, false);
+    if (track_small()) {
+      flight.pieces.reserve(pieces.size());
+      flight.done.reserve(pieces.size());
+      std::lock_guard<std::mutex> lock(plan_mu);
+      for (Piece& p : pieces) flight.add_locked(p);
+    }
+    if (pieces.size() == 1) flight.finished(pieces.front(), run(pieces.front()));
+    else parallel(pieces, &flight);
+    return got;
+  }
+
   // A large request: planned with the current shares, timed per piece, and fed back into the shares.
   uint64_t read_large(void* dst, uint64_t n, uint64_t off) {
     Route r = route_large();
+    Flight flight(*this);
     std::vector<Piece> pieces;
     uint64_t got;
+    size_t load = 0;
     {
       std::lock_guard<std::mutex> lock(plan_mu);
+      uint64_t others = 0;
+      for (const auto& l : locs) others += l->inflight;
+      load = others < n / 4 ? 0 : others < n ? 1 : others / 4 < n ? 2 : 3;
       got = plan(dst, n, off, pieces, r.split, &r.share);
-      for (const Piece& p : pieces) locs[p.loc]->inflight += p.bytes;
+      flight.pieces.reserve(pieces.size());
+      flight.done.reserve(pieces.size());
+      for (Piece& p : pieces) flight.add_locked(p);
     }
-    struct Release {
-      Impl& f;
-      const std::vector<Piece>& pieces;
-      ~Release() {
-        std::lock_guard<std::mutex> lock(f.plan_mu);
-        for (const Piece& p : pieces) f.locs[p.loc]->inflight -= p.bytes;
-      }
-    } release{*this, pieces};
     std::vector<int64_t> done_at(pieces.size(), 0);
     std::vector<size_t> served_by(pieces.size(), 0);
     int64_t t0 = now_ns();
@@ -562,22 +701,25 @@ struct MFile::Impl {
         Piece p = pieces[i];
         int64_t* at = &done_at[i];
         size_t* served = &served_by[i];
-        jobs.push_back(locs[p.loc]->pool->submit([this, p, at, served] {
+        Flight* fl = &flight;
+        jobs.push_back(locs[p.loc]->pool->submit([this, p, at, served, fl] {
           *served = run(p);
           *at = now_ns();
+          fl->finished(p, *served);
         }));
       }
     } catch (...) { finish(jobs, std::current_exception()); }
     finish(jobs);
-    learn_large(r, n, t0, pieces, done_at, served_by);
+    learn_large(r, n, t0, pieces, done_at, served_by, load);
     return got;
   }
 
-  void parallel(const std::vector<Piece>& pieces) {
+  void parallel(const std::vector<Piece>& pieces, Flight* flight) {
     std::vector<std::future<void>> jobs;
     jobs.reserve(pieces.size());
     try {
-      for (const Piece& p : pieces) jobs.push_back(locs[p.loc]->pool->submit([this, p] { run(p); }));
+      for (const Piece& p : pieces)
+        jobs.push_back(locs[p.loc]->pool->submit([this, p, flight] { flight->finished(p, run(p)); }));
     } catch (...) { finish(jobs, std::current_exception()); }
     finish(jobs);
   }
@@ -661,6 +803,18 @@ double MFile::test_rate(int loc) const {
   std::lock_guard<std::mutex> lock(impl_->share_mu);
   return impl_->rate.at(size_t(loc));
 }
+uint64_t MFile::test_inflight(int loc) const {
+  std::lock_guard<std::mutex> lock(impl_->plan_mu);
+  return impl_->locs.at(size_t(loc))->inflight;
+}
+void MFile::test_hold(int loc, int64_t bytes) {
+  std::lock_guard<std::mutex> lock(impl_->plan_mu);
+  impl_->locs.at(size_t(loc))->inflight += uint64_t(bytes);
+}
+bool MFile::test_split_off() const {
+  std::lock_guard<std::mutex> lock(impl_->share_mu);
+  return impl_->large + 1 < impl_->split_off_until;  // the next large request reads the primary alone
+}
 
 std::vector<std::string> MFile::secondary_dirs(const std::string& primary, const std::string& weight_dirs) {
   std::string parent = canonical(fs::u8path(primary).parent_path().empty() ? "." : fs::u8path(primary).parent_path().u8string());
@@ -685,6 +839,7 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
   require(o.drive_readers >= 1 && o.drive_readers <= 32, SS_E_INVALID, "drive_readers must be in 1..32");
   require(o.verify_mode >= SS_MFILE_VERIFY_CACHED && o.verify_mode <= SS_MFILE_VERIFY_OFF, SS_E_INVALID, "invalid verify mode");
   require(o.primary_sha256.empty() || digest_valid(o.primary_sha256), SS_E_INVALID, "invalid primary SHA-256");
+  o.legacy_routing = o.legacy_routing || legacy_routing_env();
   std::string path = canonical(primary);
   std::error_code ec;
   require(fs::is_regular_file(fs::u8path(path), ec) && !ec, SS_E_IO, "primary is not a regular file");
@@ -715,6 +870,7 @@ std::shared_ptr<MFile> MFile::open(const std::string& primary, const std::string
   auto impl = std::make_unique<Impl>();
   Impl& f = *impl;
   f.options = o;
+  f.legacy = o.legacy_routing;
   f.primary = path;
   auto first = std::make_unique<Impl::Loc>();
   first->path = path;
@@ -869,10 +1025,7 @@ uint64_t MFile::pread(void* dst, uint64_t n, uint64_t offset) {
     impl_->zero_tail(dst, n, offset);
     return got;
   }
-  std::vector<Impl::Piece> pieces;
-  uint64_t got = impl_->plan(dst, n, offset, pieces, false);
-  if (pieces.size() == 1) impl_->run(pieces.front());
-  else impl_->parallel(pieces);
+  uint64_t got = impl_->read_small(dst, n, offset);
   impl_->zero_tail(dst, n, offset);
   return got;
 }
@@ -882,31 +1035,32 @@ void MFile::preadv(const ss_mfile_io* ios, uint32_t n) {
   std::vector<Impl::Piece> pieces;
   // large ios go through the adaptive shares (read_large, after the scattered ios); in a batch of at least
   // kSplitBatch, every other small io comes from the stripe
-  // medium ios (kBalanceBytes..kSplitBytes) are routed whole like a medium pread, their in-flight bytes reserved
-  // until every job of this call finished
+  // medium ios (kBalanceBytes..kSplitBytes) are routed whole like a medium pread, each reserved in flight before the
+  // next is routed; balanced routing also reserves the small ios. Each is released when it finished, at the latest
+  // when this call ends.
   bool multi_loc = impl_->locs.size() > 1;
-  struct Reserved {
-    MFile::Impl& m;
-    std::vector<Impl::Piece> pieces;
-    ~Reserved() {
-      if (pieces.empty()) return;
-      std::lock_guard<std::mutex> lock(m.plan_mu);
-      for (const auto& p : pieces) m.locs[p.loc]->inflight -= p.bytes;
-    }
-  } reserved{*impl_, {}};
+  Impl::Flight flight(*impl_);
   bool any_medium = false;
   for (uint32_t i = 0; i < n; ++i) any_medium |= multi_loc && ios[i].bytes >= kBalanceBytes && ios[i].bytes < kSplitBytes;
-  if (any_medium) {
-    Impl::Route r = impl_->route_large_shares();
-    std::lock_guard<std::mutex> lock(impl_->plan_mu);
+  const bool track = impl_->track_small();
+  {
+    Impl::Route r = any_medium ? impl_->route_large_shares() : Impl::Route{};
+    std::unique_lock<std::mutex> lock(impl_->plan_mu, std::defer_lock);
+    if (any_medium || track) lock.lock();
+    if (any_medium)
+      for (uint32_t i = 0; i < n; ++i)
+        if (ios[i].bytes >= kBalanceBytes && ios[i].bytes < kSplitBytes) {
+          size_t first = pieces.size();
+          impl_->plan_balanced(ios[i].dst, ios[i].bytes, ios[i].offset, pieces, r);
+          for (size_t k = first; k < pieces.size(); ++k) flight.add_locked(pieces[k]);
+        }
+    size_t from = pieces.size();
     for (uint32_t i = 0; i < n; ++i)
-      if (ios[i].bytes >= kBalanceBytes && ios[i].bytes < kSplitBytes)
-        impl_->plan_balanced(ios[i].dst, ios[i].bytes, ios[i].offset, reserved.pieces, r);
+      if (!(multi_loc && ios[i].bytes >= kSplitBytes) && !(any_medium && ios[i].bytes >= kBalanceBytes))
+        impl_->plan(ios[i].dst, ios[i].bytes, ios[i].offset, pieces, n >= kSplitBatch && (i & 1));
+    if (track)
+      for (size_t k = from; k < pieces.size(); ++k) flight.add_locked(pieces[k]);
   }
-  pieces = reserved.pieces;
-  for (uint32_t i = 0; i < n; ++i)
-    if (!(multi_loc && ios[i].bytes >= kSplitBytes) && !(any_medium && ios[i].bytes >= kBalanceBytes))
-      impl_->plan(ios[i].dst, ios[i].bytes, ios[i].offset, pieces, n >= kSplitBatch && (i & 1));
   struct Large {
     MFile::Impl& m;
     const ss_mfile_io* ios;
@@ -928,7 +1082,8 @@ void MFile::preadv(const ss_mfile_io* ios, uint32_t n) {
       for (const auto& p : pieces) {
         if (p.bytes >= kSubRead) {
           Impl* impl = impl_.get();
-          jobs.push_back(impl->locs[p.loc]->pool->submit([impl, p] { impl->run(p); }));
+          Impl::Flight* fl = &flight;
+          jobs.push_back(impl->locs[p.loc]->pool->submit([impl, p, fl] { fl->finished(p, impl->run(p)); }));
         } else scattered.push_back(p);
       }
     } catch (...) { finish(jobs, std::current_exception()); }
@@ -968,13 +1123,27 @@ void MFile::preadv(const ss_mfile_io* ios, uint32_t n) {
         if (error != ERROR_IO_PENDING) { q->ok = error == ERROR_HANDLE_EOF; q->issued = false; }
       }
     }
-    // First wait for every secondary completion, then permit primary fallback into any destination.
-    for (auto& q : pending) {
+    // First wait for every secondary completion, then permit primary fallback into any destination. Each piece leaves
+    // the bytes in flight once its read completed (a later verification failure still re-reads it from the primary);
+    // the completions found together are released under one lock.
+    std::vector<std::pair<size_t, size_t>> released;
+    released.reserve(pending.size());
+    for (size_t i = 0; i < pending.size(); ++i) {
+      auto& q = pending[i];
       DWORD got = 0;
       if (q->issued && !GetOverlappedResult(impl_->locs[q->piece.loc]->file->handle(), &q->ov, &got, TRUE))
         q->ok = GetLastError() == ERROR_HANDLE_EOF;
       q->got = got;
       impl_->account(q->piece.loc, q->got, q->start);
+      if (q->piece.flight != SIZE_MAX)
+        released.emplace_back(q->piece.flight,
+                              q->ok && !q->fault && q->got >= impl_->logical_bytes(q->piece) ? q->piece.loc : SIZE_MAX);
+      const bool next_done = i + 1 < pending.size() &&
+                             (!pending[i + 1]->issued || HasOverlappedIoCompleted(&pending[i + 1]->ov));
+      if (!next_done) {
+        flight.finished(released);
+        released.clear();
+      }
     }
     std::exception_ptr error;
     for (auto& q : pending) {
@@ -998,7 +1167,7 @@ void MFile::preadv(const ss_mfile_io* ios, uint32_t n) {
   finish(jobs);
   large.run();
 #else
-  impl_->parallel(pieces);
+  impl_->parallel(pieces, &flight);
   large.run();
 #endif
   for (uint32_t i = 0; i < n; ++i) impl_->zero_tail(ios[i].dst, ios[i].bytes, ios[i].offset);
@@ -1024,8 +1193,7 @@ void MFile::counters(ss_mfile_counters* out) const {
 
 void MFile::test_prefer_stripe(bool on) { impl_->prefer_stripe.store(on); }
 void MFile::test_delay(int loc, uint64_t microseconds) {
-  impl_->delay_loc.store(uint64_t(loc));
-  impl_->delay_us.store(microseconds);
+  impl_->locs.at(size_t(loc))->delay_us.store(microseconds);
 }
 
 void MFile::test_inject(int loc, int kind, uint64_t after) {

@@ -388,7 +388,24 @@ en todas las variantes):
 El propio stream de expertos pasa de 11.0 a 8.45 s por petición (-23 %, 29 % de los bytes desde la segunda unidad) y el
 servicio arranca un 17 % más rápido; los prompts más largos ganan menos porque están limitados por el cálculo. Una
 tercera unidad más lenta (un disco de sistema sin DRAM) no aportó nada: las cuotas le asignan poco. El decode lee
-expertos sueltos y filas de Engram, que se quedan en la unidad original, así que la velocidad de decode no cambia.
+expertos sueltos y filas de Engram; con el enrutado anterior (`STRIX_MFILE_ROUTE_LEGACY=1`) se quedan en la unidad
+original, así que la velocidad de decode no cambia.
+
+**Lecturas equilibradas entre copias en franjas (por defecto en modelos con franjas).** Con copias en franjas de
+`weight_dirs`, una lectura de 1-8 MiB (las partes de un experto durante el decode) cuyos bytes tienen todos copia en
+una unidad de franjas va ahora a la que tenga menos bytes en vuelo entre el archivo principal y esa copia. Antes, esas
+lecturas iban al principal salvo que ya hubiera otras lecturas grandes en cola, así que la unidad principal llevaba la
+mayor parte del tráfico del decode. Las lecturas de 8 MiB o más se siguen repartiendo entre unidades como antes. La
+salida es idéntica: los mismos bytes verificados, solo cambia la unidad que los sirve. La regla supone unidades de
+franjas aproximadamente tan rápidas como la principal; una unidad de franjas que mide menos de la mitad de la velocidad
+de la principal en lecturas grandes no recibe ninguna de estas lecturas.
+
+Desactivado: `STRIX_MFILE_ROUTE_LEGACY=1` restaura exactamente el enrutado anterior. Medido con GLM-5.3-Flash en una
+RTX PRO 6000 limitada a 24 GiB de VRAM y 32 GiB de RAM del host, modelo repartido en franjas sobre tres unidades NVMe,
+dos ejecuciones por variante en ambos órdenes, salida idéntica en todas las variantes: decode +5.5 % / +8.5 % con un
+prompt de 1K (en frío / en caliente) y +17.2 % / +0.3 % con un prompt de 8K, +7.7 % de media, nunca más lento; la cuota
+de lecturas de decode de la unidad principal pasa del 40-46 % al 28-37 %. Las repeticiones de la misma configuración
+difieren hasta un 19 % aproximadamente, así que la magnitud de la ganancia no es precisa.
 
 ### Packs preparados (un pack por modelo, para todas las disposiciones)
 
