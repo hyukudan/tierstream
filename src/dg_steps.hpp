@@ -27,6 +27,16 @@ class DgSteps {
       run_[g] = uint8_t((!rows || rows[size_t(layer_of[g])] > 0) && !resident_[g]);
     return run_;
   }
+  // ss_dg_begin_layer, before the desync check: the layer token exports gated layer g only (through its part words);
+  // its end kernel stamps EVERY gated layer's export flag with the token's seq (begin below records that). A held
+  // resident set is never exported: false (nothing planned) when g holds one.
+  bool plan_layer(uint32_t g) {
+    if (resident_[g]) return false;
+    std::fill(run_.begin(), run_.end(), uint8_t(0));
+    run_[g] = 1;
+    layer_ = true;
+    return true;
+  }
   // Every export flag holds the last sequence that exported its layer (a stray export shows here).
   bool flags_clean(const uint32_t* flag, uint32_t (*load)(const uint32_t*)) const {
     for (size_t g = 0; g < flag_seq_.size(); ++g)
@@ -36,8 +46,11 @@ class DgSteps {
   // ss_begin, after the desync check: the step `seq` exports the planned layers.
   void begin(uint32_t seq) {
     for (size_t g = 0; g < run_.size(); ++g)
-      if (run_[g]) flag_seq_[g] = seq;
+      if (run_[g] || layer_) flag_seq_[g] = seq;  // a layer token's end kernel stamps every export flag
+    layer_ = false;
   }
+  // A layer token's begin failed before the step was opened: the next plan starts clean.
+  void cancel_layer() { layer_ = false; }
   const std::vector<uint8_t>& run() const { return run_; }
   bool exported(uint32_t g) const { return run_[g] != 0; }
 
@@ -66,12 +79,14 @@ class DgSteps {
   void reset() {
     for (auto& k : keep_) k.clear();
     std::fill(resident_.begin(), resident_.end(), uint8_t(0));
+    layer_ = false;
   }
 
  private:
   std::vector<std::vector<uint32_t>> keep_;
   std::vector<uint8_t> resident_, run_;
   std::vector<uint32_t> flag_seq_;
+  bool layer_ = false;  // the planned step is a layer token (plan_layer)
 };
 
 }  // namespace ts

@@ -440,6 +440,11 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK(ss::dg_device_error(ss::kDgBadId, 1) == "an id was out of range at gated layer 1");
   CHECK(ss::dg_device_error(ss::kDgDesync, 12) == "a step ran outside ss_begin / ss_end (sequence desync) (that "
                                                   "step's seq 12)");
+  // a layer token's end kernel also reports a stray full export of gated layer 2 inside it with kDgDesync
+  CHECK(ss::dg_device_error(ss::kDgDesync, 2, true) == "a step ran outside ss_begin / ss_end (sequence desync) (that "
+                                                       "step's seq, or the gated layer exported in full inside the "
+                                                       "layer token: 2)");
+  CHECK(ss::dg_device_error(ss::kDgTimeout, 3, true) == "a wait timed out at gated layer 3");
   CHECK(ss::dg_device_error(ss::kDgAbsent, 4) == "a slot lookup met an absent entry");
   CHECK(ss::dg_device_error(ss::kDgHostAbort, 2) == "the host aborted the token at gated layer 2");
   const std::string tail = " (the context is poisoned, the token's outputs must be discarded)";
@@ -463,7 +468,11 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK_EQ(offsetof(ss_dg_stats, cuda_module_loading), offsetof(ss_dg_stats, round_cancelled) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, clean_drops), offsetof(ss_dg_stats, reserved1) + 4);
   CHECK_EQ(offsetof(ss_dg_stats, mkres_file_reads), offsetof(ss_dg_stats, clean_drop_bytes) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, mkres_wb_bytes) + 8);
+  // layer tokens' counters are appended after #10's (lm_tokens / lm_parts / lm_mid_evictions / lm_early_admits, the
+  // last fields)
+  CHECK_EQ(offsetof(ss_dg_stats, lm_tokens), offsetof(ss_dg_stats, mkres_wb_bytes) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, lm_early_admits), offsetof(ss_dg_stats, lm_mid_evictions) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, lm_early_admits) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

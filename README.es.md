@@ -257,6 +257,29 @@ y de rendimiento frente a la propia caché de ese motor, y después recibir la a
       142.4 GiB de expertos, sin ninguna lectura de archivo tras la apertura. El presupuesto real de la receta pendiente
       publicada aún deja 5.8 GiB en NVMe.
 
+**Desalojo limpio para unidades de solo lectura (`dg_clean_evict`, opcional).** Los pesos de los expertos no cambian,
+así que su archivo contiene siempre los mismos bytes. Con `dg_clean_evict = 1` (o `ss_dg_set_clean_evict` entre
+tokens), una unidad que sale del dispositivo cuando no queda ningún bloque fijado libre vuelve directamente a su
+archivo: sin copia de dispositivo a host, y sin expulsar ninguna unidad fijada para hacer sitio. Esto evita el ciclo
+"desalojar, escribir de vuelta, volver a leer" cuando el conjunto de trabajo de un modelo supera la VRAM más la RAM
+fijada (por ejemplo, un prefill de capa completa en una tarjeta pequeña). Se contabiliza en
+`ss_dg_stats.clean_drops` / `clean_drop_bytes`.
+
+**Lecturas en vuelo de `ss_dg_make_resident`.** Hasta `min(dg_disk_queue, dg_disk_staging)` lecturas de archivo se
+ejecutan a la vez y se completan según terminan; las unidades copiadas pasan igualmente a ser las más recientes en el
+orden indicado, de modo que la ubicación no depende del orden de las lecturas. Sus lecturas, bytes, tiempo de espera y
+bytes de host a dispositivo y de escritura de vuelta figuran en `ss_dg_stats.mkres_*`.
+
+**Tokens de capa para bloques de prompt por capas (`ss_dg_begin_layer`, opcional).** Un motor que procesa un bloque
+de prompt capa a capa puede abrir un token que sirve solo la capa con compuerta g, en hasta 32 partes:
+`ss_dg_begin_layer(c, g, parts)` y, en el dispositivo, `ss_dg_enqueue_export_part` / `ss_dg_enqueue_wait_part` por
+parte y `ss_dg_enqueue_end_layer` tras los lectores de la capa. Una unidad traída por una parte cubre las partes
+siguientes (una copia por unidad y token de capa). Cuando una demanda no encuentra ningún slot libre, una unidad de
+otra capa con compuerta sale del dispositivo como en la frontera (respetando `dg_clean_evict`); las unidades
+mantenidas por `ss_dg_keep` o retenidas por `ss_dg_make_resident` nunca se mueven. Una exportación completa dentro de
+un token de capa lo hace fallar como desincronización de secuencia. Los tokens ordinarios (`ss_begin`) no cambian.
+Solo afecta a la ubicación: los mismos bytes. Se contabiliza en `ss_dg_stats.lm_*`.
+
 ### Traer por adelantado
 
 - **Precarga cierta** (`ss_prefetch_layer`): el prefill capa a capa sabe que necesita la capa L+1 a continuación, así

@@ -135,8 +135,10 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DG_DISK_QUEUE SS_DG_DISK_QUEUE
 #define TS_DG_DISK_RECEIPTS SS_DG_DISK_RECEIPTS
 #define TS_DG_DISK_TIER SS_DG_DISK_TIER
+#define TS_DG_LAYER_TOKEN SS_DG_LAYER_TOKEN
 #define TS_DG_MAKE_RESIDENT SS_DG_MAKE_RESIDENT
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
+#define TS_DG_MAX_LAYER_PARTS SS_DG_MAX_LAYER_PARTS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_MKRES_STATS SS_DG_MKRES_STATS
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
@@ -309,6 +311,10 @@ TS_API ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec
 TS_API ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256);
 TS_API void ts_pack_writer_abort(ss_pack_writer* w);
 TS_API ss_status ts_dg_set_clean_evict(ss_ctx* c, uint32_t on);
+TS_API ss_status ts_dg_begin_layer(ss_ctx* c, int g, int parts);
+TS_API ss_status ts_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream);
+TS_API ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream);
+TS_API ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }

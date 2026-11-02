@@ -214,6 +214,16 @@ class CudaTransport final : public DgTransport {
       if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (ready flush)");
     }
   }
+  void signal_ready_part(uint32_t part, uint32_t seq) override {
+    ck_drv(cuStreamWriteValue32(reinterpret_cast<CUstream>(s_[kDem]), reinterpret_cast<CUdeviceptr>(lm_ready_ + part),
+                                cuuint32_t(seq), CU_STREAM_WRITE_VALUE_DEFAULT),
+           "cuStreamWriteValue32 (part ready)");
+    if (flush_ready_) {
+      const CUresult r = cuStreamQuery(reinterpret_cast<CUstream>(s_[kDem]));
+      if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (ready flush)");
+    }
+  }
+  void set_lm_ready(uint32_t* p) { lm_ready_ = p; }
   void flush(Stream s) override {
     const CUresult r = cuStreamQuery(reinterpret_cast<CUstream>(s_[s]));
     if (r != CUDA_ERROR_NOT_READY) ck_drv(r, "cuStreamQuery (prefetch flush)");
@@ -281,6 +291,7 @@ class CudaTransport final : public DgTransport {
   std::vector<char*> arena_;
   int32_t* slot_of_;
   uint32_t* ready_;
+  uint32_t* lm_ready_ = nullptr;  // layer tokens' part ready words (device address of the mapped words)
   const std::vector<char*>& blocks_;
   char* staging_;
   cudaStream_t s_[3] = {nullptr, nullptr, nullptr};
@@ -350,13 +361,16 @@ class CudaDgCtx final : public DgCtx {
   int n_sources() const override { return int(files_.size()); }
   bool source_direct(int i) const override { return files_[size_t(i)]->physical_direct(); }
 
-  void begin(const uint32_t* rows, int n_layers) override {
+  void begin(const uint32_t* rows, int n_layers) override { begin(rows, n_layers, 0, 0); }
+  void begin(const uint32_t* rows, int n_layers, uint32_t lm_g, uint32_t lm_parts) {
     require(!in_token_, SS_E_INVALID, "ss_begin: a gated token is already open (call ss_end)");
     if (rows)
       require(n_layers == int(d_.layers.size()), SS_E_INVALID, "ss_begin: rows_per_layer must cover every layer");
     // The layers this step exports: rows > 0 (or no rows) and no ss_dg_make_resident set (a resident layer reads only
     // its kept units, through ss_dg_slot, and is never exported while the set is held).
-    steps_.plan(rows, x_.gated);
+    // A layer token (lm_parts > 0) exports gated layer lm_g only, through its part words.
+    if (lm_parts) require(steps_.plan_layer(lm_g), SS_E_INVALID, "ss_dg_begin_layer: gated layer holds a resident set");
+    else steps_.plan(rows, x_.gated);
     // design rev 3.4 §11.1: no step ran outside a pair (every word still holds the last token's sequence; a gated
     // layer's export flag the last sequence that exported it: an export of a layer the step did not announce shows here)
     bool clean = dg_load_acquire(m_.done) == seq_ && dg_load_acquire(m_.began) == seq_ &&
@@ -375,9 +389,34 @@ class CudaDgCtx final : public DgCtx {
     ++seq_;
     steps_.begin(seq_);
     in_token_ = true;
+    layer_token_ = lm_parts != 0;  // (device_error's reading of kDgDesync, until the next token)
     device_busy_ = true;  // until its end kernel is seen
     dg_store_release(m_.host_seq, seq_);  // the begin kernel authorizes exactly this sequence
-    svc_->begin(seq_, &steps_.run());
+    if (lm_parts) svc_->begin_layer(seq_, lm_g, lm_parts);
+    else svc_->begin(seq_, &steps_.run());
+  }
+
+  void begin_layer(int g, int parts) override {
+    check_g(g, "ss_dg_begin_layer");
+    require(parts >= 1 && uint32_t(parts) <= kDgMaxParts, SS_E_INVALID,
+            "ss_dg_begin_layer: parts must be 1.." + std::to_string(kDgMaxParts));
+    require(!in_token_, SS_E_INVALID, "ss_dg_begin_layer: a gated token is already open (call ss_end)");
+    require(!steps_.resident(uint32_t(g)), SS_E_INVALID,
+            "ss_dg_begin_layer: gated layer " + std::to_string(g) +
+                " holds a ss_dg_make_resident set (never exported while held: release it first)");
+    // every layer's keep (ss_dg_keep sets and held ss_dg_make_resident sets) is protected from the token's mid-token
+    // evictions, as from its boundary (end_token(steps_.all_kept()))
+    core_->set_layer_token(uint32_t(g), steps_.all_kept());
+    core_->drop_window_hint();  // (after set_layer_token's refusals) no window hint: placement only, prior copies stay
+    try {
+      begin(nullptr, 0, uint32_t(g), uint32_t(parts));
+    } catch (...) {
+      if (!in_token_) {
+        core_->set_layer_token_off();
+        steps_.cancel_layer();
+      }
+      throw;
+    }
   }
 
   void end(uint32_t rows = 1) override {
@@ -729,6 +768,24 @@ class CudaDgCtx final : public DgCtx {
     require(s != nullptr, SS_E_INVALID, "ss_dg_enqueue_end: null stream");
     ck_launch(dgk::launch_end(dev_, s), "end kernel");
   }
+  void enqueue_export_part(int g, int part, const int32_t* ids, int n, void* s) override {
+    require(s && ids, SS_E_INVALID, "ss_dg_enqueue_export_part: null argument");
+    check_g(g, "ss_dg_enqueue_export_part");
+    require(part >= 0 && uint32_t(part) < kDgMaxParts, SS_E_INVALID, "ss_dg_enqueue_export_part: part outside 0..31");
+    require(n >= 1 && uint32_t(n) <= x_.B, SS_E_INVALID,
+            "ss_dg_enqueue_export_part: n must be 1..dg_max_ids (" + std::to_string(x_.B) + ")");
+    ck_launch(dgk::launch_export_part(dev_, uint32_t(g), uint32_t(part), ids, uint32_t(n), s), "part export kernel");
+  }
+  void enqueue_wait_part(int g, int part, void* s) override {
+    require(s != nullptr, SS_E_INVALID, "ss_dg_enqueue_wait_part: null stream");
+    check_g(g, "ss_dg_enqueue_wait_part");
+    require(part >= 0 && uint32_t(part) < kDgMaxParts, SS_E_INVALID, "ss_dg_enqueue_wait_part: part outside 0..31");
+    ck_launch(dgk::launch_wait_part(dev_, uint32_t(part), s), "part wait kernel");
+  }
+  void enqueue_end_layer(void* s) override {
+    require(s != nullptr, SS_E_INVALID, "ss_dg_enqueue_end_layer: null stream");
+    ck_launch(dgk::launch_end_layer(dev_, s), "layer end kernel");
+  }
 
   void winpf_set(const DgWinpf& w) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_winpf_set: between tokens only");
@@ -847,6 +904,10 @@ class CudaDgCtx final : public DgCtx {
     out->score_ns = a.score_ns;
     out->score_deferred = a.score_deferred;
     out->score_last_ns = a.score_last_ns;
+    out->lm_tokens = a.lm_tokens;
+    out->lm_parts = a.lm_parts;
+    out->lm_mid_evictions = a.lm_mid_evictions;
+    out->lm_early_admits = a.lm_early_admits;
     out->wb_outstanding_bytes = fold_wb_outstanding_;
     out->disk_reads = a.disk_reads;
     out->disk_read_bytes = a.disk_read_bytes;
@@ -966,7 +1027,7 @@ class CudaDgCtx final : public DgCtx {
   }
   // The device's error word as text (empty while it holds none).
   std::string device_error() const {
-    return dg_device_error(dg_load_acquire(m_.err_code), dg_load_acquire(m_.err_aux));
+    return dg_device_error(dg_load_acquire(m_.err_code), dg_load_acquire(m_.err_aux), layer_token_);
   }
   // dg_diag, a failed ss_end: the failed token's host timeline (the service published it; it is stopped or done)
   // stays readable through ss_dg_timeline; its device measurements are not collected (-1).
@@ -1098,6 +1159,10 @@ class CudaDgCtx final : public DgCtx {
     d.mkres_read_ns = a.mkres_read_ns - b.mkres_read_ns;
     d.mkres_h2d_bytes = a.mkres_h2d_bytes - b.mkres_h2d_bytes;
     d.mkres_wb_bytes = a.mkres_wb_bytes - b.mkres_wb_bytes;
+    d.lm_tokens = a.lm_tokens - b.lm_tokens;
+    d.lm_parts = a.lm_parts - b.lm_parts;
+    d.lm_mid_evictions = a.lm_mid_evictions - b.lm_mid_evictions;
+    d.lm_early_admits = a.lm_early_admits - b.lm_early_admits;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1233,7 +1298,11 @@ class CudaDgCtx final : public DgCtx {
         {"round_units", s.round_units},
         {"round_bytes", s.round_bytes},
         {"round_ns", s.round_ns},
-        {"round_cancelled", s.round_cancelled}};
+        {"round_cancelled", s.round_cancelled},
+        {"lm_tokens", s.lm_tokens},
+        {"lm_parts", s.lm_parts},
+        {"lm_mid_evictions", s.lm_mid_evictions},
+        {"lm_early_admits", s.lm_early_admits}};
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
     g["policy"] = Json::string(core_->policy() == 2 ? "auto" : core_->policy() == 1 ? "scored" : "lru");
     g["cuda_module_loading"] = Json::string(dg_module_loading_name(module_loading_));
@@ -1403,7 +1472,9 @@ class CudaDgCtx final : public DgCtx {
     dev_.err_code = ctl_ + 3;
     dev_.err_aux = ctl_ + 4;
     dev_.any_miss = ctl_ + 5;
-    dev_.absent_err = ctl_ + 5 + G + (G + 1);  // the last control word (design rev 3.4 §11.3)
+    dev_.absent_err = ctl_ + 5 + G + (G + 1);  // design rev 3.4 §11.3
+    dev_.lm_any_miss = ctl_ + 5 + G + (G + 1) + 1;  // [kDgMaxParts], the last control words
+    dev_.n_gated = G;
     uint32_t* ub = ctl_ + 5 + G;
     ck(cudaMemcpy(ub, x_.unit_base.data(), (G + 1) * 4, cudaMemcpyHostToDevice), "cudaMemcpy (unit_base)");
     dev_.unit_base = ub;
@@ -1433,6 +1504,9 @@ class CudaDgCtx final : public DgCtx {
     uint32_t* words_h = nullptr;
     uint32_t* words_d = nullptr;
     carve(off, 7 * 4, &words_h, &words_d);
+    carve(off, uint64_t(kDgMaxParts) * sizeof(DgRecord), &m_.lm_rec, &dev_.lm_rec);
+    carve(off, uint64_t(kDgMaxParts) * 4, &m_.lm_flag, &dev_.lm_flag);
+    carve(off, uint64_t(kDgMaxParts) * 4, &m_.lm_ready, &dev_.lm_ready);
     require(off <= x_.mapped_bytes, SS_E_BACKEND, "device-gated: mapped layout (internal)");
     m_.done = words_h;
     m_.err_code = words_h + 1;
@@ -1518,6 +1592,7 @@ class CudaDgCtx final : public DgCtx {
     // The core: residents in slots 0..R-1, every other unit in a block (key order), spares free.
     charges_.charge(SS_BUDGET_PINNED, "dg table staging", uint64_t(x_.keys ? x_.keys : 1) * 4);
     transport_ = std::make_unique<CudaTransport>(x_, arena_, slot_of_, dev_.ready, blocks_, staging_, o_.dg_flush_ready != 0);
+    transport_->set_lm_ready(dev_.lm_ready);
     DgConfig c;
     for (int L : x_.gated) c.n_units.push_back(uint32_t(d_.layers[size_t(L)].n_units));
     c.persistent_slots = x_.persistent_slots;
@@ -1814,6 +1889,7 @@ class CudaDgCtx final : public DgCtx {
   Published snap_;  // guarded by snap_mu_
   uint32_t seq_ = 0;
   bool in_token_ = false, device_busy_ = false, poisoned_ = false, closed_ = false, skip_edge_ = false;
+  bool layer_token_ = false;  // the open (or last) token is a layer token (ss_dg_begin_layer)
 };
 
 }  // namespace

@@ -35,6 +35,8 @@ class DgTransport {
   // slot_of[key] = v after everything enqueued on s so far (a release: system fence, then the write).
   virtual void write_entry(Stream s, uint32_t key, int32_t v) = 0;
   virtual void signal_ready(uint32_t g, uint32_t seq) = 0;  // ready[g] = seq on kDem, a release too
+  // Layer tokens: lm_ready[part] = seq on kDem, a release too. Default: not supported by this transport.
+  virtual void signal_ready_part(uint32_t part, uint32_t seq);
   virtual void* event_create() = 0;
   virtual void event_destroy(void* ev) = 0;
   virtual void record(void* ev, Stream s) = 0;
@@ -197,6 +199,11 @@ struct DgStats {
   // the reads' begin / end calls (a synchronous read is all begin), the bytes it copied host-to-device (pinned or
   // staging -> slot: resident_bytes), the bytes its victims' write-backs copied device-to-host
   uint64_t mkres_file_reads = 0, mkres_file_bytes = 0, mkres_read_ns = 0, mkres_h2d_bytes = 0, mkres_wb_bytes = 0;
+  // layer tokens (ss_dg_begin_layer): tokens and parts served; units of other gated layers moved off the device inside
+  // a layer token for a demand without a free or bank slot (a synchronous write-back, a clean copy's drop, or a drop
+  // to its file); demand units admitted inside a layer token (the demand stream synced) to free their source blocks
+  // for those write-backs
+  uint64_t lm_tokens = 0, lm_parts = 0, lm_mid_evictions = 0, lm_early_admits = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -304,7 +311,28 @@ class DgCore {
   void cover(uint32_t g, uint32_t unit);
   // A true use (recency + stats); was_miss = its export saw -1.
   void use(uint32_t g, uint32_t unit, bool was_miss);
-  void signal(uint32_t g);  // ready[g] = seq, after the file reads in flight landed their copies
+  // ready[g] = seq (a layer token: the part's ready word), after the file reads in flight landed their copies
+  void signal(uint32_t g);
+  // ---- layer tokens (ss_dg_begin_layer) ----
+  // Engine thread, between tokens, before the token's begin: the next token serves only gated layer g, in parts
+  // (each part an export of <= max_ids ids with its own ready word). Inside it a demand that finds neither a free
+  // nor a bank slot evicts a device unit of ANOTHER gated layer (the token never reads one) with a synchronous
+  // write-back. The token's boundary uses the recency order (no scored history or ranking for a layer token). The
+  // boundary clears the mode. `kept` = the keys every layer keeps (the context's ss_dg_keep / ss_dg_make_resident
+  // sets, the boundary's keep list): a mid-token eviction never takes one, as the boundary's victim selection never
+  // does; with no other evictable unit the demand fails as a full token's does (no free slot, no bank slot, no
+  // write-back to wait for). Refused (nothing changed) on a poisoned core.
+  void set_layer_token(uint32_t g, const std::vector<uint32_t>& kept = {});
+  uint32_t layer_token() const { return lm_g_; }
+  void set_layer_token_off() {  // a begin that failed before the token opened
+    lm_g_ = lm_part_ = kNone;
+    lm_kept_.clear();
+  }
+  // The service, before part k's serve_demand (its ready goes to the part's word).
+  void set_part(uint32_t k) {
+    lm_part_ = k;
+    ++st_.lm_parts;
+  }
   // wb_defer: after gated layer g was served (its ready and its prefetches already enqueued), the next deferred
   // write-back parts under the layer's byte credit (a part larger than the credit left still goes: the excess is a
   // debt the next layers repay) and the outstanding cap (finished write-backs are collected first). Nothing after the
@@ -447,6 +475,11 @@ class DgCore {
   // prior budget uses (exponential average).
   void observe_copy(double unit_ms);
   uint32_t hinted_rows() const { return uint32_t(win_sym_.size()); }
+  // Between tokens: forget the next window's hinted rows (a layer token follows; prior copies already issued stay).
+  void drop_window_hint() {
+    win_sym_.clear();
+    win_w_.clear();
+  }
   uint32_t coming() const {  // units whose copy is enqueued and not admitted yet (test hook)
     uint32_t n = 0;
     for (uint32_t k : coming_) n += e_[k].home == Home::Coming ? 1u : 0u;
@@ -568,6 +601,7 @@ class DgCore {
   void enter();                      // a public entry point: counted, the demand records drained
   void undo_pending(const Pending& p);
   void finish_pending(const Pending& p);
+  bool evict_other_layer(uint32_t g);  // layer tokens: one device unit of a gated layer != g back to a free block
   void apply_wb_defer();
   void issue_prior();  // window_hint's prior prefetches
   void stamp_room(const char* what) const;  // scored: the stamp counter may take one more phase of pushes
@@ -640,6 +674,8 @@ class DgCore {
   std::vector<uint32_t> coming_, banked_;
   std::vector<uint32_t> pred_;     // the deduplicated valid prediction for gated layer pred_layer_
   uint32_t pred_layer_ = kNone;
+  uint32_t lm_g_ = kNone, lm_part_ = kNone;  // layer token: its gated layer and the part being served
+  std::vector<uint8_t> lm_kept_;  // layer token: per key, kept by a layer (never a mid-token victim); empty = none
   std::vector<uint8_t> layer_missed_;  // per gated layer, this token
   std::vector<uint8_t> run_;           // per gated layer: exported this token (begin_token)
   std::vector<uint32_t> res_victims_;  // make_resident's last victims (test hook)
