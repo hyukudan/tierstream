@@ -540,6 +540,18 @@ class CudaDgCtx final : public DgCtx {
     }
   }
 
+  void set_pf_revert_unused(uint32_t on) override {
+    require(!in_token_, SS_E_INVALID, "ss_dg_set_pf_revert_unused: between tokens only");
+    require(!poisoned_, SS_E_BACKEND, "ss_dg_set_pf_revert_unused: poisoned context");
+    require(on <= 1, SS_E_INVALID, "ss_dg_set_pf_revert_unused: on is 0 or 1");
+    try {
+      core_->set_pf_revert(on != 0);
+    } catch (...) {
+      poisoned_ = true;
+      throw;
+    }
+  }
+
   void set_policy(ss_policy policy) override {
     require(!in_token_, SS_E_INVALID, "ss_dg_set_policy: between tokens only");
     require(!poisoned_, SS_E_BACKEND, "ss_dg_set_policy: poisoned context");
@@ -940,6 +952,16 @@ class CudaDgCtx final : public DgCtx {
     out->mkres_read_ns = a.mkres_read_ns;
     out->mkres_h2d_bytes = a.mkres_h2d_bytes;
     out->mkres_wb_bytes = a.mkres_wb_bytes;
+    out->pf_reverted = a.pf_reverted;
+    out->pf_revert_bytes = a.pf_revert_bytes;
+    out->pred_skipped_ahead = a.pred_skipped_ahead;
+    out->pf_strict_refused = a.pf_strict_refused;
+    out->pred_shadow_file_predicted = a.pred_shadow_file_predicted;
+    out->pred_shadow_file_demanded = a.pred_shadow_file_demanded;
+    out->pred_shadow_file_hit = a.pred_shadow_file_hit;
+    out->pred_shadow_file_predicted_bytes = a.pred_shadow_file_predicted_bytes;
+    out->pred_shadow_file_demanded_bytes = a.pred_shadow_file_demanded_bytes;
+    out->pred_shadow_file_hit_bytes = a.pred_shadow_file_hit_bytes;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
@@ -1163,6 +1185,16 @@ class CudaDgCtx final : public DgCtx {
     d.lm_parts = a.lm_parts - b.lm_parts;
     d.lm_mid_evictions = a.lm_mid_evictions - b.lm_mid_evictions;
     d.lm_early_admits = a.lm_early_admits - b.lm_early_admits;
+    d.pf_reverted = a.pf_reverted - b.pf_reverted;
+    d.pf_revert_bytes = a.pf_revert_bytes - b.pf_revert_bytes;
+    d.pred_skipped_ahead = a.pred_skipped_ahead - b.pred_skipped_ahead;
+    d.pf_strict_refused = a.pf_strict_refused - b.pf_strict_refused;
+    d.pred_shadow_file_predicted = a.pred_shadow_file_predicted - b.pred_shadow_file_predicted;
+    d.pred_shadow_file_demanded = a.pred_shadow_file_demanded - b.pred_shadow_file_demanded;
+    d.pred_shadow_file_hit = a.pred_shadow_file_hit - b.pred_shadow_file_hit;
+    d.pred_shadow_file_predicted_bytes = a.pred_shadow_file_predicted_bytes - b.pred_shadow_file_predicted_bytes;
+    d.pred_shadow_file_demanded_bytes = a.pred_shadow_file_demanded_bytes - b.pred_shadow_file_demanded_bytes;
+    d.pred_shadow_file_hit_bytes = a.pred_shadow_file_hit_bytes - b.pred_shadow_file_hit_bytes;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1277,6 +1309,19 @@ class CudaDgCtx final : public DgCtx {
         {"l1_priced_out", s.l1_priced_out},
         {"l1_skipped_ahead", s.l1_skipped_ahead},
         {"prior_budget_stops", s.prior_budget_stops},
+        {"pf_reverted", s.pf_reverted},
+        {"pf_revert_bytes", s.pf_revert_bytes},
+        {"pf_revert_unused", uint64_t(core_->pf_revert())},
+        {"pred_skipped_ahead", s.pred_skipped_ahead},
+        {"pred_shadow_file_predicted", s.pred_shadow_file_predicted},
+        {"pred_shadow_file_demanded", s.pred_shadow_file_demanded},
+        {"pred_shadow_file_hit", s.pred_shadow_file_hit},
+        {"pred_shadow_file_predicted_bytes", s.pred_shadow_file_predicted_bytes},
+        {"pred_shadow_file_demanded_bytes", s.pred_shadow_file_demanded_bytes},
+        {"pred_shadow_file_hit_bytes", s.pred_shadow_file_hit_bytes},
+        {"pf_strict_refused", s.pf_strict_refused},
+        {"pf_strict_admit", uint64_t(o_.dg_pf_strict_admit)},
+        {"pf_legacy", uint64_t(x_.pf_legacy)},
         {"score_fallbacks", s.score_fallbacks},
         {"scored_victims", s.scored_victims},
         {"score_layers", s.score_layers},
@@ -1626,6 +1671,9 @@ class CudaDgCtx final : public DgCtx {
     c.disk_queue = x_.disk_queue;
     c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
     c.clean_evict = o_.dg_clean_evict != 0;  // (no effect without dg_disk_tier)
+    c.pf_revert = o_.dg_pf_revert_unused != 0;
+    c.pf_strict = o_.dg_pf_strict_admit != 0;
+    c.pf_legacy = x_.pf_legacy;  // DG_PF_LEGACY
     if (x_.disk_tier) {
       // (the gated layer from the layout's bases: the pool's threads never touch the core)
       transport_->pool_reader = [this](uint32_t reader, uint32_t key, char* dst) {

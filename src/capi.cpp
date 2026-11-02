@@ -16,6 +16,7 @@
 #include "plan.hpp"
 #include "recipe.hpp"
 #include "dg_ctx.hpp"
+#include "dg_layout.hpp"
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
 #include "strix_stream/ss_test.h"
@@ -1023,6 +1024,9 @@ ss_status ss_dg_set_sched(ss_ctx* c, uint32_t wb_defer, uint32_t flush_ready) {
 ss_status ss_dg_set_clean_evict(ss_ctx* c, uint32_t on) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_clean_evict").set_clean_evict(on); });
 }
+ss_status ss_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_pf_revert_unused").set_pf_revert_unused(on); });
+}
 ss_status ss_dg_set_budgets(ss_ctx* c, uint32_t spare_target, uint32_t prefetch_per_layer,
                             uint32_t prefetch_per_token) {
   return ctx_guard(c, [&] {
@@ -1101,6 +1105,17 @@ ss_status ss_budget_plan(const ss_budget_in* in, ss_budget_out* out) {
     x.struct_size = std::min<uint32_t>(out->struct_size, uint32_t(sizeof x));
     std::memcpy(static_cast<void*>(out), &x, x.struct_size);
     if (!ok) ts::fail(SS_E_CAPACITY, x.refuse);
+  });
+}
+ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o) {
+  return guard([&] {
+    need(in && d && in->struct_size >= offsetof(ss_budget_in, dg_bounce_request) + sizeof in->dg_bounce_request,
+         "ss_budget_in_dg_library: null argument or in->struct_size below the library fields");
+    const ss_options v = versioned(o, options_defaults, "ss_budget_in_dg_library options");  // (NULL: the defaults)
+    ss_budget_in x = versioned(in, ts::budget_in_defaults, "ss_budget_in_dg_library input");
+    ts::dg_budget_inputs(d->d, v, &x);
+    x.struct_size = in->struct_size;
+    std::memcpy(static_cast<void*>(in), &x, std::min<size_t>(in->struct_size, sizeof x));
   });
 }
 size_t ss_budget_plan_json(const ss_budget_in* in, const ss_budget_out* out, char* buf, size_t len) {

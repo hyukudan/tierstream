@@ -157,5 +157,7 @@ ss_status ts_dg_begin_layer(ss_ctx* c, int g, int parts) { return ss_dg_begin_la
 ss_status ts_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream) { return ss_dg_enqueue_export_part(c, g, part, ids_dev, n, stream); }
 ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream) { return ss_dg_enqueue_wait_part(c, g, part, stream); }
 ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream) { return ss_dg_enqueue_end_layer(c, stream); }
+ss_status ts_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on) { return ss_dg_set_pf_revert_unused(c, on); }
+ss_status ts_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o) { return ss_budget_in_dg_library(in, d, o); }
 
 }  // extern "C"

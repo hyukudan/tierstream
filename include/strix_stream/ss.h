@@ -305,8 +305,9 @@ typedef struct ss_options {
   /* appended, device-gated three-tier placement (SS_DG_DISK_TIER below). dg_disk_tier: 1 = gated units of tier DISK
    * are accepted (file homes: read from their file on demand); 0 (default) = refused as before. dg_disk_prefetch: 1 =
    * predictions / window prefetches may read a disk unit too (the read runs while the layer computes; its copy and
-   * entry follow the read, before the unit's layer is signalled ready); 0 (default) = disk units arrive on demand
-   * only. dg_disk_staging: pinned one-unit buffers the file reads land in before their copy to the device (0 = 8;
+   * entry follow the read, before the unit's layer is signalled ready when that layer routes the unit; a read of a unit
+   * the layer does not route is not waited for there: it ends at the latest at the boundary); 0 (default) = disk
+   * units arrive on demand only. dg_disk_staging: pinned one-unit buffers the file reads land in before their copy to the device (0 = 8;
    * only with dg_disk_tier). dg_inclusive_blocks: at most this many device-resident units keep their pinned block as
    * a clean copy after a promotion (their eviction is then a drop: no device-to-host copy); the blocks come from the
    * spare blocks (host_spare_units), so it must leave at least one spare block for write-backs; 0 (default) =
@@ -353,6 +354,23 @@ typedef struct ss_options {
    * tokens (ss_dg_set_clean_evict). */
   uint32_t dg_clean_evict;
   uint32_t reserved7;  /* explicit padding (never read) */
+  /* appended, unused prefetches reverted (SS_DG_PF_REVERT below): 1 = at every boundary a unit that arrived by a
+   * prefetch (a prediction's, a window prefetch's, a file read's with dg_disk_prefetch) and that its token did not use
+   * goes back to its source instead of becoming a device unit: its pinned block (which still holds its bytes) or, read
+   * from its file, its file; no device-to-host copy, its slot free again, its entry unpublished. The freed slot counts
+   * toward the boundary's spare target, so fewer device units are evicted (and written back) for it. Kept and held
+   * units are never reverted; a used prefetch is admitted as before. 0 (default) = as before (an unused prefetch is
+   * admitted and its block freed, except winpf's revert_unused in a hinted window). Also settable between tokens
+   * (ss_dg_set_pf_revert_unused). */
+  uint32_t dg_pf_revert_unused;
+  uint32_t reserved8;  /* explicit padding (never read) */
+  /* appended, strict prediction admission (SS_DG_PF_ADMIT below): 1 = a prefetch (a prediction, a window prefetch)
+   * takes a free slot only while more slots are free than the boundary's spare target (ss_dg_set_budgets'
+   * spare_target; at least dg_prefetch_reserve), so prefetches never take the spare slots this token's demand misses
+   * need: they run in the slots beyond the target (a target below the billed spare slots). A prefetch refused so is
+   * counted in ss_dg_stats.pf_strict_refused. 0 (default) = only dg_prefetch_reserve is kept free, as before. */
+  uint32_t dg_pf_strict_admit;
+  uint32_t reserved9;  /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -737,6 +755,29 @@ typedef struct ss_dg_stats {
    * inclusive_drops, or a drop to its file, disk_discards and with dg_clean_evict clean_drops); lm_early_admits =
    * demand units admitted inside a layer token to free their source blocks for those write-backs (placement only) */
   uint64_t lm_tokens, lm_parts, lm_mid_evictions, lm_early_admits;
+  /* appended, unused prefetches reverted (SS_DG_PF_REVERT; 0 when off): prefetched units their token did not use, sent
+   * back to their pinned block or file at a boundary without a copy (winpf's prior and l+1 ones also count in
+   * prior_reverted / l1_reverted), and their bytes */
+  uint64_t pf_reverted, pf_revert_bytes;
+  /* appended (SS_DG_PF_ADMIT): pred_skipped_ahead = plain predictions not served because the device had already
+   * exported the predicted layer (its demand covers it: a copy then only adds bytes; winpf's l+1 ones count in
+   * l1_skipped_ahead); pf_strict_refused = prefetches dg_pf_strict_admit refused (no slot above the spare target; 0
+   * when off) */
+  uint64_t pred_skipped_ahead, pf_strict_refused;
+  /* appended, the prediction shadow tally (SS_DG_PRED_SHADOW; always counted, changes nothing): how well the
+   * predictions would serve the file tier, whatever is issued. pred_shadow_file_predicted = predicted unit ids of a
+   * layer (every ss_dg_enqueue_predict / service prediction, the winpf l+1 candidates included, before any filter:
+   * device units, dg_disk_prefetch, slots, budgets, the device ahead) whose home was the file at the prediction,
+   * deduplicated per layer and token; pred_shadow_file_demanded = the layer's routed ids (deduplicated) that are
+   * file-homed when the layer is demanded, or that this token's prediction recorded as file-homed (a prefetch only
+   * changed their home), counted only at layers that had a prediction this token; pred_shadow_file_hit = both. Without
+   * issued prefetches the demanded ones are the layer's file misses. recall = hit / demanded, precision = hit /
+   * predicted. The *_bytes are the same x the unit bytes. A prediction for a layer the token never demands counts as
+   * predicted only. A file-homed unit a winpf prior prefetch (ss_dg_window_hint) brought in this token and no
+   * prediction named is not file-homed at its demand and so not counted as demanded: with priors running, recall reads
+   * high. */
+  uint64_t pred_shadow_file_predicted, pred_shadow_file_demanded, pred_shadow_file_hit;
+  uint64_t pred_shadow_file_predicted_bytes, pred_shadow_file_demanded_bytes, pred_shadow_file_hit_bytes;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1086,6 +1127,22 @@ typedef struct ss_budget_in {
      Default 0 (two caps, unchanged); with no cap it changes nothing. */
   uint32_t unified;
   uint32_t reserved1;             /* explicit padding (never read) */
+  /* SS_BUDGET_LIBRARY (appended): the device-gated library's own host memory, which ss_open admits against
+     ss_budget.host_pinned_bytes beside the plan's blocks: the mapped control area and the one-unit staging buffer
+     (pinned), one bounce buffer per file reader (pageable: the context's reader, plus dg_disk_queue disk readers when
+     dg_disk_queue > 1 and the plan has a file tier) and the file tier's staging buffers (already planned: staging x
+     unit_bytes). With dg_gated_layers set, the first three are a fixed host part like the engine's components
+     (host_fixed_bytes; the RAM cap, the pinned ceiling and host_avail_bytes leave the expert tiers that much less) and
+     ss_budget_out.lib_* reports all four, computed exactly as ss_open computes them for the same descriptor and
+     options (unit_bytes = the host stride, staging = dg_disk_staging or 8). ss_budget_in_dg_library fills these
+     fields (and staging) from the descriptor and the options. dg_gated_layers = 0 (default) = not charged: the plans
+     of before, unchanged. */
+  uint32_t dg_gated_layers;       /* the descriptor's gated layers (its layers with units); 0 = not charged */
+  uint32_t dg_disk_queue;         /* ss_options.dg_disk_queue (0 or 1: no disk reader of its own) */
+  uint64_t dg_part_max_bytes;     /* the largest part of a gated unit (a disk reader's bounce buffer covers one part) */
+  uint64_t dg_source_align;       /* the largest source alignment (the descriptor's sources[].align; below 4096 =
+                                     4096) */
+  uint64_t dg_bounce_request;     /* ss_options.staging_bytes (0 = 16 MiB; at most 16 MiB is used) */
 } ss_budget_in;
 typedef struct ss_budget_out {
   uint32_t struct_size;           /* set by the caller; the library writes min(struct_size, sizeof) bytes */
@@ -1116,6 +1173,19 @@ typedef struct ss_budget_out {
   uint32_t device_capped;         /* 1 = the VRAM cap, not the arena request, sized the arena */
   uint32_t host_capped;           /* 1 = the RAM cap lowered the pinned ceiling below what the non-resident experts
                                      and the spares want */
+  /* SS_BUDGET_LIBRARY (appended; all 0 unless ss_budget_in.dg_gated_layers): the device-gated library's own host bytes
+     for this plan, as ss_open admits them. lib_host_bytes = lib_mapped_bytes + lib_bounce_bytes + lib_staging_bytes +
+     lib_disk_staging_bytes: what an open of this plan needs in ss_budget.host_pinned_bytes beyond the plan's blocks
+     and pinned components. All but lib_disk_staging_bytes are in host_fixed_bytes (and min_ram_total_bytes,
+     need_host_bytes; the pinned ones in pinned_peak_bytes); lib_disk_staging_bytes is staging x unit_bytes, already
+     in host_planned_bytes. */
+  uint64_t lib_host_bytes;
+  uint64_t lib_mapped_bytes;        /* pinned: the mapped control area */
+  uint64_t lib_bounce_bytes;        /* pageable: the lib_bounce_readers bounce buffers together */
+  uint64_t lib_staging_bytes;       /* pinned: the one-unit staging buffer */
+  uint64_t lib_disk_staging_bytes;  /* pinned: the file tier's staging buffers (three-tier only) */
+  uint32_t lib_bounce_readers;      /* the context's reader + the disk readers (three-tier, dg_disk_queue > 1) */
+  uint32_t reserved0;               /* explicit padding (never read) */
 } ss_budget_out;
 SS_API void ss_budget_in_defaults_sized(ss_budget_in* in, uint32_t size);
 static inline void ss_budget_in_defaults(ss_budget_in* in) { ss_budget_in_defaults_sized(in, (uint32_t)sizeof *in); }
@@ -1585,6 +1655,33 @@ SS_API ss_status ss_dg_begin_layer(ss_ctx* c, int g, int parts);
 SS_API ss_status ss_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream);
 SS_API ss_status ss_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream);
 SS_API ss_status ss_dg_enqueue_end_layer(ss_ctx* c, void* stream);
+/* Unused prefetches reverted (ss_options.dg_pf_revert_unused, ss_dg_stats.pf_reverted / pf_revert_bytes). Between
+ * tokens (the state rules of ss_dg_set_sched; refused inside a token with SS_E_INVALID): on = 0 or 1, from the next
+ * boundary on; ss_dg_reset_open restores the open's setting. Placement only: the same bytes. */
+#define SS_DG_PF_REVERT 1
+SS_API ss_status ss_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on);
+/* Whole-device budgets, the library's own host bytes (ss_budget_in.dg_gated_layers .. dg_bounce_request,
+ * ss_budget_out.lib_*). ss_budget_in_dg_library overwrites in->staging with the options' dg_disk_staging (0 = 8), and
+ * fills those inputs from the descriptor and the options the device-gated context will be opened with (o NULL = the
+ * defaults); in must
+ * have been initialized with ss_budget_in_defaults (read and written up to its struct_size). SS_E_INVALID for a NULL
+ * in or d, or an in too small for those fields. */
+#define SS_BUDGET_LIBRARY 1
+SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o);
+/* Prediction admission: a plain prediction for a layer the device already exported is skipped
+ * (ss_dg_stats.pred_skipped_ahead); a layer's ready waits only for the prefetch reads of the units it routes (another
+ * prefetch read keeps running, ended when its unit is touched, when it completed, when its staging buffer is reused,
+ * when the read queue is full and no demand read can be ended first, or at the latest at the boundary: the wait for a
+ * wrong prediction's read moves off the layer's ready, it does not disappear); a full read queue ends the completed
+ * reads, then the oldest demand reads, and only then the oldest prefetch reads; ss_options.dg_pf_strict_admit keeps
+ * prefetches above the spare target (ss_dg_stats.pf_strict_refused). The environment switch DG_PF_LEGACY (read at
+ * ss_open; 0 / false / off or 1 / true / on, anything else refuses the open; DEFAULT 1 until the new admission is
+ * measured not slower on the GPU) keeps the behaviour before these: no ahead skip for plain predictions, every
+ * prefetch read of a layer ended before its ready, a full queue ending the oldest reads. DG_PF_LEGACY=0 selects the
+ * admission described above. */
+#define SS_DG_PF_ADMIT 1
+/* ss_dg_stats.pred_shadow_file_* exist (the prediction shadow tally of the file tier) */
+#define SS_DG_PRED_SHADOW 1
 
 #ifdef __cplusplus
 }

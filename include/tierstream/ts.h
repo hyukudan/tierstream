@@ -116,6 +116,7 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_BUDGET_AUTO SS_BUDGET_AUTO
 #define TS_BUDGET_JSON SS_BUDGET_JSON
 #define TS_BUDGET_KINDS SS_BUDGET_KINDS
+#define TS_BUDGET_LIBRARY SS_BUDGET_LIBRARY
 #define TS_BUDGET_MARGINS SS_BUDGET_MARGINS
 #define TS_BUDGET_NAME SS_BUDGET_NAME
 #define TS_BUDGET_NO_SAMPLE SS_BUDGET_NO_SAMPLE
@@ -141,6 +142,9 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DG_MAX_LAYER_PARTS SS_DG_MAX_LAYER_PARTS
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_MKRES_STATS SS_DG_MKRES_STATS
+#define TS_DG_PF_ADMIT SS_DG_PF_ADMIT
+#define TS_DG_PF_REVERT SS_DG_PF_REVERT
+#define TS_DG_PRED_SHADOW SS_DG_PRED_SHADOW
 #define TS_DG_PROTOCOL SS_DG_PROTOCOL
 #define TS_DG_RESET_OPEN SS_DG_RESET_OPEN
 #define TS_DG_RESIDENCY SS_DG_RESIDENCY
@@ -315,6 +319,8 @@ TS_API ss_status ts_dg_begin_layer(ss_ctx* c, int g, int parts);
 TS_API ss_status ts_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream);
 TS_API ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream);
 TS_API ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream);
+TS_API ss_status ts_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on);
+TS_API ss_status ts_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }

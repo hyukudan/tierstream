@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "dg_layout.hpp"
 #include "errors.hpp"
 
 struct ss_budget_ledger {
@@ -30,7 +31,7 @@ namespace ts {
 namespace {
 
 constexpr uint64_t kAuto = SS_BUDGET_AUTO;
-constexpr uint64_t kGiB = uint64_t(1) << 30;
+// (kGiB: plan.hpp)
 
 uint64_t add_sat(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
 uint64_t sub_sat(uint64_t a, uint64_t b) { return a > b ? a - b : 0; }
@@ -83,9 +84,23 @@ const char* kind_name(ss_budget_kind k) {
   return k == SS_BUDGET_DEVICE ? "device" : k == SS_BUDGET_PINNED ? "pinned" : "pageable";
 }
 
+// SS_BUDGET_LIBRARY: the device-gated library's own host bytes for a plan, as ss_open admits them (dg_host_bytes);
+// three = the plan has a file tier (its disk readers and staging buffers exist); none when not asked for.
+DgHostBytes lib_bytes(const ss_budget_in& in, bool three) {
+  if (!in.dg_gated_layers) return DgHostBytes{};
+  return dg_host_bytes(in.dg_gated_layers, in.unit_bytes, in.dg_part_max_bytes, in.dg_source_align,
+                       in.dg_bounce_request, three ? std::max<uint32_t>(in.dg_disk_queue, 1) : 0,
+                       three ? in.staging : 0);
+}
+// Its fixed host part (the file tier's staging buffers are planned as units already) and the pinned share of that.
+uint64_t lib_fixed(const DgHostBytes& h) { return h.total() - h.disk_staging; }
+uint64_t lib_pinned(const DgHostBytes& h) { return h.mapped + h.staging; }
+
 }  // namespace
 
 bool unified_plan(const ss_budget_in& in, ss_budget_out& out);
+bool caps_plan(const ss_budget_in& in, ss_budget_out& out, const DgHostBytes& lib_two, const DgHostBytes& lib_three,
+               bool file_readers);
 
 void budget_in_defaults(ss_budget_in* in) {
   *in = ss_budget_in{};
@@ -102,6 +117,19 @@ void budget_in_defaults(ss_budget_in* in) {
 
 bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   if (in.unified && (in.vram_total_bytes || in.ram_total_bytes)) return unified_plan(in, out);
+  // The library's disk readers exist only with a file tier: planned without them, then again with them when the
+  // placement has one (a smaller host ceiling only moves more experts to the files, so it keeps its file tier).
+  const DgHostBytes lib_two = lib_bytes(in, false), lib_three = lib_bytes(in, true);
+  const bool ok = caps_plan(in, out, lib_two, lib_three, false);
+  if (!in.dg_gated_layers || !out.three_tier) return ok;
+  return caps_plan(in, out, lib_two, lib_three, true);
+}
+
+// The two-cap plan with the library's host bytes of the placement (file_readers: the file tier's) charged as a fixed
+// host part; the minimum RAM cap charges those of the smallest placement (the file tier's when it has one).
+bool caps_plan(const ss_budget_in& in, ss_budget_out& out, const DgHostBytes& lib_two, const DgHostBytes& lib_three,
+               bool file_readers) {
+  const DgHostBytes& lib = file_readers ? lib_three : lib_two;
   out = ss_budget_out{};
   out.struct_size = uint32_t(sizeof out);
   const Parts dev = parts(in.device_fixed, in.n_device_fixed, "device_fixed");
@@ -152,11 +180,15 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   // Host: the pinned room (available now, the pinned ceiling, the RAM cap), then the three-tier placement.
   const uint64_t nonres = keys - resident;
   const uint64_t extra = in.load_staging_bytes;
-  out.host_fixed_bytes = add_sat(add_sat(pin.sum, page.sum), extra);
-  const uint64_t room_host =
-      in.host_avail_bytes == kAuto ? UINT64_MAX : sub_sat(sub_sat(in.host_avail_bytes, in.host_margin_bytes), extra);
-  const uint64_t room_pin =
-      in.max_pinned_bytes == kAuto ? UINT64_MAX : sub_sat(sub_sat(in.max_pinned_bytes, pin.sum), extra);
+  const uint64_t lfix = lib_fixed(lib), lpin = lib_pinned(lib);  // (0 without SS_BUDGET_LIBRARY)
+  const uint64_t host_base = add_sat(add_sat(pin.sum, page.sum), extra);
+  out.host_fixed_bytes = add_sat(host_base, lfix);
+  const uint64_t room_host = in.host_avail_bytes == kAuto
+                                 ? UINT64_MAX
+                                 : sub_sat(sub_sat(sub_sat(in.host_avail_bytes, in.host_margin_bytes), extra), lfix);
+  const uint64_t room_pin = in.max_pinned_bytes == kAuto
+                                ? UINT64_MAX
+                                : sub_sat(sub_sat(sub_sat(in.max_pinned_bytes, pin.sum), extra), lpin);
   uint64_t room_bytes = std::min(room_host, room_pin);
   const uint64_t room_uncapped = room_bytes;
   if (in.ram_total_bytes)
@@ -179,7 +211,10 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   const uint64_t min_units = nonres == 0 ? spares
                              : in.file_tier ? add_sat(spares, uint64_t(in.staging) + 1)
                                             : add_sat(spares, nonres);
-  out.min_ram_total_bytes = add_sat(add_sat(out.host_fixed_bytes, in.ram_margin_bytes), mul_sat(min_units, unit));
+  // the smallest placement's library bytes (the file tier's when it has one)
+  const uint64_t lmin = lib_fixed(nonres && in.file_tier ? lib_three : lib_two);
+  out.min_ram_total_bytes =
+      add_sat(add_sat(add_sat(host_base, lmin), in.ram_margin_bytes), mul_sat(min_units, unit));
   const bool ram_short = in.ram_total_bytes && out.min_ram_total_bytes > in.ram_total_bytes;
   if (ram_short && !out.refused) {
     std::string m = "RAM cap " + gib(in.ram_total_bytes) + " GiB cannot hold the fixed parts; needs at least " +
@@ -189,6 +224,7 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
     if (!pin.text.empty()) t += " + " + pin.text;
     if (!page.text.empty()) t += " + " + page.text;
     if (extra) t += " + load staging " + gib(extra);
+    if (lmin) t += " + tierstream host " + gib(lmin);
     if (rmargin) t += " + margin " + gib(rmargin);
     if (spares) t += " + spare blocks " + gib(mul_sat(spares, unit));
     if (nonres && in.file_tier) t += " + file staging and one block " + gib(mul_sat(uint64_t(in.staging) + 1, unit));
@@ -235,8 +271,16 @@ bool budget_plan(const ss_budget_in& in, ss_budget_out& out) {
   out.spare_blocks = spares + inc;
   const uint64_t blocks = mul_sat(add_sat(add_sat(pinned, out.spare_blocks), staging), unit);
   out.host_planned_bytes = add_sat(out.host_fixed_bytes, blocks);
-  out.need_host_bytes = add_sat(add_sat(blocks, extra), in.host_margin_bytes);
-  out.pinned_peak_bytes = add_sat(add_sat(blocks, extra), pin.sum);
+  out.need_host_bytes = add_sat(add_sat(add_sat(blocks, extra), in.host_margin_bytes), lfix);
+  out.pinned_peak_bytes = add_sat(add_sat(add_sat(blocks, extra), pin.sum), lpin);
+  if (in.dg_gated_layers) {
+    out.lib_mapped_bytes = lib.mapped;
+    out.lib_bounce_bytes = lib.bounce_total();
+    out.lib_bounce_readers = lib.bounce_readers;
+    out.lib_staging_bytes = lib.staging;
+    out.lib_disk_staging_bytes = lib.disk_staging;
+    out.lib_host_bytes = lib.total();
+  }
   return !out.refused;
 }
 
@@ -259,12 +303,14 @@ bool unified_plan(const ss_budget_in& in, ss_budget_out& out) {
   const uint64_t dev_fixed = add_sat(add_sat(in.device_context_bytes, dev.sum), in.vram_margin_bytes);
   const uint64_t keys = in.keys;
   const uint64_t rq = in.arena_units == kAuto ? keys : std::min(in.arena_units, keys);
+  const uint64_t lib_two = lib_fixed(lib_bytes(in, false)), lib_three = lib_fixed(lib_bytes(in, true));
   const auto host_part = [&](uint64_t r) {
     const uint64_t nonres = keys - r;
     const uint64_t units = nonres == 0 ? in.host_spares
                            : in.file_tier ? add_sat(in.host_spares, uint64_t(in.staging) + 1)
                                           : add_sat(in.host_spares, nonres);
-    return add_sat(host_fixed, mul_sat(units, in.unit_bytes));
+    const uint64_t lib = nonres && in.file_tier ? lib_three : lib_two;  // (SS_BUDGET_LIBRARY; 0 without)
+    return add_sat(add_sat(host_fixed, lib), mul_sat(units, in.unit_bytes));
   };
   const auto device_part = [&](uint64_t r) {
     return add_sat(dev_fixed, mul_sat(add_sat(r, in.arena_spares), in.slot_bytes));
@@ -407,6 +453,13 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
   num("host_spares", in.host_spares);
   num("staging_request", in.staging);
   flag("file_tier", in.file_tier != 0);
+  if (in.dg_gated_layers) {  // SS_BUDGET_LIBRARY: only when charged, so the plans of before read as before
+    num("dg_gated_layers", in.dg_gated_layers);
+    num("dg_disk_queue", in.dg_disk_queue);
+    num("dg_part_max_bytes", in.dg_part_max_bytes);
+    num("dg_source_align", in.dg_source_align);
+    num("dg_bounce_request", in.dg_bounce_request);
+  }
   num("resident", out.resident);
   num("arena_spares", out.arena_spares);
   num("arena_slots", out.arena_slots);
@@ -428,6 +481,14 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
   flag("host_capped", out.host_capped != 0);
   num("need_host_bytes", out.need_host_bytes);
   num("pinned_peak_bytes", out.pinned_peak_bytes);
+  if (in.dg_gated_layers) {
+    num("lib_host_bytes", out.lib_host_bytes);
+    num("lib_mapped_bytes", out.lib_mapped_bytes);
+    num("lib_bounce_bytes", out.lib_bounce_bytes);
+    num("lib_bounce_readers", out.lib_bounce_readers);
+    num("lib_staging_bytes", out.lib_staging_bytes);
+    num("lib_disk_staging_bytes", out.lib_disk_staging_bytes);
+  }
   minimum("min_vram_total_bytes", "min_vram_total_gib", "min_vram_total_flag_gib", out.min_vram_total_bytes);
   minimum("min_ram_total_bytes", "min_ram_total_gib", "min_ram_total_flag_gib", out.min_ram_total_bytes);
   flag("refused", out.refused != 0);

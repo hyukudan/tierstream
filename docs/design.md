@@ -507,6 +507,60 @@ a device-to-host copy as well.
   boundary's clean drop is also a `disk_discards` eviction (no write-back), make_resident's and rounds' count in their
   own counters. A later miss of a dropped unit reads it from its file through the usual hash-checked path.
 
+### 3.12 Device-gated unused prefetches reverted
+
+A prefetch (a prediction's l+1 copy, a window prefetch, a file read with `dg_disk_prefetch`) takes a free slot and is
+coming until the boundary, where it is admitted: a device unit, its pinned block freed. A prefetch its token did not
+use is admitted all the same, so the boundary evicts another device unit (a write-back) to restore the spare target,
+and the prefetched unit is usually evicted again later (another write-back). With plain L+1 prediction that is about
+one write-back per wasted prefetch: measured on a decode with no demand miss left, ~14 prefetches per token cost 177 MB
+host-to-device and ~450 MB device-to-host per token. winpf reverted unused prefetches only in hinted windows
+(`revert_unused`).
+
+- **The setting.** `ss_options.dg_pf_revert_unused = 1` (default 0), or between tokens `ss_dg_set_pf_revert_unused(c,
+  on)` (the state rules of `ss_dg_set_sched`, refused inside a token; `ss_dg_reset_open` restores the open's value).
+  With it, at every boundary each coming unit that arrived by a prefetch, was not used by its token and is not kept
+  (held units are kept) goes back to its source exactly as winpf's revert: its slot to the free list, its home to its
+  pinned block (which still holds its bytes: a coming unit's block is freed only at admission; it becomes the least
+  recently homed pinned unit, the first to drop to its file: an unused prediction is not a use) or, read from its file (no block), to its file; its entry unpublished by the boundary's
+  table upload, its prefetch event recycled. No copy either way. A used prefetch is admitted as before.
+- **Effect.** The reverted slot counts toward the spare target, so the boundary evicts nothing for it: the homes,
+  victims and write-backs are those of a cache that never issued the unused prefetches (tests/test_dg.cpp, two-tier and
+  three-tier with file prefetches, with and without clean eviction). The cost left is the prefetch's own copy.
+- **Counters.** `ss_dg_stats.pf_reverted` / `pf_revert_bytes` (stats JSON, with `pf_revert_unused`); winpf's prior
+  and l+1 kinds also count in `prior_reverted` / `l1_reverted`, and the bucket precision is updated first as before.
+
+### 3.13 Device-gated prediction admission that never waits or pollutes
+
+A prediction is advice: it must never delay a layer or take what a demand needs.
+
+- **Ahead.** When the device already exported the predicted layer (the service sees its flag), a plain prediction is
+  counted (`predicted`) but not served: that layer's demand covers it, and a copy now only adds bytes to the copy
+  engine. winpf's l+1 path already did this (`l1_skipped_ahead`); plain ones count in `pred_skipped_ahead`.
+- **No wait for an unrouted prefetch read.** Before a layer's ready the service ends its misses' reads and the
+  prefetch reads of the units the layer routes (those were misses: their covers ended them already). A prefetch read
+  of a unit the layer does not route keeps running: its slot and staging buffer stay held, its copy and entry follow
+  when it ends (a completed read at the next poll, a reused staging buffer, a full queue, at the latest the boundary's
+  drain, where `dg_pf_revert_unused` then reverts it). The layer's kernels read only routed ids, so the late entry is
+  never read by it; a failed read undoes its fetch as before. With no prefetch nothing changes. The wait moves, it does
+  not disappear: a later fetch that reuses its staging buffer, or a full read queue with no demand read to end first,
+  still ends it. A full queue ends the completed reads, then the oldest demand reads, and only then the oldest
+  prefetch reads.
+- **Legacy.** `DG_PF_LEGACY` (read at open; 0 / false / off or 1 / true / on, anything else refuses the open;
+  default 1 until the new admission is measured not slower on the GPU) keeps the admission before these exactly
+  (`DG_PF_LEGACY=0` selects the new one): plain predictions served when the device is ahead, every prefetch
+  read of a layer ended before its ready, a full queue ending the oldest reads.
+- **Strict admission.** `ss_options.dg_pf_strict_admit = 1` (default 0): a prefetch takes a free slot only while more
+  are free than the boundary's spare target (at least `dg_prefetch_reserve`), so it never takes a spare slot this
+  token's demand misses need; prefetches run in the slots beyond the target (`ss_dg_set_budgets` with a target below
+  the billed spare slots). Refusals count in `pf_strict_refused`.
+- **Shadow tally.** Always on, no effect on placement: each served prediction records, before any filter or branch
+  (device units, `dg_disk_prefetch`, slots, budgets, ahead), the predicted ids of its layer that are file-homed; the
+  layer's demand in the same token counts its routed ids that are file-homed or were recorded so (a prefetch only
+  changed their home), and the ids in both. `pred_shadow_file_predicted` / `_demanded` / `_hit` (and `_bytes`): recall
+  = hit / demanded, precision = hit / predicted, the same whatever is issued. Cleared at the layer's demand and at the
+  boundary (a prediction for a layer never demanded counts as predicted only).
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier
@@ -714,6 +768,19 @@ saturating; no device call) is the one implementation every engine uses for it:
   (device) or `host components + RAM margin + spare blocks + staging + one block` (host; every non-resident expert
   without a file tier) is refused with `SS_E_CAPACITY` and a message naming each component and the smallest cap that
   would do (`min_vram_total_bytes`, `min_ram_total_bytes`, the flag value rounded up to whole GiB).
+- **The library's own host bytes.** A device-gated open admits, beside the plan's blocks, the mapped control area
+  and a one-unit staging buffer (pinned), one bounce buffer per file reader (pageable: the context's, plus
+  `dg_disk_queue` disk readers when the queue is above 1) and the file tier's staging buffers. With
+  `ss_budget_in.dg_gated_layers` set (`ss_budget_in_dg_library` fills it, the largest part, the source alignment, the
+  bounce request, the disk queue and `staging` from the descriptor and options) the planner computes them with the
+  open's own function (`dg_host_bytes`, shared with `dg_layout`) and charges all but the staging buffers (planned as
+  units already) as a fixed host part: `host_fixed_bytes`, the RAM cap's room, the pinned ceiling (the pinned share),
+  the host available, `min_ram_total_bytes` and the refusal text ("tierstream host"). The disk readers count only when
+  the plan has a file tier (planned without them, then again with them; a lower host ceiling keeps the file tier);
+  the minimum charges those of the smallest placement. `ss_budget_out.lib_host_bytes` (and its parts `lib_*`) is what
+  the open needs in `ss_budget.host_pinned_bytes` beyond the plan's blocks and pinned components; the open's startup
+  ring (`DG_LOAD_BUFFERS` x at least one unit, temporary) comes out of what is left. Unset (0, the default) changes
+  nothing: the plans of before bit for bit.
 - **Uncapped = today.** With both caps 0 the outputs (counts per tier, inclusive, spare blocks, staging, room, the
   host need and the pinned peak) are those of DeepSeek's `rtx::tier_plan`; `tests/test_budget.cpp` carries that
   function unchanged as an oracle and compares its cases and a 16,200-case grid.

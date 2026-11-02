@@ -184,3 +184,21 @@ ss.h-sha256 750b708bec48ac57b2e33c659c538796fa6628d007ef7eded25e53d3b8379948
 
 # layer token review notes (additive: appended ss_dg_stats lm_early_admits; comment: lm_mid_evictions counts every way off the device)
 ss.h-sha256 33d02f3ed00f55e2ba6fe0613c860f5deeb27a28c934884b489ca40d3537bd63
+
+# unused prefetches reverted (additive: appended ss_options dg_pf_revert_unused / reserved8, appended ss_dg_stats pf_reverted / pf_revert_bytes, ss_dg_set_pf_revert_unused, SS_DG_PF_REVERT)
+ss.h-sha256 ec2f4ddd5ebf3fc0800b7940d80ae6ba6a999a7f6035e67dd2e5cd9e99d98175
+
+# whole-device budgets: the library's own host bytes (additive: appended ss_budget_in dg_gated_layers / dg_disk_queue / dg_part_max_bytes / dg_source_align / dg_bounce_request, appended ss_budget_out lib_host_bytes / lib_mapped_bytes / lib_bounce_bytes / lib_staging_bytes / lib_disk_staging_bytes / lib_bounce_readers / reserved0, ss_budget_in_dg_library, SS_BUDGET_LIBRARY)
+ss.h-sha256 90d3a9abab5c946947b1da26eec97c54faacdfd3c80095e44be59a85298574b6
+
+# prediction admission (additive: appended ss_options dg_pf_strict_admit / reserved9, appended ss_dg_stats pred_skipped_ahead / pf_strict_refused, SS_DG_PF_ADMIT; comment: dg_disk_prefetch reads of unrouted units end at the boundary)
+ss.h-sha256 2611d5ed5da3d43d23be37f11e728f5ae64bfb197d44728c12c5d73b94aadb8d
+
+# prediction shadow tally (additive: appended ss_dg_stats pred_shadow_file_predicted / pred_shadow_file_demanded / pred_shadow_file_hit and their _bytes, SS_DG_PRED_SHADOW)
+ss.h-sha256 0c6b1a4d8ed249e0ca546a428716d4acf0696bf9fb7529a76ae7cf561a88e0cb
+
+# prediction admission review (comments only: the moved wait of an unrouted prefetch read, the full queue's order, DG_PF_LEGACY, winpf priors in the shadow tally, ss_budget_in_dg_library overwrites staging)
+ss.h-sha256 81ffa71c11bd65e272402d35a370f771a102d6f8107c8907185aa2420db1b651
+
+# prediction admission measured before it becomes the default (comments only: DG_PF_LEGACY defaults to 1)
+ss.h-sha256 187f303776538693778a7f87f5ed62be5f9b8227b119d1311cfe8f37230674a1

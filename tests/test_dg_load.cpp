@@ -472,7 +472,10 @@ TEST(dg_failure_report_and_module_loading) {
   // last fields)
   CHECK_EQ(offsetof(ss_dg_stats, lm_tokens), offsetof(ss_dg_stats, mkres_wb_bytes) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, lm_early_admits), offsetof(ss_dg_stats, lm_mid_evictions) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, lm_early_admits) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, pf_reverted), offsetof(ss_dg_stats, lm_early_admits) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, pred_skipped_ahead), offsetof(ss_dg_stats, pf_revert_bytes) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, pred_shadow_file_predicted), offsetof(ss_dg_stats, pf_strict_refused) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, pred_shadow_file_hit_bytes) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }
@@ -637,3 +640,40 @@ TEST(dg_load_overlap_alloc_failure_frees_everything) {
 }
 
 int main(int argc,char** argv) {return sstest::run_all(argc>1?argv[1]:nullptr);}
+
+// DG_PF_LEGACY: read at open like the other DG_ switches (0 / false / off or 1 / true / on; anything else refuses).
+TEST(dg_pf_legacy_env) {
+  auto set = [](const char* v) {
+#if defined(_WIN32)
+    _putenv_s("DG_PF_LEGACY", v ? v : "");
+#else
+    if (v) setenv("DG_PF_LEGACY", v, 1);
+    else unsetenv("DG_PF_LEGACY");
+#endif
+  };
+  Fixture f;
+  ss_budget b;
+  ss_options o;
+  sstest::dg_budget(b, f.model, 4, 8);
+  sstest::dg_options(o, 8, SS_BACKEND_CPU);
+  auto p = ss::plan_from_tiers(f.d, b, f.model.tiers(16));
+  p.budget.host_pinned_bytes = uint64_t(1) << 32;
+  set(nullptr);
+  CHECK(ss::dg_layout(f.d, p, o).pf_legacy);  // the previous admission by default until measured
+  for (const char* v : {"1", "true", "on"}) {
+    set(v);
+    CHECK(ss::dg_layout(f.d, p, o).pf_legacy);
+  }
+  for (const char* v : {"0", "false", "off"}) {
+    set(v);
+    CHECK(!ss::dg_layout(f.d, p, o).pf_legacy);
+  }
+  set("yes");
+  try {
+    (void)ss::dg_layout(f.d, p, o);
+    CHECK(false);
+  } catch (const ss::Error& e) {
+    CHECK_EQ(int(e.status()), int(SS_E_INVALID));
+  }
+  set(nullptr);
+}
