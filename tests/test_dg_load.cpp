@@ -243,6 +243,9 @@ TEST(dg_load_admission_and_options) {
     try{(void)ss::dg_layout(f.d,p,o); CHECK(false);}
     catch(const ss::Error& e){CHECK_EQ(int(e.status()),int(SS_E_INVALID));}
   }
+  o.dg_disk_queue=SS_DG_DISK_QUEUE_AUTO;  // AUTO without the disk tier: accepted, no reader (as 0)
+  CHECK_EQ(ss::dg_layout(f.d,p,o).disk_queue,0u);
+  CHECK_EQ(ss::dg_layout(f.d,p,o).disk_locations,0u);
   o.dg_disk_queue=0;
 }
 
@@ -475,7 +478,10 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK_EQ(offsetof(ss_dg_stats, pf_reverted), offsetof(ss_dg_stats, lm_early_admits) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, pred_skipped_ahead), offsetof(ss_dg_stats, pf_revert_bytes) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, pred_shadow_file_predicted), offsetof(ss_dg_stats, pf_strict_refused) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, pred_shadow_file_hit_bytes) + 8);
+  // SS_DG_DISK_QUEUE_AUTO's report (disk_queue_resolved / disk_locations) after them, the last fields
+  CHECK_EQ(offsetof(ss_dg_stats, disk_queue_resolved), offsetof(ss_dg_stats, pred_shadow_file_hit_bytes) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, disk_locations), offsetof(ss_dg_stats, disk_queue_resolved) + 4);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, disk_locations) + 4);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

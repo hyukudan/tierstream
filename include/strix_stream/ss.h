@@ -321,7 +321,16 @@ typedef struct ss_options {
    * same bytes, slots and table entries); a prefetch's read stays in flight across the service's calls until its
    * layer is demanded; each read ends on its own (a demand or a layer's ready waits only for the reads it needs, not
    * for older ones); 0 = 1 (default: one read at a time inside its fetch, as before), 2..64 = that many in flight;
-   * only with dg_disk_tier. */
+   * only with dg_disk_tier. SS_DG_DISK_QUEUE_AUTO (below) = resolved at ss_open, before any buffer is sized:
+   * clamp(3 x L, 4, 8) with L = the most read locations of a source the gated layers read (the source's file plus each
+   * weight_dirs directory, other than its own, holding its stripe manifest; 1 when not striped; directories, not
+   * volumes: two directories on one drive count twice), then at most an explicit dg_disk_staging (reads in flight
+   * never exceed the staging buffers); with dg_disk_staging 0 the default 8 is raised to the resolved queue if it is
+   * larger. L is counted (a stat per directory) only for AUTO; an explicit queue does no file system work. AUTO
+   * without dg_disk_tier is not refused: it resolves to no reader, as 0. ss_dg_stats.disk_queue_resolved /
+   * disk_locations report the result. ss_budget_in_dg_library and ss_open each count L at their own time: a stripe
+   * added between the plan and the open can raise the readers, and a budget ledger then refuses the open; for the
+   * planned numbers exactly, pass the helper's resolved dg_disk_queue and staging to ss_open explicitly. */
   uint32_t dg_disk_queue;
   uint32_t reserved4;  /* explicit padding (never read) */
   /* appended, bound source opens: every descriptor source is resolved once to its real path, then opened through
@@ -780,6 +789,11 @@ typedef struct ss_dg_stats {
    * high. */
   uint64_t pred_shadow_file_predicted, pred_shadow_file_demanded, pred_shadow_file_hit;
   uint64_t pred_shadow_file_predicted_bytes, pred_shadow_file_demanded_bytes, pred_shadow_file_hit_bytes;
+  /* appended (SS_DG_DISK_QUEUE_AUTO; properties of the open, never reset): disk_queue_resolved = file reads in flight
+   * the open resolved from dg_disk_queue (0 without dg_disk_tier, 1 = synchronous; AUTO resolved); disk_locations =
+   * the most read locations (directories) of a gated source it counted for AUTO (1 = not striped; 0 without
+   * dg_disk_tier, and 0 for an explicit dg_disk_queue: not counted) */
+  uint32_t disk_queue_resolved, disk_locations;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1140,7 +1154,9 @@ typedef struct ss_budget_in {
      fields (and staging) from the descriptor and the options. dg_gated_layers = 0 (default) = not charged: the plans
      of before, unchanged. */
   uint32_t dg_gated_layers;       /* the descriptor's gated layers (its layers with units); 0 = not charged */
-  uint32_t dg_disk_queue;         /* ss_options.dg_disk_queue (0 or 1: no disk reader of its own) */
+  uint32_t dg_disk_queue;         /* ss_options.dg_disk_queue (0 or 1: no disk reader of its own), resolved: 0..64
+                                     (ss_budget_in_dg_library resolves SS_DG_DISK_QUEUE_AUTO; a raw AUTO here is
+                                     refused with SS_E_INVALID) */
   uint64_t dg_part_max_bytes;     /* the largest part of a gated unit (a disk reader's bounce buffer covers one part) */
   uint64_t dg_source_align;       /* the largest source alignment (the descriptor's sources[].align; below 4096 =
                                      4096) */
@@ -1673,7 +1689,7 @@ SS_API ss_status ss_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on);
 /* Whole-device budgets, the library's own host bytes (ss_budget_in.dg_gated_layers .. dg_bounce_request,
  * ss_budget_out.lib_*). ss_budget_in_dg_library overwrites in->staging with the options' dg_disk_staging (0 = 8), and
  * fills those inputs from the descriptor and the options the device-gated context will be opened with (o NULL = the
- * defaults); in must
+ * defaults; a dg_disk_queue of SS_DG_DISK_QUEUE_AUTO is resolved, with its staging, as ss_open resolves it); in must
  * have been initialized with ss_budget_in_defaults (read and written up to its struct_size). SS_E_INVALID for a NULL
  * in or d, or an in too small for those fields. */
 #define SS_BUDGET_LIBRARY 1
@@ -1692,6 +1708,11 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
 #define SS_DG_PF_ADMIT 1
 /* ss_dg_stats.pred_shadow_file_* exist (the prediction shadow tally of the file tier) */
 #define SS_DG_PRED_SHADOW 1
+/* ss_options.dg_disk_queue = SS_DG_DISK_QUEUE_AUTO: the reads in flight chosen for the read locations (directories)
+ * the gated sources are read from (see dg_disk_queue; reported in ss_dg_stats.disk_queue_resolved / disk_locations).
+ * ss_budget_in_dg_library resolves it (and the raised default staging) with ss_open's function; each counts the
+ * locations when called (see dg_disk_queue: pass the resolved values to ss_open for the planned numbers exactly). */
+#define SS_DG_DISK_QUEUE_AUTO 0xFFFFFFFFu
 
 #ifdef __cplusplus
 }

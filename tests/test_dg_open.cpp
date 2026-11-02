@@ -76,6 +76,33 @@ TEST(dg_open_production_layout_needs_cuda) {
          SS_E_UNSUPPORTED, "needs the CUDA backend");
 }
 
+// SS_DG_DISK_QUEUE_AUTO through ss_open on a build without CUDA: the layout accepts it (resolved there), so the open
+// still ends at the backend. An explicit queue does no file system work: with more weight_dirs than a stripe session
+// takes, the open still reaches the backend's refusal (SS_E_UNSUPPORTED, not the directories' SS_E_INVALID).
+TEST(dg_open_disk_queue_auto_needs_cuda) {
+  DgModel m("open-qauto", 6, 288);
+  auto three = [](O& o, T& t, uint32_t queue, uint32_t staging) {
+    sstest::dg_production_options(o);
+    sstest::dg_production_tiers(t);
+    o.dg_disk_queue = queue;
+    o.dg_disk_staging = staging;
+  };
+  expect(try_open(m, [&](B&, O& o, T& t) { three(o, t, SS_DG_DISK_QUEUE_AUTO, 0); }, 64, 16, 8), SS_E_UNSUPPORTED,
+         "needs the CUDA backend");
+  expect(try_open(m, [&](B&, O& o, T& t) { three(o, t, SS_DG_DISK_QUEUE_AUTO, 3); }, 64, 16, 8), SS_E_UNSUPPORTED,
+         "needs the CUDA backend");
+  static std::string many;  // nine directories that do not exist (never looked at with an explicit queue)
+  many.clear();
+  for (int i = 0; i < 9; ++i) many += (m.dir / ("no-such-dir-" + std::to_string(i))).u8string() + ";";
+  expect(try_open(m, [&](B&, O& o, T& t) { three(o, t, 4, 4); o.weight_dirs = many.c_str(); }, 64, 16, 8),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [&](B&, O& o, T& t) { three(o, t, 0, 0); o.weight_dirs = many.c_str(); }, 64, 16, 8),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  // AUTO without the disk tier: accepted (no reader), the backend's refusal as well
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_disk_queue = SS_DG_DISK_QUEUE_AUTO; }), SS_E_UNSUPPORTED,
+         "needs the CUDA backend");
+}
+
 TEST(dg_open_refusals) {
   DgModel m("open");
   expect(try_open(m, [](B& b, O&, T&) { b.tier_mode = SS_TIER_MODE_INCLUSIVE; }), SS_E_INVALID, "tier_mode EXCLUSIVE");

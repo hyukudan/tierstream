@@ -120,21 +120,30 @@ inline FileIdentity expected_source_identity(const ss_options& o, size_t index) 
   return id;
 }
 
+// The read locations of a source with these weight_dirs: the primary plus each secondary directory that holds its
+// stripe manifest (<file name>.stripe.json), found by a stat only (nothing is opened). 1 = read from the primary alone
+// (no weight_dirs, or no manifest beside it). open_source reads a source through a stripe session exactly when this is
+// above 1; dg_layout's SS_DG_DISK_QUEUE_AUTO counts the same locations before the sources are opened.
+inline uint32_t stripe_locations(const std::string& path, const char* weight_dirs) {
+  // Do not even canonicalise the primary on the default path.
+  if (!weight_dirs || !*weight_dirs) return 1;
+  const auto name = std::filesystem::u8path(path).filename().u8string() + ".stripe.json";
+  uint32_t n = 1;
+  for (const auto& dir : MFile::secondary_dirs(path, weight_dirs)) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(std::filesystem::u8path(dir) / std::filesystem::u8path(name), ec)) ++n;
+  }
+  return n;
+}
+
 inline std::unique_ptr<SourceFile> open_source(const std::string& path, const ss_options& o,
                                              const FileIdentity& expected = FileIdentity()) {
-  // Do not even canonicalise the primary on the default path.
-  if (o.weight_dirs && *o.weight_dirs) {
-    const auto dirs = MFile::secondary_dirs(path, o.weight_dirs);
-    const auto name = std::filesystem::u8path(path).filename().u8string() + ".stripe.json";
-    for (const auto& dir : dirs) {
-      std::error_code ec;
-      if (!std::filesystem::is_regular_file(std::filesystem::u8path(dir) / std::filesystem::u8path(name), ec)) continue;
-      MFile::Options opt;
-      opt.direct = o.direct_io != 0;
-      opt.drive_readers = o.drive_readers ? o.drive_readers : 4;
-      opt.verify_mode = o.weight_verify;
-      return checked_source(std::make_unique<MFileSource>(MFile::open(path, o.weight_dirs, opt)), expected, path);
-    }
+  if (stripe_locations(path, o.weight_dirs) > 1) {
+    MFile::Options opt;
+    opt.direct = o.direct_io != 0;
+    opt.drive_readers = o.drive_readers ? o.drive_readers : 4;
+    opt.verify_mode = o.weight_verify;
+    return checked_source(std::make_unique<MFileSource>(MFile::open(path, o.weight_dirs, opt)), expected, path);
   }
   return checked_source(std::make_unique<FileSource>(path, o.direct_io != 0), expected, path);
 }

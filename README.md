@@ -251,6 +251,17 @@ a prefetch only uses free slots above the spare target, so demand misses always 
 These three admission changes are measured before they become the default: until then `DG_PF_LEGACY` defaults to 1
 (the previous behaviour, exactly) and `DG_PF_LEGACY=0` selects them.
 
+**Read queue for your drives (`SS_DG_DISK_QUEUE_AUTO`, opt-in).** Setting `dg_disk_queue = SS_DG_DISK_QUEUE_AUTO`
+picks the three-tier reads in flight from the read locations the gated sources are read from: `clamp(3 x L, 4, 8)`,
+L = the source file plus each `weight_dirs` directory holding its stripe copy (normally one per drive: one = 4, two =
+6, three or more = 8). The planner bills the same readers; the result is in `ss_dg_stats.disk_queue_resolved` /
+`disk_locations`. Details: [design §3.14](docs/design.md).
+
+Off: leave `dg_disk_queue` at 0 (one synchronous read, the default) or set any value from 1 to 64. Measured with DeepSeek V4.1
+Flash on one RTX PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host RAM, one drive, output identical in every arm:
+5.45 tok/s at queue 1 -> 6.55 tok/s at queue 4 (+20 %), +26 % with speculative decoding; queue 16 = queue 4 (one
+drive saturates at 4).
+
 **`ss_dg_make_resident` reads in flight.** Up to `min(dg_disk_queue, dg_disk_staging)` file reads run together and are
 finished as they complete; the copied units still become the most recent in the order given, so placement does not
 depend on read timing. Its own reads, bytes, wait time, host-to-device and write-back bytes are in `ss_dg_stats.mkres_*`.

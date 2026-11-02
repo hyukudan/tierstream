@@ -88,6 +88,9 @@ const char* kind_name(ss_budget_kind k) {
 // three = the plan has a file tier (its disk readers and staging buffers exist); none when not asked for.
 DgHostBytes lib_bytes(const ss_budget_in& in, bool three) {
   if (!in.dg_gated_layers) return DgHostBytes{};
+  // a resolved queue only: ss_budget_in_dg_library resolves SS_DG_DISK_QUEUE_AUTO from the descriptor and options
+  require(in.dg_disk_queue <= 64, SS_E_INVALID,
+          "ss_budget_plan: dg_disk_queue must be 0..64 (ss_budget_in_dg_library resolves SS_DG_DISK_QUEUE_AUTO)");
   return dg_host_bytes(in.dg_gated_layers, in.unit_bytes, in.dg_part_max_bytes, in.dg_source_align,
                        in.dg_bounce_request, three ? std::max<uint32_t>(in.dg_disk_queue, 1) : 0,
                        three ? in.staging : 0);

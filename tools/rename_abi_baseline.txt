@@ -208,3 +208,6 @@ ss.h-sha256 4f0c45d9053b8ec6182e63e427a92af64ca4eb5213ace66c98c9537b2d344623
 
 # range uploads only while a layer is held (comments only)
 ss.h-sha256 d4c2e2e4e896d7d065de9752588ef11f2fac769efacf25f4ce24fc1a0e9fa7af
+
+# read queue for the read locations (additive: appended SS_DG_DISK_QUEUE_AUTO, appended ss_dg_stats disk_queue_resolved / disk_locations; comments: dg_disk_queue AUTO, ss_budget_in.dg_disk_queue resolved, ss_budget_in_dg_library resolves AUTO)
+ss.h-sha256 75ae91592334dccfae908d121645ef362b8ebdf063c8390f73a78355dfea9859

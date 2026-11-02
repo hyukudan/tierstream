@@ -577,6 +577,40 @@ A prediction is advice: it must never delay a layer or take what a demand needs.
   = hit / demanded, precision = hit / predicted, the same whatever is issued. Cleared at the layer's demand and at the
   boundary (a prediction for a layer never demanded counts as predicted only).
 
+### 3.14 Device-gated three-tier read queue (`dg_disk_queue`, AUTO)
+
+`ss_options.dg_disk_queue` is the number of three-tier file reads in flight (reader threads, each with its own bounce
+buffer): 0 (the default) and 1 = one read at a time, synchronous inside its fetch; 2..64 = that many in flight. One
+NVMe drive saturates at about 4 reads in flight (depth 16 measured no faster than 4); a source striped over several
+drives (the primary plus stripe copies found through `weight_dirs`, §4.4) peaked at 8 in flight over 3 drives.
+
+- **AUTO.** `SS_DG_DISK_QUEUE_AUTO` (0xFFFFFFFF) picks the depth for the read locations: `clamp(3 x L, 4, 8)`, where L
+  is the most read locations of any source a gated layer's parts read (a source only ungated layers read is not
+  counted): 1 for the source file, plus each `weight_dirs` directory (other than the source's own; duplicates once)
+  that holds the source's stripe manifest (`<file name>.stripe.json`; the same test that makes the open read the
+  source through a stripe session). 1 location = 4, 2 = 6, 3 or more = 8. Locations are directories, not volumes: two
+  stripe directories on one drive count twice (normally each stripe directory is on its own drive).
+- **When.** At `ss_open`, in `dg_layout`, before the staging buffers, the read pool and the bounce buffers are sized:
+  the sources are not open yet, so L is counted by a stat per directory (nothing is read; a manifest that later fails
+  to verify still counted). Only AUTO counts: an explicit queue (0..64) does no new file system work and keeps the
+  open's previous refusals. `ss_budget_in_dg_library` calls the same function on the same descriptor and options, so
+  the plan bills the open's readers (`1 + queue` bounce buffers) and staging buffers. Each counts L when it is called:
+  a stripe added between the plan and the open can raise the readers, and a budget ledger then refuses the open; for
+  the planned numbers exactly, pass the helper's resolved `dg_disk_queue` / `staging` to `ss_open` explicitly. A raw
+  AUTO given to `ss_budget_plan` in `ss_budget_in.dg_disk_queue` is refused (`SS_E_INVALID`): only the helper
+  resolves it. More than seven `weight_dirs` with AUTO refuse the open with `SS_E_INVALID`, as the stripe open would.
+- **Staging.** Reads in flight never exceed the staging buffers. With `dg_disk_staging` left at 0 (= 8) the default is
+  raised to the resolved queue when that is larger (never with today's clamp at 8); with an explicit
+  `dg_disk_staging` below the resolved queue, the queue is cut to it (no reader or bounce buffer beyond what the
+  staging buffers can feed).
+- **Without the disk tier.** AUTO is accepted and resolves to no reader and no pool, as 0 (other non-zero queues still
+  need `dg_disk_tier = 1`).
+- **Report.** `ss_dg_stats.disk_queue_resolved` / `disk_locations` (properties of the open; 0 without the disk tier;
+  `disk_locations` is 0 for an explicit queue, which counts nothing) and the stats JSON `three_tier` keys of the same
+  names.
+- **Measured** (one drive, DS RTX at 24+32, output identical in every arm): 5.45 tok/s at queue 1, 6.55 at queue 4
+  (+20 %; +26 % with speculative decoding), queue 16 = queue 4.
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier

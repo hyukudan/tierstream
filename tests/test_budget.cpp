@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <random>
 #include <thread>
@@ -15,6 +17,7 @@
 #include "check.hpp"
 #include "dg_fixture.hpp"
 #include "dg_layout.hpp"
+#include "errors.hpp"
 #include "fixture.hpp"
 #include "strix_stream/ss.h"
 
@@ -1599,4 +1602,257 @@ TEST(library_planner_equals_the_open) {
   CHECK_EQ(in.dg_source_align, 4096u);
   CHECK_EQ(in.struct_size, uint32_t(sizeof in));
   ss_desc_free(cd);
+}
+
+// SS_DG_DISK_QUEUE_AUTO: clamp(3 x L, 4, 8) with L = the most read locations of a gated source (the source plus each
+// weight_dirs directory holding its stripe manifest), at most an explicit dg_disk_staging, the default staging raised
+// to the queue; no disk tier = no reader (not refused); the planner (ss_budget_in_dg_library) bills the open's readers.
+TEST(dg_disk_queue_auto) {
+  // the rule
+  CHECK_EQ(ss::dg_auto_disk_queue(1, 0), 4u);
+  CHECK_EQ(ss::dg_auto_disk_queue(2, 0), 6u);
+  CHECK_EQ(ss::dg_auto_disk_queue(3, 0), 8u);
+  CHECK_EQ(ss::dg_auto_disk_queue(5, 0), 8u);  // clamped
+  CHECK_EQ(ss::dg_auto_disk_queue(0, 0), 4u);
+  CHECK_EQ(ss::dg_auto_disk_queue(3, 5), 5u);  // an explicit smaller staging caps it
+  CHECK_EQ(ss::dg_auto_disk_queue(1, 1), 1u);
+  CHECK_EQ(ss::dg_auto_disk_queue(2, 200), 6u);
+  CHECK_EQ(ss::dg_auto_disk_staging(0, 6), 8u);    // the default 8 ...
+  CHECK_EQ(ss::dg_auto_disk_staging(0, 12), 12u);  // ... raised to a larger queue
+  CHECK_EQ(ss::dg_auto_disk_staging(3, 8), 3u);    // explicit: as given
+  CHECK_EQ(SS_DG_DISK_QUEUE_AUTO, 0xFFFFFFFFu);
+
+  sstest::DgModel model("qauto", 3, 32);
+  // secondary directories, each holding the source's stripe manifest (only its presence is counted at layout)
+  const std::filesystem::path root = model.dir.parent_path() / "ss-test-dg-qauto-stripes";
+  struct RemoveAll {  // the test's directories go when it ends (also on an early return)
+    std::filesystem::path p;
+    ~RemoveAll() {
+      std::error_code ec;
+      std::filesystem::remove_all(p, ec);
+    }
+  } remove_root{root};
+  {
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);  // (a previous run's)
+  }
+  std::vector<std::string> dirs;
+  for (int i = 0; i < 4; ++i) {
+    const std::filesystem::path dir = root / ("s" + std::to_string(i));
+    std::filesystem::create_directories(dir);
+    std::ofstream(dir / (model.file.filename().u8string() + ".stripe.json")) << "{}";
+    dirs.push_back(dir.u8string());
+  }
+  const std::filesystem::path empty = root / "no-manifest";  // a weight_dirs entry without the manifest: not counted
+  std::filesystem::create_directories(empty);
+  ss::Desc d = ss::desc_from_json(ss::json_parse(model.json));
+  ss_desc* cd = nullptr;
+  CHECK_OK(ss_desc_from_json(model.json.data(), model.json.size(), &cd));
+  if (!cd) return;
+  ss_budget b;
+  sstest::dg_budget(b, model, 4, 8);
+  b.host_pinned_bytes = uint64_t(1) << 34;
+  std::vector<uint8_t> tiers = model.tiers(16);
+  for (size_t i = 0; i < tiers.size(); ++i)
+    if (tiers[i] == SS_TIER_PINNED && i % 2) tiers[i] = SS_TIER_DISK;
+  const ss::Plan p3 = ss::plan_from_tiers(d, b, tiers);
+  const ss::Plan p2 = ss::plan_from_tiers(d, b, model.tiers(16));
+  auto opts = [&](uint32_t queue, uint32_t staging, size_t secondaries, bool disk, std::string* wd) {
+    ss_options o;
+    sstest::dg_options(o, 8, SS_BACKEND_CPU);
+    o.dg_disk_tier = disk;
+    o.dg_disk_queue = queue;
+    o.dg_disk_staging = staging;
+    wd->clear();
+    for (size_t i = 0; i < secondaries; ++i) *wd += dirs[i] + ";";
+    *wd += empty.u8string();
+    o.weight_dirs = wd->c_str();
+    return o;
+  };
+  // the planner's bytes are the open's (the same readers and staging buffers)
+  auto planner_equals_open = [&](const ss_options& o, const ss::DgLayout& x) {
+    ss_budget_in in;
+    ss_budget_in_defaults(&in);
+    CHECK_OK(ss_budget_in_dg_library(&in, cd, &o));
+    CHECK_EQ(in.dg_disk_queue == 0 ? 1u : in.dg_disk_queue, x.disk_queue);
+    CHECK_EQ(in.staging, x.S);
+    in.keys = uint64_t(model.G) * uint64_t(model.U);
+    in.slot_bytes = model.unit();
+    in.unit_bytes = x.host_stride;
+    in.arena_units = uint64_t(model.G) * 16;
+    in.host_spares = 4;
+    in.ram_expert_bytes = uint64_t(20 + x.S) * x.host_stride;  // (room for the staging buffers too)
+    const ss_budget_out out = lib_plan(in);
+    CHECK(!out.refused);
+    CHECK_EQ(out.three_tier, 1u);
+    CHECK_EQ(out.lib_host_bytes,
+             x.mapped_bytes + x.bounce_bytes * x.bounce_readers + x.staging_bytes + uint64_t(x.S) * x.host_stride);
+    CHECK_EQ(out.lib_bounce_readers, x.bounce_readers);
+    CHECK_EQ(out.lib_disk_staging_bytes, uint64_t(x.S) * x.host_stride);
+  };
+  std::string wd;
+  // 1, 2, 3, 4 and 5 locations, default staging
+  const uint32_t want[5] = {4, 6, 8, 8, 8};
+  for (size_t k = 0; k <= 4; ++k) {
+    const ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 0, k, true, &wd);
+    CHECK_EQ(ss::dg_disk_locations(d, o), uint32_t(k + 1));
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, want[k]);
+    CHECK_EQ(x.disk_locations, uint32_t(k + 1));
+    CHECK_EQ(x.S, 8u);  // the default 8 covers every AUTO queue (at most 8)
+    CHECK_EQ(x.bounce_readers, 1u + want[k]);
+    planner_equals_open(o, x);
+  }
+  {  // an explicit smaller staging caps the queue (reads in flight never exceed the staging buffers)
+    const ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 3, 2, true, &wd);
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, 3u);
+    CHECK_EQ(x.S, 3u);
+    CHECK_EQ(x.disk_locations, 3u);
+    CHECK_EQ(x.bounce_readers, 4u);
+    planner_equals_open(o, x);
+  }
+  {  // a larger explicit staging leaves the AUTO queue as resolved
+    const ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 16, 1, true, &wd);
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, 6u);
+    CHECK_EQ(x.S, 16u);
+    planner_equals_open(o, x);
+  }
+  {  // no weight_dirs: one location
+    ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 0, 0, true, &wd);
+    o.weight_dirs = nullptr;
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, 4u);
+    CHECK_EQ(x.disk_locations, 1u);
+    planner_equals_open(o, x);
+  }
+  {  // 0 keeps meaning 1 (synchronous: no reader of its own), whatever the locations
+    const ss_options o = opts(0, 0, 3, true, &wd);
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, 1u);
+    CHECK_EQ(x.S, 8u);
+    CHECK_EQ(x.bounce_readers, 1u);
+    CHECK_EQ(x.disk_locations, 0u);  // an explicit queue counts nothing (no file system work)
+    planner_equals_open(o, x);
+    ss_budget_in in;
+    ss_budget_in_defaults(&in);
+    CHECK_OK(ss_budget_in_dg_library(&in, cd, &o));
+    CHECK_EQ(in.dg_disk_queue, 0u);  // passed through as before
+  }
+  {  // an explicit queue is kept
+    const ss_options o = opts(16, 0, 3, true, &wd);
+    CHECK_EQ(ss::dg_layout(d, p3, o).disk_queue, 16u);
+  }
+  {  // AUTO without the disk tier: not refused, no reader and no staging (as 0)
+    const ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 0, 2, false, &wd);
+    const ss::DgLayout x = ss::dg_layout(d, p2, o);
+    CHECK_EQ(x.disk_queue, 0u);
+    CHECK_EQ(x.S, 0u);
+    CHECK_EQ(x.disk_locations, 0u);
+    CHECK_EQ(x.bounce_readers, 1u);
+    const ss::DgDiskQueue r = ss::dg_resolve_disk_queue(d, o);
+    CHECK_EQ(r.queue + r.staging + r.locations, 0u);
+    ss_budget_in in;
+    ss_budget_in_defaults(&in);
+    CHECK_OK(ss_budget_in_dg_library(&in, cd, &o));
+    CHECK_EQ(in.dg_disk_queue, 0u);
+    CHECK_EQ(in.staging, 8u);
+  }
+  // option range: 65 and every value up to AUTO - 1 are refused, with or without the disk tier
+  for (uint32_t q : {65u, 0xFFFFFFFEu})
+    for (bool disk : {false, true}) {
+      const ss_options o = opts(q, 0, 0, disk, &wd);
+      try {
+        (void)ss::dg_layout(d, disk ? p3 : p2, o);
+        CHECK(false);
+      } catch (const ss::Error& e) {
+        CHECK_EQ(int(e.status()), int(SS_E_INVALID));
+      }
+    }
+  {  // the planner refuses a raw AUTO (only ss_budget_in_dg_library resolves it)
+    ss_budget_in in;
+    ss_budget_in_defaults(&in);
+    library_inputs(in, SS_DG_DISK_QUEUE_AUTO);
+    in.keys = 1000;
+    in.unit_bytes = 1 << 20;
+    ss_status st = SS_OK;
+    (void)lib_plan(in, &st);
+    CHECK_EQ(int(st), int(SS_E_INVALID));
+  }
+  {  // NULL options = the defaults: no disk tier, no reader, the default staging
+    ss_budget_in in;
+    ss_budget_in_defaults(&in);
+    CHECK_OK(ss_budget_in_dg_library(&in, cd, nullptr));
+    CHECK_EQ(in.dg_disk_queue, 0u);
+    CHECK_EQ(in.staging, 8u);
+  }
+  {  // more than seven weight_dirs: AUTO counts them and refuses as the stripe open would; an explicit queue never looks
+    std::string many;
+    for (int i = 0; i < 9; ++i) many += (root / ("m" + std::to_string(i))).u8string() + ";";
+    ss_options o = opts(SS_DG_DISK_QUEUE_AUTO, 0, 0, true, &wd);
+    o.weight_dirs = many.c_str();
+    try {
+      (void)ss::dg_layout(d, p3, o);
+      CHECK(false);
+    } catch (const ss::Error& e) {
+      CHECK_EQ(int(e.status()), int(SS_E_INVALID));
+    }
+    o.dg_disk_queue = 4;
+    const ss::DgLayout x = ss::dg_layout(d, p3, o);
+    CHECK_EQ(x.disk_queue, 4u);
+    CHECK_EQ(x.disk_locations, 0u);
+  }
+  ss_desc_free(cd);
+
+  // Several sources: the most locations over the sources the gated layers read. a.bin (gated) has 1 stripe directory,
+  // b.bin (gated) 2, c.bin (read only by an ungated layer) 4: L = 3. The sources' own directory (holding a manifest
+  // named for a.bin) and a repeated directory are not extra locations.
+  {
+    const std::filesystem::path own = root / "own";
+    std::filesystem::create_directories(own);
+    auto manifest = [](const std::filesystem::path& dir, const char* name) {
+      std::ofstream(dir / (std::string(name) + ".stripe.json")) << "{}";
+    };
+    const std::filesystem::path sdir[4] = {std::filesystem::u8path(dirs[0]), std::filesystem::u8path(dirs[1]),
+                                           std::filesystem::u8path(dirs[2]), std::filesystem::u8path(dirs[3])};
+    manifest(sdir[0], "a.bin");
+    manifest(sdir[0], "b.bin");
+    manifest(sdir[1], "b.bin");
+    for (const auto& dir : sdir) manifest(dir, "c.bin");
+    manifest(own, "a.bin");
+    ss::Desc m;
+    for (const char* name : {"a.bin", "b.bin", "c.bin"}) {
+      ss::Source src;
+      src.name = name;
+      src.path = (own / name).u8string();
+      m.sources.push_back(src);
+    }
+    for (int s = 0; s < 3; ++s) {
+      ss::Layer l;
+      l.index = s;
+      l.n_units = s == 2 ? 0 : 4;  // layer 2: ungated (no units) though it lists a part of c.bin
+      ss::Part part;
+      part.source = s;
+      part.bytes = 4096;
+      l.parts.push_back(part);
+      m.layers.push_back(l);
+    }
+    ss_options o;
+    ss_options_defaults(&o);
+    o.dg_disk_tier = 1;
+    o.dg_disk_queue = SS_DG_DISK_QUEUE_AUTO;
+    std::string w = own.u8string() + ";" + dirs[0] + ";" + dirs[1] + ";" + dirs[2] + ";" + dirs[3] + ";" + dirs[0];
+    o.weight_dirs = w.c_str();
+    CHECK_EQ(ss::dg_disk_locations(m, o), 3u);
+    const ss::DgDiskQueue r = ss::dg_resolve_disk_queue(m, o);
+    CHECK_EQ(r.locations, 3u);
+    CHECK_EQ(r.queue, 8u);
+    CHECK_EQ(r.staging, 8u);
+    m.layers[1].n_units = 0;  // b.bin no longer gated: a.bin's 2 (its own directory and the repeat not counted)
+    CHECK_EQ(ss::dg_disk_locations(m, o), 2u);
+    CHECK_EQ(ss::dg_resolve_disk_queue(m, o).queue, 6u);
+    o.dg_disk_queue = 0;  // explicit: nothing counted
+    CHECK_EQ(ss::dg_resolve_disk_queue(m, o).locations, 0u);
+  }
 }

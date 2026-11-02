@@ -2017,6 +2017,39 @@ void make_resident_prefill(const char* tag, bool production) {
   (void)cudaFree(sums_dev);
 }
 
+// SS_DG_DISK_QUEUE_AUTO through the real context: the production three-tier setup with the queue AUTO and the default
+// staging (one location, no weight_dirs: 4 reads in flight, staging 8), decode tokens exact, and the open's report in
+// ss_dg_stats and the stats JSON's three_tier keys; then an explicit queue reports 0 locations (nothing counted).
+//   ts-test-dg-cuda --only dg_cuda_disk_queue_auto
+TEST(dg_cuda_disk_queue_auto) {
+  for (const bool automatic : {true, false}) {
+    Rig r(automatic ? "qauto" : "qauto-explicit", 16, 4, 8, 10000, true,
+          [&](ss_options& o) {
+            sstest::dg_production_options(o);
+            o.dg_disk_queue = automatic ? SS_DG_DISK_QUEUE_AUTO : 2u;
+            o.dg_disk_staging = 0;
+          },
+          nullptr, false, 64, [](std::vector<uint8_t>& t) { sstest::dg_production_tiers(t); });
+    if (!r.c) return;
+    Tally k;
+    for (int i = 0; i < 40; ++i) k.add(r.token(true, i % 2 == 0));
+    CHECK_EQ(k.wrong + k.failed, 0);
+    CHECK_OK(ss_test_dg_check(r.c));
+    const ss_dg_stats x = r.stats();
+    CHECK_EQ(x.disk_queue_resolved, automatic ? 4u : 2u);
+    CHECK_EQ(x.disk_locations, automatic ? 1u : 0u);
+    char* js = nullptr;
+    size_t len = 0;
+    CHECK_OK(ss_stats_to_json(r.c, &js, &len));
+    const std::string j = js ? std::string(js, len) : std::string();
+    ss_free(js);
+    CHECK(j.find("\"three_tier\"") != std::string::npos);
+    CHECK(j.find(automatic ? "\"disk_queue_resolved\":4" : "\"disk_queue_resolved\":2") != std::string::npos);
+    CHECK(j.find(automatic ? "\"disk_locations\":1" : "\"disk_locations\":0") != std::string::npos);
+    CHECK(j.find("\"staging\":8") != std::string::npos);
+  }
+}
+
 TEST(dg_cuda_make_resident_prefill) { make_resident_prefill("mkres", false); }
 TEST(dg_cuda_make_resident_prefill_production) { make_resident_prefill("mkresp", true); }
 
