@@ -45,6 +45,9 @@ class DgTransport {
   virtual void event_sync(void* ev) = 0;
   virtual void sync(Stream s) = 0;
   virtual void upload_table(const int32_t* table, uint32_t n) = 0;  // the whole table on kDem, then sync
+  // Only n disjoint key ranges (ranges[2i] = the first key, ranges[2i + 1] = the count): table[first, first + count)
+  // -> the device table on kDem, then sync (n = 0: the sync alone). No entry outside the ranges is written.
+  virtual void upload_table_ranges(const int32_t* table, const uint32_t* ranges, uint32_t n) = 0;
   // Diagnostics (dg_diag): a timing mark on kDem, which = 0 before the first demand copy of layer g, 2 after the
   // first fetched unit's copies (if any), 1 after its ready. Only called for a layer with a non-zero mask. Default:
   // nothing.
@@ -457,6 +460,9 @@ class DgCore {
   bool wb_defer() const { return c_.wb_defer; }
   // Between tokens: dg_clean_evict at runtime (from the next victim on; reset_open restores the open's setting).
   void set_clean_evict(bool on);
+  // Changed-range table uploads (the held-layer overlap contract): on while some layer is held; off = the whole
+  // table per upload, as before (one copy; the decode boundary's cost unchanged).
+  void set_range_uploads(bool on) { range_uploads_ = on; }
   bool clean_evict() const { return c_.clean_evict; }
   // Between tokens: dg_pf_revert_unused at runtime (from the next boundary on; reset_open restores the open's setting).
   void set_pf_revert(bool on);
@@ -598,6 +604,9 @@ class DgCore {
   void force_free_slot();
   int32_t take_bank_slot(uint32_t g);
   void write_entry(DgTransport::Stream s, uint32_t k, int32_t v);
+  void set_entry(uint32_t k, int32_t v);  // the mirror's entry, marked for the next upload (dg_core.cpp)
+  void clear_marks();
+  void upload();  // the marked layers' ranges, then the kDem sync
   bool fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted);
   void serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead);
   void copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t src);  // h2d + entry (kEntryBeforeCopy order)
@@ -671,6 +680,9 @@ class DgCore {
   uint32_t keys_ = 0, slots_ = 0, bank_first_ = 0;
   std::vector<Entry> e_;
   std::vector<int32_t> table_;
+  bool range_uploads_ = false;
+  std::vector<uint32_t> mark_lo_, mark_hi_;  // per gated layer: its changed keys since the last upload (lo > hi: none)
+  std::vector<uint32_t> ranges_;             // upload's ranges (2 per gated layer, sized at construction)
   std::vector<int32_t> free_slots_, free_blocks_;
   std::deque<Writeback> wbs_;
   std::deque<Deferred> deferred_;

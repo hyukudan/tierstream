@@ -273,6 +273,17 @@ class CudaTransport final : public DgTransport {
     ck(cudaMemcpyAsync(slot_of_, table_pin_, size_t(n) * 4, cudaMemcpyHostToDevice, s_[kDem]), "cudaMemcpyAsync (table)");
     sync(kDem);
   }
+  // The same staging, only the ranges' entries (each range staged and copied on its own: the rest of the device table
+  // is never written, its readers unaffected).
+  void upload_table_ranges(const int32_t* t, const uint32_t* ranges, uint32_t n) override {
+    for (uint32_t i = 0; i < n; ++i) {
+      const size_t first = ranges[2 * i], count = ranges[2 * i + 1];
+      std::memcpy(table_pin_ + first, t + first, count * 4);
+      ck(cudaMemcpyAsync(slot_of_ + first, table_pin_ + first, count * 4, cudaMemcpyHostToDevice, s_[kDem]),
+         "cudaMemcpyAsync (table range)");
+    }
+    sync(kDem);
+  }
   void gate(Stream s, void* ev) { wait(s, ev); }
   std::vector<cudaEvent_t> dma_a_, dma_b_, dma_f_;
   std::vector<uint8_t> dma_used_;  // 0 unmarked, 1 marked, 2 marked with a first-fetch mark
@@ -576,6 +587,7 @@ class CudaDgCtx final : public DgCtx {
               SS_E_BACKEND, "ss_dg_reset_open: service does not have terminal ownership");
       core_->reset_open();
       steps_.reset();
+      core_->set_range_uploads(steps_.any_held());
       svc_->invalidate_timeline();
       std::fill(diag_.begin(), diag_.end(), LayerDiag{});
       timeline_valid_ = false;
@@ -619,6 +631,7 @@ class CudaDgCtx final : public DgCtx {
       k.push_back(core_->key(uint32_t(g), uint32_t(ids[i])));
     }
     steps_.keep(uint32_t(g), std::move(k));  // a plain keep: g is exported again
+    core_->set_range_uploads(steps_.any_held());
   }
 
   void make_resident(int g, const int32_t* ids, int n) override {
@@ -644,6 +657,7 @@ class CudaDgCtx final : public DgCtx {
             "ss_dg_make_resident: service does not have terminal ownership");
     if (n == 0) {  // nothing to make resident: the release (as ss_dg_keep(c, g, NULL, 0))
       steps_.keep(uint32_t(g), {});
+      core_->set_range_uploads(steps_.any_held());
       return;
     }
     // every keep is protected during the call, g's current one included: a failed call leaves it, and its units, as
@@ -658,6 +672,7 @@ class CudaDgCtx final : public DgCtx {
       throw;
     }
     steps_.hold(uint32_t(g), std::move(keys));
+    core_->set_range_uploads(steps_.any_held());
     fold(false);  // publish the resident counters without reporting a token to the hook
   }
 

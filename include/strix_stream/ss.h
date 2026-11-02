@@ -611,7 +611,9 @@ SS_API ss_status ss_dg_enqueue_wait(ss_ctx* c, int g, void* stream);
 SS_API ss_status ss_dg_enqueue_end(ss_ctx* c, void* stream);
 /* Between tokens: units of gated layer g the next boundary must not evict (opt-in; replaces the previous set of g,
  * also an ss_dg_make_resident set: g is exported again; n = 0 releases). A kept unit on the device stays in its slot
- * (no boundary evicts or reverts it) while kept. */
+ * (no boundary evicts or reverts it) while kept. Releasing a held layer (an ss_dg_make_resident set) whose kernels
+ * may still run: only after they completed (their event), as its slots may be reused by the next call; a keep of
+ * another layer may overlap them (see ss_dg_make_resident: held-layer overlap). */
 SS_API ss_status ss_dg_keep(ss_ctx* c, int g, const int32_t* ids, int n);
 /* Between tokens: the spare target (<= the billed spares; the next boundary's evictions) and the prefetch budgets
  * (from the next token). The default prefetch reserve follows the spare target, min(24, spare_target / 4); an
@@ -1272,7 +1274,15 @@ SS_API int ss_budget_ledger_within_caps(const ss_budget_ledger* l);
    make_resident(g, all units), one step exporting no other layer (rows_per_layer[h] = 0 for h != g), release; several
    layers may be held at once. A read failure (SS_E_IO) leaves the cache consistent and every keep unchanged, its units
    in their slots (the units moved so far stay). A device failure (a copy, publication, event or synchronize:
-   SS_E_BACKEND) poisons the context. */
+   SS_E_BACKEND) poisons the context.
+   Held-layer overlap: a held layer's kernels (slots through ss_dg_slot) may also run outside ss_begin / ss_end, and
+   ss_dg_make_resident / ss_dg_keep of OTHER layers (and the boundaries and ss_dg_round between them) may overlap them,
+   e.g. make_resident(g + 1) right after enqueueing layer g: they never evict or move a held unit, they synchronize only
+   the cache's own streams (never the device or the engine's stream), and while any layer is held their table uploads
+   write only the entry ranges of layers whose placement changed (from the first to the last changed unit of each;
+   with no layer held an upload is the whole table in one copy, as before), so a held layer none of
+   whose other units moved - always so when the whole layer is held - is never rewritten. Release a held layer (n = 0)
+   only after its kernels completed (wait for their event): a released set's slots may be reused by the next call. */
 #define SS_DG_MAKE_RESIDENT 1
 SS_API ss_status ss_dg_make_resident(ss_ctx* c, int g, const int32_t* ids, int n);
 

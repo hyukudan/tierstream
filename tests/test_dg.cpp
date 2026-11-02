@@ -54,6 +54,8 @@ class Scripted final : public DgTransport {
     Ev* ev = nullptr;
     uint64_t target = 0;
     std::vector<int32_t> table;
+    std::vector<uint32_t> ranges;  // a ranged upload: (first, count) pairs, table = their values in order
+    bool ranged = false;
   };
 
   // A block holds one key per part (a write-back may land part by part); a slot is always copied whole.
@@ -210,6 +212,24 @@ class Scripted final : public DgTransport {
     if (move_faults_) fault("upload_table");
     Op o{Upload};
     o.table.assign(table, table + n);
+    uploads_.push_back({0, n});
+    push(kDem, std::move(o));
+    sync(kDem);
+  }
+  void upload_table_ranges(const int32_t* table, const uint32_t* ranges, uint32_t n) override {
+    kind_fault(kFUpload);
+    if (move_faults_) fault("upload_table");
+    Op o{Upload};
+    o.ranged = true;
+    for (uint32_t i = 0; i < n; ++i) {
+      const uint32_t first = ranges[2 * i], count = ranges[2 * i + 1];
+      if (first + count > table_.size()) v_->set("upload: a range past the table");
+      for (size_t j = 0; j < o.ranges.size(); j += 2)  // disjoint within one call
+        if (first < o.ranges[j] + o.ranges[j + 1] && o.ranges[j] < first + count) v_->set("upload: overlapping ranges");
+      uploads_.push_back({first, count});
+      o.ranges.insert(o.ranges.end(), {first, count});
+      o.table.insert(o.table.end(), table + first, table + first + count);
+    }
     push(kDem, std::move(o));
     sync(kDem);
   }
@@ -274,7 +294,10 @@ class Scripted final : public DgTransport {
   // The kinds of the operations in the order they were issued (not run), since the last clear.
   const std::vector<Kind>& issued() const { return issued_; }
   const std::vector<std::vector<int64_t>>& trace() const { return trace_; }
+  // Every key range the uploads wrote (first, count; a whole-table upload: 0, keys), in order, since the last clear.
+  const std::vector<std::pair<uint32_t, uint32_t>>& uploads() const { return uploads_; }
   void clear_issued() {
+    uploads_.clear();
     trace_.clear();
     issued_.clear();
     wb_slots_.clear();
@@ -349,6 +372,7 @@ class Scripted final : public DgTransport {
   void push(Stream s, Op o) {
     issued_.push_back(o.kind);
     trace_.push_back({int64_t(s), int64_t(o.kind), o.a, o.b, int64_t(o.key)});
+    for (uint32_t r : o.ranges) trace_.back().push_back(int64_t(r));
     for (int32_t value : o.table) trace_.back().push_back(value);
     if (o.kind == D2H || o.kind == D2HPart) wb_slots_.push_back(o.a);
     q_[s].push_back(std::move(o));
@@ -387,7 +411,12 @@ class Scripted final : public DgTransport {
       case Wait:
         break;
       case Upload:
-        table_ = o.table;
+        if (!o.ranged) {
+          table_ = o.table;
+          break;
+        }
+        for (size_t i = 0, at = 0; i < o.ranges.size(); i += 2)
+          for (uint32_t k = o.ranges[i]; k < o.ranges[i] + o.ranges[i + 1]; ++k) table_[k] = o.table[at++];
         break;
       case Read:
       case Mark:  // (traced only, never queued)
@@ -396,6 +425,7 @@ class Scripted final : public DgTransport {
   }
 
   std::deque<Op> q_[3];
+  std::vector<std::pair<uint32_t, uint32_t>> uploads_;
   std::vector<std::unique_ptr<Ev>> evs_;
   std::vector<int32_t> table_, slot_, block_;
   std::vector<uint32_t> ready_;
@@ -4570,6 +4600,62 @@ TEST(dg_resident_several_layers_and_capacity) {
   CHECK(cap);
   CHECK(z.state() == s0);
   CHECK(r.v.what.empty() && z.v.what.empty());
+}
+
+// The engine's held-layer pipeline: layer g held (its kernels may still read its entries), make_resident(g + 1) with
+// victims from other layers, a boundary and a round keeping both, then g released. No upload of these calls writes an
+// entry of g's key range (only the changed layers' ranges go up, each inside one layer), and after every call the
+// device table equals the mirror at every key (the victims' -1 included); two-tier and three-tier, LRU and scored.
+TEST(dg_upload_never_writes_a_held_layer) {
+  for (int variant = 0; variant < 4; ++variant) {
+    const bool disk = variant & 1, scored = variant & 2;
+    std::vector<uint8_t> files(64, 0);
+    for (uint32_t k = 40; k < 64; ++k) files[k] = 1;
+    ResRig r({16, 16, 16, 16}, 32, 8, 8, scored, disk ? &files : nullptr, disk ? 8 : 0, 5 + variant);
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(4), all_run(4), {});
+    r.verify();
+    r.core->set_range_uploads(true);  // the context sets it while a layer is held
+    uint64_t ranges = 0, written = 0, victims = 0, moved = 0;
+    auto none_in = [&](uint32_t g, const char* when) {  // the uploads since the last check, then the exact table
+      const uint32_t lo = r.core->unit_base()[g], hi = r.core->unit_base()[g + 1];
+      for (const auto& u : r.t->uploads()) {
+        if (u.first < hi && lo < u.first + u.second) r.v.set(std::string("an upload wrote the held layer ") + when);
+        if (u.second == 0 || r.core->gated_of(u.first) != r.core->gated_of(u.first + u.second - 1))
+          r.v.set(std::string("an upload range outside one layer ") + when);
+        ++ranges;
+        written += u.second;
+      }
+      r.t->clear_issued();
+      r.verify();
+    };
+    r.core->make_resident(0, r.layer(0), {});
+    r.t->clear_issued();
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t g = i % 4, n = (i + 1) % 4;
+      const auto kg = r.keys_of(g, r.layer(g));
+      const DgCore::ResidentResult res = r.core->make_resident(n, r.layer(n), kg);
+      victims += res.evicted;
+      for (uint32_t k : r.core->resident_victims())
+        if (r.core->gated_of(k) == g) r.v.set("make_resident evicted a held unit");
+      none_in(g, "(make_resident)");
+      std::vector<uint32_t> both = kg;
+      const auto kn = r.keys_of(n, r.layer(n));
+      both.insert(both.end(), kn.begin(), kn.end());
+      std::vector<uint8_t> run = all_run(4);
+      run[g] = run[n] = 0;  // held layers are not exported
+      r.token(r.routes(4), run, both, both);
+      none_in(g, "(boundary)");
+      const ts::DgRoundOut ro = r.core->round(ts::DgRoundIn{}, both);
+      moved += ro.promoted_to_device + ro.demoted_from_device + ro.promoted_to_pinned + ro.dropped_to_file;
+      none_in(g, "(round)");
+      for (uint32_t k : kg) CHECK(r.core->home(k) == DgCore::Home::Device);  // released only now
+    }
+    CHECK(victims > 0);
+    CHECK(ranges > 0);
+    CHECK(written < uint64_t(ranges) * r.keys);  // incremental: never the whole table
+    if (!r.v.what.empty()) std::printf("  variant %d: %s (moved %llu)\n", variant, r.v.what.c_str(), (unsigned long long)moved);
+    CHECK(r.v.what.empty());
+  }
 }
 
 // LRU: the victims are the least recent device units that no layer keeps and the call does not want, written back

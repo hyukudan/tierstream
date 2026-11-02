@@ -296,6 +296,13 @@ mantenidas por `ss_dg_keep` o retenidas por `ss_dg_make_resident` nunca se mueve
 un token de capa lo hace fallar como desincronización de secuencia. Los tokens ordinarios (`ss_begin`) no cambian.
 Solo afecta a la ubicación: los mismos bytes. Se contabiliza en `ss_dg_stats.lm_*`.
 
+**Las capas retenidas se solapan con las cargas de otras capas.** Una capa retenida por `ss_dg_make_resident`
+puede ejecutar sus kernels fuera de `ss_begin` / `ss_end`. `ss_dg_make_resident` / `ss_dg_keep` de otras capas pueden
+solaparse con ellos: nunca desalojan una unidad retenida, solo sincronizan los streams propios de la caché y, mientras
+haya una capa retenida, solo suben las entradas de tabla de las capas modificadas, de modo que una capa totalmente
+retenida nunca se reescribe. Libere una capa retenida solo cuando sus kernels hayan terminado; la siguiente llamada
+puede reutilizar sus slots.
+
 ### Traer por adelantado
 
 - **Precarga cierta** (`ss_prefetch_layer`): el prefill capa a capa sabe que necesita la capa L+1 a continuación, así
