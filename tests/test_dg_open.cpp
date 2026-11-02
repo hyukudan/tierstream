@@ -535,11 +535,84 @@ TEST(dg_pf_strict_admit_abi_cpu) {
          }),
          SS_E_UNSUPPORTED, "needs the CUDA backend");
   static_assert(offsetof(ss_options, dg_pf_strict_admit) == offsetof(ss_options, reserved8) + 4, "appended");
-  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved9) + 4, "the struct's end");
   ss_options o;
   ss_options_defaults(&o);
   CHECK_EQ(o.dg_pf_strict_admit, 0u);
 #ifndef SS_DG_PF_ADMIT
 #error "SS_DG_PF_ADMIT"
+#endif
+}
+
+// The two-stage file prefetch (SS_DG_LANDING): dg_landing_blocks / dg_landing_max_queued / dg_landing_ttl appended
+// after dg_pf_strict_admit's padding (an older struct reads 0: off), each range and dependency refused by name, and
+// a valid three-tier configuration passing every layout check (the landing blocks' host admission: test_budget's
+// library_planner_equals_the_open).
+TEST(dg_landing_abi_cpu) {
+  DgModel m("open-land", 6, 288);
+  auto prod = [](O& o, T& t) {
+    sstest::dg_production_options(o);
+    sstest::dg_production_tiers(t);
+  };
+  auto open = [&](uint32_t blocks, uint32_t queued, uint32_t ttl, uint32_t disk_queue = 4, bool disk = true,
+                  uint32_t chunk = 0) {
+    return try_open(
+        m,
+        [&](B&, O& o, T& t) {
+          if (disk) prod(o, t);
+          o.dg_disk_queue = disk ? disk_queue : 0;
+          o.dg_landing_blocks = blocks;
+          o.dg_landing_max_queued = queued;
+          o.dg_landing_ttl = ttl;
+          o.dg_landing_chunk = chunk;
+        },
+        64, 16, 8);
+  };
+  expect(open(4097, 0, 0), SS_E_INVALID, "dg_landing_blocks must be 0..4096");
+  const char* needs = "dg_landing_max_queued / dg_landing_ttl / dg_landing_chunk need dg_landing_blocks > 0";
+  expect(open(0, 1, 0), SS_E_INVALID, needs);
+  expect(open(0, 0, 2), SS_E_INVALID, needs);
+  expect(open(0, 0, 0, 4, true, 8192), SS_E_INVALID, needs);
+  expect(open(0, 0, 0, 4, true, 0xFFFFFFFFu), SS_E_INVALID, needs);
+  for (uint32_t bad : {1u, 4095u, 4097u, 0xFFFFF000u + 1u})
+    expect(open(4, 0, 0, 4, true, bad), SS_E_INVALID, "dg_landing_chunk must be 0, a multiple of 4096 or 0xFFFFFFFF");
+  for (uint32_t good : {4096u, 1u << 20, 0xFFFFF000u, 0xFFFFFFFFu})
+    expect(open(4, 0, 0, 4, true, good), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(open(4, 65, 0), SS_E_INVALID, "dg_landing_max_queued must be 0..64");
+  expect(open(4, 0, 1025), SS_E_INVALID, "dg_landing_ttl must be 0..1024");
+  expect(open(4, 0, 0, 0, false), SS_E_INVALID, "dg_landing_blocks needs dg_disk_tier = 1");
+  expect(open(4, 0, 0, 1), SS_E_INVALID, "dg_landing_blocks needs dg_disk_queue > 1");
+  expect(open(4, 2, 3), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(open(0, 0, 0), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(
+             m,
+             [&](B&, O& o, T& t) {
+               prod(o, t);
+               o.struct_size = uint32_t(offsetof(ss_options, dg_landing_blocks));
+               o.dg_landing_blocks = 4097;  // beyond an older caller's struct: never read
+               o.dg_landing_ttl = 7;
+             },
+             64, 16, 8),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  static_assert(offsetof(ss_options, dg_landing_blocks) == offsetof(ss_options, reserved9) + 4, "appended");
+  static_assert(offsetof(ss_options, dg_landing_ttl) == offsetof(ss_options, dg_landing_max_queued) + 4, "appended");
+  static_assert(offsetof(ss_options, dg_landing_chunk) == offsetof(ss_options, reserved10) + 4, "appended");
+  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved11) + 4, "the struct's end");
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_landing_blocks + o.dg_landing_max_queued + o.dg_landing_ttl + o.dg_landing_chunk, 0u);
+  expect(try_open(
+             m,
+             [&](B&, O& o, T& t) {
+               prod(o, t);
+               o.struct_size = uint32_t(offsetof(ss_options, dg_landing_chunk));
+               o.dg_landing_chunk = 3;  // beyond an older caller's struct: never read (0: the 4 MiB default)
+             },
+             64, 16, 8),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+#ifndef SS_DG_LANDING
+#error "SS_DG_LANDING"
+#endif
+#ifndef SS_DG_LANDING_YIELD
+#error "SS_DG_LANDING_YIELD"
 #endif
 }

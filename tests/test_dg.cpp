@@ -46,7 +46,7 @@ class Scripted final : public DgTransport {
   struct Ev {
     uint64_t recorded = 0, completed = 0;
   };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark };
+  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark, ReadyPart };
   struct Op {
     Kind kind;
     int32_t a = 0, b = 0;
@@ -139,6 +139,54 @@ class Scripted final : public DgTransport {
     if (fails) ts::fail(SS_E_IO, "injected read failure");
     return 1000;
   }
+  // Landing reads that never started (asynchronous reads only): a read of a queued key never lands before it is ended
+  // and a cancel drops it while it has not landed; cancel_unlanded: every read not landed yet can be cancelled.
+  bool read_unit_cancel(void* h) noexcept override {
+    if (!async_) return false;
+    const uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(h));
+    auto it = std::find_if(in_flight_.begin(), in_flight_.end(), [&](const Pend& r) { return r.id == id; });
+    if (it == in_flight_.end()) {
+      v_->set("a cancel of no read in flight");
+      return false;
+    }
+    if (it->landed || (!cancel_unlanded_ && !read_queued(it->key))) return false;
+    cancelled_.push_back(it->key);
+    in_flight_.erase(it);
+    return true;
+  }
+  // Chunked landing reads (abort_unlanded): an abort of a read not landed yet stops it part-way: it is done at once
+  // (its block holds garbage: a copy from it is caught), it ends aborted with half its bytes not read and one yield. Off:
+  // an abort does nothing (the read runs to its end, as a whole read).
+  void read_landing_abort(void* h) noexcept override {
+    if (!async_) return;  // (a synchronous read landed at its begin)
+    const uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(h));
+    auto it = std::find_if(in_flight_.begin(), in_flight_.end(), [&](const Pend& r) { return r.id == id; });
+    if (it == in_flight_.end()) {
+      v_->set("an abort of no read in flight");
+      return;
+    }
+    if (!abort_unlanded_ || it->landed) return;
+    it->landed = it->aborted = true;
+    fill_block(it->block, -4);
+    ++aborts_;
+  }
+  uint64_t read_landing_end(void* h, LandingEnd* end) override {
+    *end = LandingEnd{};
+    const uint64_t id = uint64_t(reinterpret_cast<uintptr_t>(h));
+    auto it = std::find_if(in_flight_.begin(), in_flight_.end(), [&](const Pend& r) { return r.id == id; });
+    if (!async_ || it == in_flight_.end() || !it->aborted) return read_unit_end(h);
+    ended_.push_back(it->key);
+    in_flight_.erase(it);
+    end->aborted = true;
+    end->aborted_bytes = 4096;
+    end->yields = 1;
+    return 1000;
+  }
+  void set_abort_unlanded(bool on) { abort_unlanded_ = on; }
+  uint64_t aborts() const { return aborts_; }
+  void queue_reads(std::vector<uint32_t> keys) { queued_reads_ = std::move(keys); }
+  void set_cancel_unlanded(bool on) { cancel_unlanded_ = on; }
+  const std::vector<uint32_t>& cancelled() const { return cancelled_; }
   void set_async_reads(bool on, uint64_t seed) {
     async_ = on;
     read_rng_.seed(seed);
@@ -165,6 +213,8 @@ class Scripted final : public DgTransport {
     push(s, std::move(o));
   }
   void signal_ready(uint32_t g, uint32_t seq) override { push(kDem, {Ready, int32_t(g), int32_t(seq)}); }
+  // layer tokens: a part's ready word (ready_part)
+  void signal_ready_part(uint32_t part, uint32_t seq) override { push(kDem, {ReadyPart, int32_t(part), int32_t(seq)}); }
   void* event_create() override {
     fault("event_create");
     evs_.push_back(std::make_unique<Ev>());
@@ -273,6 +323,7 @@ class Scripted final : public DgTransport {
   // ---- device model ----
   int32_t entry(uint32_t key) const { return table_[key]; }
   uint32_t ready(uint32_t g) const { return ready_[g]; }
+  uint32_t ready_part(uint32_t p) const { return lm_ready_[p]; }
   int32_t slot_holds(int32_t s) const { return slot_[size_t(s)]; }
   // the key every part of block b holds, -2 if its parts disagree (a write-back partly landed)
   int32_t block_holds(int32_t b) const {
@@ -326,6 +377,7 @@ class Scripted final : public DgTransport {
     uint32_t key;
     int32_t block;
     bool landed, fails;
+    bool aborted = false;
   };
   void fault(const char* what) {
     if (fail_at_ > 0 && --fail_at_ == 0) ts::fail(SS_E_BACKEND, std::string("injected failure: ") + what);
@@ -354,11 +406,14 @@ class Scripted final : public DgTransport {
     fill_block(r.block, r.fails ? -3 : int32_t(r.key));
     if (!r.fails) ++reads_;
   }
+  bool read_queued(uint32_t key) const {
+    return std::find(queued_reads_.begin(), queued_reads_.end(), key) != queued_reads_.end();
+  }
   bool read_held(uint32_t key) const {
-    return std::find(held_reads_.begin(), held_reads_.end(), key) != held_reads_.end();
+    return std::find(held_reads_.begin(), held_reads_.end(), key) != held_reads_.end() || read_queued(key);
   }
   void land_some() {  // each read in flight lands now with probability 1/3, any of them first
-    if (!held_reads_.empty()) {
+    if (!held_reads_.empty() || !queued_reads_.empty()) {
       for (Pend& r : in_flight_)
         if (!read_held(r.key)) land(r);
       return;
@@ -405,6 +460,9 @@ class Scripted final : public DgTransport {
       case Ready:
         ready_[size_t(o.a)] = uint32_t(o.b);
         break;
+      case ReadyPart:
+        lm_ready_[size_t(o.a)] = uint32_t(o.b);
+        break;
       case Record:
         o.ev->completed = std::max(o.ev->completed, o.target);
         break;
@@ -428,7 +486,7 @@ class Scripted final : public DgTransport {
   std::vector<std::pair<uint32_t, uint32_t>> uploads_;
   std::vector<std::unique_ptr<Ev>> evs_;
   std::vector<int32_t> table_, slot_, block_;
-  std::vector<uint32_t> ready_;
+  std::vector<uint32_t> ready_, lm_ready_ = std::vector<uint32_t>(32, 0);
   uint32_t parts_;
   std::set<int32_t> reading_;
   std::vector<Kind> issued_;
@@ -442,7 +500,9 @@ class Scripted final : public DgTransport {
   bool async_ = false, eager_ = false;
   int fail_read_at_ = 0;
   std::deque<Pend> in_flight_;
-  std::vector<uint32_t> held_reads_, ended_;
+  std::vector<uint32_t> held_reads_, ended_, queued_reads_, cancelled_;
+  bool cancel_unlanded_ = false, abort_unlanded_ = false;
+  uint64_t aborts_ = 0;
   uint64_t read_id_ = 0, max_in_flight_ = 0, out_of_order_ = 0, landed_ooo_ = 0;
   std::mt19937_64 read_rng_{1};
   int32_t staging_ = -1;
@@ -494,6 +554,10 @@ struct Shape {
   // skip = 1 in skip layers of a token are not exported (rows 0)
   bool resident = false;
   uint32_t skip = 0;
+  // landings (dg_landing_blocks): landing blocks and their TTL (three-tier only)
+  uint32_t landing = 0, landing_ttl = 1;
+  bool cancel_unlanded = false;  // the transport cancels any landing read not landed yet (never started)
+  bool abort_unlanded = false;   // the transport stops an aborted landing read not landed yet (chunked)
 };
 
 // What the resident runs exercised (their coverage).
@@ -662,6 +726,7 @@ struct Outcome {
   std::vector<int64_t> homes;
   std::vector<int32_t> table, device_table, slots;
   uint64_t max_in_flight = 0, landed_out_of_order = 0;
+  uint32_t landed_end = 0;  // landings: landed units at the end (every read ended)
 };
 
 std::vector<uint64_t> counters(const ts::DgStats& s) { return {s.tokens, s.lookups, s.misses, s.covered, s.fetched, s.prefetched, s.prefetch_used, s.resurrected, s.bank_serves, s.collected_mid, s.evicted, s.evict_short, s.writebacks_done, s.stalled, s.pred_invalid, s.covered_waits, s.predicted, s.predicted_true, s.miss_layers, s.wb_deferred, s.wb_cancelled, s.wb_forced, s.wb_boundary_flushed, s.wb_issued_bytes, s.wb_completed_bytes, s.wb_cancelled_bytes, s.wb_boundary_flushed_bytes, s.winpf_hints, s.winpf_hint_rows, s.prior_issued, s.prior_used, s.prior_late, s.prior_reverted, s.l1_candidates, s.l1_issued, s.l1_used, s.l1_late, s.l1_reverted, s.l1_priced_out, s.l1_skipped_ahead, s.prior_budget_stops}; }
@@ -684,7 +749,8 @@ uint64_t reset_d2d = 0, reset_h2h = 0, reset_staging = 0;
 void reset_compare(DgCore& core, Scripted& t, const DgConfig& c, const std::vector<uint32_t>& order,
                    Violation& v, uint32_t seq, const std::vector<uint8_t>* disk = nullptr) {
   Violation fv;
-  Scripted ft(core.keys(), c.persistent_slots + 2 * c.bank_slots, c.blocks + c.disk_staging, core.gated(), 901, &fv);
+  Scripted ft(core.keys(), c.persistent_slots + 2 * c.bank_slots, c.blocks + c.disk_staging + c.landing_blocks,
+              core.gated(), 901, &fv);
   DgCore fresh(c, &ft);
   fresh.place(order, disk);
   fresh.set_prior(ts::DgPrior(core.prior()));
@@ -788,10 +854,14 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.scored = sh.scored;
   c.boundary_score = sh.boundary_score;
   c.scored_auto = sh.scored_auto;
-  Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks + c.disk_staging, G, seed, &v);
+  c.landing_blocks = sh.landing;
+  c.landing_ttl = sh.landing_ttl;
+  Scripted t(keys, c.persistent_slots + 2 * sh.bank, c.blocks + c.disk_staging + c.landing_blocks, G, seed, &v);
   t.set_slow_d2h(sh.slow_d2h);
   t.set_async_reads(sh.async_reads, seed * 31u + 7u);
   t.set_eager(sh.eager);
+  t.set_cancel_unlanded(sh.cancel_unlanded);
+  t.set_abort_unlanded(sh.abort_unlanded);
   Oracle orc(sh.units);
   orc.disk_tier = c.disk_tier;
   std::vector<uint8_t> disk;  // three-tier: the plan's file tier, `sh.disk` random non-resident keys
@@ -891,8 +961,10 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
       for (uint32_t k = 0; k < keys && v.what.empty(); ++k) {
         const DgCore::Home h = core.home(k);
         if (h == DgCore::Home::Coming) continue;
-        if (h == DgCore::Home::File) {
+        if (h == DgCore::Home::File || h == DgCore::Home::Landing || h == DgCore::Home::Landed) {
           if (t.entry(k) != -1) v.set(std::string("a file home is mapped ") + when);
+          if (h == DgCore::Home::Landed && t.block_holds(core.landing_block_of(k)) != int32_t(k))
+            v.set("unit " + std::to_string(k) + ": its landing block lost its bytes " + when);
           continue;
         }
         const bool on_slot = h == DgCore::Home::Device || h == DgCore::Home::Evicting;
@@ -1180,8 +1252,12 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         const DgCore::Home h = core.home(k);
         const bool on_slot = h == DgCore::Home::Device || h == DgCore::Home::Evicting;
         if (h == DgCore::Home::Coming) continue;  // a prior prefetch in flight: its slot fills on kPf
-        if (h == DgCore::Home::File) {  // three-tier: nothing to hold, nothing mapped
+        if (h == DgCore::Home::File || h == DgCore::Home::Landing || h == DgCore::Home::Landed) {
+          // three-tier: nothing mapped; a landed unit's landing block holds its bytes (a landing read in flight: a
+          // window's prior, between tokens)
           if (t.entry(k) != -1) v.set("a file home is mapped after the boundary");
+          if (h == DgCore::Home::Landed && t.block_holds(core.landing_block_of(k)) != int32_t(k))
+            v.set("unit " + std::to_string(k) + ": its landing block lost its bytes at a boundary");
           continue;
         }
         const int32_t holds = on_slot ? t.slot_holds(core.slot_of(k)) : t.block_holds(core.block_of(k));
@@ -1205,6 +1281,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
     for (uint32_t s = 0; s < c.persistent_slots + 2 * sh.bank; ++s) out.slots.push_back(t.slot_holds(int32_t(s)));
     out.max_in_flight = t.max_in_flight();
     out.landed_out_of_order = t.landed_out_of_order();
+    out.landed_end = core.landing_units();
   } catch (const ts::Error& e) {
     out.threw = true;
     v.set(std::string("exception: ") + e.what());
@@ -4350,7 +4427,8 @@ struct ResRig {
       c.blocks = keys - residents + host_spares;
     }
     if (tweak) tweak(c);
-    t = std::make_unique<Scripted>(keys, c.persistent_slots + 2 * c.bank_slots, c.blocks + c.disk_staging, G, seed, &v);
+    t = std::make_unique<Scripted>(keys, c.persistent_slots + 2 * c.bank_slots,
+                                   c.blocks + c.disk_staging + c.landing_blocks, G, seed, &v);
     core = std::make_unique<DgCore>(c, t.get());
     std::vector<uint32_t> order;
     for (uint32_t k = 0; k < (disk ? keys : residents); ++k) order.push_back(k);
@@ -4440,6 +4518,7 @@ struct ResRig {
       const DgCore::Home h = core->home(k);
       if (h == DgCore::Home::Device || h == DgCore::Home::Evicting) CHECK_EQ(t->slot_holds(core->slot_of(k)), int32_t(k));
       else if (h == DgCore::Home::Host) CHECK_EQ(t->block_holds(core->block_of(k)), int32_t(k));
+      else if (h == DgCore::Home::Landed) CHECK_EQ(t->block_holds(core->landing_block_of(k)), int32_t(k));
       if (core->backed(k)) CHECK_EQ(t->block_holds(core->block_of(k)), int32_t(k));
     }
   }
@@ -6579,4 +6658,729 @@ TEST(dg_pf_revert_to_the_pinned_tail) {
   r.core->check();
   r.verify();
   CHECK(r.v.what.empty());
+}
+
+// ---- the two-stage file prefetch: landings (SS_DG_LANDING) ----
+namespace {
+
+// landing blocks, their TTL, the per-layer prefetch budget (0: no prediction takes a slot, only landings)
+std::function<void(DgConfig&)> land_tweak(uint32_t blocks, uint32_t ttl = 1, uint32_t per_layer = 16) {
+  return [=](DgConfig& c) {
+    c.landing_blocks = blocks;
+    c.landing_ttl = ttl;
+    c.prefetch_per_layer = per_layer;
+    c.prefetch_per_token = per_layer ? 48 : 0;
+  };
+}
+// 72 keys: layer 0 resident, layer 1 units 0-3 pinned and 4-23 file-homed, layer 2 file-homed
+std::vector<uint8_t> land_disk() { return disk_flags(72, 24, 28); }
+std::vector<uint64_t> landing_counts(const ts::DgStats& s) {
+  return {s.landing_issued,       s.landing_promoted,   s.landing_late,   s.landing_wait_ns,
+          s.landing_expired,      s.landing_dropped_full, s.landing_read_bytes, s.landing_failed,
+          s.landing_cancelled,    s.landing_expired_layer, s.landing_skipped_passed, s.landing_yields,
+          s.landing_aborted_bytes};
+}
+
+}  // namespace
+
+// Off (no landing block) is today's code path: no landing counter moves. With landing blocks but no prediction nothing
+// lands, and every placement, table, victim, counter and slot equals the run without them.
+TEST(dg_landing_off_is_today) {
+  for (const Shape* base : {&kDisk, &kDiskTiny, &kDiskZero, &kDiskPredict, &kDiskWinpf})
+    for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 3; ++seed) {
+        const Shape off = with_reads(*base, how);
+        const Outcome a = run(off, 30, seed, DgCore::kNoMutation);
+        if (!a.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, a.violation.c_str());
+        CHECK(a.violation.empty());
+        CHECK(landing_counts(a.st) == std::vector<uint64_t>(13, 0));
+        if (off.predict || off.winpf) continue;
+        Shape on = off;
+        on.landing = 8;
+        const Outcome b = run(on, 30, seed, DgCore::kNoMutation);
+        CHECK(b.violation.empty());
+        CHECK(counters(a.st) == counters(b.st));
+        CHECK(landing_counts(b.st) == std::vector<uint64_t>(13, 0));
+        CHECK_EQ(a.st.disk_reads, b.st.disk_reads);
+        CHECK(a.victims == b.victims);
+        CHECK(a.homes == b.homes);
+        CHECK(a.table == b.table);
+        CHECK(a.device_table == b.device_table);
+        CHECK(a.slots == b.slots);
+      }
+}
+
+// Predicted file-homed units land (no slot taken); a demand of a landed one copies it from its landing block (no file
+// read); one never demanded goes back to its file at the boundary (TTL 1), its block free.
+TEST(dg_landing_promotes_without_a_file_read) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(4));
+  r.t->set_eager(true);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const ts::DgStats& s = r.core->stats();
+  const uint32_t slots0 = r.core->free_slots();
+  const uint64_t reads0 = r.t->reads();
+  const uint32_t p1[3] = {5, 6, 1};  // 5, 6 file-homed: they land; 1 pinned: a prefetch into a slot, as before
+  r.core->serve_prediction(1, p1, 3);
+  CHECK_EQ(s.landing_issued, 2u);
+  CHECK_EQ(r.t->reads() - reads0, 2u);
+  CHECK_EQ(s.prefetched, 1u);
+  CHECK_EQ(r.core->free_slots(), slots0 - 1);  // the landings took none
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Landing);  // (until its end: the next poll or demand)
+  r.core->poll_reads();
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Landed);
+  CHECK_EQ(r.core->file_units(), 48u - 4u);  // a landing's home is still its file
+  CHECK_EQ(r.core->landing_free(), 2u);
+  const uint64_t disk0 = s.disk_reads;
+  serve_layer(r, 1, {5, 7});  // 5 from its landing block, 7 a file miss (one read)
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK_EQ(s.landing_late, 0u);
+  CHECK_EQ(s.disk_reads - disk0, 1u);
+  CHECK_EQ(r.t->reads() - reads0, 3u);
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Coming);
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK_EQ(s.landing_expired, 1u);  // 6, never demanded
+  CHECK(r.core->home(r.core->key(1, 6)) == DgCore::Home::File);
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Device);
+  CHECK_EQ(r.core->landing_free(), 4u);
+  CHECK_EQ(r.core->landing_units(), 0u);
+  CHECK_EQ(s.landing_read_bytes, 2u * 8192u);
+  CHECK_EQ(s.landing_dropped_full, 0u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// No free landing block: the advice is dropped (a landing in flight or landed is never displaced). A landing survives
+// TTL - 1 boundaries (TTL 2: demanded in the next token, still from its block) and expires at the TTL-th.
+TEST(dg_landing_full_and_ttl) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(1, 2));
+  r.t->set_eager(true);
+  const ts::DgStats& s = r.core->stats();
+  auto token = [&](std::vector<uint32_t> pred, uint32_t demand) {
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    if (!pred.empty()) r.core->serve_prediction(1, pred.data(), uint32_t(pred.size()));
+    serve_layer(r, 1, {demand});
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    r.verify();
+  };
+  token({5, 6, 7}, 0);  // 5 lands, 6 and 7 dropped
+  CHECK_EQ(s.landing_issued, 1u);
+  CHECK_EQ(s.landing_dropped_full, 2u);
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Landed);  // one boundary passed (TTL 2)
+  token({8}, 5);  // the block is still 5's: 8 dropped; 5 demanded a token later, from its landing block
+  CHECK_EQ(s.landing_dropped_full, 3u);
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK_EQ(s.landing_expired, 0u);
+  CHECK_EQ(r.core->landing_free(), 1u);
+  token({8}, 0);  // 8 lands, not demanded
+  token({}, 0);   // its second boundary: back to its file
+  CHECK_EQ(s.landing_issued, 2u);
+  CHECK_EQ(s.landing_expired, 1u);
+  CHECK(r.core->home(r.core->key(1, 8)) == DgCore::Home::File);
+  CHECK_EQ(r.core->landing_free(), 1u);
+  CHECK(r.v.what.empty());
+}
+
+// Landings take no GPU slot and cause no eviction or write-back: with prefetches into slots off (budget 0), the same
+// routes with predictions (landings) and without give the same placement, table, victims, write-backs and bytes read
+// by every layer; the only difference is that each promoted landing is a file read fewer.
+TEST(dg_landing_changes_no_placement) {
+  const auto disk = land_disk();
+  uint64_t promoted = 0, expired = 0;
+  for (uint64_t seed = 1; seed <= 12; ++seed) {
+    const uint32_t ttl = seed % 2 ? 1 : 0;  // token expiry, layer expiry
+    ResRig a({24, 24, 24}, 24, 8, 8, false, &disk, 4, seed, 0u, land_tweak(3 + uint32_t(seed % 3), ttl, 0));
+    ResRig b({24, 24, 24}, 24, 8, 8, false, &disk, 4, seed, 0u, land_tweak(0, 1, 0));
+    a.t->set_eager(true);
+    b.t->set_eager(true);
+    std::mt19937_64 rng(seed);
+    for (int tok = 0; tok < 16; ++tok) {
+      std::vector<std::vector<uint32_t>> ids(3), preds(3);
+      for (uint32_t g = 0; g < 3; ++g)
+        for (int i = 0; i < 4; ++i) ids[g].push_back(uint32_t(rng() % 24));
+      for (uint32_t g = 1; g < 3; ++g)
+        preds[g] = {ids[g][0], ids[g][1], uint32_t(rng() % 24), uint32_t(rng() % 24)};
+      const auto ra = a.token(ids, all_run(3), {}, {}, &preds);
+      const auto rb = b.token(ids, all_run(3), {}, {}, nullptr);
+      CHECK(ra == rb);
+    }
+    const ts::DgStats &sa = a.core->stats(), &sb = b.core->stats();
+    CHECK(a.core->table() == b.core->table());
+    for (uint32_t k = 0; k < a.keys; ++k) {
+      CHECK(a.core->home(k) == b.core->home(k));
+      CHECK_EQ(a.core->slot_of(k), b.core->slot_of(k));
+      CHECK_EQ(a.core->block_of(k), b.core->block_of(k));
+    }
+    CHECK_EQ(a.core->free_slots(), b.core->free_slots());
+    CHECK_EQ(a.core->free_blocks(), b.core->free_blocks());
+    CHECK(a.core->host_order() == b.core->host_order());
+    const std::vector<uint64_t> pa = {sa.evicted, sa.writebacks_done, sa.wb_issued_bytes, sa.fetched, sa.misses,
+                                      sa.bank_serves, sa.disk_drops, sa.disk_discards, sa.evict_short, sa.prefetched};
+    const std::vector<uint64_t> pb = {sb.evicted, sb.writebacks_done, sb.wb_issued_bytes, sb.fetched, sb.misses,
+                                      sb.bank_serves, sb.disk_drops, sb.disk_discards, sb.evict_short, sb.prefetched};
+    CHECK(pa == pb);
+    CHECK_EQ(sa.prefetched, 0u);
+    CHECK_EQ(sa.disk_reads + sa.landing_promoted, sb.disk_reads);
+    CHECK_EQ(sa.landing_issued, sa.landing_promoted + sa.landing_expired + sa.landing_expired_layer);
+    CHECK_EQ(ttl ? sa.landing_expired_layer : sa.landing_expired, 0u);
+    promoted += sa.landing_promoted;
+    expired += sa.landing_expired + sa.landing_expired_layer;
+    a.verify();
+    b.verify();
+    CHECK(a.v.what.empty());
+    CHECK(b.v.what.empty());
+  }
+  std::printf("  landings promoted %llu, expired %llu\n", (unsigned long long)promoted, (unsigned long long)expired);
+  CHECK(promoted > 0);
+  CHECK(expired > 0);
+}
+
+// A demand of a unit whose landing read is still in flight ends that read (out of order) and copies from its landing
+// block: exactly one read of it, none from its file. The layer's other misses are issued first (their reads overlap
+// the wait); a repeated late id is covered at its later occurrence.
+TEST(dg_landing_late_one_read) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(4));
+  const uint32_t k5 = r.core->key(1, 5), k7 = r.core->key(1, 7);
+  r.t->set_async_reads(true, 3);
+  r.t->hold_reads({k5, k7});  // neither lands before it is ended
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t p[1] = {5};
+  r.core->serve_prediction(1, p, 1);
+  CHECK(r.core->home(k5) == DgCore::Home::Landing);
+  CHECK_EQ(r.core->landings_in_flight(), 1u);
+  const int32_t lb = r.core->landing_block_of(k5);
+  const ts::DgStats& s = r.core->stats();
+  const uint64_t reads0 = r.t->reads(), disk0 = s.disk_reads, covered0 = s.covered;
+  r.t->clear_issued();
+  serve_layer(r, 1, {5, 7, 5});
+  CHECK_EQ(s.landing_late, 1u);
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK_EQ(s.disk_reads - disk0, 1u);   // 7 only
+  CHECK_EQ(r.t->reads() - reads0, 2u);  // 5's landing read (landed at its end) and 7's
+  CHECK_EQ(s.covered - covered0, 1u);   // the repeated 5
+  CHECK_EQ(std::count(r.t->ended().begin(), r.t->ended().end(), k5), 1);
+  size_t read7 = SIZE_MAX, copy5 = SIZE_MAX;
+  const auto& tr = r.t->trace();
+  for (size_t i = 0; i < tr.size(); ++i) {
+    if (tr[i][1] == Scripted::Read && tr[i][2] == int64_t(k7) && read7 == SIZE_MAX) read7 = i;
+    if (tr[i][1] == Scripted::H2D && tr[i][3] == lb && copy5 == SIZE_MAX) copy5 = i;
+  }
+  CHECK(read7 < copy5 && copy5 < tr.size());
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK_EQ(r.core->landing_free(), 4u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// A failed landing read (failing at its begin, or at its end) frees its block and drops the advice: the unit stays in
+// its file and its demand reads it as any file miss. No bytes count as landed.
+TEST(dg_landing_read_failure) {
+  const auto disk = land_disk();
+  for (bool async : {false, true}) {
+    ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(2));
+    r.t->set_eager(true);
+    const uint32_t k5 = r.core->key(1, 5);
+    if (async) {
+      r.t->set_async_reads(true, 5);
+      r.t->hold_reads({k5});
+    }
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    r.t->fail_read(1);
+    const uint32_t p[1] = {5};
+    r.core->serve_prediction(1, p, 1);
+    const ts::DgStats& s = r.core->stats();
+    CHECK_EQ(s.landing_issued, async ? 1u : 0u);
+    CHECK_EQ(s.landing_failed, async ? 0u : 1u);
+    CHECK(r.core->home(k5) == (async ? DgCore::Home::Landing : DgCore::Home::File));
+    const uint64_t disk0 = s.disk_reads;
+    serve_layer(r, 1, {5});
+    CHECK_EQ(s.landing_failed, 1u);
+    CHECK_EQ(s.landing_promoted + s.landing_late, 0u);
+    CHECK_EQ(s.disk_reads - disk0, 1u);
+    CHECK_EQ(r.core->landing_free(), 2u);
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    CHECK_EQ(s.landing_read_bytes, 0u);
+    CHECK(r.core->home(k5) == DgCore::Home::Device);
+    r.verify();
+    if (!r.v.what.empty()) std::printf("  async %d: %s\n", int(async), r.v.what.c_str());
+    CHECK(r.v.what.empty());
+  }
+}
+
+// make_resident of a landed unit copies it from its landing block (as from a pinned block: no file read), the block
+// free once the copy landed; counted only in resident_*. The other landing expires on schedule.
+TEST(dg_landing_make_resident) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(2, 2));
+  r.t->set_eager(true);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t p[2] = {5, 6};
+  r.core->serve_prediction(1, p, 2);
+  serve_layer(r, 1, {0});
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Landed);
+  const ts::DgStats s0 = r.core->stats();
+  const uint64_t reads0 = r.t->reads();
+  const auto res = r.core->make_resident(1, {5, 2}, {});  // 5 landed, 2 pinned
+  const ts::DgStats& s = r.core->stats();
+  CHECK_EQ(res.copied, 2u);
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Device);
+  CHECK(r.core->home(r.core->key(1, 2)) == DgCore::Home::Device);
+  CHECK_EQ(s.mkres_file_reads - s0.mkres_file_reads, 0u);
+  CHECK_EQ(r.t->reads(), reads0);
+  CHECK_EQ(s.resident_units - s0.resident_units, 2u);
+  CHECK(landing_counts(s) == landing_counts(s0));
+  CHECK_EQ(r.core->landing_free(), 1u);
+  CHECK_EQ(r.core->landing_units(), 1u);
+  r.verify();
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  serve_layer(r, 1, {5});
+  serve_layer(r, 2, {0});
+  r.core->end_token({r.core->key(1, 5), r.core->key(1, 2)});
+  CHECK_EQ(s.landing_expired, 1u);  // 6, its second boundary
+  CHECK_EQ(r.core->landing_free(), 2u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// reset_open with a landing read in flight (a window prior's, between tokens) and a landed unit (TTL 2): both back to
+// their files with no copy, every landing block free, the open state exactly; destruction with a landing read in
+// flight ends it (no read left behind).
+TEST(dg_landing_reset_open_and_destruction) {
+  const auto disk = disk_flags(72, 20, 20);  // keys 0-15 resident, 16-19 pinned, the rest file-homed
+  auto make = [&] {
+    return std::make_unique<ResRig>(std::vector<uint32_t>{24, 24, 24}, 16, 8, 8, false, &disk, 4, 3, 0u,
+                                    land_tweak(4, 2));
+  };
+  ts::DgPrior pr;  // symbol 0: gated layer 0's unit 21 (file-homed)
+  pr.layers = 1;
+  pr.k = 1;
+  pr.row.emplace(0, 0u);
+  pr.unit.push_back(21);
+  pr.p.push_back(0.9f);
+  ts::DgWinpf w;
+  w.enable = true;
+  w.top_k = 1;
+  w.prior_layers = 1;
+  w.prior_cap = 1;
+  w.prior_pmin = 0.5f;
+  w.prior_window_us = 1000000;
+  w.copy_gbps = 1.0;
+  auto r = make(), fresh = make();
+  fresh->core->set_prior(ts::DgPrior(pr));
+  r->core->begin_token(++r->seq);
+  serve_layer(*r, 0, {0});
+  const uint32_t p[1] = {5};
+  r->core->serve_prediction(1, p, 1);
+  serve_layer(*r, 1, {0});
+  serve_layer(*r, 2, {0});
+  r->core->end_token({});
+  CHECK(r->core->home(r->core->key(1, 5)) == DgCore::Home::Landed);
+  r->t->set_async_reads(true, 9);
+  r->t->hold_reads({21});
+  r->core->set_winpf(w);
+  r->core->set_prior(ts::DgPrior(pr));
+  const int32_t sym = 0;
+  r->core->window_hint(&sym, nullptr, 1);
+  CHECK(r->core->home(21) == DgCore::Home::Landing);
+  CHECK_EQ(r->core->landings_in_flight(), 1u);
+  r->core->check();
+  r->core->reset_open();
+  CHECK(r->core->same_open_state(*fresh->core));
+  CHECK(r->core->home(21) == DgCore::Home::File);
+  CHECK(r->core->home(r->core->key(1, 5)) == DgCore::Home::File);
+  CHECK_EQ(r->core->landing_free(), 4u);
+  CHECK_EQ(r->core->landings_in_flight(), 0u);
+  r->verify();
+  // a landing read never started (queued) at reset: cancelled, no read, its unit in its file
+  r->t->queue_reads({21});
+  r->core->set_winpf(w);
+  r->core->window_hint(&sym, nullptr, 1);
+  CHECK(r->core->home(21) == DgCore::Home::Landing);
+  const size_t ended0 = r->t->ended().size();
+  r->core->reset_open();
+  CHECK(r->core->same_open_state(*fresh->core));
+  CHECK_EQ(r->core->stats().landing_cancelled, 1u);
+  CHECK_EQ(r->t->ended().size(), ended0);
+  CHECK_EQ(r->t->cancelled().size(), 1u);
+  CHECK_EQ(r->t->reads_in_flight(), 0u);
+  // destruction: a running read is ended (the transport outlives the core), a queued one dropped
+  r->t->queue_reads({});
+  r->core->set_winpf(w);
+  r->core->window_hint(&sym, nullptr, 1);
+  CHECK_EQ(r->core->landings_in_flight(), 1u);
+  CHECK_EQ(r->t->reads_in_flight(), 1u);
+  CHECK(r->v.what.empty());
+  r->core.reset();
+  CHECK_EQ(r->t->reads_in_flight(), 0u);
+  CHECK_EQ(r->t->cancelled().size(), 1u);
+  auto q = make();
+  q->core->set_winpf(w);
+  q->core->set_prior(ts::DgPrior(pr));
+  q->t->set_async_reads(true, 9);
+  q->t->queue_reads({21});
+  q->core->window_hint(&sym, nullptr, 1);
+  CHECK_EQ(q->t->reads_in_flight(), 1u);
+  q->core.reset();
+  CHECK_EQ(q->t->reads_in_flight(), 0u);
+  CHECK_EQ(q->t->cancelled().size(), 1u);
+  CHECK(q->t->ended().empty());
+  CHECK(r->v.what.empty());
+  CHECK(q->v.what.empty());
+}
+
+// A layer token (ss_dg_begin_layer) demands landed units in its parts: each copied from its landing block before its
+// part's ready, a file miss read as usual.
+TEST(dg_landing_layer_token) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(4, 2));
+  r.t->set_eager(true);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t p[2] = {5, 6};
+  r.core->serve_prediction(1, p, 2);
+  serve_layer(r, 1, {0});
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK(r.core->home(r.core->key(1, 6)) == DgCore::Home::Landed);
+  const ts::DgStats& s = r.core->stats();
+  const uint64_t disk0 = s.disk_reads;
+  r.core->set_layer_token(1);
+  r.core->begin_token(++r.seq);
+  auto part = [&](uint32_t k, std::vector<uint32_t> ids) {
+    r.core->set_part(k);
+    uint64_t m = 0;
+    for (size_t i = 0; i < ids.size(); ++i)
+      if (r.t->entry(r.core->key(1, ids[i])) < 0) m |= 1ull << i;
+    r.core->serve_demand(1, ids.data(), uint32_t(ids.size()), m);
+    r.core->serve_use(1, ids.data(), uint32_t(ids.size()), m);
+    if (m)
+      while (int32_t(r.t->ready_part(k) - r.seq) < 0)
+        if (!r.t->step()) {
+          r.v.set("a part's ready never came");
+          break;
+        }
+    for (uint32_t id : ids) {
+      const int32_t sl = r.t->entry(r.core->key(1, id));
+      if (sl < 0 || r.t->slot_holds(sl) != int32_t(r.core->key(1, id))) r.v.set("a part read wrong bytes");
+    }
+  };
+  part(0, {5, 7});
+  part(1, {6});
+  r.core->end_token({});
+  CHECK_EQ(s.landing_promoted, 2u);
+  CHECK_EQ(s.disk_reads - disk0, 1u);  // 7
+  CHECK_EQ(s.lm_tokens, 1u);
+  CHECK_EQ(r.core->landing_free(), 4u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// The randomized model with landings: every three-tier shape that predicts (plain, deferred write-backs, winpf l+1 and
+// priors, scored, inclusive), synchronous / overlapped / depth-1 reads, few landing blocks (the advice is dropped when
+// full), TTL 1 and 2, with dg_pf_revert_unused and dg_clean_evict now and then; then make_resident episodes and skipped
+// layers. Every layer reads its units' exact bytes, every landed unit's landing block holds its bytes, every invariant
+// and boundary as the oracle's; every landing is promoted, expired, failed or still landed at the end, and its bytes
+// counted once (read, or not read because it was aborted part-way at its target layer: chunked reads).
+TEST(dg_landing_runs) {
+  ts::DgStats sum{};
+  uint64_t runs = 0;
+  auto one = [&](const Shape& sh, uint64_t seed, bool exact) {
+    const Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+    ++runs;
+    if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+    CHECK(o.violation.empty());
+    const ts::DgStats& s = o.st;
+    const uint64_t accounted = s.landing_promoted + s.landing_expired + s.landing_expired_layer + s.landing_failed +
+                               s.landing_cancelled + o.landed_end;
+    if (exact) CHECK_EQ(s.landing_issued, accounted);
+    else CHECK(s.landing_issued >= accounted);  // (make_resident copies landed units: counted in resident_* only)
+    CHECK_EQ(s.landing_read_bytes + s.landing_aborted_bytes,
+             (s.landing_issued - s.landing_failed - s.landing_cancelled) * 8192u);
+    CHECK_EQ(s.landing_yields * 4096u, s.landing_aborted_bytes);  // (the script: one yield, 4096 bytes per abort)
+    if (!sh.abort_unlanded) CHECK_EQ(s.landing_aborted_bytes, 0u);
+    CHECK(s.landing_late <= s.landing_promoted);
+    if (sh.landing_ttl) CHECK_EQ(s.landing_expired_layer + s.landing_skipped_passed, 0u);
+    for (auto f : {&ts::DgStats::landing_issued, &ts::DgStats::landing_promoted, &ts::DgStats::landing_late,
+                   &ts::DgStats::landing_expired, &ts::DgStats::landing_dropped_full, &ts::DgStats::landing_failed,
+                   &ts::DgStats::landing_cancelled, &ts::DgStats::landing_expired_layer,
+                   &ts::DgStats::landing_skipped_passed, &ts::DgStats::landing_aborted_bytes})
+      sum.*f += s.*f;
+  };
+  for (const Shape* base : {&kDiskPredict, &kDiskDefer, &kDiskWinpf, &kDiskScored, &kDiskInclusive})
+    for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 6; ++seed) {
+        Shape sh = with_reads(*base, how);
+        sh.landing = 1 + uint32_t(seed % 6);
+        sh.landing_ttl = seed % 3 == 0 ? 2 : seed % 3 == 1 ? 0 : 1;
+        sh.pf_revert = seed % 4 == 0;
+        sh.clean = seed % 5 == 0;
+        sh.cancel_unlanded = how == 1 && seed % 2 == 0;  // (the reads not landed at a boundary never started)
+        sh.abort_unlanded = how == 1 && seed % 3 != 2;   // (chunked: a read dropped at its layer stops part-way)
+        one(sh, seed, true);
+      }
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    Shape sh = with_resident(with_reads(kDiskPredict, int(seed % 3)), true, seed % 2 ? 4 : 0);
+    sh.landing = 4;
+    sh.landing_ttl = seed % 2 ? 2 : 0;
+    one(sh, seed, false);
+  }
+  std::printf("  %llu runs: landings issued %llu, promoted %llu (late %llu), expired %llu, dropped full %llu, "
+              "cancelled %llu, expired at their layer %llu, skipped (layer passed) %llu\n",
+              (unsigned long long)runs, (unsigned long long)sum.landing_issued,
+              (unsigned long long)sum.landing_promoted, (unsigned long long)sum.landing_late,
+              (unsigned long long)sum.landing_expired, (unsigned long long)sum.landing_dropped_full,
+              (unsigned long long)sum.landing_cancelled, (unsigned long long)sum.landing_expired_layer,
+              (unsigned long long)sum.landing_skipped_passed);
+  CHECK(sum.landing_cancelled > 0);
+  CHECK(sum.landing_expired_layer > 0);
+  CHECK(sum.landing_aborted_bytes > 0);
+  CHECK(sum.landing_issued > 0);
+  CHECK(sum.landing_promoted > 0);
+  CHECK(sum.landing_late > 0);
+  CHECK(sum.landing_expired > 0);
+  CHECK(sum.landing_dropped_full > 0);
+  CHECK_EQ(sum.landing_failed, 0u);
+}
+
+// The boundary never waits for a landing read that never started (queued behind the cap: a wrong prediction at the
+// last layers): it is cancelled (no read, its unit back in its file, its block free, landing_cancelled), and only the
+// reads already running are ended (landed, then expired at TTL 1). A demand of a queued one still promotes it with one
+// read (the read is moved to the demand queue: not cancelled). (A drain cancels the same way: reset_open's test.)
+TEST(dg_landing_boundary_cancels_queued_reads) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(6));
+  const auto k = [&](uint32_t u) { return r.core->key(2, u); };
+  r.t->set_async_reads(true, 3);
+  r.t->hold_reads({k(8)});                     // running: never lands before its end
+  r.t->queue_reads({k(4), k(5), k(6), k(7)});  // never started
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  serve_layer(r, 1, {0});
+  const uint32_t p[5] = {4, 5, 6, 7, 8};
+  r.core->serve_prediction(2, p, 5);
+  CHECK_EQ(r.core->landings_in_flight(), 5u);
+  const ts::DgStats& s = r.core->stats();
+  const uint64_t reads0 = r.t->reads();
+  serve_layer(r, 2, {4, 0});  // 4 demanded while queued: promoted with its one read (late)
+  CHECK_EQ(s.landing_late, 1u);
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK_EQ(r.t->reads() - reads0, 2u);  // 4's landing read and 0's file read
+  r.core->end_token({});
+  CHECK_EQ(s.landing_cancelled, 3u);  // 5, 6, 7: no read, no wait
+  CHECK_EQ(s.landing_expired, 1u);    // 8: ended at the boundary, then expired
+  CHECK_EQ(r.t->reads() - reads0, 3u);
+  const auto& ended = r.t->ended();
+  for (uint32_t u : {5u, 6u, 7u}) {
+    CHECK_EQ(std::count(ended.begin(), ended.end(), k(u)), 0);
+    CHECK(r.core->home(k(u)) == DgCore::Home::File);
+  }
+  CHECK_EQ(std::count(ended.begin(), ended.end(), k(8)), 1);
+  CHECK_EQ(r.t->cancelled().size(), 3u);
+  CHECK_EQ(r.core->landing_free(), 6u);
+  CHECK_EQ(s.landing_read_bytes, 2u * 8192u);
+  CHECK_EQ(s.landing_issued, s.landing_promoted + s.landing_expired + s.landing_cancelled);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// A transport failure recording the event of a landing's promotion copy poisons the core: the copy may still read the
+// landing block, and nothing could tell when it is free.
+TEST(dg_landing_promotion_record_failure_poisons) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(2));
+  r.t->set_eager(true);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t p[1] = {5};
+  r.core->serve_prediction(1, p, 1);
+  r.core->poll_reads();
+  CHECK(r.core->home(r.core->key(1, 5)) == DgCore::Home::Landed);
+  r.t->fail_kind(Scripted::kFRecord, 1);
+  const uint32_t id = 5;
+  bool threw = false;
+  try {
+    r.core->serve_demand(1, &id, 1, 1);
+  } catch (const ts::Error&) {
+    threw = true;
+  }
+  CHECK(threw);
+  CHECK(r.t->kind_fired());
+  CHECK(r.core->poisoned());
+}
+
+// ---- landing_ttl 0: expiry at the target layer ----
+
+// Six gated layers, every layer predicting two file-homed units of the next and demanding one of them: with layer
+// expiry a pool of four blocks (two layers' worth) serves every layer of every token (nothing dropped for a full pool:
+// the undemanded landing leaves its block right after its layer); with token expiry (TTL 1) the same pool fills up and
+// predictions are dropped. Bytes exact either way.
+TEST(dg_landing_layer_expiry_reuses_blocks) {
+  const auto disk = disk_flags(144, 24, 28);  // layer 0 resident, layer 1 units 0-3 pinned, the rest file-homed
+  std::vector<uint64_t> dropped(2), promoted(2), expired_layer(2);
+  for (uint32_t ttl : {0u, 1u}) {
+    ResRig r({24, 24, 24, 24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(4, ttl, 0));
+    r.t->set_eager(true);
+    for (uint32_t tok = 0; tok < 10; ++tok) {
+      r.core->begin_token(++r.seq);
+      serve_layer(r, 0, {0});
+      for (uint32_t g = 1; g < 6; ++g) {
+        const uint32_t a = 4 + (2 * tok + 3 * g) % 20, b = 4 + (2 * tok + 3 * g + 1) % 20;  // file-homed in layer 1
+        const uint32_t p[2] = {b, a};  // the wrong guess first: with token expiry it holds a block the rest of the token
+        r.core->serve_prediction(g, p, 2);
+        serve_layer(r, g, {a});
+      }
+      r.core->end_token({});
+      r.verify();
+    }
+    const ts::DgStats& s = r.core->stats();
+    dropped[ttl] = s.landing_dropped_full;
+    promoted[ttl] = s.landing_promoted;
+    expired_layer[ttl] = s.landing_expired_layer;
+    CHECK_EQ(s.landing_issued, s.landing_promoted + s.landing_expired + s.landing_expired_layer);
+    CHECK_EQ(s.landing_read_bytes, s.landing_issued * 8192u);
+    CHECK_EQ(r.core->landing_free(), 4u);
+    CHECK(r.v.what.empty());
+  }
+  std::printf("  layer expiry: dropped %llu promoted %llu expired at layer %llu; token expiry: dropped %llu "
+              "promoted %llu\n",
+              (unsigned long long)dropped[0], (unsigned long long)promoted[0], (unsigned long long)expired_layer[0],
+              (unsigned long long)dropped[1], (unsigned long long)promoted[1]);
+  CHECK_EQ(dropped[0], 0u);
+  CHECK(promoted[0] > 0);
+  CHECK(expired_layer[0] > 0);
+  CHECK(dropped[1] > 0);
+  CHECK(promoted[0] > promoted[1]);
+  CHECK_EQ(expired_layer[1], 0u);
+}
+
+// At its target layer's demand an undemanded landing leaves at once: landed -> its file, block free; still queued ->
+// cancelled (no read); running -> back to its file when its read ends (never promoted; its block free then). A
+// prediction for a layer already served is not issued. The demanded one is promoted as usual.
+TEST(dg_landing_layer_expiry_states) {
+  const auto disk = land_disk();
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(4, 0));
+  const auto k = [&](uint32_t u) { return r.core->key(1, u); };
+  r.t->set_async_reads(true, 3);
+  r.t->hold_reads({k(7)});   // running until ended
+  r.t->queue_reads({k(6)});  // never started
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t p[4] = {4, 5, 6, 7};
+  r.core->serve_prediction(1, p, 4);
+  r.core->poll_reads();  // 4 and 5 landed
+  CHECK(r.core->home(k(5)) == DgCore::Home::Landed);
+  const ts::DgStats& s = r.core->stats();
+  const uint64_t reads0 = r.t->reads();
+  serve_layer(r, 1, {4});
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK(r.core->home(k(5)) == DgCore::Home::File);  // landed, undemanded: at once
+  CHECK(r.core->home(k(6)) == DgCore::Home::File);  // queued: cancelled
+  CHECK_EQ(s.landing_cancelled, 1u);
+  CHECK_EQ(r.t->cancelled().size(), 1u);
+  CHECK(r.core->home(k(7)) == DgCore::Home::Landing);  // running: until its read ends
+  CHECK_EQ(s.landing_expired_layer, 1u);
+  CHECK_EQ(r.core->landing_free(), 2u);  // 5's and 6's (4's behind its copy, 7's still read into)
+  const uint32_t late[1] = {8};
+  r.core->serve_prediction(1, late, 1);  // layer 1 already served: not issued
+  CHECK_EQ(s.landing_skipped_passed, 1u);
+  CHECK_EQ(s.landing_issued, 4u);
+  serve_layer(r, 2, {0});
+  r.core->end_token({});  // 7's read ends: back to its file, never promoted
+  CHECK(r.core->home(k(7)) == DgCore::Home::File);
+  CHECK_EQ(s.landing_expired_layer, 2u);
+  CHECK_EQ(s.landing_promoted, 1u);
+  CHECK_EQ(s.landing_expired, 0u);
+  CHECK_EQ(r.t->reads() - reads0, 2u);  // 7's landing read and layer 2's file read: none for 4 (promoted) or 6
+  CHECK_EQ(std::count(r.t->ended().begin(), r.t->ended().end(), k(6)), 0);
+  CHECK_EQ(s.landing_read_bytes, 3u * 8192u);  // 4, 5, 7
+  CHECK_EQ(r.core->landing_free(), 4u);
+  CHECK_EQ(s.landing_issued,
+           s.landing_promoted + s.landing_expired_layer + s.landing_cancelled + s.landing_expired);
+  r.verify();
+  CHECK(r.v.what.empty());
+  // the next token: layer 1 may be predicted again (served_ is per token)
+  r.t->hold_reads({});
+  r.t->queue_reads({});
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  r.core->serve_prediction(1, late, 1);
+  CHECK_EQ(s.landing_issued, 5u);
+  serve_layer(r, 1, {8});
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK_EQ(s.landing_promoted, 2u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// A chunked landing read running when its target layer passes undemanded is aborted (the transport stops it at its next
+// chunk): it ends aborted, its unit back in its file and its block free exactly as a running one dropped when it ends
+// (never promoted, landing_expired_layer), its unread bytes in landing_aborted_bytes, the bytes it read in
+// landing_read_bytes, its yields counted. A transport that lets the read run to its end (the default: whole reads)
+// gives the behaviour before. The next token reuses the block; every byte read stays exact.
+TEST(dg_landing_layer_expiry_aborts_running_chunked_read) {
+  const auto disk = land_disk();
+  for (bool chunked : {true, false}) {
+    ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, land_tweak(2, 0));
+    const auto k = [&](uint32_t u) { return r.core->key(1, u); };
+    r.t->set_async_reads(true, 5);
+    r.t->set_abort_unlanded(chunked);
+    r.t->hold_reads({k(7)});  // running until ended (or aborted)
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    const uint32_t p[2] = {4, 7};
+    r.core->serve_prediction(1, p, 2);
+    r.core->poll_reads();  // 4 landed
+    const ts::DgStats& s = r.core->stats();
+    serve_layer(r, 1, {4});
+    CHECK_EQ(r.t->aborts(), chunked ? 1u : 0u);
+    if (chunked) {
+      r.core->poll_reads();  // the aborted read is done: ended now, back to its file, its block free
+      CHECK(r.core->home(k(7)) == DgCore::Home::File);
+      CHECK_EQ(r.core->landing_block_of(k(7)), -1);
+      CHECK_EQ(s.landing_expired_layer, 1u);
+      CHECK_EQ(s.landing_aborted_bytes, 4096u);
+      CHECK_EQ(s.landing_yields, 1u);
+    } else {
+      CHECK(r.core->home(k(7)) == DgCore::Home::Landing);  // runs to its end
+      CHECK_EQ(s.landing_aborted_bytes, 0u);
+    }
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    CHECK(r.core->home(k(7)) == DgCore::Home::File);
+    CHECK_EQ(s.landing_expired_layer, 1u);
+    CHECK_EQ(s.landing_promoted, 1u);
+    CHECK_EQ(s.landing_read_bytes + s.landing_aborted_bytes, 2u * 8192u);
+    CHECK_EQ(s.landing_aborted_bytes, chunked ? 4096u : 0u);
+    CHECK_EQ(r.core->landing_free(), 2u);
+    r.verify();
+    CHECK(r.v.what.empty());
+    // the next token: 7 demanded is a file miss (its exact bytes, never the partial landing block), its old landing
+    // block lands another unit
+    r.t->hold_reads({});
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    const uint32_t q[1] = {9};
+    r.core->serve_prediction(1, q, 1);
+    serve_layer(r, 1, {7, 9});
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    CHECK_EQ(s.landing_promoted, 2u);
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
 }

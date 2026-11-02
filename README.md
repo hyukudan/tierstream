@@ -262,6 +262,23 @@ Flash on one RTX PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host RAM, one 
 5.45 tok/s at queue 1 -> 6.55 tok/s at queue 4 (+20 %), +26 % with speculative decoding; queue 16 = queue 4 (one
 drive saturates at 4).
 
+**Two-stage file prefetch (`dg_landing_blocks`, opt-in).** In a three-tier open a predicted file unit normally needs
+a free GPU slot, which is rare when VRAM is small. With `dg_landing_blocks = L` (and `dg_disk_queue > 1`), L pinned
+landing blocks are set aside: a predicted file unit is read into one while earlier layers compute, taking no GPU slot
+and causing no eviction or write-back. Its demand then costs one host-to-device copy instead of a file read. Landing
+reads queue behind demand reads (at most `dg_landing_max_queued` running), and a landing its layer did not use returns
+to its file right after that layer (`dg_landing_ttl = 0`, the default; N >= 1 keeps it N tokens), so a few layers'
+worth of blocks serve every layer. Off by default; the planner charges the blocks. Counted in `ss_dg_stats.landing_*`.
+
+Landing reads yield to demand reads: they run in 4 MiB chunks (`dg_landing_chunk`) and hand their reader to a waiting
+demand read between chunks, one reader always stays free for demand reads, and a landing its layer no longer needs
+stops at its next chunk. Measured with GLM-5.3-Flash on one RTX PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host
+RAM, model striped over three NVMe drives, 16 landing blocks, 8 landing reads, output identical in every arm: decode
++19.6 % / +22.6 % (1K prompt cold / warm) and +39.6 % / +32.5 % (8K prompt) against no landing; the same landing with
+whole, non-yielding reads (`dg_landing_chunk = 0xFFFFFFFF`, the earlier scheduler) measured about equal to no landing,
+and slower at the same depth before. Repeats of one setting varied by 15-55 %, so the sizes are not precise; all four
+cells were faster.
+
 **`ss_dg_make_resident` reads in flight.** Up to `min(dg_disk_queue, dg_disk_staging)` file reads run together and are
 finished as they complete; the copied units still become the most recent in the order given, so placement does not
 depend on read timing. Its own reads, bytes, wait time, host-to-device and write-back bytes are in `ss_dg_stats.mkres_*`.

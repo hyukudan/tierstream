@@ -1424,7 +1424,10 @@ TEST(library_unset_is_the_plan_of_before) {
   }
   static_assert(offsetof(ss_budget_in, dg_gated_layers) == offsetof(ss_budget_in, reserved1) + 4, "appended");
   static_assert(offsetof(ss_budget_out, lib_host_bytes) == offsetof(ss_budget_out, host_capped) + 4, "appended");
-  static_assert(sizeof(ss_budget_out) == offsetof(ss_budget_out, reserved0) + 4, "the struct's end");
+  static_assert(offsetof(ss_budget_out, lib_landing_bytes) == offsetof(ss_budget_out, reserved0) + 4, "appended");
+  static_assert(sizeof(ss_budget_out) == offsetof(ss_budget_out, lib_landing_bytes) + 8, "the struct's end");
+  static_assert(offsetof(ss_budget_in, dg_landing_blocks) == offsetof(ss_budget_in, dg_bounce_request) + 8, "appended");
+  static_assert(sizeof(ss_budget_in) == offsetof(ss_budget_in, reserved2) + 4, "the struct's end");
   ss_budget_in d;
   ss_budget_in_defaults(&d);
   CHECK_EQ(d.dg_gated_layers + d.dg_disk_queue, 0u);
@@ -1510,6 +1513,54 @@ TEST(library_set_is_a_fixed_host_part) {
               after.lib_bounce_readers, (unsigned long long)before.pinned, (unsigned long long)after.pinned);
 }
 
+// SS_DG_LANDING: the landing blocks (ss_budget_in.dg_landing_blocks) are a fixed pinned host part of plans with a file
+// tier: lib_landing_bytes = blocks x unit_bytes, in lib_host_bytes, host_fixed_bytes, the pinned peak and the bytes
+// the host must have; under a RAM cap the pinned room is that much lower. A plan without a file tier places as before
+// (0, unset: library_unset_is_the_plan_of_before); the JSON names them only when asked for.
+TEST(library_landing_blocks) {
+  uint64_t three = 0;
+  for (Card& k : library_cases()) {
+    if (k.in.unified || k.in.host_avail_bytes != SS_BUDGET_AUTO) continue;
+    library_inputs(k.in);
+    const ss_budget_out a = lib_plan(k.in);
+    ss_budget_in in = k.in;
+    in.dg_landing_blocks = 10;
+    const ss_budget_out b = lib_plan(in);
+    std::string ja(ss_budget_plan_json(&k.in, &a, nullptr, 0) + 1, '\0');
+    ja.resize(ss_budget_plan_json(&k.in, &a, &ja[0], ja.size()));
+    std::string jb(ss_budget_plan_json(&in, &b, nullptr, 0) + 1, '\0');
+    jb.resize(ss_budget_plan_json(&in, &b, &jb[0], jb.size()));
+    CHECK(ja.find("landing") == std::string::npos);
+    CHECK(jb.find("\"dg_landing_blocks\":10") != std::string::npos);
+    CHECK(jb.find("\"lib_landing_bytes\":" + std::to_string(b.lib_landing_bytes)) != std::string::npos);
+    if (!a.three_tier) {  // no file tier: nothing to land, nothing charged (only the minimum RAM cap, whose smallest
+      // placement has a file tier, charges them)
+      CHECK_EQ(b.lib_landing_bytes, 0u);
+      CHECK_EQ(b.lib_host_bytes, a.lib_host_bytes);
+      CHECK_EQ(b.host_fixed_bytes, a.host_fixed_bytes);
+      CHECK_EQ(b.resident, a.resident);
+      CHECK_EQ(b.pinned, a.pinned);
+      CHECK_EQ(b.pinned_peak_bytes, a.pinned_peak_bytes);
+      CHECK(b.min_ram_total_bytes >= a.min_ram_total_bytes);
+      continue;
+    }
+    ++three;
+    const uint64_t land = 10 * k.in.unit_bytes;
+    CHECK_EQ(b.lib_landing_bytes, land);
+    CHECK_EQ(b.lib_host_bytes, a.lib_host_bytes + land);
+    CHECK_EQ(b.host_fixed_bytes, a.host_fixed_bytes + land);
+    if (!b.refused && b.pinned == a.pinned) {
+      CHECK_EQ(b.pinned_peak_bytes, a.pinned_peak_bytes + land);
+      CHECK_EQ(b.need_host_bytes, a.need_host_bytes + land);
+    }
+    if (k.in.ram_total_bytes && !a.refused && !b.refused) {
+      CHECK_EQ(b.room_bytes + land, a.room_bytes);
+      CHECK(b.pinned + 10 >= a.pinned && b.pinned <= a.pinned);  // each landing block is a pinned unit fewer
+    }
+  }
+  CHECK(three > 0);
+}
+
 // The unified pool charges the library too: with it the plan never uses more than the pool.
 TEST(library_unified_pool) {
   Card k;
@@ -1536,8 +1587,10 @@ TEST(library_planner_equals_the_open) {
   for (uint64_t align : {uint64_t(4096), uint64_t(65536)})
     for (uint32_t queue : {0u, 1u, 2u, 8u})
       for (uint64_t request : {uint64_t(0), uint64_t(64) << 10})
-        for (bool disk : {false, true}) {
+        for (bool disk : {false, true})
+        for (uint32_t land : {0u, 5u}) {
           if (!disk && queue) continue;  // (dg_disk_queue needs dg_disk_tier)
+          if (land && (!disk || queue <= 1)) continue;  // (landing blocks need dg_disk_tier and dg_disk_queue > 1)
           std::string js = model.json;
           const std::string a = "\"align\":4096";
           js.replace(js.find(a), a.size(), "\"align\":" + std::to_string(align));
@@ -1553,6 +1606,7 @@ TEST(library_planner_equals_the_open) {
           o.dg_disk_tier = disk;
           o.dg_disk_queue = queue;
           o.dg_disk_staging = disk ? 3 : 0;
+          o.dg_landing_blocks = land;
           std::vector<uint8_t> tiers = model.tiers(16);
           if (disk)
             for (size_t i = 0; i < tiers.size(); ++i)
@@ -1560,7 +1614,8 @@ TEST(library_planner_equals_the_open) {
           const ss::Plan p = ss::plan_from_tiers(d, b, tiers);
           const ss::DgLayout x = ss::dg_layout(d, p, o);
           const uint64_t open = x.mapped_bytes + x.bounce_bytes * x.bounce_readers + x.staging_bytes +
-                                uint64_t(x.S) * x.host_stride;
+                                uint64_t(x.S) * x.host_stride + uint64_t(x.L) * x.host_stride;
+          CHECK_EQ(x.L, land);
           // the planner: the library inputs from the same descriptor and options; a pinned-tier request that sends
           // experts to the files exactly when the open has a file tier
           ss_budget_in in;
@@ -1568,6 +1623,7 @@ TEST(library_planner_equals_the_open) {
           CHECK_OK(ss_budget_in_dg_library(&in, cdx, &o));
           CHECK_EQ(in.dg_gated_layers, uint32_t(model.G));
           CHECK_EQ(in.staging, disk ? 3u : 8u);
+          CHECK_EQ(in.dg_landing_blocks, land);
           in.keys = uint64_t(model.G) * uint64_t(model.U);
           in.slot_bytes = model.unit();
           in.unit_bytes = x.host_stride;
@@ -1583,6 +1639,7 @@ TEST(library_planner_equals_the_open) {
           CHECK_EQ(out.lib_bounce_readers, x.bounce_readers);
           CHECK_EQ(out.lib_staging_bytes, x.staging_bytes);
           CHECK_EQ(out.lib_disk_staging_bytes, uint64_t(x.S) * x.host_stride);
+          CHECK_EQ(out.lib_landing_bytes, uint64_t(x.L) * x.host_stride);
           ss_desc_free(cdx);
         }
   // arguments: NULL in / descriptor, an older input struct without the fields; NULL options = the defaults

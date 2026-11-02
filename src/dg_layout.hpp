@@ -30,6 +30,10 @@ struct DgLayout {
   // file reads in flight (1 = synchronous; SS_DG_DISK_QUEUE_AUTO resolved, dg_resolve_disk_queue); disk_locations =
   // the most read locations of a gated source (dg_disk_locations; counted only for AUTO, else 0)
   uint32_t F = 0, S = 0, I = 0, disk_queue = 0, disk_locations = 0;
+  // landings (dg_landing_blocks): L pinned landing blocks (only with a file tier in the plan: F > 0), block indices
+  // blocks + S .. blocks + S + L - 1; landing reads running at most (the pool's cap); the TTL in tokens (0: expiry at
+  // the target layer); a landing read's chunk bytes (0: one whole read, dg_landing_chunk 0xFFFFFFFF)
+  uint32_t L = 0, landing_queued = 1, landing_ttl = 0, landing_chunk = 4u << 20;
   bool disk_tier = false, disk_prefetch = false;
   std::vector<uint8_t> disk;
   uint32_t persistent_slots = 0, slots = 0, guard_slot = 0, blocks = 0;
@@ -77,14 +81,17 @@ struct DgHostBytes {
   uint32_t bounce_readers = 0;  // the context's thread + the disk readers (dg_disk_queue > 1)
   uint64_t staging = 0;         // pinned: one unit, 4 KiB rounded
   uint64_t disk_staging = 0;    // pinned: the file tier's staging buffers, one host stride each
+  uint64_t landing = 0;         // pinned: the landing blocks (dg_landing_blocks), one host stride each
   uint64_t bounce_total() const { return bounce * bounce_readers; }  // (checked by dg_host_bytes)
-  uint64_t total() const { return mapped + bounce_total() + staging + disk_staging; }
+  uint64_t total() const { return mapped + bounce_total() + staging + disk_staging + landing; }
 };
 // gated = G; unit_bytes = one unit; part_max = its largest part; max_align = the largest source alignment (4096 at
 // least); staging_request = ss_options.staging_bytes (0 = 16 MiB, at most 16 MiB); disk_queue / disk_staging = file
-// reads in flight and staging buffers, resolved (0 without the disk tier). Throws SS_E_INVALID on overflow.
+// reads in flight and staging buffers, resolved (0 without the disk tier); landing_blocks = the landing blocks
+// allocated (0 without a file tier). Throws SS_E_INVALID on overflow.
 DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max, uint64_t max_align,
-                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging);
+                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging,
+                          uint32_t landing_blocks = 0);
 // The read locations (directories) serving the gated sources' bytes: the most over the sources a gated layer's parts
 // read of stripe_locations (the primary plus each weight_dirs directory holding that source's stripe manifest; 1 = not
 // striped). Directories, not volumes: two directories on one drive count twice. A stat per directory, before any
@@ -107,9 +114,9 @@ struct DgDiskQueue {
 };
 DgDiskQueue dg_resolve_disk_queue(const Desc& d, const ss_options& o);
 // The planner's inputs for that memory (ss_budget_in_dg_library): the gated layers, the largest part, the source
-// alignment, the bounce request and the disk queue of this descriptor and these options (AUTO resolved as the open
-// resolves it, dg_resolve_disk_queue), and staging = the open's staging buffers (dg_disk_staging, 0 = 8, or the AUTO
-// raise).
+// alignment, the bounce request, the disk queue (AUTO resolved as the open resolves it, dg_resolve_disk_queue) and the
+// landing blocks (0 without dg_disk_tier) of this descriptor and these options, and staging = the open's staging
+// buffers (dg_disk_staging, 0 = 8, or the AUTO raise).
 void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in);
 // Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);

@@ -292,6 +292,27 @@ Medido con DeepSeek V4.1 Flash en una RTX PRO 6000 limitada a 24 GiB de VRAM y 3
 salida idéntica en todas las variantes: 5.45 tok/s con cola 1 -> 6.55 tok/s con cola 4 (+20 %), +26 % con decodificación
 especulativa; cola 16 = cola 4 (una unidad se satura con 4).
 
+**Prefetch de archivo en dos etapas (`dg_landing_blocks`, opcional).** En una apertura de tres niveles, una unidad de
+archivo predicha necesita normalmente un hueco libre en la GPU, algo raro cuando la VRAM es pequeña. Con
+`dg_landing_blocks = L` (y `dg_disk_queue > 1`) se reservan L bloques de aterrizaje en memoria fijada: una unidad de
+archivo predicha se lee en uno de ellos mientras calculan las capas anteriores, sin ocupar un hueco de la GPU y sin
+provocar desalojos ni escrituras de vuelta. Su demanda cuesta entonces una copia de host a dispositivo en lugar de una
+lectura de archivo. Las lecturas de aterrizaje esperan detrás de las lecturas por demanda (como mucho
+`dg_landing_max_queued` en curso), y un aterrizaje que su capa no usó vuelve a su archivo justo después de esa capa
+(`dg_landing_ttl = 0`, el valor por defecto; N >= 1 lo conserva N tokens), así que unos pocos bloques sirven a todas las
+capas. Desactivado por defecto; el planificador factura los bloques. Se cuenta en `ss_dg_stats.landing_*`.
+
+Las lecturas de aterrizaje ceden el paso a las lecturas por demanda: se hacen en fragmentos de 4 MiB
+(`dg_landing_chunk`) y entre fragmentos entregan su lector a una lectura por demanda que espera, un lector queda siempre
+libre para las lecturas por demanda, y un aterrizaje que su capa ya no necesita se detiene en su siguiente fragmento.
+Medido con GLM-5.3-Flash en una RTX PRO 6000 limitada a 24 GiB de VRAM y 32 GiB de RAM del host, modelo repartido en
+franjas sobre tres unidades NVMe, 16 bloques de aterrizaje, 8 lecturas de aterrizaje, salida idéntica en todas las
+variantes: decode +19.6 % / +22.6 % (prompt de 1K en frío / en caliente) y +39.6 % / +32.5 % (prompt de 8K) frente a
+no usar aterrizaje; el mismo aterrizaje con lecturas completas que no ceden el paso (`dg_landing_chunk = 0xFFFFFFFF`, el
+planificador anterior) midió aproximadamente igual que sin aterrizaje, y antes era más lento con la misma profundidad.
+Las repeticiones de una misma configuración variaron entre un 15 y un 55 %, así que las magnitudes no son precisas; las
+cuatro celdas fueron más rápidas.
+
 **Lecturas en vuelo de `ss_dg_make_resident`.** Hasta `min(dg_disk_queue, dg_disk_staging)` lecturas de archivo se
 ejecutan a la vez y se completan según terminan; las unidades copiadas pasan igualmente a ser las más recientes en el
 orden indicado, de modo que la ubicación no depende del orden de las lecturas. Sus lecturas, bytes, tiempo de espera y

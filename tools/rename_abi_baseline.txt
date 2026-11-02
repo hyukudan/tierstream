@@ -211,3 +211,5 @@ ss.h-sha256 d4c2e2e4e896d7d065de9752588ef11f2fac769efacf25f4ce24fc1a0e9fa7af
 
 # read queue for the read locations (additive: appended SS_DG_DISK_QUEUE_AUTO, appended ss_dg_stats disk_queue_resolved / disk_locations; comments: dg_disk_queue AUTO, ss_budget_in.dg_disk_queue resolved, ss_budget_in_dg_library resolves AUTO)
 ss.h-sha256 75ae91592334dccfae908d121645ef362b8ebdf063c8390f73a78355dfea9859
+# two-stage file prefetch with yielding landing reads (additive, after the AUTO queue fields: appended ss_options dg_landing_blocks / dg_landing_max_queued / dg_landing_ttl / reserved10 / dg_landing_chunk / reserved11, ss_budget_in dg_landing_blocks / reserved2, ss_budget_out lib_landing_bytes, ss_dg_stats landing_* (issued .. aborted_bytes), SS_DG_LANDING, SS_DG_LANDING_YIELD)
+ss.h-sha256 ecc37dc51444cfbb3c8ee603c40d92d230c3981009bee15a654348ac7babb8a2
