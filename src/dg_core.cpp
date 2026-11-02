@@ -45,6 +45,9 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
   bank_first_ = c_.persistent_slots;
   e_.assign(keys_, Entry{});
   table_.assign(keys_, -1);
+  mark_lo_.assign(gated(), kNone);
+  mark_hi_.assign(gated(), 0);
+  ranges_.assign(2 * size_t(gated()), 0);
   bank_key_.assign(2u * size_t(c_.bank_slots), kNone);
   pf_layer_.assign(gated(), 0);
   layer_missed_.assign(gated(), 0);
@@ -230,7 +233,7 @@ void DgCore::finish_pending(const Pending& p) {
 void DgCore::undo_pending(const Pending& p) {
   Entry& x = e_[p.key];
   const uint32_t g = gated_of(p.key);
-  table_[p.key] = -1;
+  set_entry(p.key, -1);
   if (p.bank) {
     bank_key_[size_t(p.slot) - bank_first_] = kNone;
     banked_.erase(std::find(banked_.begin(), banked_.end(), p.key));
@@ -570,7 +573,7 @@ void DgCore::place(const std::vector<uint32_t>& residents, const std::vector<uin
     Entry& x = e_[order[i]];
     x.home = Home::Device;
     x.slot = int32_t(i);
-    table_[order[i]] = x.slot;
+    table_[order[i]] = x.slot;  // (unmarked: the owner uploads the whole table at the open)
   }
   head_ = tail_ = kNone;
   for (uint32_t i = dev0; i-- > 0;) push_front(order[i]);  // the first resident most recent
@@ -643,8 +646,43 @@ void* DgCore::event() {
   return ev;
 }
 
-void DgCore::write_entry(DgTransport::Stream s, uint32_t k, int32_t v) {
+// Every write of the mirror marks its key: per gated layer, the range from its first to its last changed key since the
+// last upload. An upload writes only those ranges, so a layer none of whose entries changed (a held layer: its units
+// are never victims) is never rewritten while an engine kernel may read it. Unchanged keys inside a range get their
+// own (identical) value: the device table equals the mirror at every key after each upload.
+void DgCore::set_entry(uint32_t k, int32_t v) {
   table_[k] = v;
+  const uint32_t g = gated_of(k);
+  mark_lo_[g] = std::min(mark_lo_[g], k);
+  mark_hi_[g] = std::max(mark_hi_[g], k);
+}
+
+void DgCore::clear_marks() {
+  std::fill(mark_lo_.begin(), mark_lo_.end(), kNone);
+  std::fill(mark_hi_.begin(), mark_hi_.end(), 0u);
+}
+
+// One range per marked layer, then the kDem sync (also with no range, as the whole-table upload); the marks are
+// cleared only once the transport accepted it (a failed upload keeps them for the retry).
+void DgCore::upload() {
+  if (!range_uploads_) {  // no held layer: the whole table in one copy, as before
+    t_->upload_table(table_.data(), keys_);
+    clear_marks();
+    return;
+  }
+  uint32_t n = 0;
+  for (uint32_t g = 0; g < gated(); ++g)
+    if (mark_lo_[g] <= mark_hi_[g]) {
+      ranges_[2 * n] = mark_lo_[g];
+      ranges_[2 * n + 1] = mark_hi_[g] - mark_lo_[g] + 1;
+      ++n;
+    }
+  t_->upload_table_ranges(table_.data(), ranges_.data(), n);
+  clear_marks();
+}
+
+void DgCore::write_entry(DgTransport::Stream s, uint32_t k, int32_t v) {
+  set_entry(k, v);
   t_->write_entry(s, k, v);
 }
 
@@ -973,7 +1011,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     if (!pending_.empty()) ++st_.disk_overlapped;
     pending_.push_back({k, slot, stage, s, prefetch, bank, free_counted, h, entries_});
     st_.disk_max_in_flight = std::max<uint64_t>(st_.disk_max_in_flight, pending_.size());
-    table_[k] = slot;  // the mirror now (as a synchronous fetch), the device's entry with the copy
+    set_entry(k, slot);  // the mirror now (as a synchronous fetch), the device's entry with the copy
   } else {
     copy_in(s, k, slot, x.block);
   }
@@ -1308,7 +1346,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       // its block, or (read from its file) its file; dg_pf_revert_unused: at the pinned recency tail (an unused
       // prediction is not a use: the first to drop to its file)
       to_lower(k, c_.pf_revert);
-      if (mut_ != kRevertKeepsEntry) table_[k] = -1;
+      if (mut_ != kRevertKeepsEntry) set_entry(k, -1);
       unlink(k);
       --on_device_;
       x.via_prefetch = false;
@@ -1346,7 +1384,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     Entry& x = e_[k];
     if (x.home == Home::Bank) {
       to_lower(k);
-      table_[k] = -1;
+      set_entry(k, -1);
     }
     if (x.pf_done) {  // never: a bank serve is a demand
       event_pool_.push_back(x.pf_done);
@@ -1398,7 +1436,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       --on_device_;
       free_slots_.push_back(x.slot);
       to_lower(k);
-      table_[k] = -1;
+      set_entry(k, -1);
       ++st_.evicted;
       ++lc_[gated_of(k)].evicted;
       ++got;
@@ -1416,7 +1454,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     x.home = Home::Evicting;
     x.block = b;
     x.wb_pending = true;
-    table_[k] = -1;
+    set_entry(k, -1);
     victims_.push_back(k);
     ++got;
     return true;
@@ -1479,7 +1517,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   // reference, cache.cpp:552-566). The device is done with the token, and an evicting slot is reused only after its
   // write-back's event.
   if (diag_) bt.select_us = us_since(t);
-  t_->upload_table(table_.data(), keys_);  // the device table = the host mirror
+  upload();  // the device table = the host mirror (the changed layers' entries only)
   if (diag_) bt.upload_us = us_since(t);
   // wb_defer: a victim selected now is deferred into the next token, behind what the last token left. Of those older
   // records, as many as the larger of this and the last boundary's victim counts are carried along (pending counted
@@ -1841,12 +1879,12 @@ uint32_t DgCore::seed(const std::vector<uint32_t>& keys) {
     x.block = -1;
     x.slot = slot;
     x.home = Home::Device;
-    table_[k] = slot;
+    set_entry(k, slot);
     push_front(k);
     ++on_device_;
     ++n;
   }
-  if (n) t_->upload_table(table_.data(), keys_);  // syncs kDem: the copies landed before the blocks are reused
+  if (n) upload();  // syncs kDem: the copies landed before the blocks are reused
   return n;
 }
 
@@ -1988,7 +2026,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
     try {
       copy_in(DgTransport::kDem, k, slot, src);
     } catch (...) {
-      table_[k] = -1;
+      set_entry(k, -1);
       free_slots_.push_back(slot);
       throw;
     }
@@ -2073,7 +2111,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
         ++r.evicted;
         unlink(v);
         --on_device_;
-        table_[v] = -1;
+        set_entry(v, -1);
         if (no_copy) {
           free_slots_.push_back(x.slot);
           to_lower(v);
@@ -2140,7 +2178,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
     while (!reads.empty()) end_read(0);
     flush_d2h();
     flush_dem();
-    t_->upload_table(table_.data(), keys_);  // (syncs kDem) every entry, the victims' -1 included
+    upload();  // (syncs kDem) every changed entry, the victims' -1 included
   } catch (...) {
     // reads not ended give their slots back (their keys never changed home); the units moved so far stay
     for (const Read& rd : reads) {
@@ -2156,7 +2194,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
       try {
         flush_d2h();
         flush_dem();
-        t_->upload_table(table_.data(), keys_);
+        upload();
         ok = true;
       } catch (...) {
       }
@@ -2294,14 +2332,14 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
       copy_in(DgTransport::kDem, k, slot, b);
       t_->sync(DgTransport::kDem);
     } catch (...) {
-      table_[k] = -1;
+      set_entry(k, -1);
       free_slots_.push_back(slot);
       throw;
     }
     spent += ub;
     r.bytes_h2d += ub;
     if (cancelled()) {
-      table_[k] = -1;
+      set_entry(k, -1);
       free_slots_.push_back(slot);
       return false;
     }
@@ -2388,7 +2426,7 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
       if (y.backed || clean) {  // a clean copy: its block is its home again, no write (dg_clean_evict: its file)
         unlink(v);
         --on_device_;
-        table_[v] = -1;
+        set_entry(v, -1);
         to_lower(v);
         if (clean) count_clean();
       } else {
@@ -2407,7 +2445,7 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
         }
         unlink(v);
         --on_device_;
-        table_[v] = -1;
+        set_entry(v, -1);
         y.home = Home::Host;
         y.slot = -1;
         y.block = b;
@@ -2462,7 +2500,7 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
       }
       while (!reads.empty()) end_read();
     }
-    t_->upload_table(table_.data(), keys_);  // (syncs kDem) every entry, the demoted units' -1 included
+    upload();  // (syncs kDem) every changed entry, the demoted units' -1 included
   } catch (...) {
     for (const Rd& rd : reads) {  // reads not ended: their blocks free again, their units still in their files
       try {
@@ -2475,7 +2513,7 @@ DgRoundOut DgCore::round(const DgRoundIn& in, const std::vector<uint32_t>& kept_
     bool ok = false;
     if (io_error) {  // the device is fine (every copy was synced): the table goes up
       try {
-        t_->upload_table(table_.data(), keys_);
+        upload();
         ok = true;
       } catch (...) {
       }
@@ -2701,7 +2739,8 @@ void DgCore::reset_open() {
     prior_bytes_ = 0;
     bt_ = DgBoundaryTimes{};
     t_->diag_reset();
-    t_->upload_table(table_.data(), keys_);
+    t_->upload_table(table_.data(), keys_);  // the whole table (the open's), every mark cleared
+    clear_marks();
     t_->sync(DgTransport::kDem);
     check();
   } catch (...) {

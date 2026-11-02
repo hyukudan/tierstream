@@ -68,6 +68,10 @@ class Immediate final : public DgTransport {
   void upload_table(const int32_t* t, uint32_t n) override {
     for (uint32_t k = 0; k < n; ++k) table_[k].store(t[k], std::memory_order_release);
   }
+  void upload_table_ranges(const int32_t* t, const uint32_t* r, uint32_t n) override {
+    for (uint32_t i = 0; i < n; ++i)
+      for (uint32_t k = r[2 * i]; k < r[2 * i] + r[2 * i + 1]; ++k) table_[k].store(t[k], std::memory_order_release);
+  }
   int32_t entry(uint32_t k) const { return table_[k].load(std::memory_order_acquire); }
   int32_t slot_holds(int32_t s) const { return slot_[size_t(s)].load(std::memory_order_relaxed); }
   void fill_slot(int32_t s, int32_t k) { slot_[size_t(s)].store(k); }

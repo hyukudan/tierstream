@@ -29,6 +29,7 @@ class NullTransport final : public ts::DgTransport {
   void event_sync(void*) override {}
   void sync(Stream) override {}
   void upload_table(const int32_t*, uint32_t) override {}
+  void upload_table_ranges(const int32_t*, const uint32_t*, uint32_t) override {}
 };
 
 double run(uint32_t mode, uint32_t width, uint64_t& checksum) {

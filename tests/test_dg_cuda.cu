@@ -113,6 +113,43 @@ __global__ void checksum(ss_dg_device_view v, uint32_t g, const int32_t* ids, un
   atomicAdd(out + blockIdx.x, s);
 }
 
+// A held layer's kernel overlapping the host's calls: each block resolves its unit through ss_dg_slot and checksums it
+// again and again (every pass re-reads the table) until the host's mapped stop word is set (or a cycle bound), at least
+// twice; every pass adds into out[b], reps[b] counts the passes, moved[b] those whose slot differed from the first.
+// Block 0 sets *started once its first pass is done.
+__global__ void checksum_until(ss_dg_device_view v, uint32_t g, const int32_t* ids, unsigned long long* out,
+                               uint32_t* reps, uint32_t* moved, const volatile uint32_t* stop,
+                               volatile uint32_t* started, long long max_cycles) {
+  __shared__ int go;
+  int32_t first = -1;
+  const long long t0 = clock64();
+  for (uint32_t r = 0;; ++r) {
+    const int32_t slot = ss_dg_slot(&v, g, ids[blockIdx.x]);
+    unsigned long long s = 0;
+    uint64_t pos0 = 0;
+    for (uint32_t p = 0; p < v.n_parts; ++p) {
+      const unsigned char* base = static_cast<const unsigned char*>(v.parts[p].base) + uint64_t(slot) * v.parts[p].stride;
+      for (uint64_t i = threadIdx.x; i < v.parts[p].bytes; i += blockDim.x)
+        s += (unsigned long long)base[i] * ((pos0 + i) % 251 + 1);
+      pos0 += v.parts[p].bytes;
+    }
+    atomicAdd(out + blockIdx.x, s);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      if (r == 0) first = slot;
+      else if (slot != first) ++moved[blockIdx.x];
+      reps[blockIdx.x] = r + 1;
+      if (blockIdx.x == 0 && r == 0) {
+        __threadfence_system();
+        *started = 1;
+      }
+      go = r < 1 || (!*stop && clock64() - t0 < max_cycles);
+    }
+    __syncthreads();
+    if (!go) break;
+  }
+}
+
 // Resident-first reads (ss_dg_slot_if_ready), before layer g's wait: the checksum of each routed id whose bytes are
 // already complete (ready[i] = 1), nothing for the others (ready[i] = 0).
 __global__ void checksum_early(ss_dg_device_view v, uint32_t g, const int32_t* ids, unsigned long long* out,
@@ -1982,3 +2019,99 @@ void make_resident_prefill(const char* tag, bool production) {
 
 TEST(dg_cuda_make_resident_prefill) { make_resident_prefill("mkres", false); }
 TEST(dg_cuda_make_resident_prefill_production) { make_resident_prefill("mkresp", true); }
+
+// The engine's held-layer pipeline (ss.h, ss_dg_make_resident: held-layer overlap) on the 6 x 288 model with a spare
+// target of 8 (so the next layer's units need victims): layer 0 held whole; outside ss_begin / ss_end a kernel on the
+// engine stream checksums its 288 units through ss_dg_slot pass after pass, and while it runs (it signalled its first
+// pass, its event not complete when the call returns) the host makes 128 units of layer 1 resident, evicting units of
+// the other layers. After the stop and the event: every pass of every unit summed to its file bytes' checksum and
+// resolved to the same slot; layer 1's units are resident with their bytes; decode is exact afterwards.
+//   ts-test-dg-cuda --only dg_cuda_held_layer_overlaps_make_resident
+TEST(dg_cuda_held_layer_overlaps_make_resident) {
+  Rig r("hold", 64, 16, 8, 10000, true, [](ss_options& o) { o.dg_spare_target = 8; }, nullptr, false, 288);
+  if (!r.c) return;
+  const int U = r.m.U;
+  cudaFuncAttributes fa;
+  CU(cudaFuncGetAttributes(&fa, (const void*)checksum_until));
+  int32_t* ids_dev = nullptr;
+  unsigned long long* sums_dev = nullptr;
+  uint32_t *reps_dev = nullptr, *moved_dev = nullptr, *flags = nullptr, *flags_dev = nullptr;
+  CU(cudaMalloc(&ids_dev, size_t(U) * 4));
+  CU(cudaMalloc(&sums_dev, size_t(U) * 8));
+  CU(cudaMalloc(&reps_dev, size_t(U) * 4));
+  CU(cudaMalloc(&moved_dev, size_t(U) * 4));
+  CU(cudaHostAlloc(&flags, 8, cudaHostAllocMapped));  // [0] stop (host -> kernel), [1] started (kernel -> host)
+  CU(cudaHostGetDevicePointer(reinterpret_cast<void**>(&flags_dev), flags, 0));
+  volatile uint32_t* stop = flags;
+  volatile uint32_t* started = flags + 1;
+  *stop = 0;
+  *started = 0;
+  cudaEvent_t done = nullptr;
+  CU(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+  std::vector<int32_t> ids(static_cast<size_t>(U)), part(128);
+  for (int i = 0; i < U; ++i) ids[size_t(i)] = i;
+  for (int i = 0; i < 128; ++i) part[size_t(i)] = i;
+  Tally decode;
+  for (int t = 0; t < 4; ++t) decode.add(r.token(false, false));
+  CHECK_OK(ss_dg_make_resident(r.c, 0, ids.data(), U));
+  const ss_dg_stats x0 = r.stats();
+  // layer 0's kernels, enqueued outside a token, then make_resident(1) while they run
+  CU(cudaMemcpyAsync(ids_dev, ids.data(), size_t(U) * 4, cudaMemcpyHostToDevice, r.s));
+  CU(cudaMemsetAsync(sums_dev, 0, size_t(U) * 8, r.s));
+  CU(cudaMemsetAsync(moved_dev, 0, size_t(U) * 4, r.s));
+  checksum_until<<<unsigned(U), 128, 0, r.s>>>(r.v, 0u, ids_dev, sums_dev, reps_dev, moved_dev, flags_dev,
+                                               flags_dev + 1, 20000000000ll);
+  CU(cudaGetLastError());
+  CU(cudaEventRecord(done, r.s));
+  (void)cudaStreamQuery(r.s);  // submit now (WDDM batching)
+  const auto t0 = std::chrono::steady_clock::now();
+  while (!*started && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10)) std::this_thread::yield();
+  CHECK(*started != 0);
+  CHECK_OK(ss_dg_make_resident(r.c, 1, part.data(), int(part.size())));
+  const bool overlapped = cudaEventQuery(done) == cudaErrorNotReady;
+  CHECK(overlapped);
+  *stop = 1;
+  CU(cudaEventSynchronize(done));
+  const ss_dg_stats x1 = r.stats();
+  std::vector<unsigned long long> sums(static_cast<size_t>(U));
+  std::vector<uint32_t> reps(static_cast<size_t>(U)), moved(static_cast<size_t>(U));
+  CU(cudaMemcpy(sums.data(), sums_dev, size_t(U) * 8, cudaMemcpyDeviceToHost));
+  CU(cudaMemcpy(reps.data(), reps_dev, size_t(U) * 4, cudaMemcpyDeviceToHost));
+  CU(cudaMemcpy(moved.data(), moved_dev, size_t(U) * 4, cudaMemcpyDeviceToHost));
+  int wrong = 0, slot_moved = 0;
+  uint64_t passes = 0;
+  for (int i = 0; i < U; ++i) {
+    if (reps[size_t(i)] < 2 || sums[size_t(i)] != reps[size_t(i)] * r.want[0][size_t(i)]) ++wrong;
+    slot_moved += moved[size_t(i)] != 0;
+    passes += reps[size_t(i)];
+  }
+  CHECK_OK(ss_dg_keep(r.c, 0, nullptr, 0));  // released only after the event
+  // layer 1's units: resident, their bytes (a held layer read outside a token)
+  CU(cudaMemcpyAsync(ids_dev, part.data(), part.size() * 4, cudaMemcpyHostToDevice, r.s));
+  CU(cudaMemsetAsync(sums_dev, 0, part.size() * 8, r.s));
+  checksum<<<unsigned(part.size()), 128, 0, r.s>>>(r.v, 1u, ids_dev, sums_dev);
+  CU(cudaMemcpyAsync(sums.data(), sums_dev, part.size() * 8, cudaMemcpyDeviceToHost, r.s));
+  CU(cudaStreamSynchronize(r.s));
+  int wrong1 = 0;
+  for (size_t i = 0; i < part.size(); ++i)
+    if (sums[i] != r.want[1][size_t(part[i])]) ++wrong1;
+  CHECK_OK(ss_dg_keep(r.c, 1, nullptr, 0));
+  for (int t = 0; t < 4; ++t) decode.add(r.token(false, false));
+  std::printf("  overlapped %d, passes %llu, wrong %d, slot moved %d; layer 1 copied %llu (victims %llu), wrong %d; "
+              "decode wrong %d failed %d\n",
+              int(overlapped), (unsigned long long)passes, wrong, slot_moved,
+              (unsigned long long)(x1.resident_units - x0.resident_units),
+              (unsigned long long)(x1.resident_evicted - x0.resident_evicted), wrong1, decode.wrong, decode.failed);
+  CHECK_EQ(wrong, 0);
+  CHECK_EQ(slot_moved, 0);
+  CHECK(x1.resident_evicted > x0.resident_evicted);  // the call evicted units of the other layers
+  CHECK_EQ(wrong1, 0);
+  CHECK_EQ(decode.wrong, 0);
+  CHECK_EQ(decode.failed, 0);
+  (void)cudaEventDestroy(done);
+  (void)cudaFreeHost(flags);
+  (void)cudaFree(ids_dev);
+  (void)cudaFree(sums_dev);
+  (void)cudaFree(reps_dev);
+  (void)cudaFree(moved_dev);
+}

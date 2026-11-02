@@ -72,6 +72,11 @@ class DgSteps {
     resident_[g] = 1;
   }
   bool resident(uint32_t g) const { return resident_[g] != 0; }
+  bool any_held() const {
+    for (uint8_t r : resident_)
+      if (r) return true;
+    return false;
+  }
   const std::vector<uint32_t>& kept(uint32_t g) const { return keep_[g]; }
   // The boundary's keep list.
   std::vector<uint32_t> all_kept() const { return protect(); }

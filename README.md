@@ -264,6 +264,12 @@ demand finds no free slot, a device unit of another gated layer moves off the de
 layer token fails it as a sequence desync. Ordinary tokens (`ss_begin`) are unchanged. Placement only: the same bytes.
 Counted in `ss_dg_stats.lm_*`.
 
+**Held layers overlap other layers' loads.** A layer held by `ss_dg_make_resident` may run its kernels outside
+`ss_begin` / `ss_end`. `ss_dg_make_resident` / `ss_dg_keep` of other layers may overlap them: they never evict a held
+unit, sync only the cache's own streams, and, while a layer is held, upload only the changed layers' table entries, so
+a fully held layer is never rewritten. Release a held layer only after its kernels completed; its slots may be reused
+by the next call.
+
 ### Fetching ahead
 
 - **Certain prefetch** (`ss_prefetch_layer`): layer-by-layer prefill knows it needs layer L+1 next, so that layer is

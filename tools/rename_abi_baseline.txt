@@ -202,3 +202,9 @@ ss.h-sha256 81ffa71c11bd65e272402d35a370f771a102d6f8107c8907185aa2420db1b651
 
 # prediction admission measured before it becomes the default (comments only: DG_PF_LEGACY defaults to 1)
 ss.h-sha256 187f303776538693778a7f87f5ed62be5f9b8227b119d1311cfe8f37230674a1
+
+# held-layer overlap (comments only: a held layer's kernels may overlap ss_dg_make_resident / ss_dg_keep of other layers, incremental table uploads never rewrite it; release after its kernels completed)
+ss.h-sha256 4f0c45d9053b8ec6182e63e427a92af64ca4eb5213ace66c98c9537b2d344623
+
+# range uploads only while a layer is held (comments only)
+ss.h-sha256 d4c2e2e4e896d7d065de9752588ef11f2fac769efacf25f4ce24fc1a0e9fa7af
