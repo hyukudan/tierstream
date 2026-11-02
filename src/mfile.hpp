@@ -23,6 +23,8 @@ class MFile {
     uint32_t drive_readers = 4;
     int verify_mode = SS_MFILE_VERIFY_CACHED;
     std::string primary_sha256;
+    // the routing before balanced routing (A/B runs); also set by STRIX_MFILE_ROUTE_LEGACY=1 at open
+    bool legacy_routing = false;
   };
   static constexpr uint32_t kAlign = 4096;
 
@@ -52,12 +54,19 @@ class MFile {
   void test_inject(int loc, int kind, uint64_t after);
   // test hook: every request may use the stripe (not only large requests and long batches)
   void test_prefer_stripe(bool on);
-  // test hook: every piece served by location loc takes `microseconds` longer (a slow drive)
+  // test hook: location loc becomes a mock drive: every piece of at least 1 MiB it serves takes `microseconds` per MiB
+  // longer, one piece at a time (0 = off)
   void test_delay(int loc, uint64_t microseconds);
   // Test observation: total sessions constructed, including sessions already closed.
   static uint64_t test_sessions_created();
   static uint64_t test_pools_created();
   double test_rate(int loc) const;
+  // balanced routing: a location's bytes in flight
+  uint64_t test_inflight(int loc) const;
+  // test hook: bytes of other reads in flight on location loc (negative: remove them again)
+  void test_hold(int loc, int64_t bytes);
+  // test observation: large requests are not split now (the split auto-off)
+  bool test_split_off() const;
 
   struct Impl;
 

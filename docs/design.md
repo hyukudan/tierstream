@@ -721,15 +721,35 @@ lookup tables (Engram) unbuffered (study §6.5).
   reads go to the pools, even if all pieces use one location.
 - **Which reads use a stripe.** The primary holds every byte, so a stripe pays only when two drives work on the same
   request. Requests of at least 8 MiB (whole-layer expert streams, startup loads) are split; smaller requests (one
-  expert's parts, a decode step's 24-48 Engram pages) and scattered batches under 64 reads stay on the primary,
-  exactly as with one drive: a split small request waits for the slower drive. Measured: splitting a
+  expert's parts, a decode step's 24-48 Engram pages) and scattered batches under 64 reads are never split: a split
+  small request waits for the slower drive (medium ones may still go whole to a stripe, next item). Measured: splitting a
   24-row Engram job made it slower on a quiet primary (0.29 -> 0.47 ms), so it is not done.
+- **Balanced routing of medium requests.** A request of 1 MiB up to 8 MiB is never split, but when every chunk it
+  touches has its stripe copy on one location it goes whole to whichever of the primary and that location has fewer
+  bytes in flight; two idle locations take turns, so idle reads no longer all go to the primary. Bytes in flight count
+  every request routed to a location, small ones included while a stripe serves chunks, from planning until each
+  piece finished (on every path, fallback and errors included). Across concurrent calls a faster drive empties its
+  queue sooner and so takes more requests by itself; weighting by a measured drive rate was tried and fed back on
+  itself (the location that got less traffic measured slower and then got still less). Within one call (a batch's
+  medium ios, or one caller reading one at a time) the turns split evenly whatever the speeds, so a stripe location
+  whose large-request share (learned from split requests) is under half the primary's gets no medium requests; the
+  rule otherwise assumes stripe drives about as fast as the primary (else set the legacy switch below). Each file
+  session counts its own bytes in flight, while the drive pools are shared per volume. Measured
+  before: a decode run with ~3 MB expert parts read 53 % of its bytes from the primary (75 % busy) and kept its two
+  stripe drives 25-30 % busy. `STRIX_MFILE_ROUTE_LEGACY=1` (read at each open; 0 / false / off or 1 / true / on,
+  anything else refuses the open; `MFile::Options::legacy_routing` in process) restores the earlier routing exactly:
+  medium requests reach a stripe only while other medium or large requests are in flight, by the large-request
+  shares, and small requests are not counted.
 - **Adaptive shares.** In a split request each chunk with a stripe copy goes to whichever of its two homes has the
   least of (bytes this request already gave it + the chunk) / its share. Shares follow each location's measured
   throughput (its bytes of a request over the time until its last piece finished, EWMA). Every 16th large request
   reads the primary alone, so a current single-drive baseline is always known; while split requests measure slower
   than that baseline, splitting is off for the next 64 large requests. This bounds a regression rather than excluding
-  it: no controller can know the single-drive time of the request it splits.
+  it: no controller can know the single-drive time of the request it splits. Whole-request throughput depends on what
+  else is in flight, so under concurrent reads a primary-only sample taken alone could switch splitting off while the
+  stripes sat idle (a prefill run read only the primary at 2.4 GB/s). Balanced routing therefore compares split and
+  primary-only requests only within one load class (bytes other reads had in flight at planning: under a quarter of
+  the request's size, so record pages count as none, under its size, under four times it, more).
 - **Verification.** Every byte served from a stripe belongs to a chunk whose xxh64 matched the manifest, checked
   through the serving handle at open (`weight_verify = always`) or at the first open of that data-file version
   (`cached`: the passing-chunk bitmap is kept by file identity; the identity is volume, file index, size, last-write

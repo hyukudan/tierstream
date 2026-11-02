@@ -342,8 +342,22 @@ original on a PCIe 4.0 NVMe, stripe on a second PCIe 4.0 NVMe; the same tokens a
 
 The expert stream itself goes from 11.0 to 8.45 s per request (-23 %, 29 % of the bytes from the second drive) and the
 service starts 17 % faster; longer prompts gain less because they are compute bound. A third, slower drive (a
-DRAM-less system disk) added nothing: the shares give it little. Decode reads single experts and Engram rows, which
-stay on the original drive, so decode speed does not change.
+DRAM-less system disk) added nothing: the shares give it little. Decode reads single experts and Engram rows; with the
+previous routing (`STRIX_MFILE_ROUTE_LEGACY=1`) those stay on the original drive, so decode speed does not change.
+
+**Balanced reads across stripe copies (default for striped models).** With `weight_dirs` stripe copies, a read of
+1-8 MiB (one expert's parts during decode) whose bytes all have a copy on one stripe drive now goes to whichever of
+the primary file and that copy has fewer bytes in flight. Before, such reads went to the primary unless other large
+reads were already queued, so the primary drive carried most of the decode traffic. Reads of 8 MiB and more are still
+split across drives as before. Output is identical: the same verified bytes, only the drive that serves them changes.
+The rule assumes stripe drives about as fast as the primary; a stripe drive that measures under half the primary's
+speed on large reads gets none of these reads.
+
+Off: `STRIX_MFILE_ROUTE_LEGACY=1` restores the previous routing exactly. Measured on GLM-5.3-Flash on one RTX PRO 6000
+limited to 24 GiB of VRAM and 32 GiB of host RAM, model striped over three NVMe drives, two runs per arm in both
+orders, output identical in every arm: decode +5.5 % / +8.5 % with a 1K prompt (cold / warm) and +17.2 % / +0.3 % with
+an 8K prompt, +7.7 % on average, never slower; the primary drive's share of decode reads goes from 40-46 % to
+28-37 %. Repeats of the same configuration differ by up to about 19 %, so the size of the gain is not precise.
 
 ### Prepared packs (one pack per model, every layout)
 
