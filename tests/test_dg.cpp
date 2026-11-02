@@ -452,6 +452,9 @@ struct Shape {
   uint32_t inclusive = 0;
   // dg_clean_evict at open; toggle_clean: flipped between random tokens (set_clean_evict)
   bool clean = false, toggle_clean = false;
+  // dg_pf_revert_unused at open; toggle_pf_revert: flipped between random tokens (set_pf_revert, its own random stream)
+  bool pf_revert = false, toggle_pf_revert = false;
+  bool pf_strict = false;  // dg_pf_strict_admit
   // overlapped file reads: the core's queue depth (1 = synchronous), the transport's reads asynchronous (landing out
   // of order), an eager device (every operation runs at once: timing-free, for the depth comparisons)
   uint32_t queue = 16;
@@ -742,6 +745,8 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.inclusive = sh.inclusive;
   c.disk_queue = sh.queue;
   c.clean_evict = sh.clean;
+  c.pf_revert = sh.pf_revert;
+  c.pf_strict = sh.pf_strict;
   c.spare_target = sh.spare;
   c.prefetch_reserve = std::min(24u, sh.spare / 4);
   c.prefetch_per_layer = sh.pf_layer;
@@ -765,6 +770,8 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   std::mt19937_64 kr(seed * 2654435761u + 5u);  // resident / skip runs: episodes and skipped layers
   std::vector<std::vector<uint32_t>> held(G);    // per gated layer: its make_resident set (keys), empty = none
   std::vector<std::vector<int32_t>> held_slot(G);
+  std::mt19937_64 prr(seed * 40503u + 9u);  // pf_revert toggles (no other stream draws for them)
+  std::vector<uint8_t> demanded(keys, 0);    // this token's routed keys (a prefetch of one is used)
   uint32_t seq_ctr = 0;
   try {
     DgCore core(c, &t);
@@ -959,6 +966,8 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         core.check();
       }
       if (sh.toggle_clean && kr() % 3 == 0) core.set_clean_evict(!core.clean_evict());
+      if (sh.toggle_pf_revert && prr() % 3 == 0) core.set_pf_revert(!core.pf_revert());
+      std::fill(demanded.begin(), demanded.end(), uint8_t(0));
       keep.clear();
       if (sh.vary) {
         if (vr() % 4 == 0) {
@@ -1010,6 +1019,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
         }
         t.steps(jitter);
         core.serve(g, ids.data(), n, mask);
+        for (uint32_t id : ids) demanded[core.key(g, id)] = 1;
         if (sh.scored) orc.serve(g, ids.data(), n);
         core.check();
         t.steps(jitter);
@@ -1089,7 +1099,28 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
             g_cov.kept_skipped += dev && std::find(keep.begin(), keep.end(), k) != keep.end();
           }
         });
+      // the unused prefetches: coming (a demand's copy is routed, so every coming key not routed is a prefetch's),
+      // not routed by this token, not kept. dg_pf_revert_unused sends each back to its block or file (no write-back,
+      // unpublished) and counts each once; off, it counts none.
+      std::vector<uint32_t> unused;
+      for (uint32_t k = 0; k < keys; ++k)
+        if (core.home(k) == DgCore::Home::Coming && !demanded[k] && std::find(keep.begin(), keep.end(), k) == keep.end())
+          unused.push_back(k);
+      const bool reverting = core.pf_revert();
+      const uint64_t reverted0 = core.stats().pf_reverted;
       core.end_token(keep, rows);
+      if (reverting) {
+        if (core.stats().pf_reverted - reverted0 != unused.size()) v.set("boundary: pf_reverted != the unused prefetches");
+        for (uint32_t k : unused) {
+          const DgCore::Home h = core.home(k);
+          if (h != DgCore::Home::Host && h != DgCore::Home::File) v.set("boundary: an unused prefetch was admitted");
+          if (core.table()[k] != -1) v.set("boundary: a reverted prefetch is still published");
+          const auto& vic = core.last_victims();
+          if (std::find(vic.begin(), vic.end(), k) != vic.end()) v.set("boundary: an unused prefetch was written back");
+        }
+      } else if (core.stats().pf_reverted != reverted0) {
+        v.set("boundary: pf_reverted counted while off");
+      }
       out.victims.push_back(core.last_victims());
       if (probed) {
         core.set_boundary_probe(nullptr);
@@ -3916,9 +3947,10 @@ TEST(dg_three_tier_read_error) {
 }
 
 // Prefetch file reads stay in flight across calls: issued by the prediction for layer 1, they are still in flight
-// through layer 0's write-back slice, ranking and use, and end at layer 1's demand: a covered key's at its cover, the
-// others' before the ready; every copy and entry of layer 1 is enqueued before its ready. A fetch of a key whose read
-// is in flight ends it; the boundary ends the rest.
+// through layer 0's write-back slice, ranking and use; at layer 1's demand a covered key's ends at its cover, before the
+// ready with every copy and entry of the units layer 1 routes; the reads of the units it does not route are not waited
+// for (still in flight, unpublished, at its ready) and end at the boundary. A fetch of a key whose read is in flight
+// ends it; the boundary ends the rest.
 TEST(dg_three_tier_prefetch_reads_carried) {
   ReadErrorRig r(16, true, true, 8);
   DgCore& core = *r.core;
@@ -3937,11 +3969,11 @@ TEST(dg_three_tier_prefetch_reads_carried) {
   r.t.clear_issued();
   const uint32_t ids[2] = {6, 8};  // 6 was prefetched (covered), 8 is a demand miss
   core.serve(1, ids, 2, 3);
-  CHECK_EQ(core.reads_in_flight(), 0u);
-  CHECK_EQ(core.stats().disk_carried, 3ull);
-  CHECK_EQ(core.stats().disk_carried_bytes, 3 * (2048ull + 2048 + 4096));
+  CHECK_EQ(core.reads_in_flight(), 2u);  // 5 and 7 (keys 25, 27): not routed by layer 1, not waited for
+  CHECK_EQ(core.stats().disk_carried, 1ull);
+  CHECK_EQ(core.stats().disk_carried_bytes, 1 * (2048ull + 2048 + 4096));
   CHECK_EQ(core.stats().covered_waits, 1ull);
-  // the ready of layer 1 after every copy and entry of its units
+  // the ready of layer 1 after every copy and entry of the units it routes, none of the others'
   const auto& tr = r.t.trace();
   size_t ready = tr.size();
   for (size_t i = 0; i < tr.size(); ++i)
@@ -3953,13 +3985,21 @@ TEST(dg_three_tier_prefetch_reads_carried) {
       copied = copied || (tr[i][1] == Scripted::H2D && tr[i][2] == core.slot_of(k));
       entry = entry || (tr[i][1] == Scripted::Entry && tr[i][4] == int64_t(k));
     }
-    CHECK(copied && entry);
+    if (k == 26 || k == 28) CHECK(copied && entry);
+    else CHECK(!copied && !entry);
   }
   r.t.sync(DgTransport::kDem);
   r.t.sync(DgTransport::kPf);
-  for (uint32_t k : {25u, 26u, 27u, 28u}) CHECK_EQ(r.t.slot_holds(core.slot_of(k)), int32_t(k));
-  core.end_token({});
+  for (uint32_t k : {26u, 28u}) CHECK_EQ(r.t.slot_holds(core.slot_of(k)), int32_t(k));
+  for (uint32_t k : {25u, 27u}) CHECK_EQ(r.t.entry(k), -1);
+  core.end_token({});  // ends the two reads: their copies, then their admission
   core.check();
+  CHECK_EQ(core.reads_in_flight(), 0u);
+  CHECK_EQ(core.stats().disk_carried, 3ull);
+  CHECK_EQ(core.stats().disk_carried_bytes, 3 * (2048ull + 2048 + 4096));
+  r.t.sync(DgTransport::kPf);
+  for (uint32_t k : {25u, 26u, 27u, 28u})
+    if (core.slot_of(k) >= 0) CHECK_EQ(r.t.slot_holds(core.slot_of(k)), int32_t(k));
   r.t.drain_all();  // the boundary's write-backs land: their slots are free for the next prefetches
   // a fetch of a key whose read is in flight ends it (and only up to it)
   core.begin_token(2);
@@ -3997,7 +4037,8 @@ struct OooRig {
   Scripted t{40, 12 + 2 * 4, 30 + 6, 2, 5, &v};
   DgConfig c;
   std::unique_ptr<DgCore> core;
-  explicit OooRig(std::vector<uint32_t> held, uint32_t queue = 16) {
+  explicit OooRig(std::vector<uint32_t> held, uint32_t queue = 16, bool legacy = false) {
+    c.pf_legacy = legacy;  // DG_PF_LEGACY
     c.n_units = {20, 20};
     c.persistent_slots = 12;
     c.bank_slots = 4;
@@ -4304,8 +4345,10 @@ struct ResRig {
   // One token: the layers with run[g] export ids[g] (miss bits from the device table), are served (ranked when
   // scored), waited for and read; every key of `held` is read in every layer, its slot under the read throughout.
   // Returns the units the token read (the bytes of each slot).
+  // preds (optional): per gated layer g >= 1, the prediction served right after layer g - 1's demand.
   std::vector<int32_t> token(const std::vector<std::vector<uint32_t>>& ids, const std::vector<uint8_t>& run,
-                             const std::vector<uint32_t>& keep, const std::vector<uint32_t>& held = {}) {
+                             const std::vector<uint32_t>& keep, const std::vector<uint32_t>& held = {},
+                             const std::vector<std::vector<uint32_t>>* preds = nullptr) {
     ++seq;
     core->begin_token(seq, &run);
     std::vector<int32_t> out;
@@ -4324,6 +4367,8 @@ struct ResRig {
           if (t->entry(core->key(g, ids[g][i])) < 0) m |= 1ull << i;
         t->steps(4);
         core->serve(g, ids[g].data(), uint32_t(ids[g].size()), m);
+        if (preds && g + 1 < G && !(*preds)[g + 1].empty())
+          core->serve_prediction(g + 1, (*preds)[g + 1].data(), uint32_t((*preds)[g + 1].size()));
         core->score_layer(g);
         if (m)
           while (int32_t(t->ready(g) - seq) < 0)
@@ -5877,4 +5922,575 @@ TEST(dg_resident_read_failure_overlapped) {
       if (!r.v.what.empty()) std::printf("  seed %llu at %d: %s\n", (unsigned long long)seed, at, r.v.what.c_str());
       CHECK(r.v.what.empty());
     }
+}
+
+// ---- unused prefetches reverted (dg_pf_revert_unused) ----
+namespace {
+
+std::function<void(DgConfig&)> pf_tweak(bool revert, bool disk_prefetch = false, bool clean = false) {
+  return [=](DgConfig& c) {
+    c.pf_revert = revert;
+    c.disk_prefetch = disk_prefetch;
+    c.clean_evict = clean;
+  };
+}
+// Per gated layer g >= 1: up to n units of g, from a random start, that are pinned or file-homed now and that the token
+// does not route at g: predictions their token never uses (never a device or evicting unit, which a prefetch would not
+// copy, or would resurrect).
+std::vector<std::vector<uint32_t>> unused_preds(const ResRig& r, const std::vector<std::vector<uint32_t>>& ids,
+                                                uint32_t n, std::mt19937_64& rng) {
+  std::vector<std::vector<uint32_t>> p(r.G);
+  for (uint32_t g = 1; g < r.G; ++g) {
+    const uint32_t nu = r.core->units(g), start = uint32_t(rng() % nu);
+    for (uint32_t i = 0; i < nu && p[g].size() < n; ++i) {
+      const uint32_t u = (start + i) % nu;
+      const DgCore::Home h = r.core->home(r.core->key(g, u));
+      if ((h == DgCore::Home::Host || h == DgCore::Home::File) &&
+          std::find(ids[g].begin(), ids[g].end(), u) == ids[g].end())
+        p[g].push_back(u);
+    }
+  }
+  return p;
+}
+uint64_t host_homes(const DgCore& core) {
+  uint64_t n = 0;
+  for (uint32_t k = 0; k < core.keys(); ++k) n += core.home(k) == DgCore::Home::Host;
+  return n;
+}
+
+}  // namespace
+
+// The randomized model with the setting on (and flipped between tokens on even seeds): predictions, window prefetches
+// (with and without winpf's own revert), pressure, deferred write-backs, and every three-tier shape with synchronous,
+// overlapped and depth-1 reads (file prefetches among them), some with clean eviction. Every read exact, every
+// invariant, the oracle's victims at every boundary, and at every boundary each unused, unkept prefetch reverted to its
+// block or file (unpublished, never written back) and counted once.
+TEST(dg_pf_revert_runs) {
+  uint64_t reverted = 0, runs = 0;
+  auto one = [&](Shape sh, uint64_t seed, const char* what) {
+    sh.pf_revert = true;
+    sh.toggle_pf_revert = seed % 2 == 0;
+    const Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+    ++runs;
+    if (!o.violation.empty())
+      std::printf("  %s seed %llu: %s\n", what, (unsigned long long)seed, o.violation.c_str());
+    CHECK(o.violation.empty());
+    CHECK_EQ(o.st.pf_revert_bytes, o.st.pf_reverted * 8192u);
+    CHECK(o.st.pf_reverted <= o.st.prefetched - o.st.prefetch_used);
+    reverted += o.st.pf_reverted;
+  };
+  for (const Shape* sh : {&kPredict, &kPredictPressure, &kSlowWriteback, &kWinpf, &kWinpfDefer, &kWinpfKeep})
+    for (uint64_t seed = 1; seed <= 6; ++seed) one(*sh, seed, "two-tier");
+  for (const Shape* base : kTierShapes)
+    for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 4; ++seed) {
+        Shape sh = with_reads(*base, how);
+        sh.clean = seed % 3 == 0;
+        one(sh, seed, "three-tier");
+      }
+  std::printf("  %llu runs: %llu unused prefetches reverted\n", (unsigned long long)runs, (unsigned long long)reverted);
+  CHECK(reverted > 0);
+}
+
+// Off (the default) counts nothing; on, a cache that issues no prefetch is today's: the same victims at every
+// boundary, counters, homes and table on the same seeds.
+TEST(dg_pf_revert_off_is_today) {
+  for (const Shape* sh : kShapes)
+    for (uint64_t seed = 1; seed <= 3; ++seed) CHECK_EQ(run(*sh, 30, seed, DgCore::kNoMutation).st.pf_reverted, 0u);
+  for (const Shape* base : {&kWarm, &kPressure, &kDisk, &kDiskTiny}) {
+    Shape on = *base;
+    on.pf_revert = true;
+    for (uint64_t seed = 1; seed <= 4; ++seed) {
+      const Outcome a = run(*base, 30, seed, DgCore::kNoMutation), b = run(on, 30, seed, DgCore::kNoMutation);
+      CHECK(a.violation.empty() && b.violation.empty());
+      CHECK(a.victims == b.victims);
+      CHECK(counters(a.st) == counters(b.st));
+      CHECK(a.homes == b.homes && a.table == b.table && a.slots == b.slots);
+      CHECK_EQ(b.st.pf_reverted, 0u);
+    }
+  }
+}
+
+// The reverted unit keeps its table entry (the mutation): the model's boundary check sees it published.
+TEST(dg_pf_revert_mutation_caught) {
+  int caught = 0, runs = 0;
+  for (const Shape* base : {&kPredict, &kPredictPressure, &kDiskPredict})
+    for (uint64_t seed = 1; seed <= 8; ++seed) {
+      Shape sh = *base;
+      sh.pf_revert = true;
+      ++runs;
+      if (!run(sh, 40, seed, DgCore::kRevertKeepsEntry).violation.empty()) ++caught;
+    }
+  std::printf("  revert keeps the table entry caught in %d/%d runs\n", caught, runs);
+  CHECK(caught > 0);
+}
+
+// Two-tier, predictions that their tokens never use: with the setting, the same demands through a cache that predicts
+// nothing give the same homes (the pinned set unchanged), the same victims and the same write-backs at every boundary;
+// every prefetch is reverted and counted (its bytes), none is used. Without it, the admitted prefetches displace device
+// units: more write-backs. Later demands of the reverted units read their bytes from their blocks.
+TEST(dg_pf_revert_unused_two_tier) {
+  uint64_t reverted = 0, off_wb = 0, on_wb = 0, none_wb = 0;
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    ResRig none({24, 24, 24}, 24, 20, 24, false, nullptr, 0, seed);
+    ResRig off({24, 24, 24}, 24, 20, 24, false, nullptr, 0, seed, 0u, pf_tweak(false));
+    ResRig on({24, 24, 24}, 24, 20, 24, false, nullptr, 0, seed, 0u, pf_tweak(true));
+    for (ResRig* r : {&none, &off, &on}) r->t->set_eager(true);
+    none.rng.seed(seed);
+    std::mt19937_64 pr(seed);
+    std::vector<std::vector<uint32_t>> preds;
+    for (int tok = 0; tok < 24; ++tok) {
+      const auto ids = none.routes(2);
+      preds = unused_preds(on, ids, 2, pr);
+      const ts::DgStats s0 = on.core->stats();
+      for (ResRig* r : {&none, &off, &on}) r->t->clear_issued();
+      CHECK(none.token(ids, all_run(3), {}) == on.token(ids, all_run(3), {}, {}, &preds));
+      off.token(ids, all_run(3), {}, {}, &preds);
+      const ts::DgStats& s = on.core->stats();
+      CHECK(s.prefetched > s0.prefetched);
+      CHECK_EQ(s.pf_reverted - s0.pf_reverted, s.prefetched - s0.prefetched);
+      CHECK_EQ(s.pf_revert_bytes - s0.pf_revert_bytes, (s.pf_reverted - s0.pf_reverted) * 8192u);
+      CHECK_EQ(s.prefetch_used, 0u);
+      CHECK(home_list(*on.core) == home_list(*none.core));
+      CHECK_EQ(host_homes(*on.core), host_homes(*none.core));
+      CHECK(on.core->last_victims() == none.core->last_victims());
+      CHECK_EQ(count_kind(*on.t, Scripted::D2H), count_kind(*none.t, Scripted::D2H));
+      for (uint32_t g = 1; g < 3; ++g)
+        for (uint32_t u : preds[g]) CHECK(on.core->home(on.core->key(g, u)) == DgCore::Home::Host);
+      none_wb += count_kind(*none.t, Scripted::D2H);
+      on_wb += count_kind(*on.t, Scripted::D2H);
+      off_wb += count_kind(*off.t, Scripted::D2H);
+    }
+    reverted += on.core->stats().pf_reverted;
+    CHECK_EQ(off.core->stats().pf_reverted, 0u);
+    // the last token's reverted units demanded: copied from their blocks, the same bytes as the cache that never
+    // prefetched them
+    std::vector<std::vector<uint32_t>> again(3, std::vector<uint32_t>{0});
+    again[1] = preds[1];
+    again[2] = preds[2];
+    const uint64_t fetched0 = on.core->stats().fetched, none0 = none.core->stats().fetched;
+    CHECK(none.token(again, all_run(3), {}) == on.token(again, all_run(3), {}));
+    CHECK_EQ(on.core->stats().fetched - fetched0, none.core->stats().fetched - none0);
+    for (uint32_t g = 1; g < 3; ++g)
+      for (uint32_t u : preds[g]) CHECK(on.core->home(on.core->key(g, u)) == DgCore::Home::Device);
+    for (ResRig* r : {&none, &off, &on}) {
+      r->verify();
+      if (!r->v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r->v.what.c_str());
+      CHECK(r->v.what.empty());
+    }
+  }
+  std::printf("  reverted %llu; write-backs: no prediction %llu, reverted %llu, admitted %llu\n",
+              (unsigned long long)reverted, (unsigned long long)none_wb, (unsigned long long)on_wb,
+              (unsigned long long)off_wb);
+  CHECK(reverted > 0);
+  CHECK_EQ(on_wb, none_wb);
+  CHECK(off_wb > on_wb);
+}
+
+// A used prefetch is admitted (a device unit, its block freed), a kept unused one stays on the device, an unused one
+// goes back to the block it came from; off, all three are admitted.
+TEST(dg_pf_revert_used_and_kept) {
+  for (bool revert : {false, true}) {
+    ResRig r({24, 24, 24}, 24, 8, 8, false, nullptr, 0, 3, 0u, pf_tweak(revert));
+    r.t->set_eager(true);
+    const uint32_t ku = r.core->key(1, 2), kv = r.core->key(1, 3), kw = r.core->key(1, 4);
+    const int32_t bv = r.core->block_of(kv);
+    CHECK(r.core->home(ku) == DgCore::Home::Host && r.core->home(kv) == DgCore::Home::Host && bv >= 0);
+    std::vector<std::vector<uint32_t>> ids = {{0}, {2}, {0}}, preds = {{}, {2, 3, 4}, {}};
+    r.token(ids, all_run(3), {kw}, {}, &preds);
+    const ts::DgStats& s = r.core->stats();
+    CHECK_EQ(s.prefetched, 3u);
+    CHECK_EQ(s.prefetch_used, 1u);
+    CHECK(r.core->home(ku) == DgCore::Home::Device && r.core->block_of(ku) == -1);
+    CHECK(r.core->home(kw) == DgCore::Home::Device);
+    if (revert) {
+      CHECK(r.core->home(kv) == DgCore::Home::Host && r.core->block_of(kv) == bv && r.core->table()[kv] == -1);
+      CHECK_EQ(s.pf_reverted, 1u);
+      CHECK_EQ(s.pf_revert_bytes, 8192u);
+    } else {
+      CHECK(r.core->home(kv) == DgCore::Home::Device);
+      CHECK_EQ(s.pf_reverted, 0u);
+    }
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// Three-tier with file prefetches (disk_prefetch): an unused prefetch read from its file goes back to its file (no
+// block, no copy), one copied from a pinned block back to its block. Against a cache that predicts nothing: the same
+// homes, victims, write-backs and drops at every boundary, only the prefetch reads more. With clean eviction on both
+// and no spare block beyond the pinned homes: the same again (victims without a block dropped to their files alike).
+TEST(dg_pf_revert_file_prefetch) {
+  const auto disk = disk_flags(72, 24, 28);
+  uint64_t file_reverted = 0, reverted = 0;
+  for (bool clean : {false, true})
+    for (uint64_t seed = 1; seed <= 4; ++seed) {
+      const uint32_t spares = clean ? 0 : 48;  // without clean eviction: never short of a block (no pinned drop)
+      ResRig none({24, 24, 24}, 24, 20, spares, false, &disk, 4, seed, 0u, pf_tweak(false, true, clean));
+      ResRig on({24, 24, 24}, 24, 20, spares, false, &disk, 4, seed, 0u, pf_tweak(true, true, clean));
+      for (ResRig* r : {&none, &on}) r->t->set_eager(true);
+      none.rng.seed(seed);
+      std::mt19937_64 pr(seed);
+      for (int tok = 0; tok < 20; ++tok) {
+        const auto ids = none.routes(2);
+        const auto preds = unused_preds(on, ids, 2, pr);
+        std::vector<uint32_t> from_file;
+        for (uint32_t g = 1; g < 3; ++g)
+          for (uint32_t u : preds[g])
+            if (on.core->home(on.core->key(g, u)) == DgCore::Home::File) from_file.push_back(on.core->key(g, u));
+        const ts::DgStats s0 = on.core->stats(), n0 = none.core->stats();
+        none.t->clear_issued();
+        on.t->clear_issued();
+        CHECK(none.token(ids, all_run(3), {}) == on.token(ids, all_run(3), {}, {}, &preds));
+        const ts::DgStats &s = on.core->stats(), &n = none.core->stats();
+        CHECK_EQ(s.pf_reverted - s0.pf_reverted, s.prefetched - s0.prefetched);
+        CHECK(home_list(*on.core) == home_list(*none.core));
+        CHECK_EQ(on.core->file_units(), none.core->file_units());
+        CHECK(on.core->last_victims() == none.core->last_victims());
+        CHECK_EQ(count_kind(*on.t, Scripted::D2H), count_kind(*none.t, Scripted::D2H));
+        CHECK_EQ(s.disk_drops - s0.disk_drops, n.disk_drops - n0.disk_drops);
+        CHECK_EQ(s.clean_drops - s0.clean_drops, n.clean_drops - n0.clean_drops);
+        CHECK_EQ(s.disk_reads - s0.disk_reads, n.disk_reads - n0.disk_reads + from_file.size());
+        for (uint32_t k : from_file) CHECK(on.core->home(k) == DgCore::Home::File && on.core->block_of(k) == -1);
+        file_reverted += from_file.size();
+      }
+      reverted += on.core->stats().pf_reverted;
+      on.verify();
+      none.verify();
+      if (!on.v.what.empty() || !none.v.what.empty())
+        std::printf("  seed %llu: %s %s\n", (unsigned long long)seed, none.v.what.c_str(), on.v.what.c_str());
+      CHECK(on.v.what.empty() && none.v.what.empty());
+    }
+  std::printf("  reverted %llu (%llu read from their files)\n", (unsigned long long)reverted,
+              (unsigned long long)file_reverted);
+  CHECK(file_reverted > 0);
+  CHECK(reverted > file_reverted);
+}
+
+// At runtime: set between tokens it applies from the next boundary on; reset_open restores the open's setting.
+TEST(dg_pf_revert_runtime_setting) {
+  ResRig r({24, 24, 24}, 24, 8, 8, false, nullptr, 0, 5);
+  r.t->set_eager(true);
+  std::mt19937_64 pr(5);
+  auto tokens = [&](int n) {
+    for (int tok = 0; tok < n; ++tok) {
+      const auto ids = r.routes(2);
+      const auto preds = unused_preds(r, ids, 2, pr);
+      r.token(ids, all_run(3), {}, {}, &preds);
+    }
+  };
+  tokens(4);
+  CHECK(!r.core->pf_revert());
+  CHECK_EQ(r.core->stats().pf_reverted, 0u);
+  r.core->set_pf_revert(true);
+  CHECK(r.core->pf_revert());
+  tokens(4);
+  const uint64_t n = r.core->stats().pf_reverted;
+  CHECK(n > 0);
+  r.verify();
+  r.core->reset_open();
+  CHECK(!r.core->pf_revert());
+  tokens(4);
+  CHECK_EQ(r.core->stats().pf_reverted, n);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// ---- prediction admission that never waits or pollutes (SS_DG_PF_ADMIT) ----
+namespace {
+
+std::function<void(DgConfig&)> admit_tweak(bool strict, bool revert = false, bool disk_prefetch = false) {
+  return [=](DgConfig& c) {
+    c.pf_strict = strict;
+    c.pf_revert = revert;
+    c.disk_prefetch = disk_prefetch;
+    c.prefetch_per_layer = 16;
+  };
+}
+// Serves gated layer g of the open token: the miss bits from the device table, then the read of every routed unit.
+void serve_layer(ResRig& r, uint32_t g, const std::vector<uint32_t>& ids) {
+  uint64_t m = 0;
+  for (size_t i = 0; i < ids.size(); ++i)
+    if (r.t->entry(r.core->key(g, ids[i])) < 0) m |= 1ull << i;
+  r.core->serve(g, ids.data(), uint32_t(ids.size()), m);
+  if (m)
+    while (int32_t(r.t->ready(g) - r.seq) < 0)
+      if (!r.t->step()) {
+        r.v.set("ready never came");
+        break;
+      }
+  for (uint32_t id : ids) {
+    const int32_t s = r.t->entry(r.core->key(g, id));
+    if (s < 0 || r.t->slot_holds(s) != int32_t(r.core->key(g, id))) r.v.set("a routed unit read wrong bytes");
+  }
+}
+
+}  // namespace
+
+// A plain prediction for a layer the device already exported is counted (predicted) but not served: no prefetch,
+// counted in pred_skipped_ahead; the same prediction not ahead is served. winpf's l+1 path keeps its own counter.
+TEST(dg_pred_ahead_skipped) {
+  ResRig r({24, 24, 24}, 24, 8, 8);
+  r.t->set_eager(true);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t pred[3] = {2, 3, 3};
+  r.core->serve_prediction(1, pred, 3, 0, true);
+  CHECK_EQ(r.core->stats().prefetched, 0u);
+  CHECK_EQ(r.core->stats().pred_skipped_ahead, 1u);
+  CHECK_EQ(r.core->stats().predicted, 2u);
+  CHECK_EQ(r.core->stats().l1_skipped_ahead, 0u);
+  r.core->serve_prediction(1, pred, 3, 0, false);
+  CHECK_EQ(r.core->stats().prefetched, 2u);
+  CHECK_EQ(r.core->stats().pred_skipped_ahead, 1u);
+  serve_layer(r, 1, {2});
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  r.core->check();
+  CHECK_EQ(r.core->stats().prefetch_used, 1u);
+  r.verify();
+  CHECK(r.v.what.empty());
+}
+
+// A file prefetch whose read never completes and whose unit the layer does not route: the layer's ready comes with the
+// read still in flight (its slot and staging buffer held, its entry unpublished); the boundary ends it (its copy then,
+// or with dg_pf_revert_unused its file again). Routed, the same read is ended before the ready (the layer reads it).
+TEST(dg_undemanded_prefetch_read_not_waited) {
+  const auto disk = disk_flags(72, 24, 28);
+  for (int routed = 0; routed < 2; ++routed)
+    for (bool revert : {false, true}) {
+      ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, admit_tweak(false, revert, true));
+      r.t->set_eager(true);
+      r.t->set_async_reads(true, 3);
+      const uint32_t kf = r.core->key(2, 3), kw = r.core->key(2, 4);
+      CHECK(r.core->home(kf) == DgCore::Home::File && r.core->home(kw) == DgCore::Home::File);
+      r.t->hold_reads({kf});  // never lands until ended
+      r.core->begin_token(++r.seq);
+      serve_layer(r, 0, {0});
+      serve_layer(r, 1, {5});
+      const uint32_t pred[2] = {3, 4};
+      r.core->serve_prediction(2, pred, 2);
+      CHECK_EQ(r.core->stats().prefetched, 2u);
+      const std::vector<uint32_t> ids = routed ? std::vector<uint32_t>{3, 4} : std::vector<uint32_t>{4};
+      serve_layer(r, 2, ids);
+      CHECK_EQ(r.t->ready(2), r.seq);
+      const auto& ended = r.t->ended();
+      const bool kf_ended = std::find(ended.begin(), ended.end(), kf) != ended.end();
+      CHECK(std::find(ended.begin(), ended.end(), kw) != ended.end());  // routed: ended by its cover
+      if (routed) {
+        CHECK(kf_ended);
+        CHECK_EQ(r.t->reads_in_flight(), 0u);
+      } else {
+        CHECK(!kf_ended);
+        CHECK_EQ(r.t->reads_in_flight(), 1u);
+        CHECK(r.core->home(kf) == DgCore::Home::Coming && r.t->entry(kf) == -1);
+      }
+      r.core->check();
+      r.core->end_token({});
+      r.core->check();
+      CHECK(std::find(r.t->ended().begin(), r.t->ended().end(), kf) != r.t->ended().end());
+      CHECK_EQ(r.t->reads_in_flight(), 0u);
+      CHECK(r.core->home(kf) == (revert && !routed ? DgCore::Home::File : DgCore::Home::Device));
+      CHECK_EQ(r.core->stats().pf_reverted, revert && !routed ? 1u : 0u);
+      r.verify();
+      if (!r.v.what.empty()) std::printf("  routed %d revert %d: %s\n", routed, int(revert), r.v.what.c_str());
+      CHECK(r.v.what.empty());
+    }
+}
+
+// dg_pf_strict_admit: a prefetch takes a free slot only above the spare target. At the target (8 free, target 8) every
+// prediction is refused and counted; with the target at 4 the first 4 are admitted; off, all 8. The demand misses
+// after them still find their free slots (no bank serve).
+TEST(dg_pf_strict_admit_refuses_below_the_target) {
+  for (int how = 0; how < 3; ++how) {
+    ResRig r({24, 24, 24}, 24, 8, 8, false, nullptr, 0, 3, 0u, admit_tweak(how > 0));
+    r.t->set_eager(true);
+    if (how == 2) r.core->set_spare_target(4);
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    const uint32_t pred[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+    r.core->serve_prediction(1, pred, 8);
+    const ts::DgStats& s = r.core->stats();
+    const uint64_t want = how == 0 ? 8 : how == 1 ? 0 : 4;
+    CHECK_EQ(s.prefetched, want);
+    CHECK_EQ(s.pf_strict_refused, how == 0 ? 0u : 8u - want);
+    CHECK_EQ(r.core->free_slots(), uint32_t(8 - want));
+    serve_layer(r, 1, {1, 2});
+    serve_layer(r, 2, {1});
+    CHECK_EQ(r.core->stats().bank_serves, how == 0 ? 3u : 0u);  // off: the predictions took the demand's spares
+    r.core->end_token({});
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The randomized model with strict admission (random spare targets, so some slots lie above the target): every read
+// exact, every invariant and boundary as the oracle's; prefetches are admitted and refused.
+TEST(dg_pf_strict_admit_runs) {
+  uint64_t admitted = 0, refused = 0;
+  for (const Shape* base : {&kPredict, &kPredictPressure, &kWinpf, &kDiskPredict})
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+      Shape sh = *base;
+      sh.pf_strict = true;
+      sh.vary = true;
+      sh.pf_revert = seed % 2 == 0;
+      const Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+      if (!o.violation.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, o.violation.c_str());
+      CHECK(o.violation.empty());
+      admitted += o.st.prefetched;
+      refused += o.st.pf_strict_refused;
+    }
+  std::printf("  prefetched %llu, refused by strict admission %llu\n", (unsigned long long)admitted,
+              (unsigned long long)refused);
+  CHECK(admitted > 0);
+  CHECK(refused > 0);
+}
+
+// ---- the prediction shadow tally (SS_DG_PRED_SHADOW) ----
+
+// Known predictions and demands on a three-tier cache (layer 1: units 0-3 pinned, 4-23 file-homed; layer 2: all
+// file-homed): exact counts, the same whether file prefetches, strict admission and revert are on or off and whether
+// the device ran ahead (the tally is independent of what is issued). Token 1: layer 1 predicted {0 pinned, 5, 6, 5,
+// 99 invalid}, demanded {5, 7, 7}; layer 2 predicted {1, 2, 3}, demanded {2, 9}: predicted 2 + 3, demanded 2 + 2, hit
+// 1 + 1. Token 2: layer 2 predicted {10} and never demanded (predicted only), layer 1 demanded without a prediction
+// (not counted).
+TEST(dg_pred_shadow_tally) {
+  const auto disk = disk_flags(72, 24, 28);
+  std::vector<uint64_t> first;
+  for (int how = 0; how < 16; ++how) {
+    const bool disk_prefetch = how & 1, strict = how & 2, revert = how & 4, ahead = how & 8;
+    ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, admit_tweak(strict, revert, disk_prefetch));
+    r.t->set_eager(true);
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    const uint32_t p1[5] = {0, 5, 6, 5, 99};
+    r.core->serve_prediction(1, p1, 5, 0, ahead);
+    serve_layer(r, 1, {5, 7, 7});
+    const uint32_t p2[3] = {1, 2, 3};
+    r.core->serve_prediction(2, p2, 3, 0, ahead);
+    serve_layer(r, 2, {2, 9});
+    r.core->end_token({});
+    const ts::DgStats& s = r.core->stats();
+    CHECK_EQ(s.pred_shadow_file_predicted, 5u);
+    CHECK_EQ(s.pred_shadow_file_demanded, 4u);
+    CHECK_EQ(s.pred_shadow_file_hit, 2u);
+    CHECK_EQ(s.pred_shadow_file_predicted_bytes, 5u * 8192u);
+    CHECK_EQ(s.pred_shadow_file_demanded_bytes, 4u * 8192u);
+    CHECK_EQ(s.pred_shadow_file_hit_bytes, 2u * 8192u);
+    if (disk_prefetch && !strict && !ahead) CHECK(s.prefetched > 0);  // (issued here, the tally the same)
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    serve_layer(r, 1, {11});
+    const uint32_t p3[1] = {10};
+    r.core->serve_prediction(2, p3, 1, 0, ahead);
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    // layer 2 of token 2 was demanded: its {0} is file-homed but not predicted -> demanded, no hit
+    const std::vector<uint64_t> got = {s.pred_shadow_file_predicted, s.pred_shadow_file_demanded,
+                                       s.pred_shadow_file_hit, s.pred_shadow_file_predicted_bytes,
+                                       s.pred_shadow_file_demanded_bytes, s.pred_shadow_file_hit_bytes};
+    CHECK(got == (std::vector<uint64_t>{6, 5, 2, 6 * 8192, 5 * 8192, 2 * 8192}));
+    // token 3: a prediction for a layer the token never demands counts as predicted only, and is cleared at the boundary
+    std::vector<uint8_t> run = {1, 1, 0};
+    r.core->begin_token(++r.seq, &run);
+    serve_layer(r, 0, {0});
+    const uint32_t p4[2] = {12, 13};
+    r.core->serve_prediction(2, p4, 2, 0, ahead);
+    serve_layer(r, 1, {12});
+    r.core->end_token({});
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    serve_layer(r, 1, {13});
+    serve_layer(r, 2, {12});  // (no prediction this token: not counted)
+    r.core->end_token({});
+    const std::vector<uint64_t> all = {s.pred_shadow_file_predicted, s.pred_shadow_file_demanded, s.pred_shadow_file_hit};
+    CHECK(all == (std::vector<uint64_t>{8, 5, 2}));
+    if (how == 0) first = all;
+    CHECK(all == first);
+    r.verify();
+    if (!r.v.what.empty()) std::printf("  how %d: %s\n", how, r.v.what.c_str());
+    CHECK(r.v.what.empty());
+  }
+}
+
+// ---- review follow-ups: the full read queue's order, DG_PF_LEGACY, reverted units at the pinned recency tail ----
+
+// A full read queue (depth 2) ends a demand read before a prefetch read: a prefetch read that never completes (held)
+// does not take a demand's place in the queue when a demand read can be ended. DG_PF_LEGACY: the oldest (the
+// prefetch's), as before.
+TEST(dg_full_queue_ends_demand_reads_first) {
+  for (bool legacy : {false, true}) {
+    OooRig f({25, 5}, 2, legacy);
+    DgCore& g = *f.core;
+    CHECK(g.fetch(1, 5, true));   // key 25: a prefetch read, held (never completes until ended)
+    CHECK(g.fetch(0, 5, false));  // key 5: a demand read, held
+    CHECK_EQ(g.reads_in_flight(), 2u);
+    CHECK(g.fetch(0, 6, false));  // key 6: the queue is full, nothing completed
+    const auto& e = f.t.ended();
+    CHECK_EQ(e.size(), 1u);
+    if (!e.empty()) CHECK_EQ(e[0], legacy ? 25u : 5u);
+    g.check();
+    f.finish();
+    CHECK(f.v.what.empty());
+  }
+}
+
+// DG_PF_LEGACY restores the admission before SS_DG_PF_ADMIT exactly: a plain prediction for a layer the device already
+// exported is served (no pred_skipped_ahead), and a layer's ready waits for every prefetch read of the layer, routed
+// or not (the counts of before: dg_three_tier_prefetch_reads_carried's ready with all four units' copies).
+TEST(dg_pf_legacy_restores_the_admission) {
+  for (bool legacy : {false, true}) {
+    ResRig r({24, 24, 24}, 24, 8, 8, false, nullptr, 0, 3, 0u, [legacy](DgConfig& c) { c.pf_legacy = legacy; });
+    r.t->set_eager(true);
+    r.core->begin_token(++r.seq);
+    serve_layer(r, 0, {0});
+    const uint32_t pred[3] = {2, 3, 3};
+    r.core->serve_prediction(1, pred, 3, 0, true);
+    CHECK_EQ(r.core->stats().prefetched, legacy ? 2u : 0u);
+    CHECK_EQ(r.core->stats().pred_skipped_ahead, legacy ? 0u : 1u);
+    serve_layer(r, 1, {2});
+    serve_layer(r, 2, {0});
+    r.core->end_token({});
+    r.verify();
+    CHECK(r.v.what.empty());
+  }
+  for (bool legacy : {false, true}) {
+    OooRig f({25}, 16, legacy);
+    DgCore& g = *f.core;
+    const uint32_t id0 = 0;
+    g.serve(0, &id0, 1, f.t.entry(0) < 0 ? 1 : 0);
+    const uint32_t pred[1] = {5};
+    g.serve_prediction(1, pred, 1);  // key 25: held
+    CHECK_EQ(g.reads_in_flight(), 1u);
+    const uint32_t id = 0;  // layer 1 routes unit 0 (key 20, pinned), not 5
+    g.serve(1, &id, 1, f.t.entry(20) < 0 ? 1 : 0);
+    CHECK_EQ(g.reads_in_flight(), legacy ? 0u : 1u);
+    CHECK_EQ(f.t.ended().size(), legacy ? 1u : 0u);
+    f.finish();
+    CHECK(f.v.what.empty());
+  }
+}
+
+// dg_pf_revert_unused: a reverted unit's pinned home is the least recently homed (an unused prediction is not a use):
+// the first to drop to its file for a block. Off (winpf's revert, admission), the order is unchanged.
+TEST(dg_pf_revert_to_the_pinned_tail) {
+  const auto disk = disk_flags(72, 24, 28);
+  ResRig r({24, 24, 24}, 24, 8, 8, false, &disk, 4, 3, 0u, admit_tweak(false, true, false));
+  r.t->set_eager(true);
+  const uint32_t kv = r.core->key(1, 2);  // keys 24..27: the pinned homes
+  CHECK(r.core->home(kv) == DgCore::Home::Host);
+  r.core->begin_token(++r.seq);
+  serve_layer(r, 0, {0});
+  const uint32_t pred[1] = {2};
+  r.core->serve_prediction(1, pred, 1);
+  serve_layer(r, 1, {5});
+  serve_layer(r, 2, {0});
+  r.core->end_token({});
+  CHECK_EQ(r.core->stats().pf_reverted, 1u);
+  CHECK(r.core->home(kv) == DgCore::Home::Host);
+  const auto order = r.core->host_order();
+  CHECK(!order.empty() && order.back() == kv);
+  r.core->check();
+  r.verify();
+  CHECK(r.v.what.empty());
 }

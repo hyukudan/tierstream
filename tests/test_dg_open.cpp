@@ -469,9 +469,50 @@ TEST(dg_clean_evict_abi_cpu) {
          }),
          SS_E_UNSUPPORTED, "needs the CUDA backend");
   static_assert(offsetof(ss_options, dg_clean_evict) == offsetof(ss_options, reserved6) + 4, "appended");
-  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved7) + 4, "the struct's end");
   ss_options o;
   ss_options_defaults(&o);
   CHECK_EQ(o.dg_clean_evict, 0u);
   CHECK_EQ(int(ss_dg_set_clean_evict(nullptr, 1)), int(SS_E_INVALID));
+}
+
+// dg_pf_revert_unused: 0 or 1, appended after dg_clean_evict's padding; an older struct (without it) reads 0; the
+// runtime setter on no context.
+TEST(dg_pf_revert_abi_cpu) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_pf_revert_unused = 2; }), SS_E_INVALID,
+         "dg_pf_revert_unused must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_pf_revert_unused = 1; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B&, O& o, T&) {
+           o.struct_size = uint32_t(offsetof(ss_options, dg_pf_revert_unused));
+           o.dg_pf_revert_unused = 7;  // beyond an older caller's struct: never read
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  static_assert(offsetof(ss_options, dg_pf_revert_unused) == offsetof(ss_options, reserved7) + 4, "appended");
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_pf_revert_unused, 0u);
+  CHECK_EQ(int(ss_dg_set_pf_revert_unused(nullptr, 1)), int(SS_E_INVALID));
+#ifndef SS_DG_PF_REVERT
+#error "SS_DG_PF_REVERT"
+#endif
+}
+
+// dg_pf_strict_admit: 0 or 1, appended after dg_pf_revert_unused's padding; an older struct (without it) reads 0.
+TEST(dg_pf_strict_admit_abi_cpu) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_pf_strict_admit = 2; }), SS_E_INVALID, "dg_pf_strict_admit must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_pf_strict_admit = 1; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+  expect(try_open(m, [](B&, O& o, T&) {
+           o.struct_size = uint32_t(offsetof(ss_options, dg_pf_strict_admit));
+           o.dg_pf_strict_admit = 7;  // beyond an older caller's struct: never read
+         }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+  static_assert(offsetof(ss_options, dg_pf_strict_admit) == offsetof(ss_options, reserved8) + 4, "appended");
+  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved9) + 4, "the struct's end");
+  ss_options o;
+  ss_options_defaults(&o);
+  CHECK_EQ(o.dg_pf_strict_admit, 0u);
+#ifndef SS_DG_PF_ADMIT
+#error "SS_DG_PF_ADMIT"
+#endif
 }

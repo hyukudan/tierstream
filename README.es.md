@@ -265,6 +265,22 @@ archivo: sin copia de dispositivo a host, y sin expulsar ninguna unidad fijada p
 fijada (por ejemplo, un prefill de capa completa en una tarjeta pequeña). Se contabiliza en
 `ss_dg_stats.clean_drops` / `clean_drop_bytes`.
 
+**Precargas no usadas devueltas (`dg_pf_revert_unused`, opcional).** Una precarga que su token no utilizó se admite
+normalmente en la frontera como cualquier otra copia, de modo que la frontera escribe de vuelta otra unidad del
+dispositivo para mantener libres los slots de reserva. Con `dg_pf_revert_unused = 1` (o `ss_dg_set_pf_revert_unused`
+entre tokens), esa unidad vuelve en su lugar a su bloque fijado o a su archivo (sin copia), y la frontera no desaloja
+nada por ella. Las precargas usadas y mantenidas se admiten como antes. Se contabiliza en
+`ss_dg_stats.pf_reverted` / `pf_revert_bytes`.
+
+**Las predicciones no estorban a la demanda.** Se omite una predicción ordinaria para una capa que el dispositivo ya
+alcanzó (`pred_skipped_ahead`); la señal de lista de una capa solo espera las lecturas de precarga de las unidades que
+realmente usa (una precarga de archivo errónea sigue leyéndose en segundo plano; una lectura posterior que necesite su
+puesto en la cola o su búfer de staging, o el final del token, sigue esperándola); una cola de lectura llena completa
+las lecturas por demanda antes que las de precarga; y con `dg_pf_strict_admit = 1` una precarga solo usa slots libres
+por encima del objetivo de reserva, así que los fallos por demanda siempre encuentran el suyo (`pf_strict_refused`).
+Estos tres cambios de admisión se miden antes de pasar a ser el comportamiento por defecto: hasta entonces
+`DG_PF_LEGACY` vale 1 por defecto (exactamente el comportamiento anterior) y `DG_PF_LEGACY=0` los activa.
+
 **Lecturas en vuelo de `ss_dg_make_resident`.** Hasta `min(dg_disk_queue, dg_disk_staging)` lecturas de archivo se
 ejecutan a la vez y se completan según terminan; las unidades copiadas pasan igualmente a ser las más recientes en el
 orden indicado, de modo que la ubicación no depende del orden de las lecturas. Sus lecturas, bytes, tiempo de espera y
@@ -417,7 +433,11 @@ medido y las partes fijas con nombre del motor (tronco, KV para el contexto soli
 búferes del host pinned y paginables, staging de carga); la arena de expertos recibe lo que queda del dispositivo, el
 nivel pinned lo que queda del host y el nivel de archivo el resto. Cuando las partes fijas por sí solas no caben, se
 niega a arrancar indicando cuáles son y el límite más pequeño que funcionaría. Sin límite, produce exactamente la
-colocación en tres niveles actual. `ss_budget_ledger` (pasado como `ss_options.budget`) imputa cada asignación que hace
+colocación en tres niveles actual. Un motor con compuerta en el dispositivo le pasa también la memoria de host propia
+de la biblioteca (`ss_budget_in_dg_library` la rellena a partir del descriptor y las opciones: el área de control
+mapeada, un búfer de rebote por lector de archivo con `dg_disk_queue` y los búferes de staging), imputada como parte
+fija del host e informada en `ss_budget_out.lib_*` con la misma aritmética con la que la admite `ss_open`.
+`ss_budget_ledger` (pasado como `ss_options.budget`) imputa cada asignación que hace
 tierstream contra los mismos límites y conserva el pico por tipo con los componentes en ese pico, junto al pico que
 midió el motor (cudaMemGetInfo / NVML). Detalles: [diseño §5.1](docs/design.md).
 

@@ -394,6 +394,7 @@ void expect_poisoned(Rig& r) {
   CHECK_EQ(int(ss_dg_enqueue_begin(r.c, r.s)), int(SS_E_BACKEND));
   CHECK_EQ(int(ss_dg_set_budgets(r.c, 0, 0, 0)), int(SS_E_BACKEND));
   CHECK_EQ(int(ss_dg_set_clean_evict(r.c, 1)), int(SS_E_BACKEND));
+  CHECK_EQ(int(ss_dg_set_pf_revert_unused(r.c, 1)), int(SS_E_BACKEND));
   ss_dg_stats x{};
   CHECK_OK(ss_stats_dg(r.c, &x));
   char* js = nullptr;
@@ -1121,12 +1122,16 @@ TEST(dg_cuda_hooks_and_budgets) {
   CHECK_OK(ss_begin(r.c, nullptr, 0));
   CHECK_EQ(int(ss_dg_set_budgets(r.c, 2, 4, 48)), int(SS_E_INVALID));
   CHECK_EQ(int(ss_dg_set_clean_evict(r.c, 1)), int(SS_E_INVALID));  // dg_clean_evict: between tokens too
+  CHECK_EQ(int(ss_dg_set_pf_revert_unused(r.c, 1)), int(SS_E_INVALID));  // dg_pf_revert_unused: between tokens too
   r.enqueue_step(false);
   CHECK_OK(ss_end(r.c));
   CU(cudaStreamSynchronize(r.s));
   CHECK_EQ(int(ss_dg_set_clean_evict(r.c, 2)), int(SS_E_INVALID));
   CHECK_OK(ss_dg_set_clean_evict(r.c, 1));  // (two-tier: accepted, no effect)
   CHECK_OK(ss_dg_set_clean_evict(r.c, 0));
+  CHECK_EQ(int(ss_dg_set_pf_revert_unused(r.c, 2)), int(SS_E_INVALID));
+  CHECK_OK(ss_dg_set_pf_revert_unused(r.c, 1));
+  CHECK_OK(ss_dg_set_pf_revert_unused(r.c, 0));
 }
 
 // design rev 3.4 §11.7 / §11.8: option refusals at open.

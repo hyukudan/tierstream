@@ -140,6 +140,15 @@ struct DgConfig {
   // is free goes to its file (no copy: the file holds its bytes) instead of a pinned unit being dropped to its file to
   // free one; with a free block it is written back as before. Placement only (boundary, make_resident, rounds).
   bool clean_evict = false;
+  // dg_pf_revert_unused: at every boundary a prefetched unit its token did not use (not kept) goes back to its source
+  // (its block, or its file) with no copy, as winpf's revert_unused does in a hinted window. Placement only.
+  bool pf_revert = false;
+  // dg_pf_strict_admit: a prefetch takes a free slot only while more are free than max(prefetch_reserve,
+  // spare_target), so it never takes a spare slot this token's demand misses need.
+  bool pf_strict = false;
+  // DG_PF_LEGACY: the prediction admission before SS_DG_PF_ADMIT (no ahead skip of plain predictions, drain_layer ends
+  // every prefetch read of its layer, a full read queue ends the oldest reads)
+  bool pf_legacy = false;
 };
 
 struct DgStats {
@@ -204,6 +213,16 @@ struct DgStats {
   // to its file); demand units admitted inside a layer token (the demand stream synced) to free their source blocks
   // for those write-backs
   uint64_t lm_tokens = 0, lm_parts = 0, lm_mid_evictions = 0, lm_early_admits = 0;
+  // dg_pf_revert_unused: unused prefetches sent back to their block or file at a boundary (winpf's also in
+  // prior_reverted / l1_reverted), and their bytes
+  uint64_t pf_reverted = 0, pf_revert_bytes = 0;
+  // plain predictions skipped because the device had already exported their layer; prefetches dg_pf_strict_admit
+  // refused (no free slot above the spare target)
+  uint64_t pred_skipped_ahead = 0, pf_strict_refused = 0;
+  // the prediction shadow tally (ss_dg_stats.pred_shadow_file_*): file-homed predicted ids, file-homed demanded ids at
+  // predicted layers, both; and x the unit bytes
+  uint64_t pred_shadow_file_predicted = 0, pred_shadow_file_demanded = 0, pred_shadow_file_hit = 0;
+  uint64_t pred_shadow_file_predicted_bytes = 0, pred_shadow_file_demanded_bytes = 0, pred_shadow_file_hit_bytes = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -311,7 +330,7 @@ class DgCore {
   void cover(uint32_t g, uint32_t unit);
   // A true use (recency + stats); was_miss = its export saw -1.
   void use(uint32_t g, uint32_t unit, bool was_miss);
-  // ready[g] = seq (a layer token: the part's ready word), after the file reads in flight landed their copies
+  // ready[g] = seq (a layer token: the part's ready word), after the demand file reads in flight landed their copies
   void signal(uint32_t g);
   // ---- layer tokens (ss_dg_begin_layer) ----
   // Engine thread, between tokens, before the token's begin: the next token serves only gated layer g, in parts
@@ -439,6 +458,9 @@ class DgCore {
   // Between tokens: dg_clean_evict at runtime (from the next victim on; reset_open restores the open's setting).
   void set_clean_evict(bool on);
   bool clean_evict() const { return c_.clean_evict; }
+  // Between tokens: dg_pf_revert_unused at runtime (from the next boundary on; reset_open restores the open's setting).
+  void set_pf_revert(bool on);
+  bool pf_revert() const { return c_.pf_revert; }
   bool reset_failed() const { return reset_failed_; }
   // A reset or a make_resident failed on the device: the core refuses every token, reset and make_resident.
   bool poisoned() const { return reset_failed_; }
@@ -597,7 +619,7 @@ class DgCore {
   void drain_through(const std::function<bool(const Pending&)>& f);  // the records f accepts (only those)
   void drain_demand();               // every demand record
   void drain_key(uint32_t k);        // k's record
-  void drain_layer(uint32_t g);      // every demand record and every record of gated layer g
+  void drain_layer(uint32_t g, const uint32_t* ids, uint32_t n);  // every demand record, layer g's routed prefetches
   void enter();                      // a public entry point: counted, the demand records drained
   void undo_pending(const Pending& p);
   void finish_pending(const Pending& p);
@@ -609,8 +631,9 @@ class DgCore {
   // block if it holds one, else its file), a block freed by dropping the least recently homed pinned key to its file,
   // the next staging buffer (waits for its last copy)
   void hpush(uint32_t k);
+  void hpush_tail(uint32_t k);
   void hunlink(uint32_t k);
-  void to_lower(uint32_t k);
+  void to_lower(uint32_t k, bool cold = false);  // cold: a pinned home goes to the recency tail (dropped first)
   // skip (make_resident): keys never dropped; count = false: not counted in disk_drops
   bool drop_host_lru(const std::vector<uint8_t>* skip = nullptr, bool count = true);
   // dg_clean_evict: a device victim without a free block goes to its file (three-tier), no pinned unit displaced
@@ -678,6 +701,12 @@ class DgCore {
   std::vector<uint8_t> lm_kept_;  // layer token: per key, kept by a layer (never a mid-token victim); empty = none
   std::vector<uint8_t> layer_missed_;  // per gated layer, this token
   std::vector<uint8_t> run_;           // per gated layer: exported this token (begin_token)
+  // the prediction shadow tally: per gated layer, whether this token predicted it and the file-homed unit ids it
+  // predicted (deduplicated); used by the layer's demand, cleared there and at the boundary
+  std::vector<uint8_t> shadow_has_;
+  std::vector<std::vector<uint32_t>> shadow_file_;
+  void shadow_predict(uint32_t g_next, const uint32_t* pred, uint32_t n);
+  void shadow_demand(uint32_t g, const uint32_t* ids, uint32_t n);
   std::vector<uint32_t> res_victims_;  // make_resident's last victims (test hook)
   // placement rounds: the decayed counts, the exports since the last round, the round's state (idle, running, a
   // cancellation requested while running)

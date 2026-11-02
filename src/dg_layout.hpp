@@ -50,6 +50,10 @@ struct DgLayout {
   // takes 0 / false / off or 1 / true / on): the ring first, then the pinned blocks on a helper thread while the
   // loader reads the residents
   bool load_overlap_alloc = false;
+  // DG_PF_LEGACY (0 / false / off or 1 / true / on, default on until the new admission is measured): the prediction
+  // admission before SS_DG_PF_ADMIT (no ahead skip of plain predictions, every prefetch read of a layer ended before
+  // its ready, a full read queue ending the oldest reads); DG_PF_LEGACY=0 selects the new admission
+  bool pf_legacy = true;
   // DG_UNIT_SUBREAD_KIB: the sub-read size of one unit's in-place parts (dg_read_unit; 0 = one request per part)
   uint64_t unit_subread = 0;
   // Exactly what the context allocates, so admission bills what it allocates.
@@ -61,6 +65,29 @@ struct DgLayout {
 
 // Bytes of the mapped control area for G gated layers (64-byte aligned arrays).
 uint64_t dg_mapped_bytes(uint32_t gated);
+
+// The context's own host memory beside the plan's blocks, as the open admits and allocates it: the mapped control area,
+// one bounce buffer per file reader (pageable), the one-unit staging buffer and the file tier's staging buffers. The
+// host admission below and the whole-device planner (ss_budget_in.dg_gated_layers, SS_BUDGET_LIBRARY) both take it
+// from here, so a plan charges what an open admits.
+struct DgHostBytes {
+  uint64_t mapped = 0;          // pinned
+  uint64_t bounce = 0;          // pageable, per reader
+  uint32_t bounce_readers = 0;  // the context's thread + the disk readers (dg_disk_queue > 1)
+  uint64_t staging = 0;         // pinned: one unit, 4 KiB rounded
+  uint64_t disk_staging = 0;    // pinned: the file tier's staging buffers, one host stride each
+  uint64_t bounce_total() const { return bounce * bounce_readers; }  // (checked by dg_host_bytes)
+  uint64_t total() const { return mapped + bounce_total() + staging + disk_staging; }
+};
+// gated = G; unit_bytes = one unit; part_max = its largest part; max_align = the largest source alignment (4096 at
+// least); staging_request = ss_options.staging_bytes (0 = 16 MiB, at most 16 MiB); disk_queue / disk_staging = file
+// reads in flight and staging buffers, resolved (0 without the disk tier). Throws SS_E_INVALID on overflow.
+DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max, uint64_t max_align,
+                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging);
+// The planner's inputs for that memory (ss_budget_in_dg_library): the gated layers, the largest part, the source
+// alignment, the bounce request and the disk queue of this descriptor and these options, and staging = the open's
+// staging buffers (dg_disk_staging, 0 = 8).
+void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in);
 // Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);
 

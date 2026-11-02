@@ -237,6 +237,20 @@ when no pinned block is free goes straight back to its file: no device-to-host c
 to make room. This stops the "evict, write back, re-read" loop when a model's working set is larger than VRAM + pinned
 RAM (for example a whole-layer prefill on a small card). Counted in `ss_dg_stats.clean_drops` / `clean_drop_bytes`.
 
+**Unused prefetches reverted (`dg_pf_revert_unused`, opt-in).** A prefetch its token did not use is normally admitted
+at the boundary like any other copy, so the boundary writes another device unit back to keep the spare slots free. With
+`dg_pf_revert_unused = 1` (or `ss_dg_set_pf_revert_unused` between tokens), such a unit goes back to its pinned block
+or its file instead (no copy), and the boundary evicts nothing for it. Used and kept prefetches are admitted as before.
+Counted in `ss_dg_stats.pf_reverted` / `pf_revert_bytes`.
+
+**Predictions stay out of the demand's way.** A plain prediction for a layer the device already reached is skipped
+(`pred_skipped_ahead`); a layer's ready waits only for the prefetch reads of units it actually uses (a wrong file
+prefetch keeps reading in the background; a later read that needs its queue place or staging buffer, or the token's
+end, still waits for it); a full read queue ends demand reads before prefetch reads; and with `dg_pf_strict_admit = 1`
+a prefetch only uses free slots above the spare target, so demand misses always find theirs (`pf_strict_refused`).
+These three admission changes are measured before they become the default: until then `DG_PF_LEGACY` defaults to 1
+(the previous behaviour, exactly) and `DG_PF_LEGACY=0` selects them.
+
 **`ss_dg_make_resident` reads in flight.** Up to `min(dg_disk_queue, dg_disk_staging)` file reads run together and are
 finished as they complete; the copied units still become the most recent in the order given, so placement does not
 depend on read timing. Its own reads, bytes, wait time, host-to-device and write-back bytes are in `ss_dg_stats.mkres_*`.
@@ -369,9 +383,13 @@ host (`--ram-total-gib`, pinned included). `ss_budget_plan` subtracts the measur
 named fixed parts (trunk, KV for the requested context, workspaces, drafter, pinned and pageable host buffers, load
 staging); the expert arena gets what is left of the device, the pinned tier what is left of the host, the file tier
 the rest. When the fixed parts alone do not fit, it refuses at startup naming them and the smallest cap that would
-work. With no cap it gives exactly today's three-tier placement. `ss_budget_ledger` (passed as `ss_options.budget`)
-charges every allocation tierstream makes against the same caps and keeps the peak per kind with the components at
-that peak, next to the peak the engine measured (cudaMemGetInfo / NVML). Details: [design §5.1](docs/design.md).
+work. With no cap it gives exactly today's three-tier placement. A device-gated engine also gives it the library's own
+host memory (`ss_budget_in_dg_library` fills it from the descriptor and options: the mapped control area, one bounce
+buffer per file reader with `dg_disk_queue`, the staging buffers), charged as a fixed host part and reported in
+`ss_budget_out.lib_*` with the same arithmetic `ss_open` admits it with. `ss_budget_ledger` (passed as
+`ss_options.budget`) charges every allocation tierstream makes against the same caps and keeps the peak per kind with
+the components at that peak, next to the peak the engine measured (cudaMemGetInfo / NVML). Details:
+[design §5.1](docs/design.md).
 
 ### Running on your hardware (device profiles)
 

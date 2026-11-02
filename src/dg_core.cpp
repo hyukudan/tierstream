@@ -49,6 +49,8 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
   pf_layer_.assign(gated(), 0);
   layer_missed_.assign(gated(), 0);
   run_.assign(gated(), 1);
+  shadow_has_.assign(gated(), 0);
+  shadow_file_.resize(gated());
   lc_.assign(gated(), DgLayerCounts{});
   if (c_.prefetch_reserve_auto) c_.prefetch_reserve = std::min<uint32_t>(24, c_.spare_target / 4);
   require(t_->parts() >= 1, SS_E_INVALID, "device-gated: a unit without parts");
@@ -108,6 +110,17 @@ void DgCore::hpush(uint32_t k) {
   x.in_hlist = true;
 }
 
+void DgCore::hpush_tail(uint32_t k) {  // the least recently homed pinned key (dropped to its file first)
+  ++on_host_;
+  if (!c_.disk_tier) return;
+  Entry& x = e_[k];
+  x.hnext = kNone;
+  x.hprev = htail_;
+  if (htail_ != kNone) e_[htail_].hnext = k; else hhead_ = k;
+  htail_ = k;
+  x.in_hlist = true;
+}
+
 void DgCore::hunlink(uint32_t k) {
   --on_host_;
   if (!c_.disk_tier) return;
@@ -127,7 +140,7 @@ std::vector<uint32_t> DgCore::host_order() const {
 
 // A key that leaves the device / a bank without a write-back: its block (it held one: a clean copy or a bank home)
 // is its home again, else its file (three-tier). Its slot and entry are the caller's.
-void DgCore::to_lower(uint32_t k) {
+void DgCore::to_lower(uint32_t k, bool cold) {
   Entry& x = e_[k];
   x.slot = -1;
   if (x.backed) {
@@ -136,7 +149,8 @@ void DgCore::to_lower(uint32_t k) {
   }
   if (x.block >= 0) {
     x.home = Home::Host;
-    hpush(k);
+    if (cold) hpush_tail(k);
+    else hpush(k);
   } else {
     if (!c_.disk_tier) broken("a key without a block left the device without a write-back");
     x.home = Home::File;
@@ -186,7 +200,8 @@ int32_t DgCore::take_stage() {
 // the reads whose key, slot, staging buffer or event it touches (targeted), and the demand reads at a public entry
 // point; everything else it does is on other keys, slots, blocks and events, so it sees what it saw with synchronous
 // reads (the host state is the same, and the device work it enqueues or waits on is independent of the copies not
-// enqueued yet). The device reads a layer's entries only after its ready, which ends the layer's reads first.
+// enqueued yet). The device reads a layer's entries only after its ready, which ends the reads of the units it routes
+// first (another unit's entry is never read by that layer: published whenever its read ends).
 void DgCore::copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t src) {
   if (mut_ == kEntryBeforeCopy) {
     write_entry(s, k, slot);
@@ -307,9 +322,10 @@ void DgCore::end_reads(const std::function<bool(const Pending&)>& pick) {
 
 // Prefetch reads in flight across calls: a public entry point ends the demand reads (only those: an older prefetch read
 // stays in flight); a prefetch's read ends when its key is touched again (drain_key: a fetch or a cover), when its
-// layer is done (drain_layer: before its ready), once it completed (poll_reads, a full queue), or at a drain of
-// everything (the end of the token, slot pressure, write-backs submitted between tokens, a seed, a reset, a setting,
-// destruction). A staging buffer reused ends the one read that holds it.
+// layer routes it (drain_layer: before its ready; a read of a unit the layer does not route is not waited for there),
+// once it completed (poll_reads, a full queue), or at a drain of everything (the end of the token, slot pressure,
+// write-backs submitted between tokens, a seed, a reset, a setting, destruction). A staging buffer reused ends the one
+// read that holds it.
 void DgCore::drain_through(const std::function<bool(const Pending&)>& f) {
   end_reads(f);
 }
@@ -322,8 +338,18 @@ void DgCore::drain_key(uint32_t k) {
   drain_through([k](const Pending& p) { return p.key == k; });
 }
 
-void DgCore::drain_layer(uint32_t g) {
-  drain_through([this, g](const Pending& p) { return !p.prefetch || gated_of(p.key) == g; });
+// A prefetch read of a unit layer g does not route keeps running (its slot and staging buffer stay held, its copy and
+// entry follow when it ends): the layer's ready does not wait for a wrong prediction's read. The wait moves, it does
+// not disappear: a later touch of its key, its staging buffer's reuse (take_stage), a full read queue with no demand
+// read to end first, or the boundary's drain ends it. (A routed one was a miss, already ended by its cover; this ends
+// any left.) DG_PF_LEGACY: every prefetch read of layer g, as before.
+void DgCore::drain_layer(uint32_t g, const uint32_t* ids, uint32_t n) {
+  const uint32_t first = key(g, 0);
+  const bool legacy = c_.pf_legacy;
+  drain_through([this, g, ids, n, first, legacy](const Pending& p) {
+    return !p.prefetch ||
+           (gated_of(p.key) == g && (legacy || std::find(ids, ids + n, p.key - first) != ids + n));
+  });
 }
 
 void DgCore::enter() {
@@ -872,7 +898,9 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
   }
   int32_t slot = -1;
   bool bank = false, free_counted = false;
-  const size_t reserve = prefetch ? c_.prefetch_reserve : 0u;
+  // a prefetch keeps the reserve free; dg_pf_strict_admit: the spare target too (the demand misses' spares)
+  const size_t reserve =
+      prefetch ? (c_.pf_strict ? std::max<size_t>(c_.prefetch_reserve, c_.spare_target) : c_.prefetch_reserve) : 0u;
   if (c_.no_admit) {  // a demand (prefetches return above): a bank slot, released at the boundary, its home unchanged
     slot = take_bank_slot(g);
     if (slot < 0) fail(SS_E_BACKEND, "device-gated: dg_no_admit: no bank slot for a miss of gated layer " +
@@ -891,6 +919,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     slot = free_slots_.back();
     free_slots_.pop_back();
   } else if (prefetch) {
+    if (c_.pf_strict && free_slots_.size() > c_.prefetch_reserve) ++st_.pf_strict_refused;  // (strict refused it)
     return false;
   } else {
     slot = take_bank_slot(g);
@@ -917,8 +946,16 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     int32_t stage = -1;
     void* h = nullptr;
     try {
-      if (pending_.size() >= depth) {  // the queue depth: the completed reads first, then the oldest
-        end_reads([this](const Pending& p) { return t_->read_unit_done(p.handle); });
+      if (pending_.size() >= depth) {  // the queue depth: the completed reads first, then the oldest demand reads,
+        end_reads([this](const Pending& p) { return t_->read_unit_done(p.handle); });  // then the oldest prefetches
+        if (pending_.size() >= depth && !c_.pf_legacy) {  // (DG_PF_LEGACY: the oldest, whatever they are)
+          size_t n = pending_.size() + 1 - depth;
+          end_reads([&n](const Pending& p) {
+            if (n == 0 || p.prefetch) return false;
+            --n;
+            return true;
+          });
+        }
         if (pending_.size() >= depth) drain_pending(pending_.size() + 1 - depth);
       }
       stage = take_stage();
@@ -1021,7 +1058,8 @@ void DgCore::use(uint32_t g, uint32_t unit, bool was_miss) {
 }
 
 // Drain points: the start (a public entry point: the demand reads), cover() of a prefetch (the demand reads and that
-// key's), signal() (this layer's reads, its misses' and its prefetches', in flight until its ready).
+// key's), the end (drain_layer: its misses' reads and the reads of the prefetched units it routes, before its ready;
+// the other prefetch reads stay in flight).
 void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
   enter();
   const uint32_t nu = units(g);
@@ -1032,6 +1070,7 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
   if (wp_.enable && !win_w_.empty() && (!wp_.top_k || n % wp_.top_k != 0))  // winpf: a hinted window's export
     fail(SS_E_BACKEND, "winpf: gated layer " + std::to_string(g) + " exported " + std::to_string(n) +
                            " ids: not rows x top_k (" + std::to_string(wp_.top_k) + ")");
+  shadow_demand(g, ids, n);  // (the homes before this layer's fetches)
   if (diag_ && mask) t_->diag_mark(g, 0);
   bool first_marked = false;
   uint32_t first_read = kNone;  // dg_diag: the first fetched key while its read is in flight
@@ -1056,15 +1095,48 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
     drain_key(first_read);    // and the mark follows them
     t_->diag_mark(g, 2);
   }
-  if (mask) signal(g);
-  else drain_layer(g);  // (no miss: the layer's prefetch reads still end before it is done)
+  drain_layer(g, ids, n);  // drain point: this layer's copies and entries (demand, routed prefetches)
+  if (mask) signal(g);     // enqueued before its ready
   if (diag_ && mask) t_->diag_mark(g, 1);
 }
 
 void DgCore::signal(uint32_t g) {
-  drain_layer(g);  // drain point: this layer's copies and entries (demand, prefetch) enqueued before its ready
+  drain_demand();  // drain point: the demand reads' copies and entries enqueued before the ready (serve_demand's
+                   // drain_layer also ended the routed prefetch reads)
   if (lm_part_ != kNone) t_->signal_ready_part(lm_part_, seq_);
   else t_->signal_ready(g, seq_);
+}
+
+// The prediction shadow tally (ss_dg_stats.pred_shadow_file_*): no state but its own, no device work.
+void DgCore::shadow_predict(uint32_t g_next, const uint32_t* pred, uint32_t n) {
+  if (g_next >= gated()) return;
+  shadow_has_[g_next] = 1;
+  std::vector<uint32_t>& s = shadow_file_[g_next];
+  for (uint32_t i = 0; i < n; ++i) {
+    if (pred[i] >= units(g_next) || e_[key(g_next, pred[i])].home != Home::File) continue;
+    if (std::find(s.begin(), s.end(), pred[i]) != s.end()) continue;
+    s.push_back(pred[i]);
+    ++st_.pred_shadow_file_predicted;
+    st_.pred_shadow_file_predicted_bytes += unit_bytes_;
+  }
+}
+
+void DgCore::shadow_demand(uint32_t g, const uint32_t* ids, uint32_t n) {
+  if (!shadow_has_[g]) return;
+  std::vector<uint32_t>& s = shadow_file_[g];
+  for (uint32_t i = 0; i < n; ++i) {
+    if (std::find(ids, ids + i, ids[i]) != ids + i) continue;  // a repeated id once
+    const bool predicted = std::find(s.begin(), s.end(), ids[i]) != s.end();
+    if (!predicted && e_[key(g, ids[i])].home != Home::File) continue;  // (a predicted one: file-homed at prediction)
+    ++st_.pred_shadow_file_demanded;
+    st_.pred_shadow_file_demanded_bytes += unit_bytes_;
+    if (predicted) {
+      ++st_.pred_shadow_file_hit;
+      st_.pred_shadow_file_hit_bytes += unit_bytes_;
+    }
+  }
+  shadow_has_[g] = 0;
+  s.clear();
 }
 
 void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
@@ -1093,6 +1165,7 @@ void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mas
 // layer g_next is demanded (cover of the key, at the latest its ready), or at a drain of everything.
 void DgCore::serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export, bool ahead) {
   enter();
+  shadow_predict(g_next, pred, n);  // before any filter or branch (the tally is independent of what is issued)
   serve_prediction_impl(g_next, pred, n, n_export, ahead);
 }
 
@@ -1177,6 +1250,11 @@ void DgCore::serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32
   st_.predicted += uniq_.size();  // counted whatever the budget lets through (the replica's definition)
   pred_.assign(uniq_.begin(), uniq_.end());
   pred_layer_ = g_next;
+  if (ahead && !c_.pf_legacy) {  // the device ran ahead: layer g_next's demand is (being) served; a copy now only
+                                // adds bytes (as l+1; DG_PF_LEGACY: served as before)
+    ++st_.pred_skipped_ahead;
+    return;
+  }
   for (uint32_t id : uniq_) fetch(g_next, id, true);
 }
 
@@ -1202,6 +1280,8 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
       if (k < keys_) keep_mask[k] = 1;
   }
   auto kept = [&](uint32_t k) { return !keep_mask.empty() && keep_mask[k] && mut_ != kIgnoreKeep; };
+  // an unused prefetch reverts in a winpf hinted window (revert_unused), or at every boundary (dg_pf_revert_unused)
+  const bool revert = (wp_.enable && wp_.revert_unused && hinted) || c_.pf_revert;
   for (uint32_t k : coming_) {  // admitted: device homes now, their source blocks are free
     Entry& x = e_[k];
     if (x.home != Home::Coming) continue;
@@ -1215,13 +1295,19 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
         h /= 2;
       }
     }
-    if (wp_.enable && wp_.revert_unused && hinted && x.via_prefetch && !x.used && !kept(k)) {
-      // winpf: an unused prefetch goes back to its source block, which still holds the bytes (a Coming unit's block
-      // is freed only here, at admission): no write-back. The device is done with the token and kPf is synced; the
-      // table upload below unpublishes it.
+    if (revert && x.via_prefetch && !x.used && !kept(k)) {
+      // an unused prefetch goes back to its source block, which still holds the bytes (a Coming unit's block is freed
+      // only here, at admission), or read from its file (no block), to its file: no write-back. The device is done with
+      // the token and kPf is synced (and every read ended); the table upload below unpublishes it.
       if (x.pf_kind) ++(x.pf_kind == 1 ? st_.prior_reverted : st_.l1_reverted);
+      if (c_.pf_revert) {
+        ++st_.pf_reverted;
+        st_.pf_revert_bytes += unit_bytes_;
+      }
       free_slots_.push_back(x.slot);
-      to_lower(k);  // its block, or (read from its file) its file
+      // its block, or (read from its file) its file; dg_pf_revert_unused: at the pinned recency tail (an unused
+      // prediction is not a use: the first to drop to its file)
+      to_lower(k, c_.pf_revert);
       if (mut_ != kRevertKeepsEntry) table_[k] = -1;
       unlink(k);
       --on_device_;
@@ -1254,6 +1340,8 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     }
   }
   coming_.clear();
+  std::fill(shadow_has_.begin(), shadow_has_.end(), uint8_t(0));  // a prediction never demanded: predicted only
+  for (auto& s : shadow_file_) s.clear();
   for (uint32_t k : banked_) {  // bank units: back to their blocks (the upload below resets the entry)
     Entry& x = e_[k];
     if (x.home == Home::Bank) {
@@ -2423,7 +2511,8 @@ bool DgCore::same_open_state(const DgCore& b) const {
     return std::tie(c.n_units, c.persistent_slots, c.bank_slots, c.blocks, c.spare_target, c.prefetch_reserve,
                     c.prefetch_reserve_auto, c.prefetch_per_layer, c.prefetch_per_token, c.wb_defer, c.wb_on_d2h,
                     c.wb_layer_bytes, c.wb_max_outstanding, c.disk_tier, c.disk_prefetch, c.home_blocks,
-                    c.disk_staging, c.inclusive, c.disk_queue, c.clean_evict);
+                    c.disk_staging, c.inclusive, c.disk_queue, c.clean_evict, c.pf_revert, c.pf_strict,
+                    c.pf_legacy);
   };
   auto wp = [](const DgWinpf& w) {
     return std::tie(w.enable, w.prior_layers, w.prior_cap, w.prior_pmin, w.l1_cap, w.l1_min_votes, w.l1_pmin,
@@ -2580,6 +2669,8 @@ void DgCore::reset_open() {
     backed_ = 0;
     stage_next_ = 0;
     coming_.clear();
+    std::fill(shadow_has_.begin(), shadow_has_.end(), uint8_t(0));  // (the prediction shadow tally: none open)
+    for (auto& f : shadow_file_) f.clear();
     banked_.clear();
     std::fill(bank_key_.begin(), bank_key_.end(), kNone);
     // Empty bank ownership is invalidated by layer, independently of the retained token sequence domain.
@@ -2642,6 +2733,11 @@ void DgCore::set_spare_target(uint32_t n) {
 void DgCore::set_clean_evict(bool on) {
   drain_pending();  // drain point: a setting (between tokens)
   c_.clean_evict = on;
+}
+
+void DgCore::set_pf_revert(bool on) {
+  drain_pending();  // drain point: a setting (between tokens)
+  c_.pf_revert = on;
 }
 
 void DgCore::set_prefetch_budget(uint32_t per_layer, uint32_t per_token) {

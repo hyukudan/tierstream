@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "check.hpp"
+#include "dg_fixture.hpp"
+#include "dg_layout.hpp"
 #include "fixture.hpp"
 #include "strix_stream/ss.h"
 
@@ -1358,3 +1360,243 @@ TEST(host_context_charges_its_allocations_to_the_ledger) {
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }
+
+// ---- the device-gated library's own host bytes (SS_BUDGET_LIBRARY) ----
+namespace {
+
+// The plans the library fields must not change: two caps, RAM-capped, no file tier, host-limited, unified, refusals.
+std::vector<Card> library_cases() {
+  std::vector<Card> v(8);
+  v[1].in.ram_total_bytes = 32 * kGiB;
+  v[2].in.ram_total_bytes = 32 * kGiB;
+  v[2].in.ram_margin_bytes = 1 * kGiB;
+  v[2].in.inclusive_bytes = SS_BUDGET_AUTO;
+  v[3].in.file_tier = 0;
+  v[3].in.ram_total_bytes = 400 * kGiB;
+  v[4].in.host_avail_bytes = 40 * kGiB;
+  v[4].in.max_pinned_bytes = 30 * kGiB;
+  v[5].in.unified = 1;
+  v[5].in.ram_total_bytes = 96 * kGiB;
+  v[6].in.ram_total_bytes = 5 * kGiB;  // refused: below the fixed parts
+  v[7].in.vram_total_bytes = 0;        // uncapped
+  return v;
+}
+// The library inputs of a GLM-like open: 92 gated layers, the largest part, 4 KiB sources, the default bounce request,
+// 8 disk readers.
+void library_inputs(ss_budget_in& in, uint32_t queue = 8) {
+  in.dg_gated_layers = 92;
+  in.dg_disk_queue = queue;
+  in.dg_part_max_bytes = 4423680;
+  in.dg_source_align = 4096;
+  in.dg_bounce_request = 0;
+}
+ss_budget_out lib_plan(const ss_budget_in& in, ss_status* st = nullptr) {  // (every byte written)
+  ss_budget_out out;
+  std::memset(&out, 0x5A, sizeof out);
+  out.struct_size = sizeof out;
+  const ss_status s = ss_budget_plan(&in, &out);
+  if (st) *st = s;
+  return out;
+}
+
+}  // namespace
+
+// Unset (dg_gated_layers 0, the default; or an older caller's struct without the fields): the plans of before, bit for
+// bit (every output byte, the refusals' text included), the new outputs 0 and the JSON without the new keys.
+TEST(library_unset_is_the_plan_of_before) {
+  for (Card& k : library_cases()) {
+    ss_status s1, s2;
+    const ss_budget_out a = lib_plan(k.in, &s1);
+    ss_budget_in old = k.in;
+    old.struct_size = uint32_t(offsetof(ss_budget_in, dg_gated_layers));
+    old.dg_gated_layers = 7;  // past an older caller's struct: never read
+    const ss_budget_out b = lib_plan(old, &s2);
+    CHECK_EQ(int(s1), int(s2));
+    CHECK(std::memcmp(&a, &b, sizeof a) == 0);
+    CHECK_EQ(a.lib_host_bytes + a.lib_mapped_bytes + a.lib_bounce_bytes + a.lib_staging_bytes, 0u);
+    CHECK_EQ(a.lib_disk_staging_bytes + a.lib_bounce_readers, 0u);
+    std::string j(ss_budget_plan_json(&k.in, &a, nullptr, 0) + 1, '\0');
+    j.resize(ss_budget_plan_json(&k.in, &a, &j[0], j.size()));
+    CHECK(j.find("lib_") == std::string::npos && j.find("dg_gated_layers") == std::string::npos);
+  }
+  static_assert(offsetof(ss_budget_in, dg_gated_layers) == offsetof(ss_budget_in, reserved1) + 4, "appended");
+  static_assert(offsetof(ss_budget_out, lib_host_bytes) == offsetof(ss_budget_out, host_capped) + 4, "appended");
+  static_assert(sizeof(ss_budget_out) == offsetof(ss_budget_out, reserved0) + 4, "the struct's end");
+  ss_budget_in d;
+  ss_budget_in_defaults(&d);
+  CHECK_EQ(d.dg_gated_layers + d.dg_disk_queue, 0u);
+  CHECK_EQ(d.dg_part_max_bytes + d.dg_source_align + d.dg_bounce_request, 0u);
+}
+
+// Set: the library's fixed bytes are a fixed host part. The plan equals the plan of before with them as the engine's
+// own components (the mapped area and the staging buffer pinned, the bounce buffers pageable): the same placement,
+// host_fixed / planned / room / ceiling / minimum / refusal, only need_host_bytes (the host available is charged
+// too) and the lib_* outputs differ; the RAM cap's pinned room is lower by exactly those bytes. Three-tier plans charge
+// the disk readers' bounce buffers (planned twice), two-tier ones only the context's.
+TEST(library_set_is_a_fixed_host_part) {
+  uint64_t three = 0;
+  for (Card& k : library_cases()) {
+    if (k.in.unified || k.in.host_avail_bytes != SS_BUDGET_AUTO) continue;  // (components are not charged there)
+    const ss_budget_out a = lib_plan(k.in);
+    library_inputs(k.in);
+    ss_status s;
+    const ss_budget_out b = lib_plan(k.in, &s);
+    CHECK_EQ(b.lib_host_bytes,
+             b.lib_mapped_bytes + b.lib_bounce_bytes + b.lib_staging_bytes + b.lib_disk_staging_bytes);
+    CHECK_EQ(b.lib_bounce_readers, b.three_tier ? 9u : 1u);
+    CHECK_EQ(b.lib_disk_staging_bytes, b.staging * k.in.unit_bytes);
+    CHECK_EQ(b.lib_staging_bytes, k.in.unit_bytes);  // (the unit stride is already 4 KiB rounded)
+    const uint64_t fixed = b.lib_host_bytes - b.lib_disk_staging_bytes;
+    CHECK_EQ(b.host_fixed_bytes, a.host_fixed_bytes + fixed);
+    if (k.in.ram_total_bytes && !b.refused) CHECK_EQ(b.room_bytes + fixed, a.room_bytes);
+    // the same plan with the library as named components
+    Card c = k;
+    ss_budget_component pin[2] = {k.pin[0], {"tierstream pinned", b.lib_mapped_bytes + b.lib_staging_bytes}};
+    ss_budget_component page[2] = {k.page[0], {"tierstream bounce", b.lib_bounce_bytes}};
+    c.in.pinned_fixed = pin;
+    c.in.n_pinned_fixed = 2;
+    c.in.pageable_fixed = page;
+    c.in.n_pageable_fixed = 2;
+    c.in.dg_gated_layers = 0;
+    const ss_budget_out e = lib_plan(c.in);
+    CHECK_EQ(b.resident, e.resident);
+    CHECK_EQ(b.pinned, e.pinned);
+    CHECK_EQ(b.disk, e.disk);
+    CHECK_EQ(b.inclusive, e.inclusive);
+    CHECK_EQ(b.staging, e.staging);
+    CHECK_EQ(b.host_fixed_bytes, e.host_fixed_bytes);
+    CHECK_EQ(b.host_planned_bytes, e.host_planned_bytes);
+    CHECK_EQ(b.room_bytes, e.room_bytes);
+    CHECK_EQ(b.host_cap_units, e.host_cap_units);
+    CHECK_EQ(b.pinned_peak_bytes, e.pinned_peak_bytes);
+    CHECK_EQ(b.need_host_bytes, e.need_host_bytes + fixed);
+    // (the minimum charges the smallest placement's library bytes: the file tier's whenever it has one)
+    const bool min_three = k.in.keys > b.resident && k.in.file_tier;
+    if (bool(b.three_tier) == min_three) CHECK_EQ(b.min_ram_total_bytes, e.min_ram_total_bytes);
+    CHECK_EQ(b.refused, e.refused);
+    three += b.three_tier;
+    std::string j(ss_budget_plan_json(&k.in, &b, nullptr, 0) + 1, '\0');
+    j.resize(ss_budget_plan_json(&k.in, &b, &j[0], j.size()));
+    CHECK(j.find("\"lib_host_bytes\":" + std::to_string(b.lib_host_bytes)) != std::string::npos);
+    CHECK(j.find("\"dg_disk_queue\":8") != std::string::npos);
+    CHECK(j.find("\"lib_bounce_readers\":" + std::to_string(b.lib_bounce_readers)) != std::string::npos);
+  }
+  CHECK(three > 0);
+  // a RAM cap at the minimum of before: refused with the library, naming its bytes; its minimum includes them
+  Card r;
+  r.in.ram_total_bytes = 64 * kGiB;
+  r.in.ram_total_bytes = lib_plan(r.in).min_ram_total_bytes;
+  ss_status s;
+  CHECK(!lib_plan(r.in, &s).refused);
+  library_inputs(r.in);
+  const ss_budget_out o = lib_plan(r.in, &s);
+  CHECK_EQ(int(s), int(SS_E_CAPACITY));
+  CHECK(std::string(o.refuse).find("tierstream host") != std::string::npos);
+  CHECK_EQ(o.min_ram_total_bytes, r.in.ram_total_bytes + o.lib_host_bytes - o.lib_disk_staging_bytes);
+  // the GLM incident: 32 GiB of RAM, 8 disk readers; the cap's pinned room is lower by the library's bytes
+  Card g;
+  g.in.ram_total_bytes = 32 * kGiB;
+  const ss_budget_out before = lib_plan(g.in);
+  library_inputs(g.in);
+  const ss_budget_out after = lib_plan(g.in);
+  CHECK(after.three_tier && before.three_tier);
+  CHECK_EQ(before.room_bytes - after.room_bytes, after.lib_host_bytes - after.lib_disk_staging_bytes);
+  CHECK(after.pinned < before.pinned);
+  std::printf("  GLM-like, 8 disk readers: library host bytes %llu (bounce %llu x %u), pinned experts %llu -> %llu\n",
+              (unsigned long long)after.lib_host_bytes, (unsigned long long)(after.lib_bounce_bytes / 9),
+              after.lib_bounce_readers, (unsigned long long)before.pinned, (unsigned long long)after.pinned);
+}
+
+// The unified pool charges the library too: with it the plan never uses more than the pool.
+TEST(library_unified_pool) {
+  Card k;
+  k.in.unified = 1;
+  k.in.ram_total_bytes = 96 * kGiB;
+  const ss_budget_out a = lib_plan(k.in);
+  library_inputs(k.in);
+  const ss_budget_out b = lib_plan(k.in);
+  CHECK(!a.refused && !b.refused);
+  CHECK(b.lib_host_bytes > 0);
+  CHECK(b.device_planned_bytes + b.host_planned_bytes <= k.in.ram_total_bytes);
+  CHECK(b.host_fixed_bytes > a.host_fixed_bytes);
+  CHECK(b.min_ram_total_bytes > a.min_ram_total_bytes);
+}
+
+// The planner's number is the open's: ss_budget_in_dg_library on a descriptor and options, then a plan, gives the bytes
+// dg_layout admits beyond the plan's blocks for the same descriptor and options (two-tier and three-tier, disk queues
+// 0, 1, 2 and 8, a bounce request, a 64 KiB source alignment).
+TEST(library_planner_equals_the_open) {
+  sstest::DgModel model("budget-lib", 3, 32);
+  ss_desc* cd = nullptr;
+  CHECK_OK(ss_desc_from_json(model.json.data(), model.json.size(), &cd));
+  if (!cd) return;
+  for (uint64_t align : {uint64_t(4096), uint64_t(65536)})
+    for (uint32_t queue : {0u, 1u, 2u, 8u})
+      for (uint64_t request : {uint64_t(0), uint64_t(64) << 10})
+        for (bool disk : {false, true}) {
+          if (!disk && queue) continue;  // (dg_disk_queue needs dg_disk_tier)
+          std::string js = model.json;
+          const std::string a = "\"align\":4096";
+          js.replace(js.find(a), a.size(), "\"align\":" + std::to_string(align));
+          ss::Desc d = ss::desc_from_json(ss::json_parse(js));
+          ss_desc* cdx = nullptr;
+          CHECK_OK(ss_desc_from_json(js.data(), js.size(), &cdx));
+          ss_budget b;
+          ss_options o;
+          sstest::dg_budget(b, model, 4, 8);
+          sstest::dg_options(o, 8, SS_BACKEND_CPU);
+          b.host_pinned_bytes = uint64_t(1) << 34;
+          o.staging_bytes = request;
+          o.dg_disk_tier = disk;
+          o.dg_disk_queue = queue;
+          o.dg_disk_staging = disk ? 3 : 0;
+          std::vector<uint8_t> tiers = model.tiers(16);
+          if (disk)
+            for (size_t i = 0; i < tiers.size(); ++i)
+              if (tiers[i] == SS_TIER_PINNED && i % 2) tiers[i] = SS_TIER_DISK;
+          const ss::Plan p = ss::plan_from_tiers(d, b, tiers);
+          const ss::DgLayout x = ss::dg_layout(d, p, o);
+          const uint64_t open = x.mapped_bytes + x.bounce_bytes * x.bounce_readers + x.staging_bytes +
+                                uint64_t(x.S) * x.host_stride;
+          // the planner: the library inputs from the same descriptor and options; a pinned-tier request that sends
+          // experts to the files exactly when the open has a file tier
+          ss_budget_in in;
+          ss_budget_in_defaults(&in);
+          CHECK_OK(ss_budget_in_dg_library(&in, cdx, &o));
+          CHECK_EQ(in.dg_gated_layers, uint32_t(model.G));
+          CHECK_EQ(in.staging, disk ? 3u : 8u);
+          in.keys = uint64_t(model.G) * uint64_t(model.U);
+          in.slot_bytes = model.unit();
+          in.unit_bytes = x.host_stride;
+          in.arena_units = uint64_t(model.G) * 16;
+          in.host_spares = 4;
+          if (disk) in.ram_expert_bytes = 20 * x.host_stride;
+          const ss_budget_out out = lib_plan(in);
+          CHECK(!out.refused);
+          CHECK_EQ(out.three_tier, uint32_t(disk));
+          CHECK_EQ(out.lib_host_bytes, open);
+          CHECK_EQ(out.lib_mapped_bytes, x.mapped_bytes);
+          CHECK_EQ(out.lib_bounce_bytes, x.bounce_bytes * x.bounce_readers);
+          CHECK_EQ(out.lib_bounce_readers, x.bounce_readers);
+          CHECK_EQ(out.lib_staging_bytes, x.staging_bytes);
+          CHECK_EQ(out.lib_disk_staging_bytes, uint64_t(x.S) * x.host_stride);
+          ss_desc_free(cdx);
+        }
+  // arguments: NULL in / descriptor, an older input struct without the fields; NULL options = the defaults
+  ss_budget_in in;
+  ss_budget_in_defaults(&in);
+  CHECK_EQ(int(ss_budget_in_dg_library(nullptr, cd, nullptr)), int(SS_E_INVALID));
+  CHECK_EQ(int(ss_budget_in_dg_library(&in, nullptr, nullptr)), int(SS_E_INVALID));
+  ss_budget_in old = in;
+  old.struct_size = uint32_t(offsetof(ss_budget_in, dg_gated_layers));
+  CHECK_EQ(int(ss_budget_in_dg_library(&old, cd, nullptr)), int(SS_E_INVALID));
+  CHECK_OK(ss_budget_in_dg_library(&in, cd, nullptr));
+  CHECK_EQ(in.dg_disk_queue, 0u);
+  ss_options od;
+  ss_options_defaults(&od);
+  CHECK_EQ(in.dg_bounce_request, od.staging_bytes);
+  CHECK_EQ(in.dg_part_max_bytes, model.down);
+  CHECK_EQ(in.dg_source_align, 4096u);
+  CHECK_EQ(in.struct_size, uint32_t(sizeof in));
+  ss_desc_free(cd);
+}

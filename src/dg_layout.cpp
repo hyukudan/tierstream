@@ -90,6 +90,50 @@ uint64_t dg_mapped_bytes(uint32_t G) {
          2 * align64(uint64_t(kDgMaxParts) * 4);
 }
 
+DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max, uint64_t max_align,
+                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging) {
+  // A bounce buffer per reader (the context's own thread, and each disk reader with dg_disk_queue > 1: none waits for
+  // another's): min(staging_bytes, 16 MiB), at least 4 x the largest source alignment; with disk readers each is cut
+  // to what the largest part's covering read needs (one read per part, never more than that size).
+  DgHostBytes h;
+  max_align = std::max<uint64_t>(max_align, 4096);
+  const uint64_t want = std::min<uint64_t>(staging_request ? staging_request : (uint64_t(16) << 20), uint64_t(16) << 20);
+  const auto aligned_up = [max_align](uint64_t v) {
+    return (add_ck(v, max_align - 1, "the bounce buffer") / max_align) * max_align;
+  };
+  h.bounce = std::max<uint64_t>(aligned_up(want), mul_ck(4, max_align, "the bounce buffer"));
+  h.bounce_readers = 1 + (disk_queue > 1 ? disk_queue : 0);
+  if (h.bounce_readers > 1) {
+    const uint64_t cover = aligned_up(add_ck(part_max, 2 * max_align, "the bounce buffer"));
+    h.bounce = std::max<uint64_t>(std::min(h.bounce, cover), mul_ck(4, max_align, "the bounce buffer"));
+  }
+  const uint64_t bounce_total = mul_ck(h.bounce, h.bounce_readers, "the bounce buffers");
+  h.staging = (add_ck(unit_bytes, 4095, "the staging buffer") / 4096) * 4096;
+  h.mapped = dg_mapped_bytes(gated);
+  h.disk_staging = mul_ck(disk_staging, host_stride(unit_bytes), "the disk staging buffers");
+  // (total() cannot overflow once this sum did not)
+  (void)add_ck(add_ck(add_ck(h.mapped, bounce_total, "the host extras"), h.staging, "the host extras"), h.disk_staging,
+               "the host extras");
+  return h;
+}
+
+void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in) {
+  uint32_t gated = 0;
+  uint64_t part_max = 0, max_align = 4096;
+  for (const Layer& l : d.layers) {
+    if (l.n_units == 0) continue;  // the gated layers: every layer with units (dg_layout)
+    ++gated;
+    for (const Part& part : l.parts) part_max = std::max(part_max, part.bytes);
+  }
+  for (const Source& src : d.sources) max_align = std::max(max_align, src.align);
+  in->dg_gated_layers = gated;
+  in->dg_disk_queue = o.dg_disk_queue;
+  in->dg_part_max_bytes = part_max;
+  in->dg_source_align = max_align;
+  in->dg_bounce_request = o.staging_bytes;
+  in->staging = o.dg_disk_staging ? o.dg_disk_staging : 8u;
+}
+
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   auto refuse = [](ss_status st, const std::string& why) { fail(st, "device-gated: " + why); };
   if (o.forward_mode != SS_FORWARD_DEVICE_GATED) refuse(SS_E_INVALID, "forward_mode is not SS_FORWARD_DEVICE_GATED");
@@ -115,6 +159,8 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_disk_queue > 64) refuse(SS_E_INVALID, "dg_disk_queue must be 0..64");
   if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
   if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
+  if (o.dg_pf_revert_unused > 1) refuse(SS_E_INVALID, "dg_pf_revert_unused must be 0 or 1");
+  if (o.dg_pf_strict_admit > 1) refuse(SS_E_INVALID, "dg_pf_strict_admit must be 0 or 1");
 
   DgLayout x;
   x.B = o.dg_max_ids;
@@ -274,33 +320,22 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               " GiB; with the rest of the plan (" + gib(other) + " GiB) that is above the cap - margin (" +
                               gib(limit) + " GiB)");
   // Host admission: on top of what the plan bills (blocks of P + Q, host_fixed): the mapped control area, the bounce
-  // buffers and the open-time staging buffer (serial only: one unit, 4 KiB rounded). The context allocates exactly
-  // these. A bounce buffer per reader (the context's own thread, and each disk reader with dg_disk_queue > 1: none
-  // waits for another's): min(staging_bytes, 16 MiB), at least 4 x the largest source alignment; with disk readers
-  // each is cut to what the largest part's covering read needs (one read per part, never more than that size).
-  uint64_t max_align = 4096;
+  // buffers, the staging buffer (one unit, 4 KiB rounded; kept in pipeline mode too: ss_dg_reset_open's one-unit spare
+  // for placement cycles) and the disk staging buffers, as dg_host_bytes computes them for the planner too. The
+  // context allocates exactly these.
+  uint64_t max_align = 4096, part_max = 0;
   for (const Source& src : d.sources) max_align = std::max(max_align, src.align);
-  const uint64_t want = std::min<uint64_t>(o.staging_bytes ? o.staging_bytes : (uint64_t(16) << 20), uint64_t(16) << 20);
-  const auto aligned_up = [max_align](uint64_t v) {
-    return (add_ck(v, max_align - 1, "the bounce buffer") / max_align) * max_align;
-  };
-  x.bounce_bytes = std::max<uint64_t>(aligned_up(want), mul_ck(4, max_align, "the bounce buffer"));
-  x.bounce_readers = 1 + (x.disk_queue > 1 ? x.disk_queue : 0);
-  if (x.bounce_readers > 1) {
-    uint64_t part_max = 0;
-    for (int L : x.gated)
-      for (const Part& part : d.layers[size_t(L)].parts) part_max = std::max(part_max, part.bytes);
-    const uint64_t cover = aligned_up(add_ck(part_max, 2 * max_align, "the bounce buffer"));
-    x.bounce_bytes = std::max<uint64_t>(std::min(x.bounce_bytes, cover), mul_ck(4, max_align, "the bounce buffer"));
-  }
-  const uint64_t bounce_total = mul_ck(x.bounce_bytes, x.bounce_readers, "the bounce buffers");
+  for (int L : x.gated)
+    for (const Part& part : d.layers[size_t(L)].parts) part_max = std::max(part_max, part.bytes);
+  const DgHostBytes hb = dg_host_bytes(G, x.unit_bytes, part_max, max_align, o.staging_bytes, x.disk_queue, x.S);
+  x.bounce_bytes = hb.bounce;
+  x.bounce_readers = hb.bounce_readers;
+  const uint64_t bounce_total = hb.bounce_total();
   x.load_serial = env_flag("DG_LOAD_SERIAL", false);
-  x.staging_bytes = (add_ck(x.unit_bytes, 4095, "the staging buffer") / 4096) * 4096;
-  // kept in pipeline mode too: ss_dg_reset_open's one-unit spare for placement cycles (persist)
-  x.mapped_bytes = dg_mapped_bytes(G);
-  const uint64_t host_extra =
-      add_ck(add_ck(add_ck(x.mapped_bytes, bounce_total, "the host extras"), x.staging_bytes, "the host extras"),
-             mul_ck(x.S, x.host_stride, "the disk staging buffers"), "the host extras");
+  x.pf_legacy = env_flag("DG_PF_LEGACY", true);  // the previous admission until measured
+  x.staging_bytes = hb.staging;
+  x.mapped_bytes = hb.mapped;
+  const uint64_t host_extra = hb.total();
   if (add_ck(p.pinned, host_extra, "the host total") > b.host_pinned_bytes)
     refuse(SS_E_CAPACITY, "the plan's pinned bytes (" + std::to_string(p.pinned) + ") plus the mapped control area (" +
                               std::to_string(x.mapped_bytes) + "), the bounce buffers (" +
