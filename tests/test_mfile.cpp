@@ -14,10 +14,13 @@
 #include <thread>
 
 #include "check.hpp"
+#include "desc.hpp"
+#include "dg_load.hpp"
 #include "errors.hpp"
 #include "json.hpp"
 #include "mfile.hpp"
 #include "raw_file.hpp"
+#include "source_file.hpp"
 #include "stripe_manifest.hpp"
 #include "xxh64.hpp"
 
@@ -380,6 +383,42 @@ TEST(mfile_corruption_and_failure_fallback) {
     CHECK(c.disabled_mask & 2);
     CHECK(c.fallback_bytes >= 3 * C);
   }
+}
+
+// A chunked landing read (dg_read_unit_chunk, chunk 4 KiB) on a session that re-checks whole stripe chunks as they are
+// read (ALWAYS; here OFF, the tests' mode that skips the open-time scan, so only the read-path check can catch it)
+// cuts at that grid: each stripe chunk the part covers whole is read whole and re-checked, so a corrupted stripe chunk
+// is caught and read from the primary (exact bytes), as by a whole read; cut at 4 KiB it would land corrupted. A
+// CACHED session has no such grid (the chunk as asked).
+TEST(mfile_chunked_unit_read_keeps_the_stripe_check) {
+  {
+    Fixture t;
+    MFileSource cached(t.open(SS_MFILE_VERIFY_CACHED));
+    CHECK_EQ(cached.verify_grid(), uint64_t(0));
+  }
+  Fixture t;
+  t.corrupt(0);  // (stripe slot 0: chunk 1)
+  auto f = t.open(SS_MFILE_VERIFY_OFF);
+  std::vector<std::unique_ptr<SourceFile>> files;
+  files.push_back(std::make_unique<MFileSource>(f));
+  CHECK_EQ(files[0]->verify_grid(), C);
+  const std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                           t.primary.generic_u8string() +
+                           R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":1,"top_k":1,"parts":[)"
+                           R"({"name":"gate","format":"Q4_K","offset":)" + std::to_string(C) + R"(,"stride":)" +
+                           std::to_string(3 * C) + R"(,"bytes":)" + std::to_string(3 * C) + "}]}]}";
+  const Desc d = desc_from_json(json_parse(json));
+  Buffer dst(size_t(3 * C)), bounce(size_t(1) << 20);
+  DgUnitChunks c;
+  c.dst = dst.p;
+  c.chunk = 4096;
+  c.hash = true;
+  uint64_t digest = 0, steps = 0;
+  while (dg_read_unit_chunk(d, files, c, bounce.p, uint64_t(1) << 20, &digest)) ++steps;
+  CHECK_EQ(steps + 1, uint64_t(3));  // one whole stripe chunk per step
+  CHECK(std::memcmp(dst.p, t.bytes.data() + C, size_t(3 * C)) == 0);
+  CHECK_EQ(digest, xxh64(t.bytes.data() + C, size_t(3 * C)));
+  CHECK_EQ(counters(*f).verify_fail, uint64_t(1));
 }
 
 TEST(mfile_consecutive_chunks_to_unaligned_eof) {

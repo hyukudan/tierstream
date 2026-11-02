@@ -380,6 +380,43 @@ typedef struct ss_options {
    * counted in ss_dg_stats.pf_strict_refused. 0 (default) = only dg_prefetch_reserve is kept free, as before. */
   uint32_t dg_pf_strict_admit;
   uint32_t reserved9;  /* explicit padding (never read) */
+  /* appended, the two-stage file prefetch (SS_DG_LANDING below; three-tier only, needs dg_disk_tier = 1 and
+   * dg_disk_queue > 1): dg_landing_blocks = L pinned landing blocks (one host stride each, 0..4096; 0 = off, the
+   * default: nothing allocated, nothing changes), allocated at open when the plan has a file tier and admitted against
+   * ss_budget.host_pinned_bytes beside the plan's blocks (separate from the pinned tier's blocks and spares; the planner
+   * charges them through ss_budget_in.dg_landing_blocks). A prediction of a file-homed unit (ss_dg_enqueue_predict /
+   * the service's next-layer prediction, winpf's l+1 candidates and window-hint priors) then reads it from its file
+   * into a free landing block (the same hash-checked read as a demand miss's) instead of needing a free GPU slot: it
+   * never takes a slot, evicts or writes back, and is outside the prefetch budgets; with no free landing block the
+   * advice is dropped. A later demand of the unit copies it to the GPU from its landing block (one host-to-device copy,
+   * no file read; a read still in flight is waited for, never repeated); the block is free again once that copy landed.
+   * dg_landing_ttl = 0 (the default): a landing its target layer did not demand goes back to its file right after that
+   * layer's demand was served (landed: its block free at once; still queued: cancelled, no read; running: when its read
+   * ends, never promoted), and a prediction for a layer already served this token is not issued; so a few layers' worth
+   * of blocks serve every layer. dg_landing_ttl = N >= 1: an undemanded landing survives its layer and goes back to its
+   * file at the boundary once N tokens did not demand it. Either way no copy; a failed landing read only frees its
+   * block. Landing reads queue on the read pool behind
+   * every demand read not started yet, and start only while fewer than dg_landing_max_queued reads run (0 = 1, at most
+   * 64; per drive in the design, bounded here over all drives together: the pool does not see the drives; with
+   * dg_landing_chunk below: landing reads, one disk reader kept free of them). Counters: ss_dg_stats.landing_*.
+   * dg_landing_max_queued / dg_landing_ttl / dg_landing_chunk without dg_landing_blocks refuse the open. */
+  uint32_t dg_landing_blocks;
+  uint32_t dg_landing_max_queued;
+  uint32_t dg_landing_ttl;
+  uint32_t reserved10; /* explicit padding (never read) */
+  /* appended (SS_DG_LANDING_YIELD below): a landing read runs as a sequence of chunks of at most dg_landing_chunk
+   * bytes (0 = 4 MiB, the default; else a multiple of 4096; never across two of the unit's parts; on a striped session
+   * that re-checks whole stripe chunks as they are read (verify_mode ALWAYS) whole stripe chunks, at least one). Between
+   * two chunks, with a demand read queued and no idle disk reader, it gives its reader to that read and resumes later
+   * with its progress kept (ss_dg_stats.landing_yields); a demand of a unit whose landing read is part-way runs the rest of it as a demand
+   * read (never yielding); a landing dropped at its target layer stops at its next chunk (landing_aborted_bytes). The
+   * same bytes land in the same block and the unit's hash is checked as for a whole read (fed chunk by chunk). With
+   * chunks, at most dg_landing_max_queued landing reads run and one disk reader stays free of them (at most
+   * dg_disk_queue - 1 run). 0xFFFFFFFF = the behaviour before, exactly: each landing read is one whole-unit read that
+   * never yields, and one starts only while fewer than dg_landing_max_queued reads run (demand and landing together;
+   * no reader reserved). */
+  uint32_t dg_landing_chunk;
+  uint32_t reserved11; /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -794,6 +831,30 @@ typedef struct ss_dg_stats {
    * the most read locations (directories) of a gated source it counted for AUTO (1 = not striped; 0 without
    * dg_disk_tier, and 0 for an explicit dg_disk_queue: not counted) */
   uint32_t disk_queue_resolved, disk_locations;
+  /* appended, the two-stage file prefetch (SS_DG_LANDING; all 0 when off): landing_issued = landing reads begun for
+   * predictions of file-homed units; landing_promoted = demand misses served from a landing block (one host-to-device
+   * copy, no file read; also in fetched), landing_late = those whose landing read was still in flight (waited for,
+   * landing_wait_ns of host time); landing_expired = landed units not demanded within dg_landing_ttl tokens, back to
+   * their file; landing_dropped_full = predictions dropped with no free landing block; landing_read_bytes = the bytes
+   * of completed landing reads (not in disk_read_bytes; disk_reads counts the other file reads only) */
+  uint64_t landing_issued, landing_promoted, landing_late, landing_wait_ns, landing_expired, landing_dropped_full;
+  uint64_t landing_read_bytes;
+  /* appended (SS_DG_LANDING): landing reads that never started (still queued behind dg_landing_max_queued) dropped at a
+   * boundary, ss_dg_reset_open or another drain between tokens, their units back in their file with no read; the
+   * reads already running are waited for (and then landed or expired). With dg_landing_ttl 0 also the ones its target
+   * layer did not demand. */
+  uint64_t landing_cancelled;
+  /* appended (SS_DG_LANDING, dg_landing_ttl 0; 0 otherwise): landing_expired_layer = landings their target layer did
+   * not demand, back to their file after that layer (landed, or when their running read ended; landing_expired counts
+   * the token-boundary expiry); landing_skipped_passed = predictions of file-homed units not landed because their layer
+   * was already served this token */
+  uint64_t landing_expired_layer, landing_skipped_passed;
+  /* appended (SS_DG_LANDING_YIELD; 0 with dg_landing_chunk 0xFFFFFFFF): landing_yields = the times a chunked landing
+   * read gave its disk reader to a queued demand read between two chunks; landing_aborted_bytes = the bytes of landing
+   * reads never read because the landing was dropped part-way (its target layer passed while it ran: stopped at its
+   * next chunk, counted in landing_expired_layer; or cancelled after a yield: landing_cancelled). landing_read_bytes
+   * counts the bytes an aborted or part-way cancelled one read. */
+  uint64_t landing_yields, landing_aborted_bytes;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1161,6 +1222,14 @@ typedef struct ss_budget_in {
   uint64_t dg_source_align;       /* the largest source alignment (the descriptor's sources[].align; below 4096 =
                                      4096) */
   uint64_t dg_bounce_request;     /* ss_options.staging_bytes (0 = 16 MiB; at most 16 MiB is used) */
+  /* SS_DG_LANDING (appended): ss_options.dg_landing_blocks (0 = none, the default: the plans of before). With
+     dg_gated_layers set and a file tier in the plan, that many pinned landing blocks of one host stride each (as the
+     open allocates them: the 4 KiB rounded stride of unit_bytes, which SS_BUDGET_LIBRARY already takes as the host
+     stride, so exactly unit_bytes then) are charged as a fixed pinned host part (host_fixed_bytes, pinned_peak_bytes,
+     min_ram_total_bytes, need_host_bytes) and reported in ss_budget_out.lib_landing_bytes; ss_budget_in_dg_library
+     fills it (0 without dg_disk_tier). Each landing block is one pinned-tier unit fewer at a fixed RAM cap. */
+  uint32_t dg_landing_blocks;
+  uint32_t reserved2;             /* explicit padding (never read) */
 } ss_budget_in;
 typedef struct ss_budget_out {
   uint32_t struct_size;           /* set by the caller; the library writes min(struct_size, sizeof) bytes */
@@ -1193,10 +1262,10 @@ typedef struct ss_budget_out {
                                      and the spares want */
   /* SS_BUDGET_LIBRARY (appended; all 0 unless ss_budget_in.dg_gated_layers): the device-gated library's own host bytes
      for this plan, as ss_open admits them. lib_host_bytes = lib_mapped_bytes + lib_bounce_bytes + lib_staging_bytes +
-     lib_disk_staging_bytes: what an open of this plan needs in ss_budget.host_pinned_bytes beyond the plan's blocks
-     and pinned components. All but lib_disk_staging_bytes are in host_fixed_bytes (and min_ram_total_bytes,
-     need_host_bytes; the pinned ones in pinned_peak_bytes); lib_disk_staging_bytes is staging x unit_bytes, already
-     in host_planned_bytes. */
+     lib_disk_staging_bytes (+ lib_landing_bytes, appended below): what an open of this plan needs in
+     ss_budget.host_pinned_bytes beyond the plan's blocks and pinned components. All but lib_disk_staging_bytes are in
+     host_fixed_bytes (and min_ram_total_bytes, need_host_bytes; the pinned ones in pinned_peak_bytes);
+     lib_disk_staging_bytes is staging x unit_bytes, already in host_planned_bytes. */
   uint64_t lib_host_bytes;
   uint64_t lib_mapped_bytes;        /* pinned: the mapped control area */
   uint64_t lib_bounce_bytes;        /* pageable: the lib_bounce_readers bounce buffers together */
@@ -1204,6 +1273,9 @@ typedef struct ss_budget_out {
   uint64_t lib_disk_staging_bytes;  /* pinned: the file tier's staging buffers (three-tier only) */
   uint32_t lib_bounce_readers;      /* the context's reader + the disk readers (three-tier, dg_disk_queue > 1) */
   uint32_t reserved0;               /* explicit padding (never read) */
+  uint64_t lib_landing_bytes;       /* SS_DG_LANDING (appended): pinned, the landing blocks (dg_landing_blocks x
+                                       the host stride, unit_bytes; three-tier only; 0 = none); also in
+                                       lib_host_bytes */
 } ss_budget_out;
 SS_API void ss_budget_in_defaults_sized(ss_budget_in* in, uint32_t size);
 static inline void ss_budget_in_defaults(ss_budget_in* in) { ss_budget_in_defaults_sized(in, (uint32_t)sizeof *in); }
@@ -1713,6 +1785,15 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
  * ss_budget_in_dg_library resolves it (and the raised default staging) with ss_open's function; each counts the
  * locations when called (see dg_disk_queue: pass the resolved values to ss_open for the planned numbers exactly). */
 #define SS_DG_DISK_QUEUE_AUTO 0xFFFFFFFFu
+/* The two-stage file prefetch: ss_options.dg_landing_blocks / dg_landing_max_queued / dg_landing_ttl, the
+ * ss_dg_stats.landing_* counters, ss_budget_in.dg_landing_blocks and ss_budget_out.lib_landing_bytes exist. Opt-in
+ * (dg_landing_blocks 0 = off: no allocation, the behaviour and counters of before). Placement only: a landing changes
+ * where a file-homed unit's bytes wait (a pinned landing block), never the bytes, the table protocol or any GPU slot. */
+#define SS_DG_LANDING 1
+/* Landing reads yield to demand reads: ss_options.dg_landing_chunk and ss_dg_stats.landing_yields /
+ * landing_aborted_bytes exist; with chunks (the default) at most dg_disk_queue - 1 landing reads run at once
+ * (dg_landing_chunk 0xFFFFFFFF: the scheduler before). Placement and I/O order only. */
+#define SS_DG_LANDING_YIELD 1
 
 #ifdef __cplusplus
 }

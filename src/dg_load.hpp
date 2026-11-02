@@ -14,6 +14,7 @@
 #include <vector>
 #include "desc.hpp"
 #include "source_file.hpp"
+#include "xxh64.hpp"
 namespace ts {
 // Pageable aligned bounce storage for the covering reads of unaligned parts: never an H2D source. Each reader owns one
 // (no reader waits for another's).
@@ -121,35 +122,112 @@ void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>&
                   void* dst, void* bounce, uint64_t bounce_bytes, bool hash, uint64_t* digest,
                   DgLoadStats* stats = nullptr, bool parallel = true, uint64_t subread = 0);
 
+// One unit read as a sequence of chunks (a landing read that yields its reader between them, dg_landing_chunk): the
+// same bytes into the same destination as dg_read_unit, part by part in order, each part cut at file offsets that are
+// multiples of the step (chunk rounded down to the source's alignment, at least one alignment unit; on a session that
+// re-checks whole stripe chunks as they are read (SourceFile::verify_grid) a multiple of that chunk, at least one, so
+// every stripe chunk a part covers whole is still read whole and checked). A chunk never spans two parts. Each chunk
+// reads like a part of dg_read_unit: in place, its aligned middle in place and its head / tail sectors through the
+// caller's bounce buffer, or bounced whole; subread > 0 cuts its in-place bytes into pieces in flight together. Cut at
+// aligned file offsets, the head and tail sectors of an unaligned part are bounced once each, as in one read. hash:
+// the xxh64 of the unit's bytes, fed chunk by chunk as each landed (the parts in order: the digest of dg_read_unit).
+// parallel batching of several parts on one session (dg_read_unit's preadv) is not used: a chunk is one part's.
+struct DgUnitChunks {
+  int layer = 0, unit = 0;
+  char* dst = nullptr;
+  uint64_t chunk = 0;  // bytes, a multiple of 4096
+  bool hash = false;
+  // progress: the part being read, the bytes of it read, the bytes of the unit read; the digest so far
+  size_t part = 0;
+  uint64_t at = 0, done = 0;
+  Xxh64 digest;
+};
+// Reads c's next chunk (with `bounce`, the caller's own); returns the unit's bytes still to read (0: complete, its
+// digest in *digest when c.hash, else the empty digest). Throws as dg_read_unit (the progress is then undefined).
+uint64_t dg_read_unit_chunk(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>& files, DgUnitChunks& c,
+                            void* bounce, uint64_t bounce_bytes, uint64_t* digest, DgLoadStats* stats = nullptr,
+                            uint64_t subread = 0);
+
 // The three-tier file reads in flight (dg_disk_queue): `threads` workers run the submitted reads, oldest first. wait()
 // blocks until that read finished, rethrows its error and returns its own time in ns; every handle is waited for
-// exactly once. Destruction drops the reads not started and waits for the running ones.
+// exactly once. Destruction drops the reads not started, stops a chunked one at its next chunk and waits for the
+// running ones.
+// Landing reads (dg_landing_blocks) wait in a second queue: a worker takes one only while no demand read is queued and
+// (reserve) fewer than landing_cap landing reads run and one reader stays free of them (at most threads - 1 landing
+// reads at once; one thread: a landing read only while nothing else runs); without reserve (dg_landing_chunk
+// 0xFFFFFFFF: the scheduler before) fewer than landing_cap reads run, demand and landing together. The pool does not
+// know the drives: landing_cap (dg_landing_max_queued) bounds the reads of all of them together. A chunked landing
+// read (submit_steps) runs one chunk per step: between two chunks, with a demand read queued that no idle worker takes
+// (more queued than idle workers), it yields its worker (back at the FRONT of the landing queue, its progress kept:
+// landing_yields) and the worker takes the demand read; a whole landing read (submit_indexed) is never preempted. A wait() for a landing read
+// makes it a demand: still queued (never started or part-way) it moves to the back of the demand queue, running it no
+// longer yields, and it runs to its end. cancel() drops one in the landing queue (never started, or yielded part-way);
+// abort() stops one at its next chunk.
 class DgReadPool {
  public:
-  explicit DgReadPool(uint32_t threads);
+  explicit DgReadPool(uint32_t threads, uint32_t landing_cap = 1, bool reserve = true);
   ~DgReadPool();
   DgReadPool(const DgReadPool&) = delete;
   DgReadPool& operator=(const DgReadPool&) = delete;
   void* submit(std::function<void()> read);
-  // the same, the read given the index of the worker that runs it (0 .. threads - 1; e.g. its own bounce buffer)
-  void* submit_indexed(std::function<void(uint32_t)> read);
-  uint64_t wait(void* handle);
+  // the same, the read given the index of the worker that runs it (0 .. threads - 1; e.g. its own bounce buffer);
+  // landing: into the landing queue
+  void* submit_indexed(std::function<void(uint32_t)> read, bool landing = false);
+  // A read in steps (a chunked landing read): step(worker) reads the next chunk and returns the bytes still to read
+  // (0: complete); bytes = the read's total. The steps of one read never run concurrently; each may run on another
+  // worker (a worker's own buffers serve one step only).
+  void* submit_steps(std::function<uint64_t(uint32_t)> step, uint64_t bytes, bool landing = true);
+  // How a landing read ended: aborted (abort() stopped it before its end: its bytes are partial, aborted_bytes not
+  // read); the times it yielded its worker to a demand read.
+  struct End {
+    uint64_t aborted_bytes = 0;
+    uint32_t yields = 0;
+    bool aborted = false;
+  };
+  // (`end` is filled before an error is rethrown; an aborted read waited for without `end` throws SS_E_IO: its bytes
+  // are partial)
+  uint64_t wait(void* handle, End* end = nullptr);
   bool done(void* handle);  // finished (wait would not block)
+  // A landing read in the landing queue (never started, or yielded part-way) is removed: true, and the handle is gone
+  // (never waited for; nothing writes into its destination any more; `end`: a part-way one's bytes not read and its
+  // yields); false: it runs (or finished, or is a demand read): wait for it as usual.
+  bool cancel(void* handle, End* end = nullptr) noexcept;
+  // A landing read that is not a demand (never waited for) stops: still queued, at once; a chunked one running, at its
+  // next chunk boundary (a whole read runs to its end). Then done; wait for it as usual (End::aborted).
+  void abort(void* handle) noexcept;
+  // Test observation: true while the read is a landing read (a wait has not made it a demand), queued or running.
+  bool is_landing(void* handle);
+  // Test observation: the reads running, the landing reads among them, the demand and landing reads queued.
+  struct Counts {
+    uint32_t running = 0, landing_running = 0;
+    size_t queued = 0, landing_queued = 0;
+  };
+  Counts counts();
 
  private:
   struct Job {
     std::function<void(uint32_t)> read;
+    std::function<uint64_t(uint32_t)> step;  // chunked (read empty)
     std::exception_ptr error;
-    uint64_t ns = 0;
-    bool done = false;
+    uint64_t ns = 0, left = 0;  // left: a chunked read's bytes still to read
+    uint32_t yields = 0;
+    // landing: in the landing queue or running as a landing read (a wait made it a demand: false)
+    bool done = false, landing = false, started = false, stop = false, aborted = false;
   };
   void work(uint32_t worker);
+  void* push(std::unique_ptr<Job> j);
   std::mutex mu_;
   std::condition_variable cv_, done_cv_;
-  std::deque<Job*> queue_;
+  bool landing_ready() const {
+    if (!queue_.empty() || landing_.empty()) return false;
+    if (!reserve_) return running_ < landing_cap_;
+    if (threads_n_ <= 1) return running_ == 0;
+    return landing_running_ < landing_cap_ && landing_running_ + 1 < threads_n_;
+  }
+  std::deque<Job*> queue_, landing_;  // demand reads, landing reads
   std::vector<std::unique_ptr<Job>> jobs_;  // submitted, not waited for yet
-  uint32_t running_ = 0;
-  bool stop_ = false;
+  uint32_t running_ = 0, landing_running_ = 0, landing_cap_ = 1, threads_n_ = 1;
+  bool stop_ = false, reserve_ = true;
   std::vector<std::thread> threads_;
 };
 }  // namespace ts

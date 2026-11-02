@@ -122,8 +122,9 @@ void DgService::wait_word(const uint32_t* w, uint32_t seq, const char* what, uin
       fail(SS_E_BACKEND, std::string("device-gated: sequence desync: ") + what + " of gated layer " +
                              std::to_string(g) + " holds " + std::to_string(v) + " while serving token " +
                              std::to_string(seq));
-    // three-tier: prefetch reads in flight across calls get their copies enqueued as soon as they finished
-    if ((spins & 63u) == 0 && core_->reads_in_flight()) core_->poll_reads();
+    // three-tier: prefetch reads in flight across calls get their copies enqueued as soon as they finished (landing
+    // reads: landed)
+    if ((spins & 63u) == 0 && (core_->reads_in_flight() || core_->landings_in_flight())) core_->poll_reads();
     if ((spins & 4095u) == 0) {
       if (stop_.load(std::memory_order_acquire)) throw Stop{};
       if (clock_type::now() - start > cfg_.timeout)
@@ -142,7 +143,8 @@ void DgService::wait_began(uint32_t seq) {
   for (uint32_t spins = 0;; ++spins) {
     const uint32_t v = dg_load_acquire(m_.began);
     if (v == seq) return;
-    if ((spins & 63u) == 0 && core_->reads_in_flight()) core_->poll_reads();  // a window's prior reads
+    if ((spins & 63u) == 0 && (core_->reads_in_flight() || core_->landings_in_flight()))
+      core_->poll_reads();  // a window's prior reads (and landings)
     if (int32_t(v - seq) > 0)
       fail(SS_E_BACKEND, "device-gated: sequence desync: a gated step began with seq " + std::to_string(v) +
                              " while serving token " + std::to_string(seq) +

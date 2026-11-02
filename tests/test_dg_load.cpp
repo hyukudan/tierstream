@@ -1,4 +1,5 @@
 #include <atomic>
+#include <condition_variable>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -284,6 +285,116 @@ TEST(dg_read_pool_overlaps_and_rethrows) {
   for (int i = 0; i < 6; ++i) left.submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(3)); });
 }
 
+// Landing reads (dg_landing_blocks) wait in the pool's second queue: a queued demand read starts before every queued
+// landing read, whatever the submission order; landing reads start only while fewer than the cap landing reads run and
+// a reader stays free of them; a wait for a landing read still queued starts it as a demand (the cap no longer holds it
+// back).
+TEST(dg_read_pool_demand_first) {
+  {  // one worker, busy with a demand read: two landing reads, then a demand read, queue behind it
+    ts::DgReadPool pool(1, 4);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool go = false;
+    std::vector<int> order;
+    auto rec = [&](int id) {
+      std::lock_guard<std::mutex> lk(mu);
+      order.push_back(id);
+    };
+    void* a = pool.submit([&] {
+      std::unique_lock<std::mutex> lk(mu);
+      cv.wait(lk, [&] { return go; });
+      order.push_back(0);
+    });
+    void* l1 = pool.submit_indexed([&](uint32_t) { rec(1); }, true);
+    void* l2 = pool.submit_indexed([&](uint32_t) { rec(2); }, true);
+    void* d = pool.submit([&] { rec(3); });
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      go = true;
+    }
+    cv.notify_all();
+    for (void* h : {a, l1, l2, d}) pool.wait(h);
+    CHECK(order == (std::vector<int>{0, 3, 1, 2}));
+  }
+  {  // four workers, cap 2: eight landing reads never run more than two at once
+    ts::DgReadPool pool(4, 2);
+    std::atomic<int> running{0}, most{0};
+    std::vector<void*> h;
+    for (int i = 0; i < 8; ++i)
+      h.push_back(pool.submit_indexed(
+          [&](uint32_t) {
+            const int now = ++running;
+            int m = most.load();
+            while (now > m && !most.compare_exchange_weak(m, now)) {
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            --running;
+          },
+          true));
+    // all end as landing reads first: a wait would make a landing read still queued or running a demand, which the
+    // cap no longer holds back
+    for (void* x : h)
+      while (!pool.done(x)) std::this_thread::yield();
+    for (void* x : h) pool.wait(x);
+    CHECK(most.load() >= 1 && most.load() <= 2);
+  }
+  {  // one worker busy: a queued landing read is cancelled (never runs, its handle gone); a started one is not
+    ts::DgReadPool pool(1, 1);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool go = false;
+    std::atomic<bool> started{false}, ran{false};
+    void* a = pool.submit_indexed(
+        [&](uint32_t) {
+          started = true;
+          std::unique_lock<std::mutex> lk(mu);
+          cv.wait(lk, [&] { return go; });
+        },
+        true);
+    while (!started) std::this_thread::yield();
+    void* l = pool.submit_indexed([&](uint32_t) { ran = true; }, true);
+    void* d = pool.submit([] {});
+    CHECK(pool.cancel(l));
+    CHECK(!pool.cancel(a));  // running
+    CHECK(!pool.cancel(d));  // a demand read: never cancelled
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      go = true;
+    }
+    cv.notify_all();
+    pool.wait(a);
+    pool.wait(d);
+    CHECK(!ran.load());
+  }
+  {  // two workers, cap 1: a landing read runs (blocked), a second one is held back by the cap until it is waited for;
+     // the wait starts it on the free worker while the first still runs
+    ts::DgReadPool pool(2, 1);
+    std::mutex mu;
+    std::condition_variable cv;
+    bool go = false;
+    std::atomic<bool> started{false}, landed{false};
+    void* a = pool.submit_indexed(
+        [&](uint32_t) {
+          started = true;
+          std::unique_lock<std::mutex> lk(mu);
+          cv.wait(lk, [&] { return go; });
+        },
+        true);
+    while (!started) std::this_thread::yield();
+    void* l = pool.submit_indexed([&](uint32_t) { landed = true; }, true);
+    CHECK(!pool.done(l));  // held back: one read runs, the cap is 1
+    CHECK_EQ(pool.counts().landing_queued, size_t(1));
+    pool.wait(l);
+    CHECK(landed.load());
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      go = true;
+    }
+    cv.notify_all();
+    pool.wait(a);
+  }
+}
+
 // Concurrent three-tier reads (dg_disk_queue > 1): every reader reads with its own bounce buffer (no lock is shared;
 // only the open source is), and units whose gate / up parts are not sector multiples (DeepSeek's are 3,041,280 bytes)
 // land the same bytes and digest from four readers at once. A part whose destination has its file offset's
@@ -388,6 +499,508 @@ TEST(dg_read_unit_concurrent_readers_own_bounces) {
   }
 }
 
+// ---- chunked landing reads (SS_DG_LANDING_YIELD) ----
+namespace {
+// One gated layer of U units whose gate / up parts are 3.5 sectors and down 5 (unaligned units, as DeepSeek's), the
+// file's bytes byte_at(9, offset); each unit's expected bytes and digest.
+struct ChunkFile {
+  static constexpr int U = 8;
+  const uint64_t pb[3] = {14336, 14336, 20480};
+  uint64_t off[3] = {4096, 0, 0}, unit = 0;
+  ss::Desc d;
+  std::vector<std::vector<uint8_t>> expected;
+  std::vector<uint64_t> digests;
+  explicit ChunkFile(const char* name) {
+    const auto dir = sstest::Fixture::temp_root() / name;
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "experts.bin";
+    off[1] = off[0] + uint64_t(U) * pb[0];
+    off[2] = off[1] + uint64_t(U) * pb[1];
+    const uint64_t size = off[2] + uint64_t(U) * pb[2] + 4096;
+    {
+      std::vector<char> buf(static_cast<size_t>(size));
+      for (uint64_t i = 0; i < size; ++i) buf[size_t(i)] = char(sstest::byte_at(9, i));
+      std::ofstream f(file, std::ios::binary);
+      f.write(buf.data(), std::streamsize(size));
+    }
+    std::string json = R"({"schema":"strix-stream/desc-v1","engine":"dg-test","unit_align":256,"sources":[{"path":")" +
+                       file.generic_string() + R"(","align":4096}],"layers":[{"index":0,"kind":"moe","n_units":)" +
+                       std::to_string(U) + R"(,"top_k":4,"parts":[)";
+    const char* names[3] = {"gate", "up", "down"};
+    for (int p = 0; p < 3; ++p)
+      json += std::string(p ? "," : "") + R"({"name":")" + names[p] + R"(","format":"Q4_K","offset":)" +
+              std::to_string(off[p]) + R"(,"stride":)" + std::to_string(pb[p]) + R"(,"bytes":)" +
+              std::to_string(pb[p]) + "}";
+    json += "]}]}";
+    d = ss::desc_from_json(ss::json_parse(json));
+    unit = pb[0] + pb[1] + pb[2];
+    for (int u = 0; u < U; ++u) {
+      expected.emplace_back();
+      for (int p = 0; p < 3; ++p)
+        for (uint64_t i = 0; i < pb[p]; ++i)
+          expected.back().push_back(sstest::byte_at(9, off[p] + uint64_t(u) * pb[p] + i));
+      digests.push_back(ss::xxh64(expected.back().data(), expected.back().size()));
+    }
+  }
+  std::vector<std::unique_ptr<ss::SourceFile>> open(bool direct) const {
+    ss_options o;
+    ss_options_defaults(&o);
+    o.direct_io = direct;
+    std::vector<std::unique_ptr<ss::SourceFile>> files;
+    files.push_back(ss::open_source(d.sources[0].path, o));
+    return files;
+  }
+};
+// A gate a step waits at (open: every later wait passes).
+struct Gate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+  void wait() {
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [&] { return open; });
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      open = true;
+    }
+    cv.notify_all();
+  }
+};
+template <class F>
+void spin_until(F f) {
+  while (!f()) std::this_thread::yield();
+}
+}  // namespace
+
+// A unit read in chunks lands the same bytes and digest as one whole read (dg_read_unit), buffered and direct, with and
+// without subread pieces: each chunk at most the step (the chunk in whole sectors), never across two parts, cut at
+// aligned file offsets so the unaligned parts bounce exactly the bytes of a whole read (their head and tail sectors
+// once). A chunk at least the unit's largest part reads part by part.
+TEST(dg_read_unit_chunks_same_bytes) {
+  const ChunkFile cf("ss-test-dg-read-chunks");
+  const uint64_t al = 4096;
+  for (bool direct : {false, true}) {
+    const auto files = cf.open(direct);
+    ss::DgBounce bounce(size_t(1) << 20, size_t(al));
+    ss::DgBounce dst{size_t(cf.unit), size_t(al)};
+    for (uint64_t chunk : {uint64_t(4096), uint64_t(8192), uint64_t(12288), uint64_t(4) << 20})
+      for (uint64_t subread : {uint64_t(0), uint64_t(4096)})
+        for (int u = 0; u < ChunkFile::U; ++u) {
+          std::memset(dst.p, 0x5a, size_t(cf.unit));
+          ss::DgLoadStats whole_st;
+          uint64_t whole_digest = 0;
+          ss::dg_read_unit(cf.d, files, 0, u, dst.p, bounce.p, bounce.bytes, true, &whole_digest, &whole_st);
+          CHECK(std::memcmp(dst.p, cf.expected[size_t(u)].data(), size_t(cf.unit)) == 0);
+          std::memset(dst.p, 0x5a, size_t(cf.unit));
+          ss::DgUnitChunks c;
+          c.layer = 0;
+          c.unit = u;
+          c.dst = dst.p;
+          c.chunk = chunk;
+          c.hash = true;
+          ss::DgLoadStats st;
+          uint64_t digest = 0, left = cf.unit, steps = 0;
+          while (left) {
+            const uint64_t before = c.done;
+            const size_t part = c.part;
+            const uint64_t was = left;
+            left = ss::dg_read_unit_chunk(cf.d, files, c, bounce.p, bounce.bytes, &digest, &st, subread);
+            ++steps;
+            CHECK(left < was);
+            CHECK(c.done - before <= std::max(chunk, al));
+            CHECK(c.part == part || c.at == 0);  // a chunk ends inside its part, or at its end
+          }
+          CHECK(std::memcmp(dst.p, cf.expected[size_t(u)].data(), size_t(cf.unit)) == 0);
+          CHECK_EQ(digest, cf.digests[size_t(u)]);
+          CHECK_EQ(digest, whole_digest);
+          CHECK_EQ(st.bounce_bytes, whole_st.bounce_bytes);
+          if (chunk >= cf.pb[2]) CHECK_EQ(steps, 3u);
+          else CHECK(steps > 3);
+        }
+  }
+}
+
+// Demand reads preempt a running chunked landing read at its next chunk boundary: with one worker the demand runs
+// between two chunks and the landing resumes after it (one yield); with two workers busy (a demand blocked on one) the
+// landing yields the other worker to a queued demand and resumes once it is free. A whole landing read (no chunks,
+// dg_landing_chunk 0xFFFFFFFF) is never preempted: the demand waits for its end.
+TEST(dg_read_pool_demand_preempts_chunked_landing) {
+  {  // one worker
+    ts::DgReadPool pool(1, 4);
+    std::mutex mu;
+    std::vector<int> order;
+    auto rec = [&](int id) {
+      std::lock_guard<std::mutex> lk(mu);
+      order.push_back(id);
+    };
+    Gate g;
+    std::atomic<int> steps{0};
+    void* l = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          const int s = ++steps;
+          rec(10 + s);
+          if (s == 2) g.wait();
+          return uint64_t(4 - s);
+        },
+        4);
+    spin_until([&] { return steps.load() == 2; });
+    void* d = pool.submit([&] { rec(1); });
+    g.release();
+    pool.wait(d);
+    ts::DgReadPool::End e;
+    pool.wait(l, &e);
+    CHECK(order == (std::vector<int>{11, 12, 1, 13, 14}));
+    CHECK_EQ(e.yields, 1u);
+    CHECK(!e.aborted);
+    CHECK_EQ(e.aborted_bytes, 0u);
+  }
+  {  // two workers, one blocked on a demand read: the landing yields the other one to a queued demand, then resumes
+    ts::DgReadPool pool(2, 4);
+    Gate g0, g1;
+    std::atomic<bool> d0_running{false}, d1_done{false};
+    std::atomic<int> steps{0};
+    void* d0 = pool.submit([&] {
+      d0_running = true;
+      g0.wait();
+    });
+    spin_until([&] { return d0_running.load(); });
+    std::atomic<bool> d1_before_end{false};
+    void* l = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          const int s = ++steps;
+          if (s == 1) g1.wait();
+          if (s == 3) d1_before_end = d1_done.load();
+          return uint64_t(3 - s);
+        },
+        3);
+    spin_until([&] { return steps.load() == 1; });
+    void* d1 = pool.submit([&] { d1_done = true; });
+    g1.release();
+    pool.wait(d1);
+    ts::DgReadPool::End e;
+    pool.wait(l, &e);
+    CHECK(d1_before_end.load());  // the demand ran between the landing's chunks, on the worker the landing gave up
+    CHECK_EQ(e.yields, 1u);
+    g0.release();
+    pool.wait(d0);
+  }
+  {  // a whole landing read: never preempted
+    ts::DgReadPool pool(1, 4);
+    std::mutex mu;
+    std::vector<int> order;
+    auto rec = [&](int id) {
+      std::lock_guard<std::mutex> lk(mu);
+      order.push_back(id);
+    };
+    Gate g;
+    std::atomic<bool> started{false};
+    void* l = pool.submit_indexed(
+        [&](uint32_t) {
+          started = true;
+          g.wait();
+          rec(10);
+        },
+        true);
+    spin_until([&] { return started.load(); });
+    void* d = pool.submit([&] { rec(1); });
+    g.release();
+    pool.wait(d);
+    ts::DgReadPool::End e;
+    pool.wait(l, &e);
+    CHECK(order == (std::vector<int>{10, 1}));
+    CHECK_EQ(e.yields, 0u);
+  }
+}
+
+// A wait for a chunked landing read that yielded part-way makes it a demand: it moves to the demand queue (behind the
+// demand read already queued), runs to its end with demand priority on the first free worker and never yields again
+// (a demand queued while it runs waits for it), and its unit's bytes and digest are exact.
+TEST(dg_read_pool_wait_completes_partway_landing) {
+  const ChunkFile cf("ss-test-dg-read-chunks-wait");
+  const uint64_t al = 4096;
+  for (bool direct : {false, true}) {
+    const auto files = cf.open(direct);
+    std::vector<std::unique_ptr<ss::DgBounce>> bounces;  // one per worker
+    for (int i = 0; i < 2; ++i) bounces.push_back(std::make_unique<ss::DgBounce>(size_t(1) << 20, size_t(al)));
+    ss::DgBounce dst{size_t(cf.unit), size_t(al)};
+    std::memset(dst.p, 0x5a, size_t(cf.unit));
+    const int u = 5;
+    ts::DgReadPool pool(2, 4);
+    Gate g0, g1, gl;
+    std::mutex mu;
+    std::vector<int> order;
+    auto rec = [&](int id) {
+      std::lock_guard<std::mutex> lk(mu);
+      order.push_back(id);
+    };
+    std::atomic<bool> d0_running{false}, d1_running{false};
+    void* d0 = pool.submit([&] {
+      d0_running = true;
+      g0.wait();
+      rec(0);
+    });
+    spin_until([&] { return d0_running.load(); });
+    auto c = std::make_shared<ss::DgUnitChunks>();
+    c->layer = 0;
+    c->unit = u;
+    c->dst = dst.p;
+    c->chunk = 4096;
+    c->hash = true;
+    uint64_t digest = 0;
+    std::atomic<int> steps{0};
+    void* d3 = nullptr;
+    std::atomic<bool> submitted3{false};
+    void* l = pool.submit_steps(
+        [&](uint32_t worker) -> uint64_t {
+          const int s = ++steps;
+          if (s == 1) gl.wait();
+          const uint64_t left =
+              ss::dg_read_unit_chunk(cf.d, files, *c, bounces[worker]->p, bounces[worker]->bytes, &digest);
+          if (s == 3) {  // a demand now: one queued meanwhile waits for its end
+            d3 = pool.submit([&] { rec(3); });
+            submitted3 = true;
+          }
+          if (!left) rec(9);
+          return left;
+        },
+        cf.unit);
+    spin_until([&] { return steps.load() == 1; });
+    void* d1 = pool.submit([&] {  // queued: the landing yields to it after its first chunk
+      d1_running = true;
+      g1.wait();
+      rec(1);
+    });
+    gl.release();
+    spin_until([&] { return d1_running.load(); });  // both workers blocked, the landing parked part-way
+    CHECK(!pool.done(l));
+    CHECK(c->done > 0 && c->done < cf.unit);
+    void* d2 = pool.submit([&] { rec(2); });
+    ts::DgReadPool::End e;
+    std::thread waiter([&] { pool.wait(l, &e); });  // to the demand queue, behind d2
+    spin_until([&] { return !pool.is_landing(l); });
+    CHECK_EQ(pool.counts().queued, size_t(2));  // d2, then the landing read
+    g0.release();  // worker 0: d2, then the landing to its end, then d3 (worker 1 still blocked in d1)
+    waiter.join();
+    CHECK(submitted3.load());
+    pool.wait(d3);
+    pool.wait(d2);
+    pool.wait(d0);
+    g1.release();
+    pool.wait(d1);
+    CHECK(order == (std::vector<int>{0, 2, 9, 3, 1}));
+    CHECK_EQ(e.yields, 1u);
+    CHECK(!e.aborted);
+    CHECK(std::memcmp(dst.p, cf.expected[size_t(u)].data(), size_t(cf.unit)) == 0);
+    CHECK_EQ(digest, cf.digests[size_t(u)]);
+  }
+}
+
+// Abort (the core dropped a landing): a chunked landing read running stops at its next chunk (aborted, the bytes not
+// read reported), one still queued is done at once (nothing read), a whole one runs to its end; a demand (waited for)
+// is never aborted. A landing read parked part-way is cancelled with its unread bytes and its yield. Without `end` a
+// wait for an aborted read throws (its bytes are partial).
+TEST(dg_read_pool_abort_and_cancel) {
+  {  // running, chunked: stops at its next chunk
+    ts::DgReadPool pool(2, 1);
+    Gate g;
+    std::atomic<int> steps{0};
+    void* l = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          const int s = ++steps;
+          if (s == 2) g.wait();
+          return uint64_t(10 - s) * 100;
+        },
+        1000);
+    spin_until([&] { return steps.load() == 2; });
+    pool.abort(l);
+    g.release();
+    ts::DgReadPool::End e;
+    pool.wait(l, &e);
+    CHECK(e.aborted);
+    CHECK_EQ(e.aborted_bytes, 800u);
+    CHECK_EQ(steps.load(), 2);
+  }
+  {  // queued (cap 1, one landing running): done at once, nothing read; a whole read runs to its end
+    ts::DgReadPool pool(2, 1);
+    Gate g;
+    std::atomic<bool> started{false}, ran{false};
+    void* a = pool.submit_indexed(
+        [&](uint32_t) {
+          started = true;
+          g.wait();
+        },
+        true);
+    spin_until([&] { return started.load(); });
+    void* q = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          ran = true;
+          return 0;
+        },
+        700);
+    pool.abort(q);
+    CHECK(pool.done(q));
+    ts::DgReadPool::End e;
+    pool.wait(q, &e);
+    CHECK(e.aborted);
+    CHECK_EQ(e.aborted_bytes, 700u);
+    pool.abort(a);  // whole: no chunk to stop at
+    g.release();
+    pool.wait(a, &e);
+    CHECK(!e.aborted);
+    CHECK(!ran.load());
+    // without `end`, an aborted read throws when waited for
+    void* r = pool.submit_steps([](uint32_t) -> uint64_t { return 0; }, 5);
+    started = false;
+    Gate g2;
+    void* b = pool.submit_indexed(
+        [&](uint32_t) {
+          started = true;
+          g2.wait();
+        },
+        true);
+    pool.wait(r);  // (ran or not: a demand now)
+    spin_until([&] { return started.load(); });
+    void* r2 = pool.submit_steps([](uint32_t) -> uint64_t { return 0; }, 5);
+    pool.abort(r2);
+    bool threw = false;
+    try {
+      pool.wait(r2);
+    } catch (const ts::Error& x) {
+      threw = x.status() == SS_E_IO;
+    }
+    CHECK(threw);
+    g2.release();
+    pool.wait(b);
+  }
+  {  // a demand (waited for while running) is never aborted
+    ts::DgReadPool pool(2, 4);
+    Gate g;
+    std::atomic<int> steps{0};
+    void* l = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          const int s = ++steps;
+          if (s == 1) g.wait();
+          return uint64_t(3 - s);
+        },
+        3);
+    spin_until([&] { return steps.load() == 1; });
+    ts::DgReadPool::End e;
+    std::thread waiter([&] { pool.wait(l, &e); });
+    spin_until([&] { return !pool.is_landing(l); });  // a demand now
+    pool.abort(l);  // (only reachable through misuse: the core never aborts a read it waits for)
+    g.release();
+    waiter.join();
+    CHECK(!e.aborted);
+    CHECK_EQ(steps.load(), 3);
+  }
+  {  // parked part-way: cancelled with its unread bytes and its yield
+    ts::DgReadPool pool(1, 4);
+    Gate gl, gd;
+    std::atomic<int> steps{0};
+    std::atomic<bool> d_running{false};
+    void* l = pool.submit_steps(
+        [&](uint32_t) -> uint64_t {
+          const int s = ++steps;
+          if (s == 1) gl.wait();
+          return uint64_t(4 - s) * 10;
+        },
+        40);
+    spin_until([&] { return steps.load() == 1; });
+    void* d = pool.submit([&] {
+      d_running = true;
+      gd.wait();
+    });
+    gl.release();
+    spin_until([&] { return d_running.load(); });
+    ts::DgReadPool::End e;
+    CHECK(pool.cancel(l, &e));
+    CHECK_EQ(e.aborted_bytes, 30u);
+    CHECK_EQ(e.yields, 1u);
+    gd.release();
+    pool.wait(d);
+    CHECK_EQ(steps.load(), 1);
+  }
+}
+
+// At most threads - 1 landing reads run at once (one reader stays free for demand reads), and never more than the cap;
+// with one thread a landing read runs only while nothing else runs (the first case of dg_read_pool_demand_first). The
+// landing reads are held at their first chunk: the pool's own counts show how many started, and a demand read submitted
+// then runs on the free reader. Without the reserve (dg_landing_chunk 0xFFFFFFFF: the scheduler before) landing reads
+// start while fewer than the cap reads run, demand reads included, and may take every reader.
+TEST(dg_read_pool_landings_leave_a_reader) {
+  auto deadline_done = [](ts::DgReadPool& pool, void* x) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pool.done(x) && std::chrono::steady_clock::now() < end) std::this_thread::yield();
+    return pool.done(x);
+  };
+  for (uint32_t cap : {8u, 2u})
+    for (bool chunked : {true, false}) {
+      ts::DgReadPool pool(4, cap);
+      Gate g;
+      std::vector<void*> h;
+      for (int i = 0; i < 12; ++i) {
+        if (chunked) {
+          auto n = std::make_shared<int>(0);
+          h.push_back(pool.submit_steps(
+              [&g, n](uint32_t) -> uint64_t {
+                if (++*n == 1) g.wait();
+                return uint64_t(3 - *n);
+              },
+              3));
+        } else {
+          h.push_back(pool.submit_indexed([&](uint32_t) { g.wait(); }, true));
+        }
+      }
+      const uint32_t bound = std::min<uint32_t>(cap, 3);
+      spin_until([&] { return pool.counts().landing_running == bound; });
+      void* d = pool.submit([] {});
+      CHECK(deadline_done(pool, d));  // the free reader took it
+      const auto c = pool.counts();
+      CHECK_EQ(c.landing_running, bound);
+      CHECK_EQ(c.running, bound);
+      CHECK_EQ(c.landing_queued, size_t(12 - bound));
+      pool.wait(d);
+      g.release();
+      for (void* x : h) pool.wait(x);
+    }
+  {  // no reserve, cap 2: a demand read running counts against the cap
+    ts::DgReadPool pool(4, 2, false);
+    Gate gd, g;
+    std::atomic<bool> d_running{false};
+    void* d = pool.submit([&] {
+      d_running = true;
+      gd.wait();
+    });
+    spin_until([&] { return d_running.load(); });
+    std::vector<void*> h;
+    for (int i = 0; i < 4; ++i) h.push_back(pool.submit_indexed([&](uint32_t) { g.wait(); }, true));
+    spin_until([&] { return pool.counts().running == 2; });
+    auto c = pool.counts();
+    CHECK_EQ(c.landing_running, 1u);
+    CHECK_EQ(c.landing_queued, size_t(3));
+    gd.release();
+    pool.wait(d);
+    spin_until([&] { return pool.counts().landing_running == 2; });  // the demand's place
+    g.release();
+    for (void* x : h) pool.wait(x);
+  }
+  {  // no reserve, cap 8: landing reads take every reader; a demand read queues behind them
+    ts::DgReadPool pool(4, 8, false);
+    Gate g;
+    std::vector<void*> h;
+    for (int i = 0; i < 6; ++i) h.push_back(pool.submit_indexed([&](uint32_t) { g.wait(); }, true));
+    spin_until([&] { return pool.counts().landing_running == 4; });
+    void* d = pool.submit([] {});
+    CHECK(!pool.done(d));
+    CHECK_EQ(pool.counts().queued, size_t(1));
+    g.release();
+    pool.wait(d);
+    for (void* x : h) pool.wait(x);
+  }
+}
+
 // A short part with the destination's misalignment that ends before its next sector (the last part of a unit, at an
 // unaligned end of file): bounced whole, nothing written past the unit, no read past the end of the file.
 TEST(dg_read_unit_short_part_without_aligned_middle) {
@@ -481,7 +1094,14 @@ TEST(dg_failure_report_and_module_loading) {
   // SS_DG_DISK_QUEUE_AUTO's report (disk_queue_resolved / disk_locations) after them, the last fields
   CHECK_EQ(offsetof(ss_dg_stats, disk_queue_resolved), offsetof(ss_dg_stats, pred_shadow_file_hit_bytes) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, disk_locations), offsetof(ss_dg_stats, disk_queue_resolved) + 4);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, disk_locations) + 4);
+  // the landing counters after them, the last fields
+  CHECK_EQ(offsetof(ss_dg_stats, landing_issued), offsetof(ss_dg_stats, disk_locations) + 4);
+  CHECK_EQ(offsetof(ss_dg_stats, landing_read_bytes), offsetof(ss_dg_stats, landing_dropped_full) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, landing_cancelled), offsetof(ss_dg_stats, landing_read_bytes) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, landing_skipped_passed), offsetof(ss_dg_stats, landing_expired_layer) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, landing_yields), offsetof(ss_dg_stats, landing_skipped_passed) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, landing_aborted_bytes), offsetof(ss_dg_stats, landing_yields) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, landing_aborted_bytes) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

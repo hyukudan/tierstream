@@ -611,6 +611,73 @@ drives (the primary plus stripe copies found through `weight_dirs`, §4.4) peake
 - **Measured** (one drive, DS RTX at 24+32, output identical in every arm): 5.45 tok/s at queue 1, 6.55 at queue 4
   (+20 %; +26 % with speculative decoding), queue 16 = queue 4.
 
+### 3.15 Device-gated two-stage file prefetch (landings)
+
+In a three-tier open a prediction of a file-homed unit needs a free GPU slot beyond the reserve; at a small VRAM and
+RAM there is almost none, so almost every file miss is a dependent read on the critical path. A landing moves the
+file bytes into host RAM while earlier layers compute, without touching the GPU's placement.
+
+- **Opt-in.** `ss_options.dg_landing_blocks = L` (0 = off, the default: nothing allocated, today's behaviour and
+  counters exactly; needs `dg_disk_tier = 1` and `dg_disk_queue > 1`). L pinned landing blocks of one host stride each
+  are allocated at open in their own chunks of at most 1 GiB, after the file tier's staging buffers (block indices
+  `blocks + S ..`), only when the plan has a file tier. They are separate from the pinned tier's blocks and spares and billed in the open's host admission;
+  `ss_budget_in.dg_landing_blocks` makes the planner charge them as a fixed pinned host part (`lib_landing_bytes`):
+  each landing block is one pinned-tier unit fewer at a fixed RAM cap.
+- **Issue.** A predicted unit (the plain next-layer prediction, winpf's l+1 candidates after their pricing, a window
+  hint's priors) whose home is its file takes a free landing block and its file read starts into it (`Landing`): the
+  transport's hash-checked read, per-reader bounce buffers for unaligned parts, exactly a demand miss's read. It is
+  outside the prefetch budgets and `l1_cap` and takes no slot. No free landing block: the advice is dropped
+  (`landing_dropped_full`); a landing in flight or landed is never displaced. A unit already landing is left alone.
+- **Read pool.** Landing reads wait in the pool's second queue: a worker takes a queued demand read first, and starts a
+  landing read only while no demand read is queued and fewer than `dg_landing_max_queued` reads (0 = 1) run. The pool
+  does not see the drives, so the cap bounds the reads of all drives together (the design's per-drive cap times one).
+  A demand read therefore queues behind at most that many reads already on the drives; started reads are never
+  preempted. Ending a landing read still queued moves it to the demand queue. That is the scheduler of
+  `dg_landing_chunk = 0xFFFFFFFF` (whole reads). By default (`dg_landing_chunk` 0 = 4 MiB) a landing read runs in
+  chunks inside one part each, cut at aligned file offsets (whole stripe chunks on a session that re-checks them), its hash
+  fed chunk by chunk (the same digest); at most `dg_landing_max_queued` landing reads run and one reader stays free of
+  them (at most `dg_disk_queue - 1`); between two chunks, with a demand read queued that no idle reader takes, it gives
+  its reader to that read and resumes later with its progress kept (`landing_yields`). Ending one makes it a demand: it
+  runs to its end and never yields again.
+- **Unit state.** `Landing` (read in flight) and `Landed` hold the landing block, no slot, no block, no entry; the
+  permanent home stays the file (`file_units()` counts them, as the shadow tally does). A landing never takes a slot,
+  evicts or writes back; boundaries, victims, rounds and the pinned tier never see it.
+- **Demand.** A miss of a `Landed` unit is the pinned path: one host-to-device copy from its landing block into the
+  slot the file miss would have taken (`landing_promoted`, no file read); the block returns to the free list once that
+  copy's event completed. A miss of a `Landing` unit is fetched after the layer's other misses were issued (their reads
+  overlap the wait), its read ended out of order, then the same copy (`landing_late`, `landing_wait_ns`): never a
+  second read. A prediction never promotes a landing: only a demand (or `ss_dg_make_resident`) copies it to the GPU.
+- **Cancellation.** A landing read that never started (still queued behind the cap) is never waited for at a boundary,
+  a drain between tokens, `ss_dg_reset_open` or destruction: it is dropped from the pool (`DgReadPool::cancel`), its
+  unit back in its file and its block free with no read (`landing_cancelled`). A demand of one still moves it to the
+  demand queue and promotes it.
+- **Layer expiry (`dg_landing_ttl = 0`, the default).** A prediction for layer g + 1 that layer g + 1 did not route can
+  never be used later in its token, so it must not hold a block through the remaining layers: right after layer g + 1's
+  demand was served (its misses issued and covered), each of its landings it did not route goes back to its file
+  (`landing_expired_layer`): a landed one at once (no copy ever read its block), one still queued cancelled (no read,
+  `landing_cancelled`), one running when its read ends (never promoted; a chunked one stops at its next chunk, the
+  bytes not read in `landing_aborted_bytes`). A prediction for a layer already served this
+  token is not issued (`landing_skipped_passed`). A few layers' worth of blocks then serve every layer. Layer tokens
+  (one layer exported in parts) and unexported layers leave theirs to the boundary.
+- **Expiry.** The boundary ends the landing reads still running (landed, or back to the file on a failure), frees
+  every landing block a promotion's copy read (the streams are synced), and sends a landed unit not demanded for
+  `dg_landing_ttl` boundaries (TTL 0: the token it landed in) back to its file without a copy (`landing_expired`).
+- **Failures.** A failed landing read frees its block and drops the advice (the error is not reported: the unit's
+  next demand reads it as any file miss and reports its own error). Device-failure and read-failure contracts are
+  unchanged.
+- **Interactions.** Kept and held units are never file-homed, so never landed. `ss_dg_make_resident` of a landed unit
+  copies from its landing block (freed once `kDem` is synced, as a pinned source); every drain point between tokens
+  (`ss_dg_make_resident`, `ss_dg_round`, `ss_dg_reset_open`, a policy change) ends the landing reads first; rounds
+  leave landings alone; `ss_dg_reset_open` sends every landing back to its file (the open holds none); destruction ends
+  the reads in flight before their blocks are freed. A layer token's parts promote landings like any demand.
+- **Counters.** `ss_dg_stats.landing_issued / landing_promoted / landing_late / landing_wait_ns / landing_expired /
+  landing_dropped_full / landing_read_bytes / landing_cancelled / landing_expired_layer / landing_skipped_passed /
+  landing_yields / landing_aborted_bytes` (also in the stats JSON, with `landing_failed` and
+  the settings). The service's wait polls at most the 8 oldest landing reads per look.
+  Landing reads are not in `disk_reads` / `disk_read_bytes`: a promoted landing is a file read fewer there.
+- **Horizon.** Only the existing next-layer prediction (g + 1) is used; a prediction protocol carrying its target layer
+  (g + h, h >= 2) is later work.
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier

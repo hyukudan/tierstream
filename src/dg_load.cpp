@@ -17,6 +17,43 @@ namespace {
 struct Span { size_t source; uint64_t offset, bytes; char* dst; uint64_t room; };
 struct Batch { size_t first, count; bool resident; size_t need; };  // need: chunks published before a host read
 struct Ready { size_t buffer; std::vector<DgLoadCopy> copies; };
+// [F, F + n) of f (alignment al) into out, as dg_read_unit reads a part: in place (no direct I/O, or aligned offset,
+// length and destination); else the aligned middle in place when the destination has the offset's misalignment and the
+// rest through `bounce` in covering aligned reads, or all of it through `bounce`.
+void read_range(const SourceFile& f, uint64_t al, uint64_t F, char* out, uint64_t n, void* bounce,
+                uint64_t bounce_bytes, DgLoadStats* stats) {
+  auto read = [&](void* dst, uint64_t len, uint64_t off) {
+    const uint64_t got = f.pread(dst, len, off);
+    if (stats) { stats->read_bytes += got; ++stats->read_calls; }
+    return got;
+  };
+  if (!f.direct() || (F % al == 0 && n % al == 0 && uintptr_t(out) % al == 0)) {
+    require(read(out, n, F) == n, SS_E_IO, "short read");
+    return;
+  }
+  // [lo, hi): the aligned middle, read in place when the destination has the offset's misalignment (aligned offset,
+  // length and address there); the rest through the bounce buffer, in covering aligned reads
+  uint64_t lo = 0, hi = 0;
+  if (uintptr_t(out) % al == F % al) {
+    lo = (al - F % al) % al;
+    if (n > lo) hi = lo + (n - lo) / al * al;
+    if (hi <= lo) lo = hi = 0;  // no aligned middle (a range ending before the next sector): bounced whole
+  }
+  if (hi > lo) require(read(out + lo, hi - lo, F + lo) == hi - lo, SS_E_IO, "short read");
+  const uint64_t cap = (bounce_bytes - 2 * al) / al * al;
+  auto bounced = [&](uint64_t from, uint64_t to) {
+    if (stats) stats->bounce_bytes += to - from;
+    for (uint64_t c = from; c < to;) {
+      const uint64_t len = std::min(cap, to - c);
+      const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = (F + c + len + al - 1) / al * al;
+      require(read(bounce, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
+      std::memcpy(out + c, static_cast<char*>(bounce) + delta, size_t(len));
+      c += len;
+    }
+  };
+  bounced(0, lo);
+  bounced(hi > lo ? hi : 0, n);
+}
 }
 DgLoadStats dg_load_pipeline(const Desc& d, const std::vector<DgLoadUnit>& input,
     const std::vector<char*>& buffers, uint64_t buffer_bytes, uint32_t readers,
@@ -303,11 +340,6 @@ void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>&
                   void* dst, void* bounce, uint64_t bounce_bytes, bool hash, uint64_t* digest, DgLoadStats* stats,
                   bool parallel, uint64_t subread) {
   const Layer& l = d.layers[size_t(layer)];
-  auto read = [&](const SourceFile& file, void* out, uint64_t n, uint64_t off) {
-    const uint64_t got = file.pread(out, n, off);
-    if (stats) { stats->read_bytes += got; ++stats->read_calls; }
-    return got;
-  };
   auto out_of = [&](size_t i) {
     uint64_t pos = 0;
     for (size_t j = 0; j < i; ++j) pos += l.parts[j].bytes;
@@ -371,33 +403,7 @@ void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>&
     require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(layer) + ", " + std::to_string(unit) +
                                                      ") part " + part.name + " is past the end of its source");
     if (batched[i]) continue;
-    const bool in_place = !f.direct() || (F % al == 0 && part.bytes % al == 0 && uintptr_t(out) % al == 0);
-    if (in_place) {
-      require(read(f, out, part.bytes, F) == part.bytes, SS_E_IO, "short read");
-    } else {
-      // [lo, hi): the aligned middle, read in place when the destination has the offset's misalignment (aligned
-      // offset, length and address there); the rest through the bounce buffer, in covering aligned reads
-      uint64_t lo = 0, hi = 0;
-      if (uintptr_t(out) % al == F % al) {
-        lo = (al - F % al) % al;
-        if (part.bytes > lo) hi = lo + (part.bytes - lo) / al * al;
-        if (hi <= lo) lo = hi = 0;  // no aligned middle (a part ending before the next sector): bounced whole
-      }
-      if (hi > lo) require(read(f, out + lo, hi - lo, F + lo) == hi - lo, SS_E_IO, "short read");
-      const uint64_t cap = (bounce_bytes - 2 * al) / al * al;
-      auto bounced = [&](uint64_t from, uint64_t to) {
-        if (stats) stats->bounce_bytes += to - from;
-        for (uint64_t c = from; c < to;) {
-          const uint64_t len = std::min(cap, to - c);
-          const uint64_t a0 = (F + c) / al * al, delta = F + c - a0, a1 = (F + c + len + al - 1) / al * al;
-          require(read(f, bounce, a1 - a0, a0) >= delta + len, SS_E_IO, "short read");
-          std::memcpy(out + c, static_cast<char*>(bounce) + delta, size_t(len));
-          c += len;
-        }
-      };
-      bounced(0, lo);
-      bounced(hi > lo ? hi : 0, part.bytes);
-    }
+    read_range(f, al, F, out, part.bytes, bounce, bounce_bytes, stats);
   }
   for (const Cut& c : cuts) {  // every piece lands or it throws (after none is in flight)
     c.file->read_pieces(c.pieces);
@@ -425,6 +431,67 @@ void dg_read_unit(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>&
   } else if (digest) {
     *digest = Xxh64().digest();
   }
+}
+
+uint64_t dg_read_unit_chunk(const Desc& d, const std::vector<std::unique_ptr<SourceFile>>& files, DgUnitChunks& c,
+                            void* bounce, uint64_t bounce_bytes, uint64_t* digest, DgLoadStats* stats,
+                            uint64_t subread) {
+  const Layer& l = d.layers[size_t(c.layer)];
+  auto skip_empty = [&] {
+    while (c.part < l.parts.size() && l.parts[c.part].bytes == 0) ++c.part;
+  };
+  skip_empty();
+  if (c.part < l.parts.size()) {
+    const Part& part = l.parts[c.part];
+    const SourceFile& f = *files[size_t(part.source)];
+    const uint64_t al = f.alignment(d.sources[size_t(part.source)].align);
+    const uint64_t F = part.offset + uint64_t(c.unit) * part.stride;
+    require(F + part.bytes <= f.size(), SS_E_IO, "unit (" + std::to_string(c.layer) + ", " + std::to_string(c.unit) +
+                                                     ") part " + part.name + " is past the end of its source");
+    // the step: the chunk in whole alignment units; on a re-checking session whole stripe chunks
+    uint64_t step = std::max(al, c.chunk / al * al);
+    if (const uint64_t grid = f.verify_grid()) step = step >= grid ? step / grid * grid : grid;
+    const uint64_t end = std::min(part.bytes, ((F + c.at) / step + 1) * step - F);
+    const uint64_t n = end - c.at, off = F + c.at;
+    char* out = c.dst + c.done;
+    if (subread && (!f.direct() || (off % al == 0 && n % al == 0 && uintptr_t(out) % al == 0))) {
+      // pieces of `subread` bytes from the chunk's start, cut at the grid, all in flight together
+      std::vector<RawFile::Piece> pieces;
+      const uint64_t grid = f.piece_grid();
+      for (uint64_t at = 0; at < n;) {
+        uint64_t len = std::min(subread, n - at);
+        if (grid) len = std::min(len, grid - (off + at) % grid);
+        pieces.push_back({out + at, off + at, len});
+        at += len;
+      }
+      f.read_pieces(pieces);
+      if (stats) {
+        stats->read_bytes += n;
+        stats->pieces += pieces.size();
+        ++stats->read_calls;
+      }
+    } else {
+      read_range(f, al, off, out, n, bounce, bounce_bytes, stats);
+    }
+    if (c.hash) {  // this chunk's bytes, landed: the unit's bytes in order
+      const auto hash_start = std::chrono::steady_clock::now();
+      c.digest.update(out, size_t(n));
+      if (stats)
+        stats->hash_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hash_start).count();
+    }
+    c.done += n;
+    c.at = end;
+    if (c.at == part.bytes) {
+      ++c.part;
+      c.at = 0;
+      skip_empty();
+    }
+  }
+  uint64_t total = 0;
+  for (const Part& p : l.parts) total += p.bytes;
+  const uint64_t left = total - c.done;
+  if (!left && digest) *digest = c.hash ? c.digest.digest() : Xxh64().digest();
+  return left;
 }
 
 DgBlockAlloc::DgBlockAlloc(std::vector<uint64_t> chunk_blocks, uint64_t stride, Alloc alloc, Release release)
@@ -509,9 +576,10 @@ void DgBlockAlloc::finish(std::vector<void*>* out_chunks, std::vector<char*>* ou
   if (failed()) std::rethrow_exception(error_);
 }
 
-DgReadPool::DgReadPool(uint32_t threads) {
+DgReadPool::DgReadPool(uint32_t threads, uint32_t landing_cap, bool reserve)
+    : landing_cap_(std::max<uint32_t>(landing_cap, 1)), threads_n_(std::max<uint32_t>(threads, 1)), reserve_(reserve) {
   try {
-    for (uint32_t i = 0; i < std::max<uint32_t>(threads, 1); ++i) threads_.emplace_back([this, i] { work(i); });
+    for (uint32_t i = 0; i < threads_n_; ++i) threads_.emplace_back([this, i] { work(i); });
   } catch (...) {
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -526,8 +594,9 @@ DgReadPool::DgReadPool(uint32_t threads) {
 DgReadPool::~DgReadPool() {
   {
     std::unique_lock<std::mutex> lk(mu_);
-    queue_.clear();  // never started: nothing writes for them
-    stop_ = true;
+    queue_.clear();  // never started (or yielded part-way): nothing writes for them any more
+    landing_.clear();
+    stop_ = true;  // (a chunked read running stops at its next chunk)
     done_cv_.wait(lk, [&] { return running_ == 0; });
   }
   cv_.notify_all();
@@ -539,48 +608,122 @@ void DgReadPool::work(uint32_t worker) {
     Job* j = nullptr;
     {
       std::unique_lock<std::mutex> lk(mu_);
-      cv_.wait(lk, [&] { return stop_ || !queue_.empty(); });
+      cv_.wait(lk, [&] { return stop_ || !queue_.empty() || landing_ready(); });
       if (stop_) return;
-      j = queue_.front();
-      queue_.pop_front();
+      std::deque<Job*>& q = queue_.empty() ? landing_ : queue_;  // a queued demand read first
+      j = q.front();
+      q.pop_front();
       ++running_;
+      if (j->landing) ++landing_running_;
+      j->started = true;
+      if (landing_ready()) cv_.notify_one();  // (the demand queue emptied: a yielded landing read may resume)
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    std::exception_ptr error;
-    try {
-      j->read(worker);
-    } catch (...) {
-      error = std::current_exception();
+    for (;;) {  // a whole read once; a chunked one chunk by chunk until it ends, stops or yields
+      const auto t0 = std::chrono::steady_clock::now();
+      std::exception_ptr error;
+      uint64_t left = 0;
+      try {
+        if (j->step) left = j->step(worker);
+        else j->read(worker);
+      } catch (...) {
+        error = std::current_exception();
+      }
+      const uint64_t ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+      bool more = false, landings = false;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        j->ns += ns;
+        j->left = left;
+        j->error = error;
+        // only a landing read stops part-way (a wait made the others demands: their bytes are needed)
+        const bool stop = left && !error && (stop_ || (j->landing && j->stop));
+        if (!left || error || stop) {
+          j->done = true;
+          j->aborted = stop;
+        } else if (j->landing && queue_.size() > threads_n_ - running_) {
+          // a demand read no idle worker takes waits: this worker takes it, j resumes later
+          ++j->yields;
+          landing_.push_front(j);
+        } else {
+          more = true;
+        }
+        if (!more) {
+          --running_;
+          if (j->landing) --landing_running_;
+        }
+        landings = !landing_.empty();
+      }
+      if (more) continue;
+      done_cv_.notify_all();
+      if (landings) cv_.notify_one();  // (a landing read may start now)
+      break;
     }
-    const uint64_t ns = uint64_t(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      j->error = error;
-      j->ns = ns;
-      j->done = true;
-      --running_;
-    }
-    done_cv_.notify_all();
   }
+}
+
+void* DgReadPool::push(std::unique_ptr<Job> j) {
+  Job* p = j.get();
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    jobs_.reserve(jobs_.size() + 1);  // nothing can fail once the job is queued
+    (p->landing ? landing_ : queue_).push_back(p);
+    jobs_.push_back(std::move(j));
+  }
+  cv_.notify_one();
+  return p;
 }
 
 void* DgReadPool::submit(std::function<void()> read) {
   return submit_indexed([read = std::move(read)](uint32_t) { read(); });
 }
 
-void* DgReadPool::submit_indexed(std::function<void(uint32_t)> read) {
+void* DgReadPool::submit_indexed(std::function<void(uint32_t)> read, bool landing) {
   auto j = std::make_unique<Job>();
   j->read = std::move(read);
-  Job* p = j.get();
+  j->landing = landing;
+  return push(std::move(j));
+}
+
+void* DgReadPool::submit_steps(std::function<uint64_t(uint32_t)> step, uint64_t bytes, bool landing) {
+  auto j = std::make_unique<Job>();
+  j->step = std::move(step);
+  j->left = bytes;
+  j->landing = landing;
+  return push(std::move(j));
+}
+
+bool DgReadPool::cancel(void* handle, End* end) noexcept {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto q = std::find(landing_.begin(), landing_.end(), static_cast<Job*>(handle));
+  if (q == landing_.end()) return false;
+  landing_.erase(q);
+  const auto it =
+      std::find_if(jobs_.begin(), jobs_.end(), [&](const std::unique_ptr<Job>& x) { return x.get() == handle; });
+  if (end) {
+    *end = End{};
+    end->yields = (*it)->yields;
+    if ((*it)->started) end->aborted_bytes = (*it)->left;  // (yielded part-way: the rest is never read)
+  }
+  jobs_.erase(it);  // (not running: nothing writes for it any more)
+  return true;
+}
+
+void DgReadPool::abort(void* handle) noexcept {
+  Job* p = static_cast<Job*>(handle);
   {
     std::lock_guard<std::mutex> lk(mu_);
-    jobs_.reserve(jobs_.size() + 1);  // nothing can fail once the job is queued
-    queue_.push_back(p);
-    jobs_.push_back(std::move(j));
+    if (p->done || !p->landing) return;  // finished, or a demand now
+    const auto q = std::find(landing_.begin(), landing_.end(), p);
+    if (q == landing_.end()) {  // running: stops at its next chunk (a whole read at its end)
+      p->stop = true;
+      return;
+    }
+    landing_.erase(q);  // queued: stopped now, nothing (more) read
+    p->done = true;
+    p->aborted = true;
   }
-  cv_.notify_one();
-  return p;
+  done_cv_.notify_all();
 }
 
 bool DgReadPool::done(void* handle) {
@@ -588,17 +731,50 @@ bool DgReadPool::done(void* handle) {
   return static_cast<Job*>(handle)->done;
 }
 
-uint64_t DgReadPool::wait(void* handle) {
+uint64_t DgReadPool::wait(void* handle, End* end) {
   Job* p = static_cast<Job*>(handle);
   std::unique_ptr<Job> j;
   {
     std::unique_lock<std::mutex> lk(mu_);
+    if (p->landing && !p->stop && !p->done) {  // a landing read needed now: a demand (an aborted one is only ended)
+      const auto q = std::find(landing_.begin(), landing_.end(), p);
+      if (q != landing_.end()) {  // queued (never started, or yielded part-way): behind the demand reads queued
+        landing_.erase(q);
+        queue_.push_back(p);
+      } else {  // running: it no longer yields, and no longer counts as a landing read
+        --landing_running_;
+      }
+      p->landing = false;
+      cv_.notify_one();
+    }
     done_cv_.wait(lk, [&] { return p->done; });
     auto it = std::find_if(jobs_.begin(), jobs_.end(), [&](const std::unique_ptr<Job>& x) { return x.get() == p; });
     j = std::move(*it);
     jobs_.erase(it);
   }
+  if (end) {  // (a failed read too: its yields)
+    *end = End{};
+    end->yields = j->yields;
+    end->aborted = j->aborted;
+    if (j->aborted) end->aborted_bytes = j->left;
+  }
   if (j->error) std::rethrow_exception(j->error);
+  if (!end && j->aborted) fail(SS_E_IO, "a landing read was aborted before its end (its bytes are partial)");
   return j->ns;
+}
+
+bool DgReadPool::is_landing(void* handle) {
+  std::lock_guard<std::mutex> lk(mu_);
+  return static_cast<Job*>(handle)->landing;
+}
+
+DgReadPool::Counts DgReadPool::counts() {
+  std::lock_guard<std::mutex> lk(mu_);
+  Counts c;
+  c.running = running_;
+  c.landing_running = landing_running_;
+  c.queued = queue_.size();
+  c.landing_queued = landing_.size();
+  return c;
 }
 }  // namespace ts

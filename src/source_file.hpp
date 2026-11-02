@@ -33,6 +33,9 @@ class SourceFile {
   }
   // The grid a piece must not cross (a multi-location session's chunk; 0 = none).
   virtual uint64_t piece_grid() const { return 0; }
+  // The grid a read must cover whole for the source's own read-path check to run (a session that re-checks whole
+  // stripe chunks as they are read: its chunk; 0 = none). A read cut finer still lands the same bytes, unchecked there.
+  virtual uint64_t verify_grid() const { return 0; }
 };
 
 class FileSource final : public SourceFile {
@@ -66,7 +69,14 @@ class FileSource final : public SourceFile {
 
 class MFileSource final : public SourceFile {
  public:
-  explicit MFileSource(std::shared_ptr<MFile> file) : file_(std::move(file)) {}
+  explicit MFileSource(std::shared_ptr<MFile> file) : file_(std::move(file)) {
+    // VERIFY_CACHED serves the chunks the open verified without read-path hashing; the other modes re-check every
+    // whole-chunk read (MFile::Impl::recheck): their grid, fixed for the session
+    ss_mfile_counters c{};
+    c.struct_size = sizeof c;
+    file_->counters(&c);
+    verify_grid_ = c.verify_mode == SS_MFILE_VERIFY_CACHED ? 0 : file_->chunk_bytes();
+  }
   uint64_t pread(void* dst, uint64_t n, uint64_t off) const override { return file_->pread(dst, n, off); }
   uint64_t size() const override { return file_->size(); }
   bool direct() const override { return true; }
@@ -89,9 +99,11 @@ class MFileSource final : public SourceFile {
     file_->preadv(ios.data(), uint32_t(ios.size()));
   }
   uint64_t piece_grid() const override { return file_->chunk_bytes(); }
+  uint64_t verify_grid() const override { return verify_grid_; }
 
  private:
   std::shared_ptr<MFile> file_;
+  uint64_t verify_grid_ = 0;
 };
 
 // SS_E_DESC naming the source unless the opened file has the expected identity (volume, index, size; all zero = none).

@@ -233,6 +233,9 @@ class CudaTransport final : public DgTransport {
   std::function<void(uint32_t, char*)> reader;
   // (reader, key, block) on that reader's own bounce buffer: 0 = the context's thread, 1 + i = the pool's worker i
   std::function<void(uint32_t, uint32_t, char*)> pool_reader;
+  // a chunked landing read (dg_landing_chunk; empty: whole reads) of (key, block): its total bytes and its step, run by
+  // the pool on worker i with reader 1 + i's bounce buffer
+  std::function<std::function<uint64_t(uint32_t)>(uint32_t, char*, uint64_t*)> landing_steps;
   std::unique_ptr<DgReadPool> pool;
   void read_unit(uint32_t key, int32_t block) override {
     if (!reader) DgTransport::read_unit(key, block);
@@ -246,6 +249,48 @@ class CudaTransport final : public DgTransport {
   }
   uint64_t read_unit_end(void* handle) override { return pool ? pool->wait(handle) : 0; }
   bool read_unit_done(void* handle) override { return !pool || pool->done(handle); }
+  // landings: the same read on the pool's landing queue (behind every demand read not started yet), in chunks that
+  // yield to demand reads (landing_steps) or whole
+  void* read_landing_begin(uint32_t key, int32_t block) override {
+    if (!pool) return DgTransport::read_landing_begin(key, block);
+    char* dst = host_block(block);
+    if (landing_steps) {
+      uint64_t bytes = 0;
+      auto step = landing_steps(key, dst, &bytes);
+      return pool->submit_steps(std::move(step), bytes, true);
+    }
+    return pool->submit_indexed([this, key, dst](uint32_t worker) { pool_reader(worker + 1, key, dst); }, true);
+  }
+  bool read_unit_cancel(void* handle) noexcept override { return pool && pool->cancel(handle); }
+  uint64_t read_landing_end(void* handle, LandingEnd* end) override {
+    *end = LandingEnd{};
+    if (!pool) return 0;
+    DgReadPool::End e;
+    auto copy = [&] {
+      end->aborted_bytes = e.aborted_bytes;
+      end->yields = e.yields;
+      end->aborted = e.aborted;
+    };
+    try {
+      const uint64_t ns = pool->wait(handle, &e);
+      copy();
+      return ns;
+    } catch (...) {  // (a failed landing read still reports its yields)
+      copy();
+      throw;
+    }
+  }
+  bool read_landing_cancel(void* handle, LandingEnd* end) noexcept override {
+    *end = LandingEnd{};
+    DgReadPool::End e;
+    if (!pool || !pool->cancel(handle, &e)) return false;
+    end->aborted_bytes = e.aborted_bytes;
+    end->yields = e.yields;
+    return true;
+  }
+  void read_landing_abort(void* handle) noexcept override {
+    if (pool) pool->abort(handle);
+  }
   void* event_create() override {
     cudaEvent_t e = nullptr;
     ck(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "cudaEventCreate");
@@ -726,6 +771,15 @@ class CudaDgCtx final : public DgCtx {
       core_->check();
       return;
     }
+    if (core_->home(k) == DgCore::Home::Landed) {  // landings (drained: landed): its landing block holds the bytes
+      std::vector<char> expected(size_t(x_.unit_bytes));
+      read_unit(layer, unit, expected.data(), false, nullptr);
+      require(std::memcmp(blocks_[size_t(core_->landing_block_of(k))], expected.data(), expected.size()) == 0,
+              SS_E_HASH, "check_unit: the landed copy of (" + std::to_string(layer) + ", " + std::to_string(unit) +
+                             ") differs from the source");
+      core_->check();
+      return;
+    }
     if (core_->backed(k)) {  // a clean copy: its block must hold the bytes too
       std::vector<char> expected(size_t(x_.unit_bytes));
       read_unit(layer, unit, expected.data(), false, nullptr);
@@ -977,6 +1031,18 @@ class CudaDgCtx final : public DgCtx {
     out->pred_shadow_file_predicted_bytes = a.pred_shadow_file_predicted_bytes;
     out->pred_shadow_file_demanded_bytes = a.pred_shadow_file_demanded_bytes;
     out->pred_shadow_file_hit_bytes = a.pred_shadow_file_hit_bytes;
+    out->landing_issued = a.landing_issued;
+    out->landing_promoted = a.landing_promoted;
+    out->landing_late = a.landing_late;
+    out->landing_wait_ns = a.landing_wait_ns;
+    out->landing_expired = a.landing_expired;
+    out->landing_dropped_full = a.landing_dropped_full;
+    out->landing_read_bytes = a.landing_read_bytes;
+    out->landing_cancelled = a.landing_cancelled;
+    out->landing_expired_layer = a.landing_expired_layer;
+    out->landing_skipped_passed = a.landing_skipped_passed;
+    out->landing_yields = a.landing_yields;
+    out->landing_aborted_bytes = a.landing_aborted_bytes;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     out->disk_queue_resolved = x_.disk_queue;  // (properties of the open: SS_DG_DISK_QUEUE_AUTO resolved, dg_layout)
     out->disk_locations = x_.disk_locations;
@@ -1212,6 +1278,19 @@ class CudaDgCtx final : public DgCtx {
     d.pred_shadow_file_predicted_bytes = a.pred_shadow_file_predicted_bytes - b.pred_shadow_file_predicted_bytes;
     d.pred_shadow_file_demanded_bytes = a.pred_shadow_file_demanded_bytes - b.pred_shadow_file_demanded_bytes;
     d.pred_shadow_file_hit_bytes = a.pred_shadow_file_hit_bytes - b.pred_shadow_file_hit_bytes;
+    d.landing_issued = a.landing_issued - b.landing_issued;
+    d.landing_promoted = a.landing_promoted - b.landing_promoted;
+    d.landing_late = a.landing_late - b.landing_late;
+    d.landing_wait_ns = a.landing_wait_ns - b.landing_wait_ns;
+    d.landing_expired = a.landing_expired - b.landing_expired;
+    d.landing_dropped_full = a.landing_dropped_full - b.landing_dropped_full;
+    d.landing_read_bytes = a.landing_read_bytes - b.landing_read_bytes;
+    d.landing_failed = a.landing_failed - b.landing_failed;
+    d.landing_cancelled = a.landing_cancelled - b.landing_cancelled;
+    d.landing_expired_layer = a.landing_expired_layer - b.landing_expired_layer;
+    d.landing_skipped_passed = a.landing_skipped_passed - b.landing_skipped_passed;
+    d.landing_yields = a.landing_yields - b.landing_yields;
+    d.landing_aborted_bytes = a.landing_aborted_bytes - b.landing_aborted_bytes;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1339,6 +1418,22 @@ class CudaDgCtx final : public DgCtx {
         {"pf_strict_refused", s.pf_strict_refused},
         {"pf_strict_admit", uint64_t(o_.dg_pf_strict_admit)},
         {"pf_legacy", uint64_t(x_.pf_legacy)},
+        {"landing_blocks", uint64_t(x_.L)},
+        {"landing_max_queued", uint64_t(x_.L ? x_.landing_queued : 0)},
+        {"landing_ttl", uint64_t(x_.landing_ttl)},
+        {"landing_issued", s.landing_issued},
+        {"landing_promoted", s.landing_promoted},
+        {"landing_late", s.landing_late},
+        {"landing_wait_ns", s.landing_wait_ns},
+        {"landing_expired", s.landing_expired},
+        {"landing_dropped_full", s.landing_dropped_full},
+        {"landing_read_bytes", s.landing_read_bytes},
+        {"landing_failed", s.landing_failed},
+        {"landing_cancelled", s.landing_cancelled},
+        {"landing_expired_layer", s.landing_expired_layer},
+        {"landing_skipped_passed", s.landing_skipped_passed},
+        {"landing_yields", s.landing_yields},
+        {"landing_aborted_bytes", s.landing_aborted_bytes},
         {"score_fallbacks", s.score_fallbacks},
         {"scored_victims", s.scored_victims},
         {"score_layers", s.score_layers},
@@ -1368,6 +1463,9 @@ class CudaDgCtx final : public DgCtx {
     for (const auto& f : fields) g[f.first] = Json::number(f.second);
     g["policy"] = Json::string(core_->policy() == 2 ? "auto" : core_->policy() == 1 ? "scored" : "lru");
     g["cuda_module_loading"] = Json::string(dg_module_loading_name(module_loading_));
+    // the effective landing chunk: its bytes, or "whole" (dg_landing_chunk 0xFFFFFFFF: one whole read, never yielding)
+    if (x_.L) g["landing_chunk"] = x_.landing_chunk ? Json::number(uint64_t(x_.landing_chunk)) : Json::string("whole");
+    else g["landing_chunk"] = Json::number(uint64_t(0));
     if (!notices_.empty()) {
       Json n = Json::array();
       for (const std::string& text : notices_) n.push(Json::string(text));
@@ -1458,6 +1556,18 @@ class CudaDgCtx final : public DgCtx {
                  uint32_t reader = 0) {
     DgBounce& b = *bounces_[reader];
     dg_read_unit(d_, files_, layer, unit, dst, b.p, b.bytes, hash, digest, stats, true, x_.unit_subread);
+  }
+
+  // A chunked landing read's next chunk (dg_read_unit_chunk) on reader `reader`'s bounce buffer: the unit's bytes still
+  // to read; at the last chunk the digest of all of them checked as read_checked's.
+  uint64_t read_chunk(DgUnitChunks& c, uint32_t reader) {
+    DgBounce& b = *bounces_[reader];
+    uint64_t digest = 0;
+    const uint64_t left = dg_read_unit_chunk(d_, files_, c, b.p, b.bytes, &digest, nullptr, x_.unit_subread);
+    if (!left && c.hash && digest != d_.layers[size_t(c.layer)].hash[size_t(c.unit)])
+      fail(SS_E_HASH, "unit (" + std::to_string(c.layer) + ", " + std::to_string(c.unit) +
+                          ") bytes differ from the descriptor hash");
+    return left;
   }
 
   void read_checked(int layer, int unit, void* dst, DgLoadStats* stats = nullptr, uint32_t reader = 0) {
@@ -1587,7 +1697,8 @@ class CudaDgCtx final : public DgCtx {
     dev_.m_err_count = words_d + 6;
 
     // Pinned blocks: P + Q of the host stride, in chunks of at most 1 GiB; three-tier: then one chunk of the file
-    // reads' staging buffers, block indices blocks .. blocks + S - 1.
+    // reads' staging buffers, block indices blocks .. blocks + S - 1; then the landing blocks (dg_landing_blocks) in
+    // chunks of at most 1 GiB, block indices blocks + S .. blocks + S + L - 1.
     const uint64_t hs = x_.host_stride;
     const uint64_t per_chunk = std::max<uint64_t>(1, (uint64_t(1) << 30) / hs);
     std::vector<uint64_t> chunk_blocks;
@@ -1598,12 +1709,21 @@ class CudaDgCtx final : public DgCtx {
     }
     if (x_.S) chunk_blocks.push_back(x_.S);
     const size_t disk_staging_chunk = x_.S ? chunk_blocks.size() - 1 : chunk_blocks.size();
+    const size_t landing_chunk = chunk_blocks.size();  // the landing blocks' chunks, the blocks' 1 GiB rule
+    for (uint64_t left = x_.L; left > 0;) {
+      const uint64_t n = std::min(per_chunk, left);
+      chunk_blocks.push_back(n);
+      left -= n;
+    }
     charges_.charge(SS_BUDGET_PINNED, "dg pinned blocks", uint64_t(x_.blocks) * hs);
     if (x_.S) charges_.charge(SS_BUDGET_PINNED, "dg disk staging", uint64_t(x_.S) * hs);
-    auto pin_chunk = [disk_staging_chunk](size_t c, uint64_t bytes) {
+    if (x_.L) charges_.charge(SS_BUDGET_PINNED, "dg landing blocks", uint64_t(x_.L) * hs);
+    auto pin_chunk = [disk_staging_chunk, landing_chunk](size_t c, uint64_t bytes) {
       void* p = nullptr;
       ck(cudaHostAlloc(&p, size_t(bytes), cudaHostAllocPortable),
-         c == disk_staging_chunk ? "cudaHostAlloc (disk staging)" : "cudaHostAlloc (blocks)");
+         c == disk_staging_chunk ? "cudaHostAlloc (disk staging)"
+         : c >= landing_chunk    ? "cudaHostAlloc (landing blocks)"
+                                 : "cudaHostAlloc (blocks)");
       return p;
     };
     auto pin_ring = [&] {
@@ -1692,6 +1812,8 @@ class CudaDgCtx final : public DgCtx {
     c.pf_revert = o_.dg_pf_revert_unused != 0;
     c.pf_strict = o_.dg_pf_strict_admit != 0;
     c.pf_legacy = x_.pf_legacy;  // DG_PF_LEGACY
+    c.landing_blocks = x_.L;  // (dg_layout: 0 off or without a file tier)
+    c.landing_ttl = x_.landing_ttl;
     if (x_.disk_tier) {
       // (the gated layer from the layout's bases: the pool's threads never touch the core)
       transport_->pool_reader = [this](uint32_t reader, uint32_t key, char* dst) {
@@ -1700,7 +1822,24 @@ class CudaDgCtx final : public DgCtx {
         read_checked(x_.gated[g], int(key - x_.unit_base[g]), dst, nullptr, reader);
       };
       transport_->reader = [this](uint32_t key, char* dst) { transport_->pool_reader(0, key, dst); };
-      if (x_.disk_queue > 1) transport_->pool = std::make_unique<DgReadPool>(x_.disk_queue);
+      if (x_.L && x_.landing_chunk)  // chunked landings: the unit's hash fed chunk by chunk, checked at its last one
+        transport_->landing_steps = [this](uint32_t key, char* dst, uint64_t* bytes) {
+          const uint32_t g = uint32_t(std::upper_bound(x_.unit_base.begin(), x_.unit_base.end(), key) -
+                                      x_.unit_base.begin()) - 1;
+          auto c = std::make_shared<DgUnitChunks>();
+          c->layer = x_.gated[g];
+          c->unit = int(key - x_.unit_base[g]);
+          c->dst = dst;
+          c->chunk = x_.landing_chunk;
+          const Layer& l = d_.layers[size_t(c->layer)];
+          c->hash = o_.verify_hash && !l.hash.empty();
+          *bytes = 0;
+          for (const Part& p : l.parts) *bytes += p.bytes;
+          return std::function<uint64_t(uint32_t)>([this, c](uint32_t worker) { return read_chunk(*c, worker + 1); });
+        };
+      // (no chunks, dg_landing_chunk 0xFFFFFFFF: the scheduler before, no reader reserved for demand reads)
+      if (x_.disk_queue > 1)
+        transport_->pool = std::make_unique<DgReadPool>(x_.disk_queue, x_.landing_queued, x_.landing_chunk != 0);
     }
     core_ = std::make_unique<DgCore>(c, transport_.get());
     // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()

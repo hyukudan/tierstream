@@ -86,6 +86,40 @@ class DgTransport {
     (void)handle;
     return true;
   }
+  // Landings (dg_landing_blocks): the same verified read into landing block `block` (blocks + disk_staging + i), queued
+  // behind every demand read the transport has not started yet. Ended and queried as read_unit_begin's handles (an
+  // end of one still queued starts it first). Default: read_unit_begin.
+  virtual void* read_landing_begin(uint32_t key, int32_t block) { return read_unit_begin(key, block); }
+  // A landing read that is not running (never started, still queued behind the cap; or a chunked one that yielded its
+  // reader part-way) is dropped: true = nothing will be written into its block any more and the handle is gone (never
+  // ended); false = it runs (or finished): end it as usual. Never throws. Default: false (every read starts at its
+  // begin).
+  virtual bool read_unit_cancel(void* handle) noexcept {
+    (void)handle;
+    return false;
+  }
+  // A chunked landing read (dg_landing_chunk) yields its reader to demand reads between chunks and can stop part-way.
+  // How it ended: aborted = read_landing_abort stopped it before its end (its block holds partial bytes: never copied),
+  // aborted_bytes = the bytes not read; yields = the times it gave its reader to a demand read.
+  struct LandingEnd {
+    uint64_t aborted_bytes = 0;
+    uint32_t yields = 0;
+    bool aborted = false;
+  };
+  // read_unit_end of a landing read, *end filled. Default: read_unit_end (never aborted, no yield).
+  virtual uint64_t read_landing_end(void* handle, LandingEnd* end) {
+    *end = LandingEnd{};
+    return read_unit_end(handle);
+  }
+  // read_unit_cancel of a landing read, *end filled when true (a read that yielded part-way: the bytes it never read).
+  // Default: read_unit_cancel.
+  virtual bool read_landing_cancel(void* handle, LandingEnd* end) noexcept {
+    *end = LandingEnd{};
+    return read_unit_cancel(handle);
+  }
+  // A landing read the core drops while it runs (its layer passed) stops at its next chunk (the transport may also
+  // let it run to its end); still ended as usual (read_landing_end: aborted). Never throws. Default: nothing.
+  virtual void read_landing_abort(void* handle) noexcept { (void)handle; }
 };
 
 // dg_diag: the host time of the last boundary's phases (end_token), microseconds.
@@ -152,6 +186,13 @@ struct DgConfig {
   // DG_PF_LEGACY: the prediction admission before SS_DG_PF_ADMIT (no ahead skip of plain predictions, drain_layer ends
   // every prefetch read of its layer, a full read queue ends the oldest reads)
   bool pf_legacy = false;
+  // dg_landing_blocks (three-tier only): a prediction of a file-homed unit reads it into one of landing_blocks pinned
+  // landing blocks (block indices blocks + disk_staging ..), never a slot; a demand then copies it from there (no file
+  // read). landing_ttl 0: a landing its target layer did not demand goes back to its file right after that layer's
+  // demand (a prediction for a layer already served is not issued); N >= 1: a landing not demanded for N boundaries
+  // goes back to its file. landing_blocks 0 = off (no landing).
+  uint32_t landing_blocks = 0;
+  uint32_t landing_ttl = 0;
 };
 
 struct DgStats {
@@ -226,6 +267,22 @@ struct DgStats {
   // predicted layers, both; and x the unit bytes
   uint64_t pred_shadow_file_predicted = 0, pred_shadow_file_demanded = 0, pred_shadow_file_hit = 0;
   uint64_t pred_shadow_file_predicted_bytes = 0, pred_shadow_file_demanded_bytes = 0, pred_shadow_file_hit_bytes = 0;
+  // dg_landing_blocks: landing reads begun; demands served from a landing block (no file read; late ones included);
+  // those whose read was still in flight and their host wait; landings back to their file unused (TTL); advice dropped
+  // with no free landing block; bytes landed (completed landing reads; not in disk_read_bytes); landing reads that
+  // failed (the unit stays in its file, a later demand reads it)
+  uint64_t landing_issued = 0, landing_promoted = 0, landing_late = 0, landing_wait_ns = 0, landing_expired = 0;
+  uint64_t landing_dropped_full = 0, landing_read_bytes = 0, landing_failed = 0;
+  // landing reads not running (never started, or yielded part-way), cancelled at a boundary, a drain, a reset,
+  // destruction or (landing_ttl 0) their target layer (back to their file, no further read; the reads already running
+  // are waited for, or at their target layer aborted)
+  uint64_t landing_cancelled = 0;
+  // landing_ttl 0: landings their target layer did not demand, back to their file after its demand (landed: at once;
+  // running: when the read ended, never promoted); predictions not landed because their layer was already served
+  uint64_t landing_expired_layer = 0, landing_skipped_passed = 0;
+  // chunked landing reads: the times one gave its reader to a demand read; the bytes not read because the core dropped
+  // a landing read part-way (stopped at a chunk, or cancelled after a yield: the bytes it read are in landing_read_bytes)
+  uint64_t landing_yields = 0, landing_aborted_bytes = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -279,7 +336,9 @@ class DgCore {
  public:
   // File (three-tier only): no slot, no block; its bytes are read from its file when fetched. A Device key may also
   // hold a block (backed: a clean copy, inclusive share); a Coming / Bank key fetched from its file holds none.
-  enum class Home : uint8_t { Host, Device, Coming, Bank, Evicting, File };
+  // Landing / Landed (dg_landing_blocks): a file-homed key whose landing read is in flight / done, holding a landing
+  // block (no slot, no block, no entry); its permanent home stays its file (a transient copy, as `backed`).
+  enum class Home : uint8_t { Host, Device, Coming, Bank, Evicting, File, Landing, Landed };
 
   DgCore(const DgConfig& cfg, DgTransport* t);
   ~DgCore();
@@ -308,7 +367,13 @@ class DgCore {
   uint32_t free_blocks() const { return uint32_t(free_blocks_.size()); }
   bool backed(uint32_t k) const { return e_[k].backed; }      // a device key holding a clean copy in its block
   uint32_t backed_units() const { return backed_; }
-  uint32_t file_units() const { return on_file_; }             // file-homed keys (three-tier)
+  uint32_t file_units() const { return on_file_ + on_land_; }  // file-homed keys (three-tier; landings included)
+  // landings: the transport block a Landing / Landed key holds (-1: none), the landed keys, the reads in flight, the
+  // free landing blocks (a block whose copy may still read it is not free yet)
+  int32_t landing_block_of(uint32_t k) const { return e_[k].land < 0 ? -1 : land_block(e_[k].land); }
+  uint32_t landing_units() const { return on_land_; }
+  uint32_t landings_in_flight() const { return uint32_t(landing_.size()); }
+  uint32_t landing_free() const { return uint32_t(free_lands_.size()); }
   uint32_t host_units() const { return on_host_; }             // pinned homes (three-tier: the recency list's length)
   std::vector<uint32_t> host_order() const;                    // three-tier: pinned homes, most recently homed first
   uint32_t deferred() const { return uint32_t(deferred_.size()); }  // victims whose write-back is not recorded yet
@@ -374,7 +439,9 @@ class DgCore {
   // The prediction exported at layer g for layer g + 1: deduplicated, in order, under the prefetch budgets. With
   // winpf on and a window hint for this token: n_export = layer g's exported ids (rows = n_export / top_k, both n's
   // must be multiples: SS_E_BACKEND otherwise), ranked by weighted row votes, then by the best rank; ahead = layer g + 1
-  // already exported (nothing is issued: its demand covers).
+  // already exported (nothing is issued: its demand covers). Landings on: a predicted file-homed unit (any branch, and
+  // window_hint's priors) lands instead of a prefetch (a landing block, no slot, outside the prefetch budgets and
+  // l1_cap; no free landing block: the advice is dropped); a landing in flight or landed is left as it is.
   void serve_prediction(uint32_t g_next, const uint32_t* pred, uint32_t n, uint32_t n_export = 0, bool ahead = false);
   // Test-only fault injection (tests/test_dg.cpp, the model checker): each must be caught.
   enum Mutation { kNoMutation = 0, kEntryBeforeCopy, kNoCover, kEarlyEventRecycle, kNoBankUnpublish,
@@ -404,7 +471,8 @@ class DgCore {
   // stay, the others take free slots, else evict eligible device units (not in `units`, not in other_kept) in the
   // policy's order (LRU: the recency tail; scored / auto: the boundary's score order) with the boundary's lower-tier
   // rules (a clean copy back to its block, a write-back into a free block, three-tier: a pinned unit dropped to its
-  // file for that block, else the victim to its file), then copy in from the pinned block or the file (a staging
+  // file for that block, else the victim to its file), then copy in from the pinned block, a landed unit's landing
+  // block (freed once kDem is synced, as a pinned source) or the file (a staging
   // buffer: up to disk_queue reads in flight, bounded by disk_staging; the finished ones end first, in any order, then
   // the oldest; a staging buffer is reused only after the read holding it ended), new units most recent. No clean copy
   // is kept. Counted only in the resident_* and mkres_* stats. Transactional per
@@ -447,7 +515,8 @@ class DgCore {
   uint32_t round_hits(uint32_t k) const { return rhits_[k]; }  // exports since the last round
   // Test hook: called at every unit boundary of a round (after its cancellation check), with the moves so far.
   void set_round_probe(std::function<void(uint32_t)> f) { round_probe_ = std::move(f); }
-  // Between tokens: every deferred write-back submitted, then every stream synchronized.
+  // Between tokens: every deferred write-back submitted, then every stream synchronized (landing reads ended first:
+  // landed, or back to their file on a failure; every landing block a copy read is free again).
   void drain();
   // Between tokens, with exclusive ownership. Restore the immutable place() blueprint; copies only misplaced units.
   // Counters remain lifetime counters. A failed reset poisons the core; the owning context must also be poisoned.
@@ -576,6 +645,8 @@ class DgCore {
     bool backed = false;        // Device with a clean copy in `block` (inclusive share)
     bool in_hlist = false;      // three-tier: in the pinned homes' recency list (exactly the Host keys)
     uint32_t hprev = kNone, hnext = kNone;
+    int32_t land = -1;          // Landing / Landed: its landing block (0 .. landing_blocks - 1)
+    uint32_t land_age = 0;      // Landed: boundaries passed since it landed
   };
   struct Writeback {
     uint32_t key;
@@ -652,6 +723,23 @@ class DgCore {
     st_.clean_drop_bytes += unit_bytes_;
   }
   int32_t take_stage();
+  // landings (dg_landing_blocks): the transport block of landing block l; a prediction's advice for a unit (true: the
+  // landing path took it: a file home lands, a landing is left as it is); a file home's landing read (none with no free
+  // landing block); a read ended (false: it failed, the key back to its file); a landing back to its file (no copy, its
+  // block free at once); the landing blocks whose last copy landed back to the free list (synced: all of them)
+  int32_t land_block(int32_t l) const { return int32_t(c_.blocks + c_.disk_staging) + l; }
+  static bool file_homed(Home h) { return h == Home::File || h == Home::Landing || h == Home::Landed; }
+  bool advise_land(uint32_t g, uint32_t unit);
+  bool land(uint32_t k);
+  bool end_landing(size_t i);
+  void end_landings(const std::function<bool(uint32_t)>& pick);  // the records whose key pick accepts, oldest first
+  void poll_landings(size_t max = SIZE_MAX);  // the completed ones among the `max` oldest (never blocks)
+  void cancel_landings();  // the ones not running: back to their files, no (further) read (landing_cancelled)
+  bool cancel_landing(size_t i);  // landing_[i] if not running: true, dropped and back to its file
+  // landing_ttl 0: after layer g's demand (ids = its export), its landings it did not demand leave their blocks
+  void expire_layer_landings(uint32_t g, const uint32_t* ids, uint32_t n);
+  void unland(uint32_t k);
+  void reclaim_lands(bool synced = false);
   void score_history(uint32_t g);           // scored: serve_use's history update of layer g (union saved first)
   void rank_layer(uint32_t g);              // scored: score_layer's ranking (the public reference lists)
   // scored: the bounded selection of the `need` smallest eligible candidates of every layer, ascending, in select_heap_
@@ -704,6 +792,26 @@ class DgCore {
   uint32_t hhead_ = kNone, htail_ = kNone, on_host_ = 0, on_file_ = 0, backed_ = 0;
   std::vector<void*> stage_ev_;  // per staging buffer: its last copy's event (nullptr = unused yet)
   uint32_t stage_next_ = 0;
+  // landings: the free landing blocks, the ones a promotion's copy may still read (free once its event completed), the
+  // reads in flight (oldest first), each block's Landing / Landed key (kNone: free or busy), the landed key count
+  struct LandBusy {
+    int32_t land;
+    void* ev;
+  };
+  struct LandRead {
+    uint32_t key;
+    int32_t land;
+    void* handle;
+    bool doomed;  // landing_ttl 0: its layer passed undemanded: back to its file when the read ends (aborted: at its
+                  // next chunk)
+  };
+  std::vector<int32_t> free_lands_, open_free_lands_;
+  std::vector<LandBusy> land_busy_;
+  std::deque<LandRead> landing_;
+  std::vector<uint32_t> land_owner_;
+  uint32_t on_land_ = 0;
+  std::vector<uint32_t> late_;  // serve_demand: the layer's misses whose landing read is still in flight
+  std::vector<uint8_t> served_;  // landing_ttl 0: per gated layer, its demand was served this token
   std::deque<Pending> pending_;
   uint64_t entries_ = 0;  // public calls that drained the demand reads (enter)
   std::vector<uint32_t> coming_, banked_;

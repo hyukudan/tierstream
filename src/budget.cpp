@@ -93,11 +93,12 @@ DgHostBytes lib_bytes(const ss_budget_in& in, bool three) {
           "ss_budget_plan: dg_disk_queue must be 0..64 (ss_budget_in_dg_library resolves SS_DG_DISK_QUEUE_AUTO)");
   return dg_host_bytes(in.dg_gated_layers, in.unit_bytes, in.dg_part_max_bytes, in.dg_source_align,
                        in.dg_bounce_request, three ? std::max<uint32_t>(in.dg_disk_queue, 1) : 0,
-                       three ? in.staging : 0);
+                       three ? in.staging : 0, three ? in.dg_landing_blocks : 0);
 }
-// Its fixed host part (the file tier's staging buffers are planned as units already) and the pinned share of that.
+// Its fixed host part (the file tier's staging buffers are planned as units already) and the pinned share of that
+// (SS_DG_LANDING: the landing blocks are fixed and pinned, 0 unless asked for).
 uint64_t lib_fixed(const DgHostBytes& h) { return h.total() - h.disk_staging; }
-uint64_t lib_pinned(const DgHostBytes& h) { return h.mapped + h.staging; }
+uint64_t lib_pinned(const DgHostBytes& h) { return h.mapped + h.staging + h.landing; }
 
 }  // namespace
 
@@ -282,6 +283,7 @@ bool caps_plan(const ss_budget_in& in, ss_budget_out& out, const DgHostBytes& li
     out.lib_bounce_readers = lib.bounce_readers;
     out.lib_staging_bytes = lib.staging;
     out.lib_disk_staging_bytes = lib.disk_staging;
+    out.lib_landing_bytes = lib.landing;
     out.lib_host_bytes = lib.total();
   }
   return !out.refused;
@@ -462,6 +464,7 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
     num("dg_part_max_bytes", in.dg_part_max_bytes);
     num("dg_source_align", in.dg_source_align);
     num("dg_bounce_request", in.dg_bounce_request);
+    if (in.dg_landing_blocks) num("dg_landing_blocks", in.dg_landing_blocks);  // (only when asked for, as above)
   }
   num("resident", out.resident);
   num("arena_spares", out.arena_spares);
@@ -491,6 +494,7 @@ std::string budget_plan_json(const ss_budget_in& in, const ss_budget_out& out) {
     num("lib_bounce_readers", out.lib_bounce_readers);
     num("lib_staging_bytes", out.lib_staging_bytes);
     num("lib_disk_staging_bytes", out.lib_disk_staging_bytes);
+    if (in.dg_landing_blocks) num("lib_landing_bytes", out.lib_landing_bytes);
   }
   minimum("min_vram_total_bytes", "min_vram_total_gib", "min_vram_total_flag_gib", out.min_vram_total_bytes);
   minimum("min_ram_total_bytes", "min_ram_total_gib", "min_ram_total_flag_gib", out.min_ram_total_bytes);

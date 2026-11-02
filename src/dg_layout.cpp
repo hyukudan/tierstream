@@ -92,7 +92,8 @@ uint64_t dg_mapped_bytes(uint32_t G) {
 }
 
 DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max, uint64_t max_align,
-                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging) {
+                          uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging,
+                          uint32_t landing_blocks) {
   // A bounce buffer per reader (the context's own thread, and each disk reader with dg_disk_queue > 1: none waits for
   // another's): min(staging_bytes, 16 MiB), at least 4 x the largest source alignment; with disk readers each is cut
   // to what the largest part's covering read needs (one read per part, never more than that size).
@@ -112,9 +113,11 @@ DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max
   h.staging = (add_ck(unit_bytes, 4095, "the staging buffer") / 4096) * 4096;
   h.mapped = dg_mapped_bytes(gated);
   h.disk_staging = mul_ck(disk_staging, host_stride(unit_bytes), "the disk staging buffers");
+  h.landing = mul_ck(landing_blocks, host_stride(unit_bytes), "the landing blocks");
   // (total() cannot overflow once this sum did not)
-  (void)add_ck(add_ck(add_ck(h.mapped, bounce_total, "the host extras"), h.staging, "the host extras"), h.disk_staging,
-               "the host extras");
+  (void)add_ck(add_ck(add_ck(add_ck(h.mapped, bounce_total, "the host extras"), h.staging, "the host extras"),
+                      h.disk_staging, "the host extras"),
+               h.landing, "the host extras");
   return h;
 }
 
@@ -138,6 +141,7 @@ void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in) {
     in->dg_disk_queue = dq.queue;
     if (dq.staging) in->staging = dq.staging;
   }
+  in->dg_landing_blocks = o.dg_disk_tier ? o.dg_landing_blocks : 0;  // (charged only with a file tier in the plan)
 }
 
 uint32_t dg_disk_locations(const Desc& d, const ss_options& o) {
@@ -205,6 +209,16 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
   if (o.dg_pf_revert_unused > 1) refuse(SS_E_INVALID, "dg_pf_revert_unused must be 0 or 1");
   if (o.dg_pf_strict_admit > 1) refuse(SS_E_INVALID, "dg_pf_strict_admit must be 0 or 1");
+  if (o.dg_landing_blocks > 4096) refuse(SS_E_INVALID, "dg_landing_blocks must be 0..4096");
+  if (!o.dg_landing_blocks && (o.dg_landing_max_queued || o.dg_landing_ttl || o.dg_landing_chunk))
+    refuse(SS_E_INVALID, "dg_landing_max_queued / dg_landing_ttl / dg_landing_chunk need dg_landing_blocks > 0");
+  if (o.dg_landing_max_queued > 64) refuse(SS_E_INVALID, "dg_landing_max_queued must be 0..64");
+  if (o.dg_landing_ttl > 1024) refuse(SS_E_INVALID, "dg_landing_ttl must be 0..1024");
+  if (o.dg_landing_chunk != 0xFFFFFFFFu && o.dg_landing_chunk % 4096)
+    refuse(SS_E_INVALID, "dg_landing_chunk must be 0, a multiple of 4096 or 0xFFFFFFFF (no chunks)");
+  if (o.dg_landing_blocks && !o.dg_disk_tier) refuse(SS_E_INVALID, "dg_landing_blocks needs dg_disk_tier = 1");
+  if (o.dg_landing_blocks && o.dg_disk_queue <= 1)
+    refuse(SS_E_INVALID, "dg_landing_blocks needs dg_disk_queue > 1 (the landing reads run on the read pool)");
 
   DgLayout x;
   x.B = o.dg_max_ids;
@@ -322,6 +336,11 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   x.S = dq.staging;
   x.disk_queue = dq.queue;
   x.disk_locations = dq.locations;
+  // landing blocks only when the plan has a file tier (nothing to land otherwise; the planner charges them so too)
+  x.L = x.F ? o.dg_landing_blocks : 0u;
+  x.landing_queued = o.dg_landing_max_queued ? o.dg_landing_max_queued : 1u;
+  x.landing_ttl = o.dg_landing_ttl;  // (0: expiry at the target layer)
+  x.landing_chunk = o.dg_landing_chunk == 0xFFFFFFFFu ? 0u : o.dg_landing_chunk ? o.dg_landing_chunk : 4u << 20;
 
   // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
   // format; the context loads it before the service starts).
@@ -369,13 +388,13 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               gib(limit) + " GiB)");
   // Host admission: on top of what the plan bills (blocks of P + Q, host_fixed): the mapped control area, the bounce
   // buffers, the staging buffer (one unit, 4 KiB rounded; kept in pipeline mode too: ss_dg_reset_open's one-unit spare
-  // for placement cycles) and the disk staging buffers, as dg_host_bytes computes them for the planner too. The
-  // context allocates exactly these.
+  // for placement cycles), the disk staging buffers and the landing blocks, as dg_host_bytes computes them for the
+  // planner too. The context allocates exactly these.
   uint64_t max_align = 4096, part_max = 0;
   for (const Source& src : d.sources) max_align = std::max(max_align, src.align);
   for (int L : x.gated)
     for (const Part& part : d.layers[size_t(L)].parts) part_max = std::max(part_max, part.bytes);
-  const DgHostBytes hb = dg_host_bytes(G, x.unit_bytes, part_max, max_align, o.staging_bytes, x.disk_queue, x.S);
+  const DgHostBytes hb = dg_host_bytes(G, x.unit_bytes, part_max, max_align, o.staging_bytes, x.disk_queue, x.S, x.L);
   x.bounce_bytes = hb.bounce;
   x.bounce_readers = hb.bounce_readers;
   const uint64_t bounce_total = hb.bounce_total();
@@ -389,7 +408,8 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
                               std::to_string(x.mapped_bytes) + "), the bounce buffers (" +
                               std::to_string(bounce_total) + ") and the staging buffer (" +
                               std::to_string(x.staging_bytes) + "), the disk staging buffers (" +
-                              std::to_string(uint64_t(x.S) * x.host_stride) + ") exceed the host budget (" +
+                              std::to_string(uint64_t(x.S) * x.host_stride) + "), the landing blocks (" +
+                              std::to_string(hb.landing) + ") exceed the host budget (" +
                               std::to_string(b.host_pinned_bytes) + ")");
   // A unit's in-place parts as concurrent sub-reads (the file misses, the prefetch reads, the serial loader), e.g.
   // 1024 = 1 MiB pieces (a medium request: a multi-location session balances each across the homes of its chunk); a

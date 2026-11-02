@@ -95,6 +95,15 @@ DgCore::DgCore(const DgConfig& cfg, DgTransport* t) : c_(cfg), t_(t) {
               " bank slots per bank (dg_max_ids, two banks), " + std::to_string(c_.bank_slots) + " configured");
   rs_.assign(keys_, 0.0);
   rhits_.assign(keys_, 0);
+  require(c_.disk_tier || !c_.landing_blocks, SS_E_INVALID, "device-gated: landing blocks without the disk tier");
+  require(c_.landing_blocks < 0x7fffffffu - c_.blocks - c_.disk_staging, SS_E_INVALID,
+          "device-gated: too many landing blocks");
+  land_owner_.assign(c_.landing_blocks, kNone);
+  served_.assign(gated(), 0);
+  for (uint32_t l = c_.landing_blocks; l-- > 0;) free_lands_.push_back(int32_t(l));  // block 0 taken first
+  open_free_lands_ = free_lands_;
+  land_busy_.reserve(c_.landing_blocks);  // (the service never allocates for them)
+  late_.reserve(c_.max_ids);
 }
 
 void DgTransport::read_unit(uint32_t, int32_t) {
@@ -363,6 +372,170 @@ void DgCore::enter() {
 void DgCore::poll_reads() {
   enter();
   end_reads([this](const Pending& p) { return t_->read_unit_done(p.handle); });  // every completed one, in any position
+  poll_landings(8);  // (the service's spin: a bounded look, the oldest first)
+}
+
+void DgCore::poll_landings(size_t max) {
+  for (size_t i = 0, seen = 0; i < landing_.size() && seen < max; ++seen) {  // completed: landed now (no wait)
+    if (t_->read_unit_done(landing_[i].handle)) end_landing(i);
+    else ++i;
+  }
+}
+
+// landing_ttl 0: layer g's demand was served (its misses issued and covered); a landing of layer g it did not route can
+// never be used this token (nothing demands layer g again): a landed one goes back to its file at once (no copy ever
+// read its block), one still queued (never started, or yielded part-way) is cancelled (no further read), one running is
+// aborted (a chunked read stops at its next chunk) and goes back to its file when its read ends (its block free then).
+// Not in a layer token (each part is one export of the layer: the boundary expires them).
+void DgCore::expire_layer_landings(uint32_t g, const uint32_t* ids, uint32_t n) {
+  const uint32_t first = base_[g], last = base_[g + 1];
+  for (uint32_t l = 0; l < c_.landing_blocks; ++l) {
+    const uint32_t k = land_owner_[l];
+    if (k == kNone || k < first || k >= last || std::find(ids, ids + n, k - first) != ids + n) continue;
+    if (e_[k].home == Home::Landed) {
+      unland(k);
+      ++st_.landing_expired_layer;
+      continue;
+    }
+    size_t i = 0;
+    while (landing_[i].key != k) ++i;
+    if (!cancel_landing(i)) {
+      landing_[i].doomed = true;
+      t_->read_landing_abort(landing_[i].handle);
+    }
+  }
+}
+
+bool DgCore::cancel_landing(size_t i) {
+  DgTransport::LandingEnd end;
+  if (!t_->read_landing_cancel(landing_[i].handle, &end)) return false;
+  const uint32_t k = landing_[i].key;
+  landing_.erase(landing_.begin() + std::ptrdiff_t(i));
+  unland(k);
+  ++st_.landing_cancelled;
+  st_.landing_yields += end.yields;
+  st_.landing_aborted_bytes += end.aborted_bytes;
+  if (end.aborted_bytes) st_.landing_read_bytes += unit_bytes_ - end.aborted_bytes;  // (yielded part-way: read so far)
+  return true;
+}
+
+// A wrong prediction's landing read still queued behind the cap (or yielded part-way to demand reads) would hold the
+// boundary (or a drain) for a read it then expires: dropped instead, its unit back in its file. Only the reads already
+// running are waited for.
+void DgCore::cancel_landings() {
+  for (size_t i = 0; i < landing_.size();)
+    if (!cancel_landing(i)) ++i;
+}
+
+// ---- landings (dg_landing_blocks): the two-stage file prefetch ----
+// A prediction of a file-homed unit reads it into a landing block (a pinned host block of its own pool, never a slot,
+// never a pinned home or spare): no GPU slot is taken, nothing is evicted or written back for it. A landing holds
+// exactly its key (Landing / Landed, its permanent home still the file: no slot, block or entry) and its landing block;
+// its read is a file read like a demand's (the transport's verified read, on the read pool behind every queued demand
+// read; read in chunks it gives its reader to a queued demand read between two chunks). A demand of a Landed key copies
+// from its landing block exactly as from a pinned block (the block is free once that copy's event completed); of a
+// Landing key it ends that read first (out of order; the transport runs the rest of it as a demand read), then the
+// same: never a second read. A failed landing read frees its block and the key is file-homed again (a later demand
+// reads it as usual). At every boundary the reads in flight end (landed, or back to their file), and a landing not
+// demanded for landing_ttl boundaries goes back to its file without a copy. Off (landing_blocks 0): none of this runs.
+bool DgCore::advise_land(uint32_t g, uint32_t unit) {
+  if (!c_.landing_blocks) return false;
+  const uint32_t k = key(g, unit);
+  const Home h = e_[k].home;
+  if (h == Home::Landing || h == Home::Landed) return true;
+  if (h != Home::File) return false;
+  if (c_.landing_ttl == 0 && served_[g]) {  // its layer's demand already passed: it could never be used
+    ++st_.landing_skipped_passed;
+    return true;
+  }
+  land(k);
+  return true;
+}
+
+bool DgCore::land(uint32_t k) {
+  Entry& x = e_[k];
+  reclaim_lands();
+  if (free_lands_.empty()) {  // a prediction never displaces another landing
+    ++st_.landing_dropped_full;
+    return false;
+  }
+  const int32_t l = free_lands_.back();
+  void* h = nullptr;
+  try {
+    h = t_->read_landing_begin(k, land_block(l));
+  } catch (...) {  // advice: nothing begun, the block stays free, the key in its file
+    ++st_.landing_failed;
+    return false;
+  }
+  free_lands_.pop_back();
+  landing_.push_back({k, l, h, false});
+  land_owner_[size_t(l)] = k;
+  x.home = Home::Landing;
+  x.land = l;
+  x.land_age = 0;
+  --on_file_;
+  ++on_land_;
+  ++st_.landing_issued;
+  return true;
+}
+
+bool DgCore::end_landing(size_t i) {
+  const LandRead r = landing_[i];
+  landing_.erase(landing_.begin() + std::ptrdiff_t(i));
+  bool ok = true;
+  DgTransport::LandingEnd end;
+  try {
+    t_->read_landing_end(r.handle, &end);
+  } catch (...) {  // advice: its error is dropped (a demand's own read reports it)
+    ok = false;
+  }
+  st_.landing_yields += end.yields;
+  if (!ok) {
+    ++st_.landing_failed;
+    unland(r.key);
+    return false;
+  }
+  st_.landing_read_bytes += unit_bytes_ - end.aborted_bytes;
+  st_.landing_aborted_bytes += end.aborted_bytes;
+  if (r.doomed || end.aborted) {  // its layer passed undemanded: never promoted (partial if aborted), its block free
+    unland(r.key);
+    ++st_.landing_expired_layer;
+    return false;
+  }
+  e_[r.key].home = Home::Landed;
+  return true;
+}
+
+void DgCore::end_landings(const std::function<bool(uint32_t)>& pick) {
+  for (size_t i = 0; i < landing_.size();) {
+    if (pick(landing_[i].key)) end_landing(i);
+    else ++i;
+  }
+}
+
+void DgCore::unland(uint32_t k) {
+  Entry& x = e_[k];
+  free_lands_.push_back(x.land);
+  land_owner_[size_t(x.land)] = kNone;
+  x.land = -1;
+  x.land_age = 0;
+  x.home = Home::File;
+  --on_land_;
+  ++on_file_;
+}
+
+// synced: every stream that copied from a landing block was synchronized (each block free without a query)
+void DgCore::reclaim_lands(bool synced) {
+  size_t kept = 0;
+  for (const LandBusy& b : land_busy_) {
+    if (synced || t_->done(b.ev)) {
+      free_lands_.push_back(b.land);
+      event_pool_.push_back(b.ev);
+    } else {
+      land_busy_[kept++] = b;
+    }
+  }
+  land_busy_.resize(kept);
 }
 
 // The derived write-back scheduling state of c_.wb_defer (at construction, and after set_wb_defer / reset_open).
@@ -506,6 +679,16 @@ DgCore::~DgCore() {
   for (const Pending& p : pending_) {
     try {
       t_->read_unit_end(p.handle);
+    } catch (...) {
+    }
+  }
+  // landing reads too (one not running: dropped; one running: stopped at its next chunk): their blocks are freed
+  for (const LandRead& r : landing_) {
+    DgTransport::LandingEnd end;
+    if (t_->read_landing_cancel(r.handle, &end)) continue;
+    t_->read_landing_abort(r.handle);
+    try {
+      t_->read_landing_end(r.handle, &end);
     } catch (...) {
     }
   }
@@ -846,6 +1029,7 @@ void DgCore::begin_token(uint32_t seq, const std::vector<uint8_t>* run) {
   demand_free_used_ = 0;
   std::fill(pf_layer_.begin(), pf_layer_.end(), 0);
   std::fill(layer_missed_.begin(), layer_missed_.end(), uint8_t(0));
+  std::fill(served_.begin(), served_.end(), uint8_t(0));
   pred_.clear();
   pred_layer_ = kNone;
 }
@@ -877,6 +1061,21 @@ bool DgCore::fetch(uint32_t g, uint32_t unit, bool prefetch) { return fetch_impl
 bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted) {
   const uint32_t k = key(g, unit);
   Entry& x = e_[k];
+  if (x.home == Home::Landing || x.home == Home::Landed) {
+    if (prefetch) return false;  // a landing is promoted by a demand only: an advice never takes a slot for it
+    if (x.home == Home::Landing) {  // its read ends now (out of order; the transport starts it if still queued)
+      size_t i = 0;
+      while (landing_[i].key != k) ++i;
+      const bool late = !t_->read_unit_done(landing_[i].handle);  // (a completed one: landed, not late)
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool ok = end_landing(i);  // (failed: the key is file-homed again and read below as any file miss)
+      if (late) {
+        st_.landing_wait_ns += uint64_t(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (ok) ++st_.landing_late;
+      }
+    }
+  }
   // a prefetch over budget does nothing at all (no copy and no resurrection); dg_no_admit issues none
   if (prefetch && budgeted && (pf_layer_[g] >= c_.prefetch_per_layer || pf_token_ >= c_.prefetch_per_token))
     return false;
@@ -929,10 +1128,13 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
       return true;
     }
     case Home::Host:
+    case Home::Landed:  // (a demand: a copy from its landing block below, as from a pinned block)
       break;
     case Home::File:  // three-tier: a file read below; a prefetch only with disk_prefetch
       if (prefetch && !c_.disk_prefetch) return false;
       break;
+    case Home::Landing:  // (ended above)
+      broken("a landing read in flight at its demand");
   }
   int32_t slot = -1;
   bool bank = false, free_counted = false;
@@ -1012,6 +1214,22 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     pending_.push_back({k, slot, stage, s, prefetch, bank, free_counted, h, entries_});
     st_.disk_max_in_flight = std::max<uint64_t>(st_.disk_max_in_flight, pending_.size());
     set_entry(k, slot);  // the mirror now (as a synchronous fetch), the device's entry with the copy
+  } else if (x.home == Home::Landed) {  // its landing block is free again once this copy's event completed
+    copy_in(s, k, slot, land_block(x.land));
+    void* ev = event();
+    try {
+      t_->record(ev, s);
+    } catch (...) {  // a copy may read the block with no event to free it after: the cache is poisoned (the device
+      event_pool_.push_back(ev);  // failed; nothing reuses the block)
+      reset_failed_ = true;
+      throw;
+    }
+    land_busy_.push_back({x.land, ev});
+    land_owner_[size_t(x.land)] = kNone;
+    x.land = -1;
+    x.land_age = 0;
+    --on_land_;
+    ++st_.landing_promoted;
   } else {
     copy_in(s, k, slot, x.block);
   }
@@ -1112,22 +1330,38 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
   if (diag_ && mask) t_->diag_mark(g, 0);
   bool first_marked = false;
   uint32_t first_read = kNone;  // dg_diag: the first fetched key while its read is in flight
+  auto miss = [&](uint32_t id) {
+    fetch(g, id, false);
+    if (diag_ && !first_marked) {
+      first_marked = true;
+      const uint32_t k = key(g, id);
+      if (std::any_of(pending_.begin(), pending_.end(), [k](const Pending& p) { return p.key == k; })) first_read = k;
+      else t_->diag_mark(g, 2);  // (dg_diag: the mark follows the first fetched unit's copies, enqueued already)
+    }
+  };
   // true misses first (the device waits for them), per masked occurrence in export order: a repeated id is fetched at
-  // its first occurrence and covered at the later ones (site.cu)
+  // its first occurrence and covered at the later ones (site.cu). Landings on: a miss whose landing read is still in
+  // flight is fetched after the layer's other misses (their reads begun first, overlapping the wait for it).
+  late_.clear();
+  uint64_t late_covered = 0;
+  poll_landings();  // (a completed landing read is landed: only a read still running is late)
   for (uint32_t i = 0; i < n; ++i) {
     if (!(mask >> i & 1u)) continue;
     if (on_device_or_coming(g, ids[i])) {
       cover(g, ids[i]);
       ++st_.covered;
+    } else if (c_.landing_blocks && e_[key(g, ids[i])].home == Home::Landing) {
+      if (std::find(late_.begin(), late_.end(), ids[i]) != late_.end()) ++late_covered;
+      else late_.push_back(ids[i]);
     } else {
-      fetch(g, ids[i], false);
-      if (diag_ && !first_marked) {
-        first_marked = true;
-        const uint32_t k = key(g, ids[i]);
-        if (std::any_of(pending_.begin(), pending_.end(), [k](const Pending& p) { return p.key == k; })) first_read = k;
-        else t_->diag_mark(g, 2);  // (dg_diag: the mark follows the first fetched unit's copies, enqueued already)
-      }
+      miss(ids[i]);
     }
+  }
+  for (uint32_t id : late_) miss(id);
+  st_.covered += late_covered;  // (a repeated late miss: covered at its later occurrences, as any repeated miss)
+  if (c_.landing_blocks && c_.landing_ttl == 0 && lm_g_ == kNone) {
+    served_[g] = 1;
+    expire_layer_landings(g, ids, n);
   }
   if (first_read != kNone) {  // every miss of the layer is issued first; then that one read ends, its copies enqueued,
     drain_key(first_read);    // and the mark follows them
@@ -1150,8 +1384,8 @@ void DgCore::shadow_predict(uint32_t g_next, const uint32_t* pred, uint32_t n) {
   if (g_next >= gated()) return;
   shadow_has_[g_next] = 1;
   std::vector<uint32_t>& s = shadow_file_[g_next];
-  for (uint32_t i = 0; i < n; ++i) {
-    if (pred[i] >= units(g_next) || e_[key(g_next, pred[i])].home != Home::File) continue;
+  for (uint32_t i = 0; i < n; ++i) {  // (a landing's home is still its file)
+    if (pred[i] >= units(g_next) || !file_homed(e_[key(g_next, pred[i])].home)) continue;
     if (std::find(s.begin(), s.end(), pred[i]) != s.end()) continue;
     s.push_back(pred[i]);
     ++st_.pred_shadow_file_predicted;
@@ -1165,7 +1399,7 @@ void DgCore::shadow_demand(uint32_t g, const uint32_t* ids, uint32_t n) {
   for (uint32_t i = 0; i < n; ++i) {
     if (std::find(ids, ids + i, ids[i]) != ids + i) continue;  // a repeated id once
     const bool predicted = std::find(s.begin(), s.end(), ids[i]) != s.end();
-    if (!predicted && e_[key(g, ids[i])].home != Home::File) continue;  // (a predicted one: file-homed at prediction)
+    if (!predicted && !file_homed(e_[key(g, ids[i])].home)) continue;  // (a predicted one: file-homed at prediction)
     ++st_.pred_shadow_file_demanded;
     st_.pred_shadow_file_demanded_bytes += unit_bytes_;
     if (predicted) {
@@ -1259,10 +1493,16 @@ void DgCore::serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32
     for (const Cand& c : cand_) {
       if (issued >= wp_.l1_cap || c.votes < wp_.l1_min_votes - 1e-6f) break;
       if (on_device_or_coming(g_next, c.unit)) continue;
-      if (!c_.disk_prefetch && e_[key(g_next, c.unit)].home == Home::File) continue;  // demand only (three-tier)
+      // landings on: a file-homed candidate lands (priced as a prefetch; outside l1_cap and the budgets)
+      const bool lands = c_.landing_blocks && file_homed(e_[key(g_next, c.unit)].home);
+      if (!lands && !c_.disk_prefetch && e_[key(g_next, c.unit)].home == Home::File) continue;  // demand only
       const uint32_t b = uint32_t(std::min(4L, std::lround(c.votes))) * 3u + (c.rank <= 1 ? 0u : c.rank <= 3 ? 1u : 2u);
       if (wp_.l1_pmin > 0 && (bkt_hit_[b] + 1) / (bkt_n_[b] + 1) < wp_.l1_pmin && ++explore_ % 64u != 0) {
         ++st_.l1_priced_out;
+        continue;
+      }
+      if (lands) {
+        advise_land(g_next, c.unit);
         continue;
       }
       if (!fetch(g_next, c.unit, true)) break;  // over a budget or the reserve
@@ -1293,7 +1533,8 @@ void DgCore::serve_prediction_impl(uint32_t g_next, const uint32_t* pred, uint32
     ++st_.pred_skipped_ahead;
     return;
   }
-  for (uint32_t id : uniq_) fetch(g_next, id, true);
+  for (uint32_t id : uniq_)
+    if (!advise_land(g_next, id)) fetch(g_next, id, true);  // (landings on: a file-homed unit lands instead)
 }
 
 void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
@@ -1309,6 +1550,21 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   if (diag_) {
     bt.sync_us = us_since(t);
     t_->diag_boundary();
+  }
+  if (c_.landing_blocks) {
+    // landings: the reads never started are cancelled (back to their file, no read), the running ones end now (landed,
+    // or back to their file); every landing block a promotion's copy read is free (kDem / kPf synced); a landing not
+    // demanded for landing_ttl boundaries goes back to its file (no copy: the file holds its bytes). Placement only: no
+    // slot, block, entry or victim changes.
+    cancel_landings();
+    end_landings([](uint32_t) { return true; });
+    reclaim_lands(true);
+    for (uint32_t l = 0; l < c_.landing_blocks; ++l) {
+      const uint32_t k = land_owner_[l];
+      if (k == kNone || ++e_[k].land_age < std::max<uint32_t>(c_.landing_ttl, 1)) continue;  // (TTL 0: as 1 here)
+      unland(k);
+      ++st_.landing_expired;
+    }
   }
   const bool hinted = !win_w_.empty();  // winpf: this token was a hinted window
   std::vector<uint8_t> keep_mask;
@@ -1378,6 +1634,7 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
     }
   }
   coming_.clear();
+  std::fill(served_.begin(), served_.end(), uint8_t(0));  // (a window's priors after the boundary target the next token)
   std::fill(shadow_has_.begin(), shadow_has_.end(), uint8_t(0));  // a prediction never demanded: predicted only
   for (auto& s : shadow_file_) s.clear();
   for (uint32_t k : banked_) {  // bank units: back to their blocks (the upload below resets the entry)
@@ -1840,6 +2097,7 @@ void DgCore::issue_prior() {
     for (const Cand& x : pcand_) {
       if (issued >= wp_.prior_cap || 1.0f - x.votes < wp_.prior_pmin - 1e-6f) break;
       if (on_device_or_coming(g, x.unit)) continue;
+      if (advise_land(g, x.unit)) continue;  // landings on: a file home lands (no copy: outside the byte budget)
       if (!c_.disk_prefetch && e_[key(g, x.unit)].home == Home::File) continue;  // demand only (three-tier)
       // the copy-engine budget of the window: every byte already queued (write-backs submitted and not collected:
       // conservative) comes first on a FIFO engine; a resurrection (Evicting) copies nothing
@@ -1989,6 +2247,7 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
   // mirror entry back to -1 otherwise: the source keeps its home and its block); a source block is released, and a
   // written-back victim's slot reused, only after the stream that reads it was synced.
   std::vector<int32_t> released;  // source blocks of committed copies on kDem (free once kDem is synced)
+  std::vector<int32_t> released_lands;  // the same of landed units' landing blocks
   std::vector<int32_t> wb;        // slots of committed write-backs on kD2h (free once kD2h is synced)
   struct Read {
     uint32_t key;
@@ -2035,6 +2294,8 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
     t_->sync(DgTransport::kDem);
     free_blocks_.insert(free_blocks_.end(), released.begin(), released.end());
     released.clear();
+    free_lands_.insert(free_lands_.end(), released_lands.begin(), released_lands.end());
+    released_lands.clear();
   };
   auto flush_d2h = [&] {
     if (wb.empty()) return;
@@ -2139,6 +2400,18 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
         commit(k, slot);
         continue;
       }
+      if (x.home == Home::Landed) {  // its landing block is the source, as a pinned block (drained: landed)
+        const int32_t l = x.land;
+        transfer(k, slot, land_block(l));
+        ++next;
+        released_lands.push_back(l);
+        land_owner_[size_t(l)] = kNone;
+        x.land = -1;
+        x.land_age = 0;
+        --on_land_;
+        commit(k, slot);
+        continue;
+      }
       // its file, through the next staging buffer (its last copy landed first). The queue depth: the reads that
       // already finished end first (any position), then the oldest; a read still holding the next staging buffer ends
       // before the buffer is reused (only after out-of-order ends: in order, depth <= staging never meets one).
@@ -2208,6 +2481,8 @@ DgCore::ResidentResult DgCore::make_resident(uint32_t g, const std::vector<uint3
       wb.clear();
       free_blocks_.insert(free_blocks_.end(), released.begin(), released.end());
       released.clear();
+      free_lands_.insert(free_lands_.end(), released_lands.begin(), released_lands.end());
+      released_lands.clear();
     }
     account();
     throw;
@@ -2538,10 +2813,13 @@ void DgCore::seed_round_counts(const std::vector<uint32_t>& keys, const std::vec
 
 void DgCore::drain() {
   drain_pending();  // drain point: a public entry point (between tokens)
+  cancel_landings();  // (the ones never started: back to their file; the others landed, or back to it on a failure)
+  end_landings([](uint32_t) { return true; });
   while (!deferred_.empty()) finish_deferred_front();
   t_->sync(DgTransport::kDem);
   t_->sync(DgTransport::kPf);
   t_->sync(DgTransport::kD2h);
+  reclaim_lands(true);
 }
 
 bool DgCore::same_open_state(const DgCore& b) const {
@@ -2550,7 +2828,7 @@ bool DgCore::same_open_state(const DgCore& b) const {
                     c.prefetch_reserve_auto, c.prefetch_per_layer, c.prefetch_per_token, c.wb_defer, c.wb_on_d2h,
                     c.wb_layer_bytes, c.wb_max_outstanding, c.disk_tier, c.disk_prefetch, c.home_blocks,
                     c.disk_staging, c.inclusive, c.disk_queue, c.clean_evict, c.pf_revert, c.pf_strict,
-                    c.pf_legacy);
+                    c.pf_legacy, c.landing_blocks, c.landing_ttl);
   };
   auto wp = [](const DgWinpf& w) {
     return std::tie(w.enable, w.prior_layers, w.prior_cap, w.prior_pmin, w.l1_cap, w.l1_min_votes, w.l1_pmin,
@@ -2559,7 +2837,7 @@ bool DgCore::same_open_state(const DgCore& b) const {
   auto entry = [](const Entry& x) {
     return std::tie(x.home, x.slot, x.block, x.prev, x.next, x.in_list, x.wb_pending, x.via_prefetch, x.used,
                     x.pf_kind, x.pf_late, x.pf_bucket, x.demand_epoch, x.lru_stamp, x.backed, x.in_hlist, x.hprev,
-                    x.hnext);
+                    x.hnext, x.land, x.land_age);
   };
   if (cfg(c_) != cfg(b.c_) || wp(wp_) != wp(b.wp_) || e_.size() != b.e_.size()) return false;
   if (std::tie(hhead_, htail_, on_host_, on_file_, backed_) !=
@@ -2590,6 +2868,9 @@ bool DgCore::same_open_state(const DgCore& b) const {
             std::tie(b.sc_[g].T, b.sc_[g].rowsum, b.sc_[g].cnt, b.sc_[g].prev, b.sc_[g].served, b.sc_[g].list_epoch))
       return false;
   if (rs_ != b.rs_ || rhits_ != b.rhits_ || c_.no_admit != b.c_.no_admit) return false;
+  if (std::tie(free_lands_, land_owner_, on_land_) != std::tie(b.free_lands_, b.land_owner_, b.on_land_) ||
+      !landing_.empty() || !b.landing_.empty() || !land_busy_.empty() || !b.land_busy_.empty())
+    return false;
   return wbs_.empty() && b.wbs_.empty() && deferred_.empty() && b.deferred_.empty() && pending_.empty() &&
          b.pending_.empty() &&
          prior_.layers == b.prior_.layers && prior_.k == b.prior_.k && prior_.row == b.prior_.row &&
@@ -2619,6 +2900,9 @@ void DgCore::reset_open() {
     }
     for (void* ev : stage_ev_)  // three-tier: every staging copy landed (Coming keys from files have no block)
       if (ev) t_->event_sync(ev);
+    // landings (drained: landed or in their file, no copy reads a landing block): back to their files, no copy
+    for (uint32_t l = 0; l < c_.landing_blocks; ++l)
+      if (land_owner_[l] != kNone) unland(land_owner_[l]);
     // Coming keys fetched from their file have no source block: their persistent slot is their only copy now (they
     // were drained), so they take part as device keys; clean copies are dropped (the open holds none).
     const size_t P = c_.persistent_slots, N = P + c_.blocks, stage = N, file = N + 1;
@@ -2706,6 +2990,9 @@ void DgCore::reset_open() {
     on_file_ = open_on_file_;
     backed_ = 0;
     stage_next_ = 0;
+    free_lands_ = open_free_lands_;  // (every landing block free: the open's order)
+    on_land_ = 0;
+    std::fill(served_.begin(), served_.end(), uint8_t(0));
     coming_.clear();
     std::fill(shadow_has_.begin(), shadow_has_.end(), uint8_t(0));  // (the prediction shadow tally: none open)
     for (auto& f : shadow_file_) f.clear();
@@ -2796,10 +3083,12 @@ void DgCore::check() const {
       if (all_events_[i] == ev) return int64_t(i);
     return -1;
   };
-  uint32_t listed = 0, dev = 0, hosts = 0, files = 0, backed = 0, hlisted = 0;
+  std::vector<uint8_t> land_used(c_.landing_blocks, 0);
+  uint32_t listed = 0, dev = 0, hosts = 0, files = 0, backed = 0, hlisted = 0, lands = 0, landing_n = 0;
   for (uint32_t k = 0; k < keys_; ++k) {
     const Entry& x = e_[k];
     if (x.backed && x.home != Home::Device) broken("a clean copy of a key not on the device");
+    if ((x.land >= 0) != (x.home == Home::Landing || x.home == Home::Landed)) broken("a landing block outside a landing");
     if (x.in_hlist != (c_.disk_tier && x.home == Home::Host)) broken("the pinned recency list != the pinned homes");
     hlisted += x.in_hlist ? 1u : 0u;
     switch (x.home) {
@@ -2845,6 +3134,18 @@ void DgCore::check() const {
         if (table_[k] != -1) broken("an evicting key is mapped");
         if (!x.wb_pending) broken("an evicting key without a write-back");
         if (x.in_list) broken("an evicting key is in the recency list");
+        break;
+      case Home::Landing:
+      case Home::Landed:
+        ++lands;
+        landing_n += x.home == Home::Landing ? 1u : 0u;
+        if (!c_.disk_tier || !c_.landing_blocks) broken("a landing without landing blocks");
+        if (x.slot != -1 || x.block != -1 || table_[k] != -1 || x.in_list || x.wb_pending || x.pf_done)
+          broken("a landing holds a slot, a block, an entry or a copy");
+        take(land_used, x.land, "landing block");
+        if (land_owner_[size_t(x.land)] != k) broken("a landing block's owner is another key");
+        if (x.home == Home::Landed && x.land_age >= std::max<uint32_t>(c_.landing_ttl, 1))
+          broken("a landing past its TTL");
         break;
     }
     if (x.in_list) ++listed;
@@ -2923,6 +3224,22 @@ void DgCore::check() const {
   for (void* ev : event_pool_) take(ev_used, ev_index(ev), "pooled event");
   for (void* ev : stage_ev_)
     if (ev) take(ev_used, ev_index(ev), "staging event");
+  // landings: every landing block once (free, behind a promotion's copy, or its Landing / Landed key's); each read in
+  // flight is its Landing key's, on its block
+  for (const LandRead& r : landing_)
+    if (r.key >= keys_ || e_[r.key].home != Home::Landing || e_[r.key].land != r.land)
+      broken("a landing read does not match its key");
+  if (landing_.size() != landing_n) broken("landing reads != the keys landing");
+  for (const LandBusy& b : land_busy_) {
+    take(land_used, b.land, "busy landing block");
+    take(ev_used, ev_index(b.ev), "landing copy event");
+  }
+  for (int32_t l : free_lands_) take(land_used, l, "free landing block");
+  for (uint32_t l = 0; l < c_.landing_blocks; ++l) {
+    if (!land_used[l]) broken("a landing block is lost");
+    if (land_owner_[l] != kNone && e_[land_owner_[l]].land != int32_t(l)) broken("a landing block's owner");
+  }
+  if (lands != on_land_) broken("landing count");
   for (uint32_t b = 0; b < c_.blocks; ++b)
     if (!block_used[b]) broken("a host block is lost");
   for (uint32_t s = 0; s < bank_first_; ++s)
