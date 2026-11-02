@@ -555,6 +555,19 @@ ss_status ss_dg_end_rows(ss_ctx* c, uint32_t rows) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_end_rows").end(rows); });
 }
 
+ss_status ss_dg_begin_layer(ss_ctx* c, int g, int parts) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_begin_layer").begin_layer(g, parts); });
+}
+ss_status ss_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_export_part").enqueue_export_part(g, part, ids_dev, n, stream); });
+}
+ss_status ss_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_wait_part").enqueue_wait_part(g, part, stream); });
+}
+ss_status ss_dg_enqueue_end_layer(ss_ctx* c, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_end_layer").enqueue_end_layer(stream); });
+}
+
 ss_status ss_dg_set_policy(ss_ctx* c, ss_policy policy) {
   return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_set_policy").set_policy(policy); });
 }

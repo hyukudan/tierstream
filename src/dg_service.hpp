@@ -48,6 +48,8 @@ class DgService {
   // waits for, validates and serves exactly those, in order; a layer not exported is never waited for (no flag, no
   // prediction for it, no ready), and the core treats it as unused this token (DgCore::begin_token).
   void begin(uint32_t seq, const std::vector<uint8_t>* run = nullptr);
+  // Engine thread: hands layer token `seq` (gated layer g, `parts` part exports) to the service (release).
+  void begin_layer(uint32_t seq, uint32_t g, uint32_t parts);
   // Engine thread: the terminal word for `seq`, waiting at most `limit`. kIdle = not yet (deadline passed).
   State wait_terminal(uint32_t seq, std::chrono::milliseconds limit);
   // Requests stop, sets host_abort and joins the thread. Idempotent. After it, the core belongs to the engine thread.
@@ -68,6 +70,7 @@ class DgService {
   struct Stop {};
   void run(uint32_t seen);
   void serve_token(uint32_t seq);
+  void serve_layer_token(uint32_t seq, uint32_t g, uint32_t parts);
   // Waits until *w == seq (acquire); the deadline and the stop request end the wait. strict (the export flag, written
   // by every token that exports the layer): any value other than `last` (the last token that exported it) or seq is a
   // desync. The prediction flag is written only on tokens that predict, so it may hold any older token.
@@ -84,6 +87,8 @@ class DgService {
   std::thread th_;
   std::chrono::steady_clock::time_point t_served_{};  // the previous token's end (seen_us[0]'s origin)
   std::atomic<uint32_t> host_seq_{0};
+  // the layer token handed over with host_seq_ (written before its release store; parts 0 = a full token)
+  uint32_t lm_g_ = 0, lm_parts_ = 0;
   std::atomic<uint64_t> term_{0};  // (state << 32) | seq
   std::atomic<bool> stop_{false};
   mutable std::mutex err_mu_;

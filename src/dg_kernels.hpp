@@ -38,6 +38,13 @@ struct Dev {
   unsigned long long* gts = nullptr;
   unsigned long long timeout_ns = 0;
   uint32_t test_flags = 0;  // test-only mutations (kSkipWait)
+  // Layer tokens (ss_dg_begin_layer): any_miss per part (device memory), the part records / flags / ready words
+  // (mapped), and the number of gated layers whose export flags the layer end kernel stamps.
+  uint32_t* lm_any_miss = nullptr;  // [kDgMaxParts]
+  DgRecord* lm_rec = nullptr;
+  uint32_t* lm_flag = nullptr;
+  uint32_t* lm_ready = nullptr;
+  uint32_t n_gated = 0;
 };
 constexpr uint32_t kSkipWait = 1;  // the wait kernel returns at once (must make the GPU test fail)
 
@@ -47,6 +54,11 @@ int launch_export(const Dev& d, uint32_t g, const int32_t* ids, uint32_t n, uint
 int launch_predict(const Dev& d, uint32_t g, const int32_t* ids, uint32_t n, void* stream);
 int launch_wait(const Dev& d, uint32_t g, void* stream);
 int launch_end(const Dev& d, void* stream);
+// Layer tokens: part `part` of gated layer g (its own record / flag / ready), its wait, and the end kernel that also
+// stamps every gated layer's export flag with the token's seq (the per-token flag invariant of ss_begin / the service).
+int launch_export_part(const Dev& d, uint32_t g, uint32_t part, const int32_t* ids, uint32_t n, void* stream);
+int launch_wait_part(const Dev& d, uint32_t part, void* stream);
+int launch_end_layer(const Dev& d, void* stream);
 // Loads the kernels (no lazy loading inside a capture). Returns a cudaError_t as an int.
 int preload();
 // Test-only: a kernel that spins `ns` nanoseconds on the stream (delayed readers in the GPU test).

@@ -49,14 +49,17 @@ bool env_flag(const char* name, bool def) {
 
 }  // namespace
 
-std::string dg_device_error(uint32_t code, uint32_t aux) {
+std::string dg_device_error(uint32_t code, uint32_t aux, bool layer_token) {
   if (code == kDgOk) return std::string();
   const char* what = code == kDgTimeout  ? "a wait timed out"
                      : code == kDgBadId  ? "an id was out of range"
                      : code == kDgDesync ? "a step ran outside ss_begin / ss_end (sequence desync)"
                      : code == kDgAbsent ? "a slot lookup met an absent entry"
                                          : "the host aborted the token";
-  const std::string where = code == kDgDesync   ? " (that step's seq " + std::to_string(aux) + ")"
+  const std::string where = code == kDgDesync && layer_token
+                                ? " (that step's seq, or the gated layer exported in full inside the layer token: " +
+                                      std::to_string(aux) + ")"
+                            : code == kDgDesync ? " (that step's seq " + std::to_string(aux) + ")"
                             : code == kDgAbsent ? std::string()
                                                 : " at gated layer " + std::to_string(aux);
   return what + where;
@@ -81,9 +84,10 @@ std::string dg_module_loading_notice(uint32_t mode, size_t gated) {
 
 uint64_t dg_mapped_bytes(uint32_t G) {
   // Record[G], PredRecord[G], flag[G], pflag[G], ready[G], then done / err_code / err_aux / host_abort / host_seq /
-  // began / err_count
+  // began / err_count, then the layer tokens' part records, part flags and part ready words
   return align64(uint64_t(G) * sizeof(DgRecord)) + align64(uint64_t(G) * sizeof(DgPredRecord)) +
-         3 * align64(uint64_t(G) * 4) + align64(7 * 4);
+         3 * align64(uint64_t(G) * 4) + align64(7 * 4) + align64(uint64_t(kDgMaxParts) * sizeof(DgRecord)) +
+         2 * align64(uint64_t(kDgMaxParts) * 4);
 }
 
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {

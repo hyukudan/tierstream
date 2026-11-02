@@ -29,6 +29,8 @@ class DgCtx {
   // Host side, the engine thread.
   virtual void begin(const uint32_t* rows, int n_layers) = 0;
   virtual void end(uint32_t rows = 1) = 0;
+  // Layer tokens (ss_dg_begin_layer): one gated layer in `parts` part exports.
+  virtual void begin_layer(int g, int parts) = 0;
   virtual void set_policy(ss_policy policy) = 0;
   virtual void reset_open() = 0;
   virtual void seed(int layer, const int32_t* units, int n) = 0;
@@ -48,6 +50,9 @@ class DgCtx {
   virtual void enqueue_predict(int g, const int32_t* ids_dev, int n, void* stream) = 0;
   virtual void enqueue_wait(int g, void* stream) = 0;
   virtual void enqueue_end(void* stream) = 0;
+  virtual void enqueue_export_part(int g, int part, const int32_t* ids_dev, int n, void* stream) = 0;
+  virtual void enqueue_wait_part(int g, int part, void* stream) = 0;
+  virtual void enqueue_end_layer(void* stream) = 0;
 
   // Stats: an engine-owned copy folded at each successful ss_end (never the service's live counters), so every call
   // is safe on the engine thread at any time; the snapshot calls are safe on any thread (design rev 3.2 §5).

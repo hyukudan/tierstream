@@ -169,3 +169,18 @@ ss.h-sha256 a09d2571a5765f0fe67fa76b8defb41fd3314d0c862bc5ff4c2ddd196915be75
 
 # make_resident review notes (comments only: dg_clean_evict victims, reads in flight, recency in the order of ids, mkres_* counters)
 ss.h-sha256 ab75735553eba14d4f520754defe2fa5feca4962a66d836d8eb37e22f3a39cae
+
+# layer tokens (additive: ss_dg_begin_layer / export_part / wait_part / end_layer, SS_DG_LAYER_TOKEN / SS_DG_MAX_LAYER_PARTS; ss_dg_stats lm_tokens / lm_parts / lm_mid_evictions appended after the mkres_* counters, read through ss_stats_dg_sized)
+ss.h-sha256 36dce6dd07d3a452c3e6a7ff1f91d73b58b2592e284a66a200ac3f09eb5c32f2
+
+# layer tokens on the three-tier placement (comment only: the mid-token eviction's ways down)
+ss.h-sha256 91ae7722877b16c84033a3978d839bf95b926111f71af90d2237628fd334b760
+
+# layer tokens with keeps (comment only: kept / held units are never mid-token victims; a held layer opens no layer token)
+ss.h-sha256 0e6669dfdb2b2429d29d4959dd6bb5df3f398aeb356ffee51774e83adb032107
+
+# layer token stray full export (comment only: ss_dg_enqueue_end_layer fails a layer token whose export flag already holds its seq)
+ss.h-sha256 750b708bec48ac57b2e33c659c538796fa6628d007ef7eded25e53d3b8379948
+
+# layer token review notes (additive: appended ss_dg_stats lm_early_admits; comment: lm_mid_evictions counts every way off the device)
+ss.h-sha256 33d02f3ed00f55e2ba6fe0613c860f5deeb27a28c934884b489ca40d3537bd63

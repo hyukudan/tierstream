@@ -153,5 +153,9 @@ ss_status ts_pack_writer_add(ss_pack_writer* w, const ss_pack_record_spec* r, co
 ss_status ts_pack_writer_finish(ss_pack_writer* w, char* manifest_sha256) { return ss_pack_writer_finish(w, manifest_sha256); }
 void ts_pack_writer_abort(ss_pack_writer* w) { ss_pack_writer_abort(w); }
 ss_status ts_dg_set_clean_evict(ss_ctx* c, uint32_t on) { return ss_dg_set_clean_evict(c, on); }
+ss_status ts_dg_begin_layer(ss_ctx* c, int g, int parts) { return ss_dg_begin_layer(c, g, parts); }
+ss_status ts_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream) { return ss_dg_enqueue_export_part(c, g, part, ids_dev, n, stream); }
+ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream) { return ss_dg_enqueue_wait_part(c, g, part, stream); }
+ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream) { return ss_dg_enqueue_end_layer(c, stream); }
 
 }  // extern "C"

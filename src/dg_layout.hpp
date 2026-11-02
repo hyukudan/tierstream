@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "desc.hpp"
+#include "dg_proto.hpp"
 #include "plan.hpp"
 #include "strix_stream/ss.h"
 
@@ -53,7 +54,9 @@ struct DgLayout {
   uint64_t unit_subread = 0;
   // Exactly what the context allocates, so admission bills what it allocates.
   // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1], absent_err
-  static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1) + 1; }
+  // seq, abort, err_count, err_code, err_aux, any_miss[G], unit_base[G + 1], absent_err, then the layer tokens'
+  // any_miss[kDgMaxParts]
+  static uint64_t ctl_words(uint32_t gated) { return 5ull + gated + (uint64_t(gated) + 1) + 1 + kDgMaxParts; }
 };
 
 // Bytes of the mapped control area for G gated layers (64-byte aligned arrays).
@@ -61,8 +64,9 @@ uint64_t dg_mapped_bytes(uint32_t gated);
 // Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);
 
-// The device's own error word (err_code, err_aux; dg_proto.hpp) as text, empty for kDgOk.
-std::string dg_device_error(uint32_t code, uint32_t aux);
+// The device's own error word (err_code, err_aux; dg_proto.hpp) as text, empty for kDgOk. layer_token: the failed token
+// was a layer token, whose end kernel also reports a stray full export with kDgDesync (err_aux = that gated layer).
+std::string dg_device_error(uint32_t code, uint32_t aux, bool layer_token = false);
 // A failed token's message: the device's error word first (when it holds one), then what the host saw (the end edge,
 // the service's error), then the poisoning.
 std::string dg_token_failure(uint32_t seq, const std::string& device, const std::string& host);

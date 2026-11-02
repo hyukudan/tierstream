@@ -241,6 +241,15 @@ RAM (for example a whole-layer prefill on a small card). Counted in `ss_dg_stats
 finished as they complete; the copied units still become the most recent in the order given, so placement does not
 depend on read timing. Its own reads, bytes, wait time, host-to-device and write-back bytes are in `ss_dg_stats.mkres_*`.
 
+**Layer tokens for layer-major prompt blocks (`ss_dg_begin_layer`, opt-in).** An engine that runs a prompt block one
+layer at a time can open a token that serves only gated layer g, in up to 32 parts: `ss_dg_begin_layer(c, g, parts)`,
+then on the device `ss_dg_enqueue_export_part` / `ss_dg_enqueue_wait_part` per part and `ss_dg_enqueue_end_layer` after
+the layer's readers. A unit fetched by one part covers the later parts (one copy per unit per layer token). When a
+demand finds no free slot, a device unit of another gated layer moves off the device the boundary's way (honouring
+`dg_clean_evict`); units kept by `ss_dg_keep` or held by `ss_dg_make_resident` are never moved. A full export inside a
+layer token fails it as a sequence desync. Ordinary tokens (`ss_begin`) are unchanged. Placement only: the same bytes.
+Counted in `ss_dg_stats.lm_*`.
+
 ### Fetching ahead
 
 - **Certain prefetch** (`ss_prefetch_layer`): layer-by-layer prefill knows it needs layer L+1 next, so that layer is

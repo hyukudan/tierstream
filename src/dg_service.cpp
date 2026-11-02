@@ -66,7 +66,15 @@ void DgService::begin(uint32_t seq, const std::vector<uint8_t>* run) {
   require(!run || run->size() == run_next_.size(), SS_E_INVALID, "device-gated: the exported layers do not cover the gated layers");
   if (run) std::copy(run->begin(), run->end(), run_next_.begin());
   else std::fill(run_next_.begin(), run_next_.end(), uint8_t(1));
+  lm_parts_ = 0;
   host_seq_.store(seq, std::memory_order_release);  // publishes run_next_ (the service reads it after this load)
+}
+
+void DgService::begin_layer(uint32_t seq, uint32_t g, uint32_t parts) {
+  require(parts >= 1 && parts <= kDgMaxParts && g < core_->gated(), SS_E_INVALID, "device-gated: layer token shape");
+  lm_g_ = g;
+  lm_parts_ = parts;
+  host_seq_.store(seq, std::memory_order_release);
 }
 
 DgService::State DgService::wait_terminal(uint32_t seq, std::chrono::milliseconds limit) {
@@ -200,7 +208,64 @@ void DgService::run(uint32_t seen) {
   }
 }
 
+// A layer token: gated layer g only, `parts` exports in order, each with its own record, flag and ready word. Each
+// part: validate, demand (its misses fetched, its ready signalled), use (recency, stats); the write-back slice after
+// a part while the next part has not exported yet. No prediction and no scored history / ranking.
+void DgService::serve_layer_token(uint32_t seq, uint32_t g, uint32_t parts) {
+  std::fill(run_.begin(), run_.end(), uint8_t(0));
+  run_[g] = 1;  // the token exports gated layer g only (through its part words)
+  core_->begin_token(seq, &run_);
+  // its end kernel stamps every gated layer's export flag with seq: the next token's strict check expects that value
+  std::fill(last_flag_.begin(), last_flag_.end(), seq);
+  auto t_prev = new_origin_.exchange(false, std::memory_order_acquire) ? clock_type::now() : t_served_;
+  wait_began(seq);
+  DgLayerTimeline t;
+  for (uint32_t k = 0; k < parts; ++k) {
+    // A part flag holds an older token's seq until its export: any older value is legal (strict = false), a later
+    // one cannot happen (the begin kernel authorized this seq only).
+    wait_word(&m_.lm_flag[k], seq, "part flag", g, false);
+    const auto t_seen = clock_type::now();
+    if (k == 0) t.seen_us = us_since(t_prev, t_seen);
+    const DgRecord& r = m_.lm_rec[k];
+    require(r.seq == seq, SS_E_BACKEND,
+            "device-gated: sequence desync: part " + std::to_string(k) + " of layer token " + std::to_string(seq) +
+                " holds token " + std::to_string(r.seq));
+    require(r.pad[0] == g && r.pad[1] == k, SS_E_BACKEND,
+            "device-gated: layer token " + std::to_string(seq) + " part " + std::to_string(k) +
+                " was exported for gated layer " + std::to_string(r.pad[0]) + " part " + std::to_string(r.pad[1]) +
+                " (opened for gated layer " + std::to_string(g) + ")");
+    const uint32_t n = r.n_ids;
+    require(n >= 1 && n <= cfg_.max_ids && r.n_pred_promised == 0, SS_E_BACKEND,
+            "device-gated: layer token part " + std::to_string(k) + " exported " + std::to_string(n) + " ids");
+    const uint64_t mask = uint64_t(r.mask_lo) | uint64_t(r.mask_hi) << 32;
+    ids_.assign(r.ids, r.ids + n);
+    const DgStats before = core_->stats();
+    core_->set_part(k);
+    core_->serve_demand(g, ids_.data(), n, mask);
+    const auto t_demand = clock_type::now();
+    t.demand_us += us_since(t_seen, t_demand);
+    core_->serve_use(g, ids_.data(), n, mask);
+    if (core_->deferred() && g + 1 < core_->gated() && k + 1 < parts)
+      core_->issue_writebacks(g, [&] { return dg_load_acquire(&m_.lm_flag[k + 1]) == seq; });
+    t.serve_us += us_since(t_seen, clock_type::now());
+    if (cfg_.diag) {
+      const DgStats& after = core_->stats();
+      t.ids += uint32_t(after.lookups - before.lookups);
+      t.misses += uint32_t(after.misses - before.misses);
+      t.covered += uint32_t(after.covered - before.covered);
+      t.covered_waits += uint32_t(after.covered_waits - before.covered_waits);
+      t.fetched += uint32_t(after.fetched - before.fetched);
+      t.prefetched += uint32_t(after.prefetched - before.prefetched);
+    }
+  }
+  if (cfg_.diag) {
+    for (auto& x : tl_) x = DgLayerTimeline{};
+    tl_[g] = t;
+  }
+}
+
 void DgService::serve_token(uint32_t seq) {
+  if (lm_parts_ != 0) return serve_layer_token(seq, lm_g_, lm_parts_);
   const uint32_t G = core_->gated();
   // a failed token publishes its rows too: the layers it did not reach are empty, never an older token's
   if (cfg_.diag) std::fill(tl_.begin(), tl_.end(), DgLayerTimeline{});

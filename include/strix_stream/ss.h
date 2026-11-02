@@ -731,6 +731,12 @@ typedef struct ss_dg_stats {
    * staging buffer -> slot, = resident_bytes); mkres_wb_bytes = the bytes its victims' write-backs copied
    * device-to-host */
   uint64_t mkres_file_reads, mkres_file_bytes, mkres_read_ns, mkres_h2d_bytes, mkres_wb_bytes;
+  /* appended, layer tokens (ss_dg_begin_layer): tokens and parts served; units of other gated layers moved off the
+   * device inside a layer token for a demand that found neither a free nor a bank slot (synchronous, rare: a
+   * write-back into a free block, also in writebacks_done and wb_*_bytes; or, without a copy, a clean copy's drop,
+   * inclusive_drops, or a drop to its file, disk_discards and with dg_clean_evict clean_drops); lm_early_admits =
+   * demand units admitted inside a layer token to free their source blocks for those write-backs (placement only) */
+  uint64_t lm_tokens, lm_parts, lm_mid_evictions, lm_early_admits;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1552,6 +1558,33 @@ SS_API ss_status ss_dg_set_clean_evict(ss_ctx* c, uint32_t on);
 /* ss_dg_stats.mkres_file_reads / mkres_file_bytes / mkres_read_ns / mkres_h2d_bytes / mkres_wb_bytes exist; the file
  * reads of ss_dg_make_resident run up to dg_disk_queue in flight (the finished ones end first, in any order) */
 #define SS_DG_MKRES_STATS 1
+/* Layer tokens (opt-in; layer-major prompt blocks). ss_dg_begin_layer opens one token, as ss_begin, that serves ONLY
+   gated layer g in `parts` exports (1..SS_DG_MAX_LAYER_PARTS), each of <= dg_max_ids ids with its own record, flag
+   and ready word. Device order, inside the step(s) of the token: ss_dg_enqueue_begin; then for each part k in order
+   ss_dg_enqueue_export_part(g, k); every export may run before any wait (the service serves the parts in order and
+   copies a part's misses while the device continues); ss_dg_enqueue_wait_part(g, k) before the readers of part k's
+   ids (ss_dg_slot of gated layer g); every reader of g, then ss_dg_enqueue_end_layer (it also stamps every gated
+   layer's export flag with the token's seq, so a following ss_begin sees a clean sequence; a flag that already holds
+   it, a full ss_dg_enqueue_export of any gated layer inside the layer token, fails the token first: sequence desync
+   at ss_end, SS_E_BACKEND, the context poisoned). Host: ss_end or
+   ss_dg_end_rows after the device work, as any token. A unit fetched by one part covers the later parts' ids (one
+   copy per unit per layer token). A demand without a free or bank slot moves a device unit of ANOTHER gated layer
+   off the device synchronously (the token reads no other layer; counted in lm_mid_evictions), the boundary's way:
+   a clean copy (inclusive share) without a copy, else a write-back into a free block; three-tier (SS_DG_DISK_TIER)
+   without a free block: a pinned unit dropped to its file frees one, else the victim drops to its file (no copy).
+   File-homed units of layer g are read through the staging buffers as in a full token. The boundary evicts in recency
+   order (no scored history, no ranking: a layer token is not a decode step), and needs no prediction. A pending
+   window hint is dropped (its prior copies stay: placement only). A full token (ss_begin) follows unchanged. Keeps:
+   a unit kept by ss_dg_keep or held by ss_dg_make_resident (any layer's set) is never a mid-token victim, as at the
+   boundary; with no other device unit to move the demand fails the token as a full token's does (SS_E_BACKEND, the
+   context poisoned). A layer that holds a ss_dg_make_resident set cannot open a layer token (SS_E_INVALID: release
+   it first). */
+#define SS_DG_LAYER_TOKEN 1
+#define SS_DG_MAX_LAYER_PARTS 32
+SS_API ss_status ss_dg_begin_layer(ss_ctx* c, int g, int parts);
+SS_API ss_status ss_dg_enqueue_export_part(ss_ctx* c, int g, int part, const int32_t* ids_dev, int n, void* stream);
+SS_API ss_status ss_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* stream);
+SS_API ss_status ss_dg_enqueue_end_layer(ss_ctx* c, void* stream);
 
 #ifdef __cplusplus
 }

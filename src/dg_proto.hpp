@@ -8,6 +8,8 @@
 namespace ts {
 
 constexpr uint32_t kDgMaxIds = 64;  // ids per gated layer per token (SS_DG_MAX_IDS)
+// Layer tokens (ss_dg_begin_layer): exports ("parts") of ONE gated layer per token (SS_DG_MAX_LAYER_PARTS).
+constexpr uint32_t kDgMaxParts = 32;
 
 // One gated layer's export: written by the export kernel before flag[g], read by the service after it.
 struct DgRecord {
@@ -27,6 +29,25 @@ static_assert(sizeof(DgRecord) == 288 && sizeof(DgPredRecord) == 272, "the devic
 // slot lookup met an entry < 0 without abort (design rev 3.4 §11.1, §11.3).
 enum DgErrCode : uint32_t { kDgOk = 0, kDgTimeout = 1, kDgBadId = 2, kDgHostAbort = 3, kDgDesync = 4, kDgAbsent = 5 };
 
+#if defined(__CUDACC__)
+#define TS_DG_HD __host__ __device__
+#else
+#define TS_DG_HD
+#endif
+
+// A layer token's end (end_layer_kernel; the CPU tests' device model runs the same function): a layer token exports
+// through its part words only, so no gated layer's export flag may hold the token's seq yet. One that does was fully
+// exported inside the layer token (an engine bug: its readers may read slots the token's mid-token evictions reuse):
+// stray(g') reports it (the kernel: kDgDesync, err_aux = g'), before the stamp would hide it from the next ss_begin's
+// flag check. Then every flag takes seq (that check's expectation).
+template <class Load, class Store, class Stray>
+TS_DG_HD inline void dg_end_layer_flags(uint32_t n_gated, uint32_t seq, Load load, Store store, Stray stray) {
+  for (uint32_t g = 0; g < n_gated; ++g) {
+    if (load(g) == seq) stray(g);
+    store(g, seq);
+  }
+}
+
 // Host addresses of the mapped control area (cudaHostAlloc mapped, or plain memory in the CPU tests).
 struct DgMapped {
   DgRecord* rec = nullptr;        // [G]
@@ -41,6 +62,11 @@ struct DgMapped {
   uint32_t* host_seq = nullptr;    // host-written by ss_begin (release), read by the begin kernel
   uint32_t* began = nullptr;       // device-written by the begin kernel (its seq), after a system fence
   uint32_t* err_count = nullptr;   // device-written by the end kernel: wait timeouts since open
+  // Layer tokens: part k's record and flag (device-written by the part export kernel) and ready word (library-written
+  // on the demand stream), [kDgMaxParts] each.
+  DgRecord* lm_rec = nullptr;
+  uint32_t* lm_flag = nullptr;
+  uint32_t* lm_ready = nullptr;
 };
 
 // Acquire / release on a shared 32-bit word. GCC / Clang builtins (TSan sees them); MSVC volatile accesses are

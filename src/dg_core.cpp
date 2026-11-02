@@ -373,6 +373,100 @@ void DgCore::set_wb_defer(bool on) {
   prev_evict_ = 0;
 }
 
+void DgTransport::signal_ready_part(uint32_t, uint32_t) {
+  fail(SS_E_UNSUPPORTED, "device-gated: this transport has no layer-token ready words");
+}
+
+void DgCore::set_layer_token(uint32_t g, const std::vector<uint32_t>& kept) {
+  require(!reset_failed_, SS_E_BACKEND,
+          "device-gated: the cache failed (a reset or a make_resident); close the poisoned context");
+  require(g < gated(), SS_E_INVALID, "device-gated: layer token of gated layer " + std::to_string(g) + " of " +
+                                         std::to_string(gated()));
+  lm_kept_.clear();
+  for (uint32_t k : kept) {
+    require(k < keys_, SS_E_INVALID, "device-gated: layer token: kept key out of range");
+    if (lm_kept_.empty()) lm_kept_.assign(keys_, 0);
+    lm_kept_[k] = 1;
+  }
+  lm_g_ = g;
+  lm_part_ = kNone;
+}
+
+// A layer token's last resort for a demand (no free slot after the forced write-backs, no bank slot): the least
+// recently used device unit of another gated layer, without a write-back in flight, leaves the device now (its slot is
+// reused at once). The token never reads another gated layer, so unpublishing its entry mid-token is safe; the
+// boundary's table upload agrees (write_entry updates the mirror). Its way down is the boundary's (accept in
+// end_token): a clean copy (inclusive share) is its home again with no copy; else a free block takes a synchronous
+// write-back; with no free block, the token's landed demand copies give theirs back (early admission), then the
+// least recently homed pinned key drops to its file (three-tier); three-tier with still no block: the victim itself
+// drops to its file (no copy: the file holds its bytes). dg_clean_evict: with no free block after early admission
+// the victim drops to its file at once (no pinned key displaced; counted in clean_drops, as the boundary's).
+// Placement only: no row reads a unit that moved.
+bool DgCore::evict_other_layer(uint32_t g) {
+  drain_pending();  // (the caller drained already) no file read in flight while homes and blocks move
+  uint32_t v = kNone;
+  for (uint32_t k = tail_; k != kNone; k = e_[k].prev) {
+    const Entry& x = e_[k];
+    if (x.home != Home::Device || x.wb_pending || gated_of(k) == g) continue;
+    if (!lm_kept_.empty() && lm_kept_[k] && mut_ != kIgnoreKeep) continue;  // kept: never a victim (the boundary's rule)
+    v = k;
+    break;
+  }
+  if (v == kNone) return false;
+  Entry& x = e_[v];
+  if (!x.backed && free_blocks_.empty()) {
+    // The token's demand copies so far land (kDem synced): their source blocks are free now, as the boundary's
+    // admission would free them (a demand unit copied from a block only; a prefetch keeps its admission bookkeeping
+    // for the boundary; a unit read from its file holds no block and stays Coming until the boundary). The inclusive
+    // share is not offered these blocks (the boundary would keep some as clean copies, inclusive_kept): they are
+    // freed for the victim's write-back. Placement only: those units' next eviction copies back instead of dropping.
+    t_->sync(DgTransport::kDem);
+    for (uint32_t k : coming_) {
+      Entry& c = e_[k];
+      if (c.home != Home::Coming || c.via_prefetch || c.pf_done || c.block < 0) continue;
+      c.home = Home::Device;
+      c.pf_kind = 0;
+      c.pf_late = false;
+      if (mut_ != kEarlySourceFree) free_blocks_.push_back(c.block);  // (that mutation freed it at the fetch)
+      c.block = -1;
+      ++st_.lm_early_admits;
+    }
+  }
+  // dg_clean_evict (the boundary's accept): with still no free block the victim goes to its file, no pinned unit
+  // displaced for a block; else three-tier: RAM -> drop frees a block (no copy)
+  const bool clean = !x.backed && clean_now();
+  if (!x.backed && !clean && free_blocks_.empty()) drop_host_lru();
+  if (!x.backed && free_blocks_.empty() && !c_.disk_tier) return false;
+  const int32_t slot = x.slot;
+  if (x.backed) {
+    ++st_.inclusive_drops;
+  } else if (free_blocks_.empty()) {
+    ++st_.disk_discards;  // three-tier: to its file, no copy
+    if (clean) count_clean();
+  } else {
+    const int32_t b = free_blocks_.back();
+    free_blocks_.pop_back();
+    t_->d2h(slot, b);
+    void* ev = event();
+    t_->record(ev, DgTransport::kD2h);
+    t_->event_sync(ev);
+    event_pool_.push_back(ev);
+    x.block = b;
+    st_.wb_issued_bytes += unit_bytes_;
+    st_.wb_completed_bytes += unit_bytes_;
+    ++st_.writebacks_done;  // (a write-back that completed: the byte and unit counts agree)
+  }
+  unlink(v);
+  --on_device_;
+  to_lower(v);  // its block (written back or its clean copy): Host; else its file
+  write_entry(DgTransport::kDem, v, -1);
+  free_slots_.push_back(slot);
+  ++st_.evicted;
+  ++lc_[gated_of(v)].evicted;
+  ++st_.lm_mid_evictions;
+  return true;
+}
+
 uint32_t DgCore::gated_of(uint32_t k) const {
   return uint32_t(std::upper_bound(base_.begin(), base_.end(), k) - base_.begin()) - 1;
 }
@@ -810,6 +904,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
         collect();
         ++st_.stalled;
       }
+      if (free_slots_.empty() && lm_g_ != kNone) evict_other_layer(g);
       if (free_slots_.empty()) fail(SS_E_BACKEND, "device-gated: no free slot, no bank slot, no write-back to wait for");
       slot = free_slots_.back();
       free_slots_.pop_back();
@@ -968,7 +1063,8 @@ void DgCore::serve_demand(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t 
 
 void DgCore::signal(uint32_t g) {
   drain_layer(g);  // drain point: this layer's copies and entries (demand, prefetch) enqueued before its ready
-  t_->signal_ready(g, seq_);
+  if (lm_part_ != kNone) t_->signal_ready_part(lm_part_, seq_);
+  else t_->signal_ready(g, seq_);
 }
 
 void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mask) {
@@ -977,7 +1073,7 @@ void DgCore::serve_use(uint32_t g, const uint32_t* ids, uint32_t n, uint64_t mas
   uniq_.assign(ids, ids + n);
   std::sort(uniq_.begin(), uniq_.end());
   uniq_.erase(std::unique(uniq_.begin(), uniq_.end()), uniq_.end());
-  if (c_.scored) score_history(g);  // the union saved before serve_prediction reuses uniq_
+  if (c_.scored && lm_g_ == kNone) score_history(g);  // the union saved before serve_prediction reuses uniq_
   for (uint32_t id : uniq_) {  // placement rounds: the unit's exports since the last round (saturating)
     uint32_t& h = rhits_[key(g, id)];
     if (h != UINT32_MAX) ++h;
@@ -1183,10 +1279,12 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   // above, not reverted: a kept unit on the device stays there.)
   // dg_no_admit: nothing was admitted, no boundary evicts (placement changes only through rounds / make_resident)
   const bool select = !c_.no_admit;
-  const bool want_score = select && c_.scored && (!c_.scored_auto || rows > 1);
+  const bool layer_token = lm_g_ != kNone;  // recency order: a layer token adds no scored history
+  const bool want_score = select && c_.scored && (!c_.scored_auto || rows > 1) && !layer_token;
   // A layer this token did not export (begin_token's run) was never served or ranked: it is ranked here from its
   // unchanged history (the bounded selector only needs it closed), so every list is this token's as after a full one.
-  for (uint32_t g = 0; c_.scored && g < gated(); ++g)
+  // (A layer token's boundary uses the recency order: nothing to rank.)
+  for (uint32_t g = 0; c_.scored && !layer_token && g < gated(); ++g)
     if (!run_[g]) {
       if (c_.boundary_score) sc_[g].list_epoch = epoch_;
       else rank_layer(g);
@@ -1344,6 +1442,9 @@ void DgCore::end_token(const std::vector<uint32_t>& keep, uint32_t rows) {
   win_w_.clear();
   prior_bytes_ = 0;
   ++st_.tokens;
+  if (layer_token) ++st_.lm_tokens;
+  lm_g_ = lm_part_ = kNone;
+  lm_kept_.clear();
 }
 
 // ---- scored eviction (docs/design.md §3.8) ----
