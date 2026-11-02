@@ -978,6 +978,8 @@ class CudaDgCtx final : public DgCtx {
     out->pred_shadow_file_demanded_bytes = a.pred_shadow_file_demanded_bytes;
     out->pred_shadow_file_hit_bytes = a.pred_shadow_file_hit_bytes;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
+    out->disk_queue_resolved = x_.disk_queue;  // (properties of the open: SS_DG_DISK_QUEUE_AUTO resolved, dg_layout)
+    out->disk_locations = x_.disk_locations;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
   }
@@ -1384,6 +1386,7 @@ class CudaDgCtx final : public DgCtx {
           {"clean_drops", s.clean_drops}, {"clean_drop_bytes", s.clean_drop_bytes},
           {"clean_evict", uint64_t(core_->clean_evict())},
           {"disk_queue", uint64_t(x_.disk_queue)},
+          {"disk_queue_resolved", uint64_t(x_.disk_queue)}, {"disk_locations", uint64_t(x_.disk_locations)},
           {"disk_units_open", uint64_t(x_.F)}, {"staging", uint64_t(x_.S)}, {"inclusive_blocks", uint64_t(x_.I)}};
       for (const auto& f : tf) tt[f.first] = Json::number(f.second);
       g["three_tier"] = tt;

@@ -27,8 +27,9 @@ struct DgLayout {
   uint32_t Q = 0;  // spare blocks the planner granted and billed
   // three-tier (dg_disk_tier): F = file-homed gated units (the plan's tier DISK), their per-key flags (keys order;
   // empty without the disk tier), S = staging buffers (pinned, one unit each); I = the inclusive share; disk_queue =
-  // file reads in flight (1 = synchronous)
-  uint32_t F = 0, S = 0, I = 0, disk_queue = 0;
+  // file reads in flight (1 = synchronous; SS_DG_DISK_QUEUE_AUTO resolved, dg_resolve_disk_queue); disk_locations =
+  // the most read locations of a gated source (dg_disk_locations; counted only for AUTO, else 0)
+  uint32_t F = 0, S = 0, I = 0, disk_queue = 0, disk_locations = 0;
   bool disk_tier = false, disk_prefetch = false;
   std::vector<uint8_t> disk;
   uint32_t persistent_slots = 0, slots = 0, guard_slot = 0, blocks = 0;
@@ -84,9 +85,31 @@ struct DgHostBytes {
 // reads in flight and staging buffers, resolved (0 without the disk tier). Throws SS_E_INVALID on overflow.
 DgHostBytes dg_host_bytes(uint32_t gated, uint64_t unit_bytes, uint64_t part_max, uint64_t max_align,
                           uint64_t staging_request, uint32_t disk_queue, uint32_t disk_staging);
+// The read locations (directories) serving the gated sources' bytes: the most over the sources a gated layer's parts
+// read of stripe_locations (the primary plus each weight_dirs directory holding that source's stripe manifest; 1 = not
+// striped). Directories, not volumes: two directories on one drive count twice. A stat per directory, before any
+// source is opened (the context opens them after the layout).
+uint32_t dg_disk_locations(const Desc& d, const ss_options& o);
+// SS_DG_DISK_QUEUE_AUTO for that many locations: 3 reads in flight per location, at least 4 (one drive saturates at 4)
+// and at most 8 (three drives peaked at 8), then at most an explicit dg_disk_staging (0 = not given): reads in flight
+// are bounded by the staging buffers anyway, so no reader or bounce buffer beyond them is made.
+uint32_t dg_auto_disk_queue(uint32_t locations, uint32_t staging_option);
+// The staging buffers for a resolved AUTO queue: an explicit dg_disk_staging as given, else the default 8 raised to the
+// queue (so the default never caps an AUTO queue).
+uint32_t dg_auto_disk_staging(uint32_t staging_option, uint32_t queue);
+// dg_disk_queue / dg_disk_staging as the open resolves them (dg_layout and ss_budget_in_dg_library both call this):
+// without dg_disk_tier all 0 (AUTO included: no reader, no pool); otherwise staging = dg_disk_staging (0 = 8), queue
+// = dg_disk_queue (0 = 1, 2..64 as given), or for SS_DG_DISK_QUEUE_AUTO the two above from dg_disk_locations.
+// locations is counted only for AUTO with the disk tier (0 otherwise: an explicit queue does no file system work);
+// it is reported in ss_dg_stats.disk_locations. Values are not range-checked here (dg_layout checks the options).
+struct DgDiskQueue {
+  uint32_t queue = 0, staging = 0, locations = 0;
+};
+DgDiskQueue dg_resolve_disk_queue(const Desc& d, const ss_options& o);
 // The planner's inputs for that memory (ss_budget_in_dg_library): the gated layers, the largest part, the source
-// alignment, the bounce request and the disk queue of this descriptor and these options, and staging = the open's
-// staging buffers (dg_disk_staging, 0 = 8).
+// alignment, the bounce request and the disk queue of this descriptor and these options (AUTO resolved as the open
+// resolves it, dg_resolve_disk_queue), and staging = the open's staging buffers (dg_disk_staging, 0 = 8, or the AUTO
+// raise).
 void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in);
 // Throws ts::Error naming the refused rule. Checks every v1 scope rule except the backend (the context's).
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o);

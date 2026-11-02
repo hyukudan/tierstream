@@ -281,6 +281,17 @@ por encima del objetivo de reserva, así que los fallos por demanda siempre encu
 Estos tres cambios de admisión se miden antes de pasar a ser el comportamiento por defecto: hasta entonces
 `DG_PF_LEGACY` vale 1 por defecto (exactamente el comportamiento anterior) y `DG_PF_LEGACY=0` los activa.
 
+**Cola de lecturas para sus unidades (`SS_DG_DISK_QUEUE_AUTO`, opcional).** Con `dg_disk_queue = SS_DG_DISK_QUEUE_AUTO`
+las lecturas en vuelo de tres niveles se eligen según las ubicaciones desde las que se leen las fuentes con compuerta:
+`clamp(3 x L, 4, 8)`, L = el archivo fuente más cada directorio de `weight_dirs` que contiene su copia en franjas
+(normalmente una por unidad: una = 4, dos = 6, tres o más = 8). El planificador factura los mismos lectores; el
+resultado figura en `ss_dg_stats.disk_queue_resolved` / `disk_locations`. Detalles: [diseño §3.14](docs/design.md).
+
+Desactivado: deje `dg_disk_queue` en 0 (una lectura síncrona, el valor por defecto) o fije cualquier valor de 1 a 64.
+Medido con DeepSeek V4.1 Flash en una RTX PRO 6000 limitada a 24 GiB de VRAM y 32 GiB de RAM del host, una unidad,
+salida idéntica en todas las variantes: 5.45 tok/s con cola 1 -> 6.55 tok/s con cola 4 (+20 %), +26 % con decodificación
+especulativa; cola 16 = cola 4 (una unidad se satura con 4).
+
 **Lecturas en vuelo de `ss_dg_make_resident`.** Hasta `min(dg_disk_queue, dg_disk_staging)` lecturas de archivo se
 ejecutan a la vez y se completan según terminan; las unidades copiadas pasan igualmente a ser las más recientes en el
 orden indicado, de modo que la ubicación no depende del orden de las lecturas. Sus lecturas, bytes, tiempo de espera y

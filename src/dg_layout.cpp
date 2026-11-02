@@ -9,6 +9,7 @@
 #include "dg_proto.hpp"
 #include "dg_score.hpp"
 #include "errors.hpp"
+#include "source_file.hpp"
 
 namespace ts {
 
@@ -132,6 +133,46 @@ void dg_budget_inputs(const Desc& d, const ss_options& o, ss_budget_in* in) {
   in->dg_source_align = max_align;
   in->dg_bounce_request = o.staging_bytes;
   in->staging = o.dg_disk_staging ? o.dg_disk_staging : 8u;
+  if (o.dg_disk_queue == SS_DG_DISK_QUEUE_AUTO) {  // resolved as the open resolves it (no disk tier: 0, no reader)
+    const DgDiskQueue dq = dg_resolve_disk_queue(d, o);
+    in->dg_disk_queue = dq.queue;
+    if (dq.staging) in->staging = dq.staging;
+  }
+}
+
+uint32_t dg_disk_locations(const Desc& d, const ss_options& o) {
+  std::vector<bool> read(d.sources.size(), false);
+  for (const Layer& l : d.layers)
+    if (l.n_units != 0)  // the gated layers (dg_layout)
+      for (const Part& part : l.parts)
+        if (part.source >= 0 && size_t(part.source) < read.size()) read[size_t(part.source)] = true;
+  uint32_t most = 1;
+  for (size_t i = 0; i < read.size(); ++i)
+    if (read[i]) most = std::max(most, stripe_locations(d.sources[i].path, o.weight_dirs));
+  return most;
+}
+
+uint32_t dg_auto_disk_queue(uint32_t locations, uint32_t staging_option) {
+  const uint32_t q = uint32_t(std::min<uint64_t>(std::max<uint64_t>(uint64_t(3) * locations, 4), 8));  // 4..8
+  return staging_option ? std::min(q, staging_option) : q;  // reads in flight are bounded by the staging buffers
+}
+
+uint32_t dg_auto_disk_staging(uint32_t staging_option, uint32_t queue) {
+  return staging_option ? staging_option : std::max<uint32_t>(8, queue);
+}
+
+DgDiskQueue dg_resolve_disk_queue(const Desc& d, const ss_options& o) {
+  DgDiskQueue r;
+  if (!o.dg_disk_tier) return r;  // no disk tier: no staging, no reader (SS_DG_DISK_QUEUE_AUTO included)
+  if (o.dg_disk_queue == SS_DG_DISK_QUEUE_AUTO) {  // only AUTO touches the file system (an explicit queue: as before)
+    r.locations = dg_disk_locations(d, o);
+    r.queue = dg_auto_disk_queue(r.locations, o.dg_disk_staging);
+    r.staging = dg_auto_disk_staging(o.dg_disk_staging, r.queue);
+  } else {
+    r.queue = o.dg_disk_queue ? o.dg_disk_queue : 1u;
+    r.staging = o.dg_disk_staging ? o.dg_disk_staging : 8u;
+  }
+  return r;
 }
 
 DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
@@ -153,10 +194,13 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_wb_defer > 1) refuse(SS_E_INVALID, "dg_wb_defer must be 0 or 1");
   if (o.dg_wb_stream > 1) refuse(SS_E_INVALID, "dg_wb_stream must be 0 or 1");
   if (o.dg_disk_tier > 1 || o.dg_disk_prefetch > 1) refuse(SS_E_INVALID, "dg_disk_tier / dg_disk_prefetch must be 0 or 1");
-  if (!o.dg_disk_tier && (o.dg_disk_prefetch || o.dg_disk_staging || o.dg_disk_queue))
+  // (SS_DG_DISK_QUEUE_AUTO without the disk tier is accepted: it resolves to no reader, as 0 does)
+  const bool queue_auto = o.dg_disk_queue == SS_DG_DISK_QUEUE_AUTO;
+  if (!o.dg_disk_tier && (o.dg_disk_prefetch || o.dg_disk_staging || (o.dg_disk_queue && !queue_auto)))
     refuse(SS_E_INVALID, "dg_disk_prefetch / dg_disk_staging / dg_disk_queue need dg_disk_tier = 1");
   if (o.dg_disk_staging > 256) refuse(SS_E_INVALID, "dg_disk_staging must be 0..256");
-  if (o.dg_disk_queue > 64) refuse(SS_E_INVALID, "dg_disk_queue must be 0..64");
+  if (o.dg_disk_queue > 64 && !queue_auto)
+    refuse(SS_E_INVALID, "dg_disk_queue must be 0..64 or SS_DG_DISK_QUEUE_AUTO");
   if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
   if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
   if (o.dg_pf_revert_unused > 1) refuse(SS_E_INVALID, "dg_pf_revert_unused must be 0 or 1");
@@ -270,10 +314,14 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (x.I && x.I >= x.Q)
     refuse(SS_E_CAPACITY, "dg_inclusive_blocks " + std::to_string(x.I) + " must stay below the spare blocks (" +
                               std::to_string(x.Q) + "): raise host_spare_units by the inclusive share");
-  x.S = x.disk_tier ? (o.dg_disk_staging ? o.dg_disk_staging : 8u) : 0u;
   // 0 = 1 (synchronous reads): a measured A/B ran depth 16 slower while the reads shared one bounce buffer and ended in
-  // fetch order; the default stays 1 until an A/B with per-reader bounce buffers and independent read ends says otherwise
-  x.disk_queue = x.disk_tier ? (o.dg_disk_queue ? o.dg_disk_queue : 1u) : 0u;
+  // fetch order; the default stays 1 until an A/B with per-reader bounce buffers and independent read ends says otherwise.
+  // SS_DG_DISK_QUEUE_AUTO resolves here, before the staging buffers, readers and bounce buffers are sized (the same
+  // function as the planner's, so ss_budget_in_dg_library bills the same readers).
+  const DgDiskQueue dq = dg_resolve_disk_queue(d, o);
+  x.S = dq.staging;
+  x.disk_queue = dq.queue;
+  x.disk_locations = dq.locations;
 
   // Scored eviction: the weights, the per-layer bound and the table size (checked), the profile (every rule of its
   // format; the context loads it before the service starts).
