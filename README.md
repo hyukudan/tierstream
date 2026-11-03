@@ -262,6 +262,16 @@ Flash on one RTX PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host RAM, one 
 5.45 tok/s at queue 1 -> 6.55 tok/s at queue 4 (+20 %), +26 % with speculative decoding; queue 16 = queue 4 (one
 drive saturates at 4).
 
+**Reads in flight on one drive.** With `dg_disk_queue` above 1 and no stripe copies, the three-tier reads of a source
+now go through an overlapped file handle, so the readers really are in flight together on the drive (before, Windows
+ran them one at a time on the source's synchronous handle, and a deeper queue only added waiting). The same bytes are
+read; `STRIX_FILE_SYNC_READS=1` keeps the previous single synchronous handle. Measured with GLM-5.3-Flash on one RTX
+PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host RAM, one drive, five alternating arms, output identical in every
+arm: queue 8 with overlapped reads +7.6 % (1K prompt) and +13.8 % (8K) cold decode against queue 1, and faster in 10
+of 12 arm-and-cell pairs; the two slower warm cells come from one arm in which the drive read the same bytes at about
+half its earlier rate. The same queue on the synchronous handle was 7.5-35 % slower than queue 1. At queue 1 reads are
+issued one at a time as before.
+
 **Two-stage file prefetch (`dg_landing_blocks`, opt-in).** In a three-tier open a predicted file unit normally needs
 a free GPU slot, which is rare when VRAM is small. With `dg_landing_blocks = L` (and `dg_disk_queue > 1`), L pinned
 landing blocks are set aside: a predicted file unit is read into one while earlier layers compute, taking no GPU slot
