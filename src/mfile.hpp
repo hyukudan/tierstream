@@ -57,6 +57,8 @@ class MFile {
   // test hook: location loc becomes a mock drive: every piece of at least 1 MiB it serves takes `microseconds` per MiB
   // longer, one piece at a time (0 = off)
   void test_delay(int loc, uint64_t microseconds);
+  // test hook: balanced routing re-probes a stripe location whose rate was not sampled for this long (default 10 s)
+  void test_probe_ns(int64_t ns);
   // Test observation: total sessions constructed, including sessions already closed.
   static uint64_t test_sessions_created();
   static uint64_t test_pools_created();

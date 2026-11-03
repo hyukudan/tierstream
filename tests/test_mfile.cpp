@@ -502,6 +502,38 @@ TEST(mfile_adaptive_shares_turn_a_slow_stripe_off) {
   CHECK_EQ(later.fallback_bytes, uint64_t(0));
 }
 
+TEST(mfile_balanced_reprobes_a_stale_stripe) {
+  // a stripe measured slow by large requests, then only medium requests (decode: one expert's ~3 MiB parts): the
+  // medium rule's slow-stripe guard reads the large-request shares, which no medium request updates, so the stripe
+  // would be kept out for good; balanced routing treats a rate not sampled for the probe time as unknown (the best
+  // rate), so the drive, as fast as the primary again, serves medium reads again; bytes are the primary's throughout
+  for (int64_t probe : {int64_t(50) * 1000 * 1000, int64_t(0)}) {  // 50 ms; 0 = the default 10 s, longer than the test
+    Fixture t(16 * C);
+    auto f = t.open(SS_MFILE_VERIFY_CACHED, true, false);
+    if (probe) f->test_probe_ns(probe);
+    f->test_delay(1, 5000);  // split large requests (chunks 0 and 1) while the stripe is slow: its rate falls
+    for (int i = 0; i < 12; ++i) CHECK(t.equal(*f, 0, 32 * C));
+    CHECK(f->test_rate(1) < 0.5 * f->test_rate(0));  // below the medium rule's slow-stripe threshold
+    f->test_delay(0, 1500);  // then both mock drives of one speed (the test files share a disk)
+    f->test_delay(1, 1500);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto before = counters(*f);
+    std::vector<std::thread> threads;
+    std::atomic<int> failures{0};
+    for (int id = 0; id < 4; ++id) threads.emplace_back([&, id] {
+      for (int i = 0; i < 24; ++i)  // 3 MiB parts inside the stripe's chunk 1
+        if (!t.equal(*f, 16 * C + uint64_t((id * 3 + i) % 13) * C, 3 * C)) failures.fetch_add(1);
+    });
+    for (auto& thread : threads) thread.join();
+    CHECK_EQ(failures.load(), 0);
+    const auto after = counters(*f);
+    const uint64_t stripe = after.bytes[1] - before.bytes[1], primary = after.bytes[0] - before.bytes[0];
+    if (probe) CHECK(stripe > primary / 3);  // re-probed: the medium reads balance again
+    else CHECK_EQ(stripe, uint64_t(0));      // the stale slow rate keeps it out
+    CHECK_EQ(after.fallback_bytes, uint64_t(0));
+  }
+}
+
 TEST(mfile_rejected_locations) {
   Fixture t;
   auto rejected = [&](const std::string& dirs, MFile::Options o) {
