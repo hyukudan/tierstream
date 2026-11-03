@@ -402,13 +402,17 @@ Several layers may be held at once when the arena has room. Normal decode tokens
   staged and copied on the demand stream, then the one sync), so a layer none of whose entries changed is never
   written. These range uploads run only while some layer is held (the context switches them on at a successful
   ss_dg_make_resident and off when the last held set is released or at a reset); with no layer held an upload is the
-  whole table in one copy, as before, so the ordinary decode boundary's cost does not change. A held layer none of whose other units moved (always so when the whole layer is held) is therefore never
-  rewritten under its kernels. The open and `ss_dg_reset_open` still upload the whole table. Release a held layer only
-  after its kernels completed: a released set's slots may be reused by the next call. The CPU test
-  `dg_upload_never_writes_a_held_layer` records every uploaded range through this pipeline (make_resident, boundaries,
-  rounds; two- and three-tier, LRU and scored) and checks none meets the held layer and the device table equals the
-  mirror after each call; the GPU test `dg_cuda_held_layer_overlaps_make_resident` runs a held layer's checksum kernel
-  across make_resident of the next layer.
+  whole table in one copy, as before, so the ordinary decode boundary's cost does not change. A held layer none of
+  whose other units moved (always so when the whole layer is held) is therefore never rewritten under its kernels.
+  When only part of a layer is held and another of its units moves, that layer's range may span held keys: their
+  entries are rewritten with the values they already have (a held unit never moves), so a kernel reading them sees
+  the same slot throughout. `check()` proves the marks: while range uploads run, every entry that differs from the
+  device's copy must be marked for the next upload. The open and `ss_dg_reset_open` still upload the whole table.
+  Release a held layer only after its kernels completed: a released set's slots may be reused by the next call.
+  The CPU test `dg_upload_never_writes_a_held_layer` records every uploaded range through this pipeline
+  (make_resident, boundaries, rounds; two- and three-tier, LRU and scored) and checks none meets the held layer and
+  the device table equals the mirror after each call; the GPU test `dg_cuda_held_layer_overlaps_make_resident` runs a
+  held layer's checksum kernel across make_resident of the next layer.
 - **Unexported layers.** `rows_per_layer[h] == 0` for a gated layer (or a held set) means the step has no
   `ss_dg_enqueue_export` / `predict` / `wait` for h. The service waits for and serves only the exported layers, in
   order; a prediction an export promised for an unexported next layer is ignored; the "device ran ahead" checks and

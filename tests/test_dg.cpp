@@ -4737,6 +4737,29 @@ TEST(dg_upload_never_writes_a_held_layer) {
   }
 }
 
+// While range uploads run, check() proves every table write was marked: a write that skips its mark (the next range
+// upload would leave the device's entry stale) is caught at the next check; without range uploads nothing is kept.
+TEST(dg_upload_unmarked_entry_caught) {
+  for (bool ranges : {true, false}) {
+    ResRig r({16, 16, 16, 16}, 32, 8, 8, false, nullptr, 0, 3);
+    for (int tok = 0; tok < 4; ++tok) r.token(r.routes(4), all_run(4), {});
+    r.verify();
+    r.core->set_range_uploads(ranges);
+    r.core->make_resident(0, r.layer(0), {});  // the first range upload: the device's copy is known from here
+    r.verify();
+    r.core->set_mutation(DgCore::kUnmarkedEntry);
+    std::string err = "no error";
+    for (int tok = 0; tok < 8 && err == "no error"; ++tok) {
+      std::vector<uint8_t> run = all_run(4);
+      run[0] = 0;  // the held layer is not exported
+      const auto k0 = r.keys_of(0, r.layer(0));
+      err = error_of([&] { r.token(r.routes(4), run, k0, k0); }, SS_E_BACKEND);
+    }
+    if (ranges) CHECK(err.find("without its mark") != std::string::npos);
+    else CHECK_EQ(err, std::string("no error"));
+  }
+}
+
 // LRU: the victims are the least recent device units that no layer keeps and the call does not want, written back
 // into free blocks (two-tier) with every byte where its home says; kept units of other layers stay.
 TEST(dg_resident_eviction_lru) {
