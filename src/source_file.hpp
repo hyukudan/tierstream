@@ -2,6 +2,8 @@
 // through held directory handles (BoundDir, raw_file.hpp) and may be checked against an expected file identity.
 #pragma once
 
+#include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -38,16 +40,45 @@ class SourceFile {
   virtual uint64_t verify_grid() const { return 0; }
 };
 
+// STRIX_FILE_SYNC_READS, read at each open (any case): 1 / true / on keeps every positional read of an unstriped source on
+// its one synchronous handle (the reads before, one at a time on Windows); 0 / false / off, unset or empty reads through
+// the overlapped handle; anything else refuses the open (SS_E_INVALID).
+inline bool sync_reads_env() {
+  const char* v = std::getenv("STRIX_FILE_SYNC_READS");
+  if (!v || !*v) return false;
+  std::string s = v;
+  for (char& ch : s) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+  if (s == "1" || s == "true" || s == "on") return true;
+  require(s == "0" || s == "false" || s == "off", SS_E_INVALID,
+          "invalid STRIX_FILE_SYNC_READS (use 0, 1, false, true, off or on, in any case)");
+  return false;
+}
+
 class FileSource final : public SourceFile {
  public:
-  FileSource(const std::string& path, bool direct) : file_(path, direct), path_(path) {}
-  uint64_t pread(void* dst, uint64_t n, uint64_t off) const override { return file_.pread(dst, n, off); }
+  FileSource(const std::string& path, bool direct) : file_(path, direct), path_(path), sync_(sync_reads_env()) {}
+  // Positional reads go through the overlapped handle, so concurrent readers (the device-gated read pool) are in
+  // flight together: Windows serializes the operations on a synchronous file object, so on File's handle N readers
+  // read one at a time. The same bytes either way; File's handle when the overlapped one cannot be opened in the same
+  // mode, or with STRIX_FILE_SYNC_READS.
+  uint64_t pread(void* dst, uint64_t n, uint64_t off) const override {
+    if (const RawFile* raw = sync_ ? nullptr : overlapped()) return raw->read(dst, n, off);
+    return file_.pread(dst, n, off);
+  }
   uint64_t size() const override { return file_.size(); }
   bool direct() const override { return file_.direct(); }
   FileIdentity identity() const override { return file_.identity(); }
   // On a second, overlapped handle (opened on first use, in the same direct mode): every piece in flight together.
   // If that handle cannot be opened in the same mode, the pieces are read one after another as before.
   void read_pieces(const std::vector<RawFile::Piece>& pieces) const override {
+    const RawFile* raw = overlapped();
+    if (!raw) return SourceFile::read_pieces(pieces);
+    raw->read_many(pieces.data(), uint32_t(pieces.size()));
+  }
+
+ private:
+  // The overlapped handle, opened on first use; null when it cannot be opened in the same direct mode
+  const RawFile* overlapped() const {
     std::call_once(raw_once_, [&] {
       try {
         auto raw = std::make_unique<RawFile>(path_, file_.direct());
@@ -56,13 +87,11 @@ class FileSource final : public SourceFile {
       } catch (const Error&) {
       }
     });
-    if (!raw_) return SourceFile::read_pieces(pieces);
-    raw_->read_many(pieces.data(), uint32_t(pieces.size()));
+    return raw_.get();
   }
-
- private:
   File file_;
   std::string path_;
+  bool sync_ = false;
   mutable std::once_flag raw_once_;
   mutable std::unique_ptr<RawFile> raw_;
 };

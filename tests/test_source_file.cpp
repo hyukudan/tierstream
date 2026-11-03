@@ -1,11 +1,15 @@
 // CPU source integration with real, verified stripe sessions.
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
 
 #include "check.hpp"
@@ -486,6 +490,60 @@ TEST(source_expected_identity) {
     refused = err.status() == SS_E_DESC && std::string(err.what()).find("experts.bin") != std::string::npos;
   }
   CHECK(refused);
+}
+
+// An unstriped source's positional reads go through the overlapped handle (concurrent readers in flight together);
+// STRIX_FILE_SYNC_READS=1 keeps them on the source's one synchronous handle. Both read the same bytes from many threads
+// at once, up to the end of the file; an invalid value refuses the open.
+TEST(source_overlapped_positional_reads) {
+  SourceFixture fx("source-overlapped");
+  const std::string path = (fx.dir / "experts.bin").u8string();
+  auto set = [](const char* v) {
+#if defined(_WIN32)
+    _putenv_s("STRIX_FILE_SYNC_READS", v ? v : "");
+#else
+    if (v) setenv("STRIX_FILE_SYNC_READS", v, 1);
+    else unsetenv("STRIX_FILE_SYNC_READS");
+#endif
+  };
+  std::vector<char> whole;
+  {
+    std::ifstream in(fx.dir / "experts.bin", std::ios::binary);
+    whole.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+  }
+  const uint64_t size = whole.size();
+  for (const char* v : {static_cast<const char*>(nullptr), "1", "OFF"}) {
+    set(v);
+    for (bool direct : {false, true}) {
+      auto src = ts::open_source(path, direct, nullptr);
+      const uint64_t a = src->direct() ? 4096 : 1;  // an unbuffered source reads aligned offsets and lengths
+      std::vector<std::thread> th;
+      std::atomic<int> bad{0};
+      for (int t = 0; t < 8; ++t)
+        th.emplace_back([&, t] {
+          std::vector<char> buf(size + 2 * 4096 + 4096);
+          char* dst = buf.data() + (4096 - reinterpret_cast<uintptr_t>(buf.data()) % 4096);
+          for (int i = 0; i < 16; ++i) {
+            const uint64_t off = (uint64_t(t) * 7919 + uint64_t(i) * 104729) % size / a * a;
+            const uint64_t n = std::min<uint64_t>((uint64_t(i) % 3 + 1) * 3 * a + (a == 1 ? 17 : 0), size + a);
+            const uint64_t got = src->pread(dst, n, off);
+            const uint64_t want = std::min(n, size - off);
+            if (got < want || std::memcmp(dst, whole.data() + off, size_t(want)) != 0) bad.fetch_add(1);
+          }
+        });
+      for (auto& x : th) x.join();
+      CHECK_EQ(bad.load(), 0);
+    }
+  }
+  set("maybe");
+  bool refused = false;
+  try {
+    (void)ts::open_source(path, false, nullptr);
+  } catch (const ts::Error& err) {
+    refused = err.status() == SS_E_INVALID;
+  }
+  CHECK(refused);
+  set(nullptr);
 }
 
 int main(int argc, char** argv) { return sstest::run_all(argc > 1 ? argv[1] : nullptr); }

@@ -292,6 +292,17 @@ Medido con DeepSeek V4.1 Flash en una RTX PRO 6000 limitada a 24 GiB de VRAM y 3
 salida idéntica en todas las variantes: 5.45 tok/s con cola 1 -> 6.55 tok/s con cola 4 (+20 %), +26 % con decodificación
 especulativa; cola 16 = cola 4 (una unidad se satura con 4).
 
+**Lecturas en vuelo en una sola unidad.** Con `dg_disk_queue` mayor que 1 y sin copias en franjas, las lecturas de
+tres niveles de una fuente pasan ahora por un manejador de archivo superpuesto, de modo que los lectores están realmente
+en vuelo a la vez en la unidad (antes, Windows las ejecutaba de una en una sobre el manejador síncrono de la fuente, y una
+cola más profunda solo añadía espera). Se leen los mismos bytes; `STRIX_FILE_SYNC_READS=1` mantiene el manejador
+síncrono único anterior. Medido con GLM-5.3-Flash en una RTX PRO 6000 limitada a 24 GiB de VRAM y 32 GiB de RAM del
+host, una unidad, cinco variantes alternas, salida idéntica en todas: cola 8 con lecturas superpuestas +7.6 % (prompt
+de 1K) y +13.8 % (8K) en la decodificación en frío frente a la cola 1, y más rápida en 10 de 12 pares de variante y
+celda; las dos celdas en caliente más lentas proceden de una sola variante en la que la unidad leyó los mismos bytes a
+aproximadamente la mitad de su ritmo anterior. La misma cola sobre el manejador síncrono era entre un 7.5 y un 35 % más
+lenta que la cola 1. Con cola 1 las lecturas se emiten de una en una, como antes.
+
 **Prefetch de archivo en dos etapas (`dg_landing_blocks`, opcional).** En una apertura de tres niveles, una unidad de
 archivo predicha necesita normalmente un hueco libre en la GPU, algo raro cuando la VRAM es pequeña. Con
 `dg_landing_blocks = L` (y `dg_disk_queue > 1`) se reservan L bloques de aterrizaje en memoria fijada: una unidad de
