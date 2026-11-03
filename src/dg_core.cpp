@@ -835,6 +835,7 @@ void* DgCore::event() {
 // own (identical) value: the device table equals the mirror at every key after each upload.
 void DgCore::set_entry(uint32_t k, int32_t v) {
   table_[k] = v;
+  if (mut_ == kUnmarkedEntry) return;  // test-only: a write the next range upload would miss
   const uint32_t g = gated_of(k);
   mark_lo_[g] = std::min(mark_lo_[g], k);
   mark_hi_[g] = std::max(mark_hi_[g], k);
@@ -851,6 +852,7 @@ void DgCore::upload() {
   if (!range_uploads_) {  // no held layer: the whole table in one copy, as before
     t_->upload_table(table_.data(), keys_);
     clear_marks();
+    uploaded_valid_ = false;
     return;
   }
   uint32_t n = 0;
@@ -861,12 +863,21 @@ void DgCore::upload() {
       ++n;
     }
   t_->upload_table_ranges(table_.data(), ranges_.data(), n);
+  if (!uploaded_valid_) {  // the first range upload: taken as the device's copy (assumed: every write since the last
+                           // upload was marked; check() proves it from here on)
+    uploaded_ = table_;
+    uploaded_valid_ = true;
+  } else {
+    for (uint32_t i = 0; i < n; ++i)
+      std::copy_n(table_.begin() + ranges_[2 * i], ranges_[2 * i + 1], uploaded_.begin() + ranges_[2 * i]);
+  }
   clear_marks();
 }
 
 void DgCore::write_entry(DgTransport::Stream s, uint32_t k, int32_t v) {
   set_entry(k, v);
   t_->write_entry(s, k, v);
+  if (uploaded_valid_) uploaded_[k] = v;  // on the device too (the mark stays: the next upload rewrites the same value)
 }
 
 // Finished write-backs, in order: the key's home becomes its block and the slot is free; a discarded one (the key
@@ -2978,6 +2989,7 @@ void DgCore::reset_open() {
     apply_wb_defer();  // the open's scheduling mode (a runtime set_wb_defer may have changed it)
     std::copy(open_e_.begin(), open_e_.end(), e_.begin());
     reset_score();  // scored eviction's learning state, as winpf's: the open state (the profile's counts, if any)
+    uploaded_valid_ = false;  // the open's table goes up whole below (also when that upload fails)
     std::copy(open_table_.begin(), open_table_.end(), table_.begin());
     free_slots_ = open_free_slots_;
     free_blocks_ = open_free_blocks_;
@@ -3083,6 +3095,12 @@ void DgCore::check() const {
       if (all_events_[i] == ev) return int64_t(i);
     return -1;
   };
+  if (uploaded_valid_)  // range uploads: every entry the device does not hold yet is marked for the next upload
+    for (uint32_t k = 0; k < keys_; ++k)
+      if (table_[k] != uploaded_[k]) {
+        const uint32_t g = gated_of(k);
+        if (k < mark_lo_[g] || k > mark_hi_[g]) broken("a table entry changed without its mark");
+      }
   std::vector<uint8_t> land_used(c_.landing_blocks, 0);
   uint32_t listed = 0, dev = 0, hosts = 0, files = 0, backed = 0, hlisted = 0, lands = 0, landing_n = 0;
   for (uint32_t k = 0; k < keys_; ++k) {

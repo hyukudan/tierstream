@@ -319,13 +319,19 @@ class CudaTransport final : public DgTransport {
     sync(kDem);
   }
   // The same staging, only the ranges' entries (each range staged and copied on its own: the rest of the device table
-  // is never written, its readers unaffected).
+  // is never written, its readers unaffected). A copy that fails to enqueue first lets the ranges already enqueued
+  // finish: they read table_pin_, which the retry (the marks are kept) stages again.
   void upload_table_ranges(const int32_t* t, const uint32_t* ranges, uint32_t n) override {
-    for (uint32_t i = 0; i < n; ++i) {
-      const size_t first = ranges[2 * i], count = ranges[2 * i + 1];
-      std::memcpy(table_pin_ + first, t + first, count * 4);
-      ck(cudaMemcpyAsync(slot_of_ + first, table_pin_ + first, count * 4, cudaMemcpyHostToDevice, s_[kDem]),
-         "cudaMemcpyAsync (table range)");
+    try {
+      for (uint32_t i = 0; i < n; ++i) {
+        const size_t first = ranges[2 * i], count = ranges[2 * i + 1];
+        std::memcpy(table_pin_ + first, t + first, count * 4);
+        ck(cudaMemcpyAsync(slot_of_ + first, table_pin_ + first, count * 4, cudaMemcpyHostToDevice, s_[kDem]),
+           "cudaMemcpyAsync (table range)");
+      }
+    } catch (...) {
+      (void)cudaStreamSynchronize(s_[kDem]);
+      throw;
     }
     sync(kDem);
   }

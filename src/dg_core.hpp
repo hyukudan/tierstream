@@ -447,7 +447,7 @@ class DgCore {
   enum Mutation { kNoMutation = 0, kEntryBeforeCopy, kNoCover, kEarlyEventRecycle, kNoBankUnpublish,
                   kEarlySourceFree, kFreeResurrectedSlot, kEarlyWritebackBlock, kReevictPending,
                   kEarlyDeferredSlot, kRecordBeforeLastPart, kRevertKeepsEntry, kSeedNoPfSync,
-                  kIgnoreKeep, kStaleList, kNoUnionSave, kSkipRank, kStageNoWait };
+                  kIgnoreKeep, kStaleList, kNoUnionSave, kSkipRank, kStageNoWait, kUnmarkedEntry };
   void set_mutation(int m) {
     drain_pending();
     mut_ = m;
@@ -531,7 +531,10 @@ class DgCore {
   void set_clean_evict(bool on);
   // Changed-range table uploads (the held-layer overlap contract): on while some layer is held; off = the whole
   // table per upload, as before (one copy; the decode boundary's cost unchanged).
-  void set_range_uploads(bool on) { range_uploads_ = on; }
+  void set_range_uploads(bool on) {
+    range_uploads_ = on;
+    if (!on) uploaded_valid_ = false;
+  }
   bool clean_evict() const { return c_.clean_evict; }
   // Between tokens: dg_pf_revert_unused at runtime (from the next boundary on; reset_open restores the open's setting).
   void set_pf_revert(bool on);
@@ -771,6 +774,10 @@ class DgCore {
   bool range_uploads_ = false;
   std::vector<uint32_t> mark_lo_, mark_hi_;  // per gated layer: its changed keys since the last upload (lo > hi: none)
   std::vector<uint32_t> ranges_;             // upload's ranges (2 per gated layer, sized at construction)
+  // While range uploads run: the device table as last uploaded (or written by write_entry), so check() can prove that
+  // every entry that differs from it is marked (no table write bypasses set_entry); not kept otherwise.
+  std::vector<int32_t> uploaded_;
+  bool uploaded_valid_ = false;
   std::vector<int32_t> free_slots_, free_blocks_;
   std::deque<Writeback> wbs_;
   std::deque<Deferred> deferred_;
