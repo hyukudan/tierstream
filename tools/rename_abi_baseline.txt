@@ -219,3 +219,5 @@ ss.h-sha256 16eafd3349137e70a5b26718f186cace35e4e27fc1428bc5c410b8e01a9f560c
 ss.h-sha256 8727329f8a7c06a737efe01bd93e28684b66ca2d7312f2062ff44135ce26a515
 # bank keep at the middle (additive: dg_bank_keep accepts 2, appended SS_DG_BANK_KEEP_MID; comment)
 ss.h-sha256 5536549c4636372cdfc59d7aa687984f824a3081e16e61a6ba834febb0ad27e2
+# prediction admission default (comments only: DG_PF_LEGACY defaults to 0, the measured SS_DG_PF_ADMIT admission; 1 = the previous one)
+ss.h-sha256 45eb80b3063ac1f40eb00c20ebb903ddab1c1b890d7f51c26d7aaa419bed1090

@@ -55,10 +55,10 @@ struct DgLayout {
   // takes 0 / false / off or 1 / true / on): the ring first, then the pinned blocks on a helper thread while the
   // loader reads the residents
   bool load_overlap_alloc = false;
-  // DG_PF_LEGACY (0 / false / off or 1 / true / on, default on until the new admission is measured): the prediction
-  // admission before SS_DG_PF_ADMIT (no ahead skip of plain predictions, every prefetch read of a layer ended before
-  // its ready, a full read queue ending the oldest reads); DG_PF_LEGACY=0 selects the new admission
-  bool pf_legacy = true;
+  // DG_PF_LEGACY (0 / false / off or 1 / true / on, default off: the new admission, measured not slower): 1 = the
+  // prediction admission before SS_DG_PF_ADMIT (no ahead skip of plain predictions, every prefetch read of a layer
+  // ended before its ready, a full read queue ending the oldest reads)
+  bool pf_legacy = false;
   // DG_UNIT_SUBREAD_KIB: the sub-read size of one unit's in-place parts (dg_read_unit; 0 = one request per part)
   uint64_t unit_subread = 0;
   // Exactly what the context allocates, so admission bills what it allocates.

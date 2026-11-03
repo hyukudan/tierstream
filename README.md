@@ -257,8 +257,8 @@ used again moves to the head as usual).
 prefetch keeps reading in the background; a later read that needs its queue place or staging buffer, or the token's
 end, still waits for it); a full read queue ends demand reads before prefetch reads; and with `dg_pf_strict_admit = 1`
 a prefetch only uses free slots above the spare target, so demand misses always find theirs (`pf_strict_refused`).
-These three admission changes are measured before they become the default: until then `DG_PF_LEGACY` defaults to 1
-(the previous behaviour, exactly) and `DG_PF_LEGACY=0` selects them.
+These three admission changes are the default (measured with output identical and not slower); `DG_PF_LEGACY=1`
+restores the previous behaviour exactly.
 
 **Read queue for your drives (`SS_DG_DISK_QUEUE_AUTO`, opt-in).** Setting `dg_disk_queue = SS_DG_DISK_QUEUE_AUTO`
 picks the three-tier reads in flight from the read locations the gated sources are read from: `clamp(3 x L, 4, 8)`,

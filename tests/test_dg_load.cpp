@@ -1465,7 +1465,7 @@ TEST(dg_pf_legacy_env) {
   auto p = ss::plan_from_tiers(f.d, b, f.model.tiers(16));
   p.budget.host_pinned_bytes = uint64_t(1) << 32;
   set(nullptr);
-  CHECK(ss::dg_layout(f.d, p, o).pf_legacy);  // the previous admission by default until measured
+  CHECK(!ss::dg_layout(f.d, p, o).pf_legacy);  // the new admission by default (DG_PF_LEGACY=1: the previous one)
   for (const char* v : {"1", "true", "on"}) {
     set(v);
     CHECK(ss::dg_layout(f.d, p, o).pf_legacy);
