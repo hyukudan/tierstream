@@ -576,8 +576,106 @@ void DgBlockAlloc::finish(std::vector<void*>* out_chunks, std::vector<char*>* ou
   if (failed()) std::rethrow_exception(error_);
 }
 
+DgDepthCtl::DgDepthCtl(uint32_t bound) : DgDepthCtl(bound, Params{}) {}
+
+DgDepthCtl::DgDepthCtl(uint32_t bound, const Params& p) : p_(p), u_(std::max<uint32_t>(bound, 1)), depth_(u_) {
+  p_.min_reads = std::max<uint64_t>(p_.min_reads, 1);
+  backoff_ = p_.backoff_1;
+  calibrate(kStart);
+}
+
+void DgDepthCtl::set_depth(uint32_t d) {
+  if (d != depth_) ++changes;
+  depth_ = d;
+}
+
+// a calibration: four windows at U, 1, 1, U (phase 0..3)
+void DgDepthCtl::calibrate(Reason why) {
+  why_ = why;
+  phase_ = 0;
+  ++calibrations;
+  set_depth(u_);
+  win_reads_ = win_bytes_ = win_ns_ = 0;
+}
+
+void DgDepthCtl::decide() {
+  const double up_a = cal_[0], one_a = cal_[1], one_b = cal_[2], up_b = cal_[3];
+  const bool keep_a = up_a >= (1.0 + p_.bar) * one_a, keep_b = up_b >= (1.0 + p_.bar) * one_b;
+  Decision d;
+  d.seq = ++seq_;
+  d.reads = total_reads_;
+  d.from = depth_;
+  d.rate_u = (up_a + up_b) / 2;
+  d.rate_1 = (one_a + one_b) / 2;
+  if (keep_a != keep_b && !repeated_) {  // a split verdict: measured once more before choosing
+    repeated_ = true;
+    d.to = u_;
+    d.reason = kSplit;
+    if (ring_.size() == kRing) ring_.erase(ring_.begin());
+    ring_.push_back(d);
+    calibrate(kSplit);
+    --calibrations;  // (the same calibration, repeated)
+    return;
+  }
+  repeated_ = false;
+  const bool keep_u = keep_a && keep_b;
+  d.to = keep_u ? u_ : 1u;
+  d.reason = keep_u ? kKeepU : kKeep1;
+  if (ring_.size() == kRing) ring_.erase(ring_.begin());
+  ring_.push_back(d);
+  phase_ = 4;
+  drift_n_ = 0;
+  held_reads_ = 0;
+  held_rate_ = keep_u ? d.rate_u : d.rate_1;
+  if (keep_u) {
+    hold_for_ = p_.recheck_u;
+    backoff_ = p_.backoff_1;  // (U won: the back-off starts over)
+  } else {
+    hold_for_ = backoff_;
+    backoff_ = p_.backoff_max;
+  }
+  set_depth(keep_u ? u_ : 1u);
+}
+
+uint32_t DgDepthCtl::on_busy(uint64_t reads, uint64_t bytes, uint64_t ns) {
+  if (u_ <= 1 || reads == 0) return depth_;
+  total_reads_ += reads;
+  if (depth_ == 1) {
+    reads1 += reads;
+    bytes1 += bytes;
+    ns1 += ns;
+  } else {
+    readsu += reads;
+    bytesu += bytes;
+    nsu += ns;
+  }
+  win_reads_ += reads;
+  win_bytes_ += bytes;
+  win_ns_ += ns;
+  if (phase_ == 4) held_reads_ += reads;
+  if (win_reads_ < p_.min_reads) return depth_;
+  const double rate = win_ns_ ? double(win_bytes_) / double(win_ns_) : 0.0;
+  win_reads_ = win_bytes_ = win_ns_ = 0;
+  ++windows;
+  if (phase_ < 4) {  // calibration: the next window's depth
+    cal_[phase_++] = rate;
+    if (phase_ == 4) decide();
+    else set_depth(phase_ == 1 || phase_ == 2 ? 1u : u_);
+    return depth_;
+  }
+  // held: a re-check when due, or two windows in a row far from the held depth's calibrated rate
+  const bool far = held_rate_ > 0 && (rate > held_rate_ * (1 + p_.drift) || rate < held_rate_ * (1 - p_.drift));
+  drift_n_ = far ? drift_n_ + 1 : 0;
+  if (drift_n_ >= 2) calibrate(kDrift);
+  else if (held_reads_ >= hold_for_) calibrate(kRecheck);
+  return depth_;
+}
+
+std::vector<DgDepthCtl::Decision> DgDepthCtl::ring() const { return ring_; }
+
 DgReadPool::DgReadPool(uint32_t threads, uint32_t landing_cap, bool reserve)
-    : landing_cap_(std::max<uint32_t>(landing_cap, 1)), threads_n_(std::max<uint32_t>(threads, 1)), reserve_(reserve) {
+    : landing_cap_(std::max<uint32_t>(landing_cap, 1)), threads_n_(std::max<uint32_t>(threads, 1)), reserve_(reserve),
+      limit_(threads_n_) {
   try {
     for (uint32_t i = 0; i < threads_n_; ++i) threads_.emplace_back([this, i] { work(i); });
   } catch (...) {
@@ -608,13 +706,18 @@ void DgReadPool::work(uint32_t worker) {
     Job* j = nullptr;
     {
       std::unique_lock<std::mutex> lk(mu_);
-      cv_.wait(lk, [&] { return stop_ || !queue_.empty() || landing_ready(); });
+      cv_.wait(lk, [&] { return stop_ || demand_ready() || landing_ready(); });
       if (stop_) return;
-      std::deque<Job*>& q = queue_.empty() ? landing_ : queue_;  // a queued demand read first
+      std::deque<Job*>& q = demand_ready() ? queue_ : landing_;  // a queued demand read first
       j = q.front();
       q.pop_front();
       ++running_;
       if (j->landing) ++landing_running_;
+      if (ctl_ && !busy_) {  // dg_disk_queue_adapt: a busy period begins
+        busy_ = true;
+        busy_t0_ = std::chrono::steady_clock::now();
+        busy_reads_ = busy_bytes_ = 0;
+      }
       j->started = true;
       if (landing_ready()) cv_.notify_one();  // (the demand queue emptied: a yielded landing read may resume)
     }
@@ -630,7 +733,7 @@ void DgReadPool::work(uint32_t worker) {
       }
       const uint64_t ns = uint64_t(
           std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
-      bool more = false, landings = false;
+      bool more = false, landings = false, demands = false;
       {
         std::lock_guard<std::mutex> lk(mu_);
         j->ns += ns;
@@ -651,12 +754,24 @@ void DgReadPool::work(uint32_t worker) {
         if (!more) {
           --running_;
           if (j->landing) --landing_running_;
+          if (ctl_ && busy_ && j->done) {  // dg_disk_queue_adapt: measured; idle again ends the busy period
+            ++busy_reads_;
+            busy_bytes_ += j->bytes;
+            if (running_ == 0 && queue_.empty()) {
+              const uint64_t bns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - busy_t0_)
+                                                .count());
+              busy_ = false;
+              limit_ = std::min(std::max<uint32_t>(ctl_->on_busy(busy_reads_, busy_bytes_, bns), 1), threads_n_);
+            }
+          }
         }
         landings = !landing_.empty();
+        demands = demand_ready();
       }
       if (more) continue;
       done_cv_.notify_all();
-      if (landings) cv_.notify_one();  // (a landing read may start now)
+      if (landings || demands) cv_.notify_one();  // (a landing read, or a demand read held by the depth, may start)
       break;
     }
   }
@@ -678,10 +793,11 @@ void* DgReadPool::submit(std::function<void()> read) {
   return submit_indexed([read = std::move(read)](uint32_t) { read(); });
 }
 
-void* DgReadPool::submit_indexed(std::function<void(uint32_t)> read, bool landing) {
+void* DgReadPool::submit_indexed(std::function<void(uint32_t)> read, bool landing, uint64_t bytes) {
   auto j = std::make_unique<Job>();
   j->read = std::move(read);
   j->landing = landing;
+  j->bytes = bytes;
   return push(std::move(j));
 }
 
@@ -766,6 +882,16 @@ uint64_t DgReadPool::wait(void* handle, End* end) {
 bool DgReadPool::is_landing(void* handle) {
   std::lock_guard<std::mutex> lk(mu_);
   return static_cast<Job*>(handle)->landing;
+}
+
+void DgReadPool::set_adapt(std::unique_ptr<DgDepthCtl> ctl) {
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    ctl_ = std::move(ctl);
+    limit_ = ctl_ ? std::min(std::max<uint32_t>(ctl_->depth(), 1), threads_n_) : threads_n_;
+    busy_ = false;
+  }
+  cv_.notify_all();
 }
 
 DgReadPool::Counts DgReadPool::counts() {

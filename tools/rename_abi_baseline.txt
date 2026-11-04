@@ -215,3 +215,5 @@ ss.h-sha256 75ae91592334dccfae908d121645ef362b8ebdf063c8390f73a78355dfea9859
 ss.h-sha256 ecc37dc51444cfbb3c8ee603c40d92d230c3981009bee15a654348ac7babb8a2
 # bank-served file reads kept in RAM (additive: appended ss_options dg_bank_keep / reserved12, ss_dg_stats bank_kept, SS_DG_BANK_KEEP)
 ss.h-sha256 16eafd3349137e70a5b26718f186cace35e4e27fc1428bc5c410b8e01a9f560c
+# adaptive read depth (additive: appended ss_options dg_disk_queue_adapt / reserved13, ss_dg_stats disk_depth_active / disk_depth_adapt / disk_depth_changes / disk_depth_calibrations, SS_DG_DISK_QUEUE_ADAPT)
+ss.h-sha256 8727329f8a7c06a737efe01bd93e28684b66ca2d7312f2062ff44135ce26a515

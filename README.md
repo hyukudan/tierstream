@@ -269,6 +269,17 @@ Flash on one RTX PRO 6000 limited to 24 GiB of VRAM and 32 GiB of host RAM, one 
 5.45 tok/s at queue 1 -> 6.55 tok/s at queue 4 (+20 %), +26 % with speculative decoding; queue 16 = queue 4 (one
 drive saturates at 4).
 
+**Read depth that follows the drive (`dg_disk_queue_adapt`, opt-in, with AUTO).** More reads in flight usually help,
+but not always: in a drive's slow phase the same reads at queue 4 took 22 ms each against 5-8 ms one at a time, and
+decode was 32 % slower than at queue 1, while an hour later on the same drive queue 4 was 8 % faster. With
+`dg_disk_queue_adapt = 1` the AUTO readers stay allocated, but the pool runs demand reads either all at once or one at
+a time, whichever it measures faster: it compares the bytes per second of groups of at least 32 reads at both depths
+(U, 1, 1, U), keeps the higher depth only when both comparisons show it at least 3 % faster, checks again every 512
+reads (4096, then 8192, at depth 1) and at once when the rate moves by more than 25 %. The reads, their order and their
+bytes do not change, only how many run together. Not used with landing blocks or file prefetches. Reported in
+`ss_dg_stats.disk_depth_*` and in the stats JSON (`three_tier.disk_depth`, with the last 16 decisions). Details:
+[design §3.17](docs/design.md).
+
 **Reads in flight on one drive.** With `dg_disk_queue` above 1 and no stripe copies, the three-tier reads of a source
 now go through an overlapped file handle, so the readers really are in flight together on the drive (before, Windows
 ran them one at a time on the source's synchronous handle, and a deeper queue only added waiting). The same bytes are

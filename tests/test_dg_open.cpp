@@ -484,6 +484,35 @@ TEST(dg_no_admit_and_rounds_abi_cpu) {
   CHECK_EQ(int(ss_dg_round_seed_counts(nullptr, &u, &one, 1)), int(SS_E_INVALID));
 }
 
+// dg_disk_queue_adapt: 0 or 1, only with dg_disk_tier and dg_disk_queue = SS_DG_DISK_QUEUE_AUTO (an explicit depth
+// stays fixed); an older struct (without it) reads 0.
+TEST(dg_disk_queue_adapt_abi_cpu) {
+  DgModel m("open");
+  const char* needs = "dg_disk_queue_adapt needs dg_disk_tier = 1 and dg_disk_queue = SS_DG_DISK_QUEUE_AUTO";
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_disk_queue_adapt = 2; }), SS_E_INVALID,
+         "dg_disk_queue_adapt must be 0 or 1");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_disk_queue_adapt = 1; }), SS_E_INVALID, needs);
+  expect(try_open(m,
+                  [](B&, O& o, T&) {
+                    o.dg_disk_queue_adapt = 1;
+                    o.dg_disk_queue = SS_DG_DISK_QUEUE_AUTO;  // (no file tier)
+                  }),
+         SS_E_INVALID, needs);
+  expect(try_open(m,
+                  [](B&, O& o, T&) {
+                    o.dg_disk_queue_adapt = 1;
+                    o.dg_disk_tier = 1;
+                    o.dg_disk_queue = 4;  // an explicit depth
+                  }),
+         SS_E_INVALID, needs);
+  expect(try_open(m,
+                  [](B&, O& o, T&) {
+                    o.struct_size = uint32_t(offsetof(ss_options, dg_disk_queue_adapt));
+                    o.dg_disk_queue_adapt = 9;  // beyond an older caller's struct: never read
+                  }),
+         SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
 // dg_clean_evict: 0 or 1 (no effect without dg_disk_tier: accepted there too), appended after dg_no_admit's padding;
 // an older struct (without it) reads 0; the runtime setter on no context.
 TEST(dg_clean_evict_abi_cpu) {
@@ -597,11 +626,13 @@ TEST(dg_landing_abi_cpu) {
   static_assert(offsetof(ss_options, dg_landing_ttl) == offsetof(ss_options, dg_landing_max_queued) + 4, "appended");
   static_assert(offsetof(ss_options, dg_landing_chunk) == offsetof(ss_options, reserved10) + 4, "appended");
   static_assert(offsetof(ss_options, dg_bank_keep) == offsetof(ss_options, reserved11) + 4, "appended");
-  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved12) + 4, "the struct's end");
+  static_assert(offsetof(ss_options, dg_disk_queue_adapt) == offsetof(ss_options, reserved12) + 4, "appended");
+  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved13) + 4, "the struct's end");
   ss_options o;
   ss_options_defaults(&o);
   CHECK_EQ(o.dg_landing_blocks + o.dg_landing_max_queued + o.dg_landing_ttl + o.dg_landing_chunk, 0u);
   CHECK_EQ(o.dg_bank_keep, 0u);
+  CHECK_EQ(o.dg_disk_queue_adapt, 0u);
   expect(try_open(
              m,
              [&](B&, O& o, T& t) {
