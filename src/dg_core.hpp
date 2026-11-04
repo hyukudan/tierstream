@@ -196,7 +196,8 @@ struct DgConfig {
   // dg_bank_keep (three-tier only; no effect with no_admit): a demand file miss served through a bank slot is read
   // into a pinned block (a free one, else the least recently homed pinned unit's, dropped to its file) instead of a
   // staging buffer, and that block is its home when the bank releases it: a RAM unit at the recency head, not its file.
-  bool bank_keep = false;
+  // 2: the same, the kept unit entering the pinned recency list at its middle instead of its head.
+  uint32_t bank_keep = 0;
 };
 
 struct DgStats {
@@ -660,6 +661,8 @@ class DgCore {
     int32_t land = -1;          // Landing / Landed: its landing block (0 .. landing_blocks - 1)
     uint32_t land_age = 0;      // Landed: boundaries passed since it landed
     uint64_t keep_drop = 0;     // dg_bank_keep: tokens + 1 when dropped to its file for a kept read (0 = not)
+    bool keep_mid = false;      // dg_bank_keep 2: a kept read, homed at the middle of the pinned list at its release
+    bool hfront = false;        // three-tier: in the first half of the pinned recency list (hmid_ its last key)
   };
   struct Writeback {
     uint32_t key;
@@ -726,6 +729,8 @@ class DgCore {
   // the next staging buffer (waits for its last copy)
   void hpush(uint32_t k);
   void hpush_tail(uint32_t k);
+  void hpush_mid(uint32_t k);  // dg_bank_keep 2: after the first half of the pinned recency list (O(1): hmid_)
+  void hbalance();              // the first half's boundary after a push or an unlink (moves by one key at most)
   void hunlink(uint32_t k);
   void to_lower(uint32_t k, bool cold = false);  // cold: a pinned home goes to the recency tail (dropped first)
   // skip (make_resident): keys never dropped; count = false: not counted in disk_drops
@@ -773,6 +778,7 @@ class DgCore {
   std::vector<int32_t> open_table_, open_free_slots_, open_free_blocks_;
   uint32_t open_head_ = kNone, open_tail_ = kNone, open_on_device_ = 0;
   uint32_t open_hhead_ = kNone, open_htail_ = kNone, open_on_host_ = 0, open_on_file_ = 0;
+  uint32_t open_hmid_ = kNone, open_hfront_n_ = 0;
   DgWinpf open_wp_;
   double open_rate_gbps_ = 30;
   bool open_rate_set_ = false, reset_failed_ = false;
@@ -808,6 +814,8 @@ class DgCore {
   uint32_t head_ = kNone, tail_ = kNone, on_device_ = 0;
   // three-tier: the pinned homes' recency list (head = most recently homed), counts, the staging ring
   uint32_t hhead_ = kNone, htail_ = kNone, on_host_ = 0, on_file_ = 0, backed_ = 0;
+  // the pinned recency list's first half: on_host_ / 2 keys from the head (hfront), hmid_ the last of them (kNone: none)
+  uint32_t hmid_ = kNone, hfront_n_ = 0;
   std::vector<void*> stage_ev_;  // per staging buffer: its last copy's event (nullptr = unused yet)
   uint32_t stage_next_ = 0;
   // landings: the free landing blocks, the ones a promotion's copy may still read (free once its event completed), the

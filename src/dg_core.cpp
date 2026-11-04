@@ -120,6 +120,10 @@ void DgCore::hpush(uint32_t k) {
   if (hhead_ != kNone) e_[hhead_].hprev = k; else htail_ = k;
   hhead_ = k;
   x.in_hlist = true;
+  x.hfront = true;  // (ahead of every key: the first half grows by it)
+  ++hfront_n_;
+  if (hmid_ == kNone) hmid_ = k;
+  hbalance();
 }
 
 void DgCore::hpush_tail(uint32_t k) {  // the least recently homed pinned key (dropped to its file first)
@@ -131,6 +135,41 @@ void DgCore::hpush_tail(uint32_t k) {  // the least recently homed pinned key (d
   if (htail_ != kNone) e_[htail_].hnext = k; else hhead_ = k;
   htail_ = k;
   x.in_hlist = true;
+  x.hfront = false;
+  hbalance();
+}
+
+// dg_bank_keep 2: a kept read enters the pinned recency list right after its first half (behind on_host_ / 2 keys): a
+// one-off read no longer displaces the units most recently homed, and a unit used again goes to the head as any.
+void DgCore::hpush_mid(uint32_t k) {
+  if (!c_.disk_tier) {
+    hpush(k);
+    return;
+  }
+  ++on_host_;
+  Entry& x = e_[k];
+  x.hprev = hmid_;
+  x.hnext = hmid_ == kNone ? hhead_ : e_[hmid_].hnext;
+  if (x.hnext != kNone) e_[x.hnext].hprev = k; else htail_ = k;
+  if (hmid_ != kNone) e_[hmid_].hnext = k; else hhead_ = k;
+  x.in_hlist = true;
+  x.hfront = false;
+  hbalance();
+}
+
+// The first half holds on_host_ / 2 keys: each push or unlink changes it by one key at most.
+void DgCore::hbalance() {
+  const uint32_t want = on_host_ / 2;
+  while (hfront_n_ > want) {
+    e_[hmid_].hfront = false;
+    hmid_ = e_[hmid_].hprev;
+    --hfront_n_;
+  }
+  while (hfront_n_ < want) {
+    hmid_ = hmid_ == kNone ? hhead_ : e_[hmid_].hnext;
+    e_[hmid_].hfront = true;
+    ++hfront_n_;
+  }
 }
 
 void DgCore::hunlink(uint32_t k) {
@@ -138,10 +177,16 @@ void DgCore::hunlink(uint32_t k) {
   if (!c_.disk_tier) return;
   Entry& x = e_[k];
   if (!x.in_hlist) broken("a pinned home outside the recency list");
+  if (x.hfront) {
+    --hfront_n_;
+    if (hmid_ == k) hmid_ = x.hprev;
+    x.hfront = false;
+  }
   if (x.hprev != kNone) e_[x.hprev].hnext = x.hnext; else hhead_ = x.hnext;
   if (x.hnext != kNone) e_[x.hnext].hprev = x.hprev; else htail_ = x.hprev;
   x.hprev = x.hnext = kNone;
   x.in_hlist = false;
+  hbalance();
 }
 
 std::vector<uint32_t> DgCore::host_order() const {
@@ -162,7 +207,9 @@ void DgCore::to_lower(uint32_t k, bool cold) {
   if (x.block >= 0) {
     x.home = Home::Host;
     if (cold) hpush_tail(k);
+    else if (x.keep_mid) hpush_mid(k);
     else hpush(k);
+    x.keep_mid = false;
   } else {
     if (!c_.disk_tier) broken("a key without a block left the device without a write-back");
     x.home = Home::File;
@@ -269,6 +316,7 @@ void DgCore::undo_pending(const Pending& p) {
     if (x.block >= 0) {  // dg_bank_keep: its block was read into, never a home: free again
       free_blocks_.push_back(x.block);
       x.block = -1;
+      x.keep_mid = false;
       --st_.bank_kept;
     }
   } else {
@@ -761,7 +809,8 @@ void DgCore::place(const std::vector<uint32_t>& residents, const std::vector<uin
   }
   int32_t next_block = 0;
   on_host_ = on_file_ = backed_ = 0;
-  hhead_ = htail_ = kNone;
+  hhead_ = htail_ = hmid_ = kNone;
+  hfront_n_ = 0;
   for (uint32_t k = 0; k < keys_; ++k) {
     Entry& x = e_[k];
     x = Entry{};
@@ -798,6 +847,8 @@ void DgCore::place(const std::vector<uint32_t>& residents, const std::vector<uin
   open_on_device_ = on_device_;
   open_hhead_ = hhead_;
   open_htail_ = htail_;
+  open_hmid_ = hmid_;
+  open_hfront_n_ = hfront_n_;
   open_on_host_ = on_host_;
   open_on_file_ = on_file_;
   open_wp_ = wp_;
@@ -1248,6 +1299,7 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
     }
     if (uint32_t(stage) < c_.blocks) {  // dg_bank_keep: the block is the unit's; to_lower makes it its RAM home
       x.block = stage;
+      x.keep_mid = c_.bank_keep == 2;
       ++st_.bank_kept;
     }
     if (!pending_.empty()) ++st_.disk_overlapped;
@@ -2881,11 +2933,11 @@ bool DgCore::same_open_state(const DgCore& b) const {
   auto entry = [](const Entry& x) {
     return std::tie(x.home, x.slot, x.block, x.prev, x.next, x.in_list, x.wb_pending, x.via_prefetch, x.used,
                     x.pf_kind, x.pf_late, x.pf_bucket, x.demand_epoch, x.lru_stamp, x.backed, x.in_hlist, x.hprev,
-                    x.hnext, x.land, x.land_age);
+                    x.hnext, x.land, x.land_age, x.hfront, x.keep_mid);
   };
   if (cfg(c_) != cfg(b.c_) || wp(wp_) != wp(b.wp_) || e_.size() != b.e_.size()) return false;
-  if (std::tie(hhead_, htail_, on_host_, on_file_, backed_) !=
-      std::tie(b.hhead_, b.htail_, b.on_host_, b.on_file_, b.backed_))
+  if (std::tie(hhead_, htail_, hmid_, hfront_n_, on_host_, on_file_, backed_) !=
+      std::tie(b.hhead_, b.htail_, b.hmid_, b.hfront_n_, b.on_host_, b.on_file_, b.backed_))
     return false;
   for (size_t k = 0; k < e_.size(); ++k)
     if (entry(e_[k]) != entry(b.e_[k])) return false;
@@ -3031,6 +3083,8 @@ void DgCore::reset_open() {
     on_device_ = open_on_device_;
     hhead_ = open_hhead_;
     htail_ = open_htail_;
+    hmid_ = open_hmid_;
+    hfront_n_ = open_hfront_n_;
     on_host_ = open_on_host_;
     on_file_ = open_on_file_;
     backed_ = 0;
@@ -3142,6 +3196,7 @@ void DgCore::check() const {
     if ((x.land >= 0) != (x.home == Home::Landing || x.home == Home::Landed)) broken("a landing block outside a landing");
     if (x.in_hlist != (c_.disk_tier && x.home == Home::Host)) broken("the pinned recency list != the pinned homes");
     hlisted += x.in_hlist ? 1u : 0u;
+    if (x.hfront && !x.in_hlist) broken("a first-half mark outside the pinned recency list");
     switch (x.home) {
       case Home::Host:
         take(block_used, x.block, "host block");
@@ -3303,12 +3358,18 @@ void DgCore::check() const {
   if (hosts != on_host_ || files != on_file_ || backed != backed_ || backed_ > c_.inclusive)
     broken("pinned / file / clean-copy counts");
   if (c_.disk_tier) {  // the pinned recency list: every Host key once, links consistent
-    uint32_t n = 0, prev = kNone;
+    uint32_t n = 0, prev = kNone, front = 0, last_front = kNone;
     for (uint32_t k = hhead_; k != kNone; k = e_[k].hnext) {
       if (++n > keys_ || e_[k].home != Home::Host || e_[k].hprev != prev) broken("the pinned recency list");
+      if (e_[k].hfront) {
+        if (front != n - 1) broken("the pinned list's first half is not a prefix");
+        ++front;
+        last_front = k;
+      }
       prev = k;
     }
     if (n != hlisted || prev != htail_) broken("the pinned recency list's length / tail");
+    if (front != hfront_n_ || front != on_host_ / 2 || last_front != hmid_) broken("the pinned list's half boundary");
   }
   if (c_.scored) {  // stamps strictly decrease from the head; every row sum / ring count equals its recount
     uint64_t last = UINT64_MAX;

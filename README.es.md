@@ -278,7 +278,9 @@ corta. Una unidad que vivía en su archivo volvía después a su archivo, de mod
 disco, aunque estuviera caliente. Con `dg_bank_keep = 1` la lectura va a un bloque de RAM fijado en lugar de a un búfer
 de staging (uno libre o, si no lo hay, el de la unidad de RAM alojada hace más tiempo), y la unidad se queda en RAM como
 la alojada más recientemente. Mismos bytes, misma comprobación de hash y misma copia; sin memoria adicional. Se contabiliza en
-`ss_dg_stats.bank_kept`. No tiene efecto sin `dg_disk_tier` ni con `dg_no_admit`.
+`ss_dg_stats.bank_kept`. No tiene efecto sin `dg_disk_tier` ni con `dg_no_admit`. `dg_bank_keep = 2` inserta la unidad
+conservada en el centro del orden de recencia de la RAM en lugar de en su cabeza, de modo que una unidad leída una sola vez
+ya no expulsa a las unidades usadas más recientemente (una unidad que se vuelve a usar pasa a la cabeza como de costumbre).
 
 **Profundidad de lectura que sigue a la unidad (`dg_disk_queue_adapt`, opcional, con AUTO).** Más lecturas en vuelo
 suelen ayudar, pero no siempre: en una fase lenta de una unidad, las mismas lecturas con cola 4 tardaron 22 ms cada una

@@ -424,7 +424,9 @@ typedef struct ss_options {
    * of the pinned recency list (as a pinned unit's bank serve), instead of its file. The same bytes, hash check and
    * copy; no new memory (the existing pinned blocks). With no block free and no pinned unit to drop, a staging buffer as
    * before. Counter: ss_dg_stats.bank_kept. 0 (default) = as before. No effect without dg_disk_tier or with
-   * dg_no_admit (its homes never change). */
+   * dg_no_admit (its homes never change). 2 (SS_DG_BANK_KEEP_MID below) = the same, but the kept unit enters the pinned
+   * recency list after its first half instead of at its head: a unit read once no longer displaces the units most
+   * recently homed (a unit used again moves to the head as any pinned unit does). */
   uint32_t dg_bank_keep;
   uint32_t reserved12; /* explicit padding (never read) */
   /* appended, adaptive read depth (SS_DG_DISK_QUEUE_ADAPT below): 1 = with dg_disk_queue = SS_DG_DISK_QUEUE_AUTO, the
@@ -1833,6 +1835,8 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
 /* Adaptive read depth: ss_options.dg_disk_queue_adapt and ss_dg_stats.disk_depth_* exist. Opt-in, I/O scheduling
  * only: how many reads run at once, never which reads, their order or bytes. */
 #define SS_DG_DISK_QUEUE_ADAPT 1
+/* ss_options.dg_bank_keep = 2 is accepted (kept units inserted at the middle of the pinned recency list). */
+#define SS_DG_BANK_KEEP_MID 1
 
 #ifdef __cplusplus
 }

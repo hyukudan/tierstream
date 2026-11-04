@@ -1504,7 +1504,7 @@ class CudaDgCtx final : public DgCtx {
           {"disk_max_in_flight", s.disk_max_in_flight}, {"unit_subread_bytes", x_.unit_subread},
           {"clean_drops", s.clean_drops}, {"clean_drop_bytes", s.clean_drop_bytes},
           {"clean_evict", uint64_t(core_->clean_evict())},
-          {"bank_kept", s.bank_kept}, {"bank_keep", uint64_t(o_.dg_bank_keep != 0)},
+          {"bank_kept", s.bank_kept}, {"bank_keep", uint64_t(o_.dg_bank_keep)},
           {"bank_keep_drops", s.bank_keep_drops}, {"bank_keep_rereads", s.bank_keep_rereads},
           {"disk_queue", uint64_t(x_.disk_queue)},
           {"disk_queue_resolved", uint64_t(x_.disk_queue)}, {"disk_locations", uint64_t(x_.disk_locations)},
@@ -1861,7 +1861,7 @@ class CudaDgCtx final : public DgCtx {
     c.disk_queue = x_.disk_queue;
     c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
     c.clean_evict = o_.dg_clean_evict != 0;  // (no effect without dg_disk_tier)
-    c.bank_keep = o_.dg_bank_keep != 0;  // (no effect without dg_disk_tier or with dg_no_admit)
+    c.bank_keep = o_.dg_bank_keep;  // (0..2, dg_layout; no effect without dg_disk_tier or with dg_no_admit)
     c.pf_revert = o_.dg_pf_revert_unused != 0;
     c.pf_strict = o_.dg_pf_strict_admit != 0;
     c.pf_legacy = x_.pf_legacy;  // DG_PF_LEGACY
