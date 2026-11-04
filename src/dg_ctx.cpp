@@ -237,6 +237,7 @@ class CudaTransport final : public DgTransport {
   // the pool on worker i with reader 1 + i's bounce buffer
   std::function<std::function<uint64_t(uint32_t)>(uint32_t, char*, uint64_t*)> landing_steps;
   std::unique_ptr<DgReadPool> pool;
+  uint64_t unit_bytes = 0;  // (dg_disk_queue_adapt: a demand read's bytes, for the pool's throughput)
   void read_unit(uint32_t key, int32_t block) override {
     if (!reader) DgTransport::read_unit(key, block);
     reader(key, host_block(block));
@@ -245,7 +246,8 @@ class CudaTransport final : public DgTransport {
     if (!pool) return DgTransport::read_unit_begin(key, block);
     if (!reader) DgTransport::read_unit(key, block);
     char* dst = host_block(block);
-    return pool->submit_indexed([this, key, dst](uint32_t worker) { pool_reader(worker + 1, key, dst); });
+    return pool->submit_indexed([this, key, dst](uint32_t worker) { pool_reader(worker + 1, key, dst); }, false,
+                                unit_bytes);
   }
   uint64_t read_unit_end(void* handle) override { return pool ? pool->wait(handle) : 0; }
   bool read_unit_done(void* handle) override { return !pool || pool->done(handle); }
@@ -637,6 +639,7 @@ class CudaDgCtx final : public DgCtx {
       require(seq_ ? state == DgService::kServed : state == DgService::kIdle,
               SS_E_BACKEND, "ss_dg_reset_open: service does not have terminal ownership");
       core_->reset_open();
+      arm_adapt();  // (dg_disk_queue_adapt: a fresh calibration; the pool is idle, every read drained)
       steps_.reset();
       core_->set_range_uploads(steps_.any_held());
       svc_->invalidate_timeline();
@@ -1052,6 +1055,14 @@ class CudaDgCtx final : public DgCtx {
     out->bank_kept = a.bank_kept;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     out->disk_queue_resolved = x_.disk_queue;  // (properties of the open: SS_DG_DISK_QUEUE_AUTO resolved, dg_layout)
+    out->disk_depth_adapt = adapt_;  // dg_disk_queue_adapt (since open / reset_open)
+    out->disk_depth_active = x_.disk_tier ? x_.disk_queue : 0;
+    if (adapt_ == 1)
+      transport_->pool->adapt([&](const DgDepthCtl* c) {
+        out->disk_depth_active = c->depth();
+        out->disk_depth_changes = c->changes;
+        out->disk_depth_calibrations = c->calibrations;
+      });
     out->disk_locations = x_.disk_locations;
     // the device's wait timeouts since open, live (a timed-out token is never folded: it poisons the context)
     out->device_timeouts = m_.err_count ? dg_load_acquire(m_.err_count) : 0;
@@ -1499,6 +1510,35 @@ class CudaDgCtx final : public DgCtx {
           {"disk_queue_resolved", uint64_t(x_.disk_queue)}, {"disk_locations", uint64_t(x_.disk_locations)},
           {"disk_units_open", uint64_t(x_.F)}, {"staging", uint64_t(x_.S)}, {"inclusive_blocks", uint64_t(x_.I)}};
       for (const auto& f : tf) tt[f.first] = Json::number(f.second);
+      // dg_disk_queue_adapt (properties of the open's controller since open / reset_open, never reset by stats_reset)
+      tt["disk_queue_adapt"] = Json::string(adapt_ == 1 ? "on" : adapt_ == 2 ? std::string("declined: ") + adapt_why_
+                                                                              : "off");
+      if (adapt_ == 1) {
+        transport_->pool->adapt([&](const DgDepthCtl* c) {
+          Json a = Json::object();
+          const std::pair<const char*, uint64_t> af[] = {
+              {"depth", c->depth()}, {"bound", c->bound()}, {"calibrating", c->calibrating() ? 1u : 0u},
+              {"changes", c->changes}, {"calibrations", c->calibrations}, {"windows", c->windows},
+              {"decisions", c->decisions()}, {"reads_1", c->reads1}, {"bytes_1", c->bytes1}, {"busy_ns_1", c->ns1},
+              {"reads_u", c->readsu}, {"bytes_u", c->bytesu}, {"busy_ns_u", c->nsu}};
+          for (const auto& f : af) a[f.first] = Json::number(f.second);
+          static const char* const why[] = {"start", "keep_u", "keep_1", "split", "recheck", "drift"};
+          Json ring = Json::array();
+          for (const DgDepthCtl::Decision& d : c->ring()) {
+            Json e = Json::object();
+            e["seq"] = Json::number(d.seq);
+            e["reads"] = Json::number(d.reads);
+            e["from"] = Json::number(uint64_t(d.from));
+            e["to"] = Json::number(uint64_t(d.to));
+            e["gbps_u"] = Json::number(d.rate_u);  // (bytes / ns = GB/s)
+            e["gbps_1"] = Json::number(d.rate_1);
+            e["reason"] = Json::string(why[d.reason]);
+            ring.push(e);
+          }
+          a["ring"] = ring;
+          tt["disk_depth"] = a;
+        });
+      }
       g["three_tier"] = tt;
     }
     j["device_gated"] = g;
@@ -1853,6 +1893,16 @@ class CudaDgCtx final : public DgCtx {
       // (no chunks, dg_landing_chunk 0xFFFFFFFF: the scheduler before, no reader reserved for demand reads)
       if (x_.disk_queue > 1)
         transport_->pool = std::make_unique<DgReadPool>(x_.disk_queue, x_.landing_queued, x_.landing_chunk != 0);
+      transport_->unit_bytes = x_.unit_bytes;
+      // dg_disk_queue_adapt (AUTO only, dg_layout): demand-only reads over a pool of more than one reader
+      if (o_.dg_disk_queue_adapt) {
+        adapt_ = 2;
+        if (!transport_->pool) adapt_why_ = "one reader";
+        else if (x_.L) adapt_why_ = "landing blocks";
+        else if (x_.disk_prefetch) adapt_why_ = "file prefetches";
+        else adapt_ = 1;
+      }
+      arm_adapt();
     }
     core_ = std::make_unique<DgCore>(c, transport_.get());
     // design rev 3.4 §11.7: the seed (validated, duplicates skipped), then the plan's residents, then key order; place()
@@ -2084,6 +2134,12 @@ class CudaDgCtx final : public DgCtx {
   std::vector<char*> blocks_;
   std::unique_ptr<CudaTransport> transport_;
   std::unique_ptr<DgCore> core_;
+  // dg_disk_queue_adapt: 0 off, 1 adapting (the pool's controller), 2 declined (adapt_why_)
+  uint32_t adapt_ = 0;
+  const char* adapt_why_ = "";
+  void arm_adapt() {
+    if (adapt_ == 1) transport_->pool->set_adapt(std::make_unique<DgDepthCtl>(x_.disk_queue));
+  }
   std::unique_ptr<DgService> svc_;
   DgSteps steps_;  // keeps, held resident sets, the exported layers, the export flags' expected values
   // dg_diag: the last token's per-layer device timings (-1 = not measured)

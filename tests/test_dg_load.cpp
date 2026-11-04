@@ -285,6 +285,181 @@ TEST(dg_read_pool_overlaps_and_rethrows) {
   for (int i = 0; i < 6; ++i) left.submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(3)); });
 }
 
+// dg_disk_queue_adapt's controller on synthetic measurements (no clock): `feed` gives busy periods of `reads` reads of
+// 1 MB at the current depth's GB/s (u_gbps at depth U, one_gbps at 1) until `n` reads were fed.
+namespace {
+struct Curve {
+  double u_gbps, one_gbps;
+};
+void feed(ts::DgDepthCtl& c, const Curve& k, uint64_t n, uint64_t reads = 8) {
+  for (uint64_t done = 0; done < n; done += reads) {
+    const double g = c.depth() == 1 ? k.one_gbps : k.u_gbps;
+    const uint64_t bytes = reads * 1000000ull;
+    c.on_busy(reads, bytes, uint64_t(double(bytes) / g));
+  }
+}
+}  // namespace
+
+TEST(dg_depth_ctl_endpoints) {
+  using C = ts::DgDepthCtl;
+  {  // depth helps (N5-like, +8 %): U kept; re-checked after 512 reads at U, kept again
+    C c(4);
+    CHECK_EQ(c.depth(), 4u);
+    CHECK(c.calibrating());
+    feed(c, {2.4, 2.2}, 128);  // four 32-read windows: U, 1, 1, U
+    CHECK(!c.calibrating());
+    CHECK_EQ(c.depth(), 4u);
+    CHECK_EQ(c.decisions(), 1u);
+    CHECK(c.ring().back().reason == C::kKeepU);
+    CHECK_EQ(c.reads1, 64u);
+    CHECK_EQ(c.readsu, 64u);
+    feed(c, {2.4, 2.2}, 512);
+    CHECK(c.calibrating());  // the re-check
+    CHECK_EQ(c.calibrations, 2u);
+    feed(c, {2.4, 2.2}, 128);
+    CHECK_EQ(c.depth(), 4u);
+  }
+  {  // depth hurts (N4-like slow phase): depth 1, probed again after 4096 reads, then after 8192
+    C c(4);
+    feed(c, {1.15, 2.07}, 128);
+    CHECK_EQ(c.depth(), 1u);
+    CHECK(c.ring().back().reason == C::kKeep1);
+    feed(c, {1.15, 2.07}, 4064);
+    CHECK(!c.calibrating());
+    feed(c, {1.15, 2.07}, 32);
+    CHECK(c.calibrating());
+    CHECK_EQ(c.depth(), 4u);  // the probe's first window
+    feed(c, {1.15, 2.07}, 128);
+    CHECK_EQ(c.depth(), 1u);
+    feed(c, {1.15, 2.07}, 8160);
+    CHECK(!c.calibrating());
+    feed(c, {1.15, 2.07}, 32);
+    CHECK(c.calibrating());
+  }
+  {  // a tie (U 1 % faster: under the 3 % bar) keeps depth 1
+    C c(6);
+    feed(c, {2.02, 2.0}, 128);
+    CHECK_EQ(c.depth(), 1u);
+  }
+  {  // regime change while held at U: two windows 50 % slower recalibrate at once, and depth 1 wins
+    C c(4);
+    feed(c, {2.4, 2.2}, 128);
+    CHECK_EQ(c.depth(), 4u);
+    feed(c, {1.2, 2.2}, 64);
+    CHECK(c.calibrating());
+    CHECK_EQ(c.calibrations, 2u);
+    feed(c, {1.2, 2.2}, 128);
+    CHECK_EQ(c.depth(), 1u);
+  }
+  {  // one far window is not a drift
+    C c(4);
+    feed(c, {2.4, 2.2}, 128);
+    feed(c, {1.2, 2.2}, 32);
+    feed(c, {2.4, 2.2}, 32);
+    CHECK(!c.calibrating());
+  }
+  {  // windows sum busy periods: 31 reads are no window, the 32nd closes it
+    C c(4);
+    c.on_busy(31, 31000000, 15500000);
+    CHECK_EQ(c.windows, 0u);
+    CHECK_EQ(c.depth(), 4u);
+    c.on_busy(1, 1000000, 500000);
+    CHECK_EQ(c.windows, 1u);
+    CHECK_EQ(c.depth(), 1u);
+    c.on_busy(0, 0, 1000);  // (no read: no evidence)
+    CHECK_EQ(c.windows, 1u);
+  }
+  {  // one reader: nothing to adapt
+    C c(1);
+    feed(c, {1.0, 2.0}, 256);
+    CHECK_EQ(c.depth(), 1u);
+    CHECK_EQ(c.decisions(), 0u);
+  }
+}
+
+// A split verdict (the two brackets disagree: the rate drifted inside the calibration) is measured once more; a second
+// split chooses depth 1. The ring keeps the last 16 decisions in order.
+TEST(dg_depth_ctl_split_and_ring) {
+  using C = ts::DgDepthCtl;
+  C c(4);
+  auto window = [&](double gbps) { c.on_busy(32, 32000000, uint64_t(32000000 / gbps)); };
+  window(2.4);  // U
+  window(2.0);  // 1
+  window(2.0);  // 1
+  window(1.9);  // U: the second bracket says 1
+  CHECK(c.calibrating());
+  CHECK(c.ring().back().reason == C::kSplit);
+  CHECK_EQ(c.calibrations, 1u);
+  window(2.4);
+  window(2.0);
+  window(2.0);
+  window(1.9);  // split again: depth 1
+  CHECK(!c.calibrating());
+  CHECK_EQ(c.depth(), 1u);
+  CHECK(c.ring().back().reason == C::kKeep1);
+  for (int i = 0; i < 20; ++i) feed(c, {1.0, 2.0}, 8192 + 128);  // more decisions than the ring holds
+  const auto r = c.ring();
+  CHECK_EQ(r.size(), C::kRing);
+  CHECK_EQ(r.back().seq, c.decisions());
+  for (size_t i = 1; i < r.size(); ++i) CHECK_EQ(r[i].seq, r[i - 1].seq + 1);
+}
+
+// The pool under dg_disk_queue_adapt: at depth 1 one demand read runs at a time (every read still runs once, in
+// submission order), at U several; the depth changes only between busy periods, from the pool's own measurements.
+TEST(dg_read_pool_adapt_limits_dispatch) {
+  ts::DgDepthCtl::Params p;
+  p.min_reads = 1;  // every busy period is a window
+  auto ctl = std::make_unique<ts::DgDepthCtl>(4, p);
+  ctl->on_busy(1, 1000, 1000);  // window 0 (U) measured: the calibration's next windows run at depth 1
+  CHECK_EQ(ctl->depth(), 1u);
+  ts::DgReadPool pool(4);
+  pool.set_adapt(std::move(ctl));
+  std::atomic<int> running{0}, most{0};
+  std::mutex order_mu;
+  std::vector<int> order;
+  auto batch = [&](int n, int base) {  // one busy period: every read waits until all are queued
+    std::atomic<bool> go{false};
+    std::vector<void*> h;
+    for (int i = 0; i < n; ++i)
+      h.push_back(pool.submit_indexed(
+          [&, i, base](uint32_t) {
+            const int now = ++running;
+            int m = most.load();
+            while (now > m && !most.compare_exchange_weak(m, now)) {
+            }
+            while (!go.load()) std::this_thread::yield();
+            for (int k = 0; k < 200 && running.load() < 2 && i == 0; ++k)  // (at U: the others start beside it)
+              std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            {
+              std::lock_guard<std::mutex> lk(order_mu);
+              order.push_back(base + i);
+            }
+            --running;
+          },
+          false, 1000));
+    go = true;
+    for (void* x : h) pool.wait(x);
+  };
+  batch(8, 0);  // window 1 (depth 1)
+  CHECK_EQ(most.load(), 1);
+  for (int i = 0; i < 8; ++i) CHECK_EQ(order[size_t(i)], i);  // one at a time: in submission order
+  int depth = 0;
+  pool.adapt([&](const ts::DgDepthCtl* c) { depth = int(c->depth()); });
+  CHECK_EQ(depth, 1);  // window 2 runs at 1 too
+  batch(8, 8);
+  CHECK_EQ(most.load(), 1);
+  pool.adapt([&](const ts::DgDepthCtl* c) { depth = int(c->depth()); });
+  CHECK_EQ(depth, 4);  // window 3: U
+  most = 0;
+  batch(8, 16);
+  CHECK(most.load() > 1);
+  CHECK_EQ(order.size(), size_t(24));
+  uint64_t reads = 0;
+  pool.adapt([&](const ts::DgDepthCtl* c) { reads = c->reads1 + c->readsu; });
+  CHECK_EQ(reads, 24u + 1u);
+  pool.set_adapt(nullptr);  // off: every thread again
+}
+
 // Landing reads (dg_landing_blocks) wait in the pool's second queue: a queued demand read starts before every queued
 // landing read, whatever the submission order; landing reads start only while fewer than the cap landing reads run and
 // a reader stays free of them; a wait for a landing read still queued starts it as a demand (the cap no longer holds it
@@ -1102,7 +1277,11 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK_EQ(offsetof(ss_dg_stats, landing_yields), offsetof(ss_dg_stats, landing_skipped_passed) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, landing_aborted_bytes), offsetof(ss_dg_stats, landing_yields) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, bank_kept), offsetof(ss_dg_stats, landing_aborted_bytes) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, bank_kept) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, disk_depth_active), offsetof(ss_dg_stats, bank_kept) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, disk_depth_adapt), offsetof(ss_dg_stats, disk_depth_active) + 4);
+  CHECK_EQ(offsetof(ss_dg_stats, disk_depth_changes), offsetof(ss_dg_stats, disk_depth_adapt) + 4);
+  CHECK_EQ(offsetof(ss_dg_stats, disk_depth_calibrations), offsetof(ss_dg_stats, disk_depth_changes) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, disk_depth_calibrations) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

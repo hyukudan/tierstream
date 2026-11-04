@@ -148,6 +148,62 @@ uint64_t dg_read_unit_chunk(const Desc& d, const std::vector<std::unique_ptr<Sou
                             void* bounce, uint64_t bounce_bytes, uint64_t* digest, DgLoadStats* stats = nullptr,
                             uint64_t subread = 0);
 
+// dg_disk_queue_adapt: the read depth an AUTO pool dispatches at, 1 or its bound U (the readers stay allocated and
+// billed at U), chosen from measured read throughput. Fed one busy period at a time (the pool from idle to idle: in
+// demand-only operation a layer's demand reads): its reads, bytes and elapsed ns at the current depth. Busy periods
+// are summed into windows of at least min_reads reads; a window's rate = bytes / ns. Calibration runs four windows at
+// U, 1, 1, U: the higher depth is kept only when both brackets (window 0 vs 1, 3 vs 2) show it at least `bar` faster,
+// else depth 1 (a split verdict repeats the calibration once, then depth 1). Held at U, it recalibrates after
+// recheck_u reads; held at 1, after backoff_1 reads, then backoff_max reads while U keeps losing. While held, two
+// windows in a row whose rate is more than `drift` away from the held depth's calibrated rate recalibrate at once.
+// Pure: no clock, no thread (the pool supplies the measurements); exactness never depends on it (only how many reads
+// run at once changes).
+class DgDepthCtl {
+ public:
+  struct Params {
+    uint64_t min_reads = 32, recheck_u = 512, backoff_1 = 4096, backoff_max = 8192;
+    double bar = 0.03, drift = 0.25;
+  };
+  enum Reason : uint8_t { kStart = 0, kKeepU, kKeep1, kSplit, kRecheck, kDrift };
+  struct Decision {  // a calibration's verdict (the decision ring)
+    uint64_t seq = 0, reads = 0;  // decision number, the reads completed before it
+    uint32_t from = 0, to = 0;    // depth before, after
+    double rate_u = 0, rate_1 = 0;  // the calibration's mean window rates (bytes / ns)
+    Reason reason = kStart;
+  };
+  static constexpr size_t kRing = 16;
+  explicit DgDepthCtl(uint32_t bound);
+  DgDepthCtl(uint32_t bound, const Params& p);
+  uint32_t depth() const { return depth_; }
+  uint32_t bound() const { return u_; }
+  // a busy period at depth() ended: its reads, bytes, elapsed ns; returns the depth for the next one
+  uint32_t on_busy(uint64_t reads, uint64_t bytes, uint64_t ns);
+  bool calibrating() const { return phase_ < 4; }
+  // counters: depth changes, calibrations begun, windows measured, reads / bytes / busy ns at depth 1 and at U
+  uint64_t changes = 0, calibrations = 0, windows = 0;
+  uint64_t reads1 = 0, bytes1 = 0, ns1 = 0, readsu = 0, bytesu = 0, nsu = 0;
+  // the last kRing decisions, oldest first (decisions - ring().size() were overwritten)
+  std::vector<Decision> ring() const;
+  uint64_t decisions() const { return seq_; }
+
+ private:
+  void calibrate(Reason why);
+  void set_depth(uint32_t d);
+  void decide();
+  Params p_;
+  uint32_t u_, depth_;
+  uint32_t phase_ = 0;  // 0..3: calibration window index; 4: held
+  bool repeated_ = false;
+  Reason why_ = kStart;
+  double cal_[4] = {0, 0, 0, 0};
+  double held_rate_ = 0;
+  uint32_t drift_n_ = 0;
+  uint64_t win_reads_ = 0, win_bytes_ = 0, win_ns_ = 0;
+  uint64_t total_reads_ = 0, held_reads_ = 0, hold_for_ = 0, backoff_ = 0;
+  uint64_t seq_ = 0;
+  std::vector<Decision> ring_;
+};
+
 // The three-tier file reads in flight (dg_disk_queue): `threads` workers run the submitted reads, oldest first. wait()
 // blocks until that read finished, rethrows its error and returns its own time in ns; every handle is waited for
 // exactly once. Destruction drops the reads not started, stops a chunked one at its next chunk and waits for the
@@ -172,7 +228,7 @@ class DgReadPool {
   void* submit(std::function<void()> read);
   // the same, the read given the index of the worker that runs it (0 .. threads - 1; e.g. its own bounce buffer);
   // landing: into the landing queue
-  void* submit_indexed(std::function<void(uint32_t)> read, bool landing = false);
+  void* submit_indexed(std::function<void(uint32_t)> read, bool landing = false, uint64_t bytes = 0);
   // A read in steps (a chunked landing read): step(worker) reads the next chunk and returns the bytes still to read
   // (0: complete); bytes = the read's total. The steps of one read never run concurrently; each may run on another
   // worker (a worker's own buffers serve one step only).
@@ -203,6 +259,16 @@ class DgReadPool {
     size_t queued = 0, landing_queued = 0;
   };
   Counts counts();
+  // dg_disk_queue_adapt: demand reads dispatched at the controller's depth (1 or threads) instead of every thread;
+  // measured per busy period (from idle to idle: no read queued or running) with the bytes given at submit. Off
+  // (nullptr, the default): every thread. Set while idle (open, reset_open); the controller is read through adapt()
+  // under the pool's lock.
+  void set_adapt(std::unique_ptr<DgDepthCtl> ctl);
+  template <class F>
+  void adapt(F&& f) {
+    std::lock_guard<std::mutex> lk(mu_);
+    f(ctl_.get());
+  }
 
  private:
   struct Job {
@@ -210,6 +276,7 @@ class DgReadPool {
     std::function<uint64_t(uint32_t)> step;  // chunked (read empty)
     std::exception_ptr error;
     uint64_t ns = 0, left = 0;  // left: a chunked read's bytes still to read
+    uint64_t bytes = 0;         // dg_disk_queue_adapt: the read's bytes (given at submit)
     uint32_t yields = 0;
     // landing: in the landing queue or running as a landing read (a wait made it a demand: false)
     bool done = false, landing = false, started = false, stop = false, aborted = false;
@@ -228,6 +295,13 @@ class DgReadPool {
   std::vector<std::unique_ptr<Job>> jobs_;  // submitted, not waited for yet
   uint32_t running_ = 0, landing_running_ = 0, landing_cap_ = 1, threads_n_ = 1;
   bool stop_ = false, reserve_ = true;
+  // dg_disk_queue_adapt: demand reads run only while fewer than limit_ run; the busy period being measured
+  bool demand_ready() const { return !queue_.empty() && running_ < limit_; }
+  std::unique_ptr<DgDepthCtl> ctl_;
+  uint32_t limit_ = 1;
+  bool busy_ = false;
+  std::chrono::steady_clock::time_point busy_t0_;
+  uint64_t busy_reads_ = 0, busy_bytes_ = 0;
   std::vector<std::thread> threads_;
 };
 }  // namespace ts

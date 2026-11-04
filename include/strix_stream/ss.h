@@ -427,6 +427,19 @@ typedef struct ss_options {
    * dg_no_admit (its homes never change). */
   uint32_t dg_bank_keep;
   uint32_t reserved12; /* explicit padding (never read) */
+  /* appended, adaptive read depth (SS_DG_DISK_QUEUE_ADAPT below): 1 = with dg_disk_queue = SS_DG_DISK_QUEUE_AUTO, the
+   * resolved queue U stays the readers allocated and billed (and the reads the core keeps in flight), but the pool
+   * runs demand reads either U at once or one at a time, whichever its measurements show faster: busy periods (from
+   * idle to idle) are summed into windows of at least 32 reads, a calibration measures four windows at U, 1, 1, U and
+   * keeps U only when both brackets show it at least 3 % faster in bytes per second (else 1); it recalibrates after
+   * 512 reads at U, after 4096 then 8192 reads at 1, and at once after two windows more than 25 % away from the
+   * calibrated rate. Only how many reads run at once changes: the reads, their order, bytes, hash checks, slots and
+   * copies are those of AUTO. Declined (AUTO as before; ss_dg_stats.disk_depth_adapt = 2, the reason in the stats JSON)
+   * with a resolved queue of 1, dg_landing_blocks or dg_disk_prefetch. 0 (default) = AUTO as before. Refused without
+   * dg_disk_tier or with any dg_disk_queue other than SS_DG_DISK_QUEUE_AUTO. ss_dg_reset_open starts a new
+   * calibration. */
+  uint32_t dg_disk_queue_adapt;
+  uint32_t reserved13; /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -868,6 +881,13 @@ typedef struct ss_dg_stats {
   /* appended (SS_DG_BANK_KEEP; 0 when off): bank_kept = demand file misses served through a bank slot read into a
    * pinned block, each a pinned unit once the bank released it (also in bank_serves and disk_reads) */
   uint64_t bank_kept;
+  /* appended (SS_DG_DISK_QUEUE_ADAPT; properties of the open since open / ss_dg_reset_open, never reset by the stats
+   * reset): disk_depth_adapt = 0 off, 1 adapting, 2 declined; disk_depth_active = the demand reads run at once now
+   * (= disk_queue_resolved unless adapting; 0 without dg_disk_tier); disk_depth_changes = depth changes,
+   * disk_depth_calibrations = calibrations begun (the stats JSON three_tier.disk_depth has per-depth reads, bytes and
+   * busy time and the last 16 decisions) */
+  uint32_t disk_depth_active, disk_depth_adapt;
+  uint64_t disk_depth_changes, disk_depth_calibrations;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1810,6 +1830,9 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
 /* Bank-served file reads kept in RAM: ss_options.dg_bank_keep and ss_dg_stats.bank_kept exist. Opt-in, placement
  * only: which pinned block holds a unit's bytes, never the bytes or the table protocol. */
 #define SS_DG_BANK_KEEP 1
+/* Adaptive read depth: ss_options.dg_disk_queue_adapt and ss_dg_stats.disk_depth_* exist. Opt-in, I/O scheduling
+ * only: how many reads run at once, never which reads, their order or bytes. */
+#define SS_DG_DISK_QUEUE_ADAPT 1
 
 #ifdef __cplusplus
 }

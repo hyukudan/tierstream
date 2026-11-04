@@ -280,6 +280,18 @@ de staging (uno libre o, si no lo hay, el de la unidad de RAM alojada hace más 
 la alojada más recientemente. Mismos bytes, misma comprobación de hash y misma copia; sin memoria adicional. Se contabiliza en
 `ss_dg_stats.bank_kept`. No tiene efecto sin `dg_disk_tier` ni con `dg_no_admit`.
 
+**Profundidad de lectura que sigue a la unidad (`dg_disk_queue_adapt`, opcional, con AUTO).** Más lecturas en vuelo
+suelen ayudar, pero no siempre: en una fase lenta de una unidad, las mismas lecturas con cola 4 tardaron 22 ms cada una
+frente a 5-8 ms de una en una, y el decode fue un 32 % más lento que con cola 1, mientras que una hora después, en la
+misma unidad, la cola 4 fue un 8 % más rápida. Con `dg_disk_queue_adapt = 1` los lectores AUTO siguen reservados, pero
+el pool ejecuta las lecturas de demanda todas a la vez o de una en una, lo que mida más rápido: compara los bytes por
+segundo de grupos de al menos 32 lecturas en ambas profundidades (U, 1, 1, U), mantiene la profundidad mayor solo cuando
+las dos comparaciones la muestran al menos un 3 % más rápida, vuelve a comprobar cada 512 lecturas (4096 y después 8192
+con profundidad 1) y de inmediato cuando la velocidad cambia más de un 25 %. Las lecturas, su orden y sus bytes no
+cambian, solo cuántas se ejecutan a la vez. No se usa con bloques de aterrizaje ni con precargas de archivo. Se informa
+en `ss_dg_stats.disk_depth_*` y en el JSON de estadísticas (`three_tier.disk_depth`, con las 16 últimas decisiones).
+Detalles: [diseño §3.17](docs/design.md).
+
 **Las predicciones no estorban a la demanda.** Se omite una predicción ordinaria para una capa que el dispositivo ya
 alcanzó (`pred_skipped_ahead`); la señal de lista de una capa solo espera las lecturas de precarga de las unidades que
 realmente usa (una precarga de archivo errónea sigue leyéndose en segundo plano; una lectura posterior que necesite su

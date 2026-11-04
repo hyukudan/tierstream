@@ -208,6 +208,9 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
   if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
   if (o.dg_bank_keep > 1) refuse(SS_E_INVALID, "dg_bank_keep must be 0 or 1");
+  if (o.dg_disk_queue_adapt > 1) refuse(SS_E_INVALID, "dg_disk_queue_adapt must be 0 or 1");
+  if (o.dg_disk_queue_adapt && (!o.dg_disk_tier || !queue_auto))
+    refuse(SS_E_INVALID, "dg_disk_queue_adapt needs dg_disk_tier = 1 and dg_disk_queue = SS_DG_DISK_QUEUE_AUTO");
   if (o.dg_pf_revert_unused > 1) refuse(SS_E_INVALID, "dg_pf_revert_unused must be 0 or 1");
   if (o.dg_pf_strict_admit > 1) refuse(SS_E_INVALID, "dg_pf_strict_admit must be 0 or 1");
   if (o.dg_landing_blocks > 4096) refuse(SS_E_INVALID, "dg_landing_blocks must be 0..4096");

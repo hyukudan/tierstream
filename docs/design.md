@@ -703,6 +703,40 @@ at -13 % (plain) and -37..-42 % (self-speculative) modelled step time; the GPU A
 - **Counters.** `ss_dg_stats.bank_kept` (also in `bank_serves` and `disk_reads`; stats JSON `three_tier`, with
   `bank_keep`).
 
+### 3.17 Device-gated adaptive read depth (`dg_disk_queue_adapt`)
+
+AUTO (3.14) sizes the readers from the read locations. Whether running them all at once pays depends on the drive's
+state at the time, not on the plan: on one drive and one binary, GLM-5.3-Flash at 48 + 32 GiB measured AUTO (queue 4)
+32 % slower than queue 1 in a slow phase (22 ms per read at queue 4 against 4.8-8.2 ms at queue 1; 1.12-1.17 against
+1.31-2.07 GB/s) and 8 % faster 1.6 hours later (2.34-2.43 against 2.18-2.23 GB/s). A per-read latency rule cannot tell
+the two apart (24 ms per read also comes with useful overlap); the bytes per second of the same kind of work at both
+depths can.
+
+- **The setting.** `ss_options.dg_disk_queue_adapt = 1` (default 0), only with `dg_disk_tier` and
+  `dg_disk_queue = SS_DG_DISK_QUEUE_AUTO` (else the open refuses; an explicit depth stays fixed). Declined, AUTO as
+  before, with a resolved queue of 1, `dg_landing_blocks` or `dg_disk_prefetch` (the controller is qualified on
+  demand reads only; landing cancellation and prefetch timing change which bytes are read).
+- **What changes.** Only the read pool's dispatch: a demand read starts while fewer than the active depth d run,
+  d in {1, U}. The U readers, their bounce buffers, the staging buffers and the core's reads in flight are those of
+  AUTO (billed at U); the core issues the same reads in the same order with the same destinations, hash checks, slots,
+  copies and ready dependencies. A lower depth never stops a running read; a change applies from the next busy
+  period.
+- **Measurement.** The pool times busy periods (from idle to idle: no read queued or running; in decode, one layer's
+  demand reads) and the bytes of the reads they completed. Busy periods add up into windows of at least 32 reads; a
+  window's rate is its bytes over its busy time.
+- **Decision.** A calibration measures four windows at U, 1, 1, U. U is kept only when both brackets (U before against
+  1, U after against 1) show it at least 3 % faster; a split verdict (the rate moved inside the calibration) is
+  measured once more, then depth 1. Held at U, a calibration again after 512 reads; held at 1, after 4096 reads, then
+  every 8192 while U keeps losing. While held, two windows in a row more than 25 % away from the held depth's
+  calibrated rate start one at once. `ss_dg_reset_open` starts over (a prefill does not decide for the decode after
+  it). The constants are first choices to qualify, not fitted optima; endpoints only (no depth between 1 and U yet).
+- **Cost.** A calibration runs two of its four windows at the losing depth; the re-check spacing bounds that share.
+  An online controller cannot promise never to lose against the better fixed depth on a short run.
+- **Counters.** `ss_dg_stats.disk_depth_adapt` (0 off, 1 adapting, 2 declined), `disk_depth_active`,
+  `disk_depth_changes`, `disk_depth_calibrations`; the stats JSON `three_tier.disk_queue_adapt` (on / off /
+  declined with its reason) and `three_tier.disk_depth`: reads, bytes and busy ns per depth, windows, and the last 16
+  decisions (reads before it, depths, both mean rates in GB/s, reason).
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier
