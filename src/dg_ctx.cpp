@@ -1049,6 +1049,7 @@ class CudaDgCtx final : public DgCtx {
     out->landing_skipped_passed = a.landing_skipped_passed;
     out->landing_yields = a.landing_yields;
     out->landing_aborted_bytes = a.landing_aborted_bytes;
+    out->bank_kept = a.bank_kept;
     out->cuda_module_loading = module_loading_;  // (a property of the open: never reset)
     out->disk_queue_resolved = x_.disk_queue;  // (properties of the open: SS_DG_DISK_QUEUE_AUTO resolved, dg_layout)
     out->disk_locations = x_.disk_locations;
@@ -1297,6 +1298,9 @@ class CudaDgCtx final : public DgCtx {
     d.landing_skipped_passed = a.landing_skipped_passed - b.landing_skipped_passed;
     d.landing_yields = a.landing_yields - b.landing_yields;
     d.landing_aborted_bytes = a.landing_aborted_bytes - b.landing_aborted_bytes;
+    d.bank_kept = a.bank_kept - b.bank_kept;
+    d.bank_keep_drops = a.bank_keep_drops - b.bank_keep_drops;
+    d.bank_keep_rereads = a.bank_keep_rereads - b.bank_keep_rereads;
     return d;
   }
   // A gated layer's counters in the host contract's terms: every routed unit is a lookup, a demand copy into a
@@ -1489,6 +1493,8 @@ class CudaDgCtx final : public DgCtx {
           {"disk_max_in_flight", s.disk_max_in_flight}, {"unit_subread_bytes", x_.unit_subread},
           {"clean_drops", s.clean_drops}, {"clean_drop_bytes", s.clean_drop_bytes},
           {"clean_evict", uint64_t(core_->clean_evict())},
+          {"bank_kept", s.bank_kept}, {"bank_keep", uint64_t(o_.dg_bank_keep != 0)},
+          {"bank_keep_drops", s.bank_keep_drops}, {"bank_keep_rereads", s.bank_keep_rereads},
           {"disk_queue", uint64_t(x_.disk_queue)},
           {"disk_queue_resolved", uint64_t(x_.disk_queue)}, {"disk_locations", uint64_t(x_.disk_locations)},
           {"disk_units_open", uint64_t(x_.F)}, {"staging", uint64_t(x_.S)}, {"inclusive_blocks", uint64_t(x_.I)}};
@@ -1815,6 +1821,7 @@ class CudaDgCtx final : public DgCtx {
     c.disk_queue = x_.disk_queue;
     c.no_admit = o_.dg_no_admit != 0;  // (dg_layout checked the banks)
     c.clean_evict = o_.dg_clean_evict != 0;  // (no effect without dg_disk_tier)
+    c.bank_keep = o_.dg_bank_keep != 0;  // (no effect without dg_disk_tier or with dg_no_admit)
     c.pf_revert = o_.dg_pf_revert_unused != 0;
     c.pf_strict = o_.dg_pf_strict_admit != 0;
     c.pf_legacy = x_.pf_legacy;  // DG_PF_LEGACY

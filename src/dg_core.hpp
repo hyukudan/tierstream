@@ -193,6 +193,10 @@ struct DgConfig {
   // goes back to its file. landing_blocks 0 = off (no landing).
   uint32_t landing_blocks = 0;
   uint32_t landing_ttl = 0;
+  // dg_bank_keep (three-tier only; no effect with no_admit): a demand file miss served through a bank slot is read
+  // into a pinned block (a free one, else the least recently homed pinned unit's, dropped to its file) instead of a
+  // staging buffer, and that block is its home when the bank releases it: a RAM unit at the recency head, not its file.
+  bool bank_keep = false;
 };
 
 struct DgStats {
@@ -283,6 +287,10 @@ struct DgStats {
   // chunked landing reads: the times one gave its reader to a demand read; the bytes not read because the core dropped
   // a landing read part-way (stopped at a chunk, or cancelled after a yield: the bytes it read are in landing_read_bytes)
   uint64_t landing_yields = 0, landing_aborted_bytes = 0;
+  // dg_bank_keep: demand file misses served through a bank slot read into a pinned block (RAM units at the release);
+  // pinned units dropped to their file for one, and those read back from their file within 8 tokens (churn: stats
+  // JSON only)
+  uint64_t bank_kept = 0, bank_keep_drops = 0, bank_keep_rereads = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -335,7 +343,8 @@ struct DgLayerCounts {
 class DgCore {
  public:
   // File (three-tier only): no slot, no block; its bytes are read from its file when fetched. A Device key may also
-  // hold a block (backed: a clean copy, inclusive share); a Coming / Bank key fetched from its file holds none.
+  // hold a block (backed: a clean copy, inclusive share); a Coming / Bank key fetched from its file holds none
+  // (dg_bank_keep: a Bank key read from its file into a pinned block holds it, its RAM home at the bank's release).
   // Landing / Landed (dg_landing_blocks): a file-homed key whose landing read is in flight / done, holding a landing
   // block (no slot, no block, no entry); its permanent home stays its file (a transient copy, as `backed`).
   enum class Home : uint8_t { Host, Device, Coming, Bank, Evicting, File, Landing, Landed };
@@ -650,6 +659,7 @@ class DgCore {
     uint32_t hprev = kNone, hnext = kNone;
     int32_t land = -1;          // Landing / Landed: its landing block (0 .. landing_blocks - 1)
     uint32_t land_age = 0;      // Landed: boundaries passed since it landed
+    uint64_t keep_drop = 0;     // dg_bank_keep: tokens + 1 when dropped to its file for a kept read (0 = not)
   };
   struct Writeback {
     uint32_t key;
@@ -677,6 +687,7 @@ class DgCore {
   void* finish_deferred_front();             // the front's remaining parts, then record_deferred_front(false)
   void force_free_slot();
   int32_t take_bank_slot(uint32_t g);
+  int32_t keep_block();  // dg_bank_keep: a bank file miss's block (-1: a staging buffer)
   void write_entry(DgTransport::Stream s, uint32_t k, int32_t v);
   void set_entry(uint32_t k, int32_t v);  // the mirror's entry, marked for the next upload (dg_core.cpp)
   void clear_marks();

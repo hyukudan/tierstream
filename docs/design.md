@@ -682,6 +682,27 @@ file bytes into host RAM while earlier layers compute, without touching the GPU'
 - **Horizon.** Only the existing next-layer prediction (g + 1) is used; a prediction protocol carrying its target layer
   (g + h, h >= 2) is later work.
 
+### 3.16 Device-gated bank-served file reads kept in RAM (`dg_bank_keep`)
+
+A demand miss with no free slot (the spares used up, or a pressure cap) is served through a demand bank slot: bank
+g & 1, reused two gated layers later or released at the boundary. A pinned unit served that way goes back to its block
+at the head of the pinned recency list. A file-homed unit's read went into a staging buffer, so at the release it went
+back to its file: a unit that keeps missing under slot pressure is read from its file at every use and never becomes a
+pinned unit. A residency replay of DeepSeek V4.1 RTX decode at 24 + 32 / 32 + 32 GiB (fresh chats) measured keeping it
+at -13 % (plain) and -37..-42 % (self-speculative) modelled step time; the GPU A/B decides.
+
+- **The setting.** `ss_options.dg_bank_keep = 1` (default 0; no effect without `dg_disk_tier` or with `dg_no_admit`,
+  whose homes never change). A demand file miss that takes a bank slot is read into a pinned block: a free one, else
+  the least recently homed pinned unit's (dropped to its file, `disk_drops`, as the boundary does for a victim's block).
+  The read, its hash check, the copy and the entry are the file miss's; only the destination block differs (no staging
+  buffer and no staging wait). The block is the key's while it is banked (`Bank` with a block, as a pinned unit's bank
+  serve), and at the release `to_lower` makes it a `Host` unit at the recency head. With no free block and no pinned
+  unit, the read is staged as before. A failed read frees the block (the key back to its file).
+- **Memory.** None new: the blocks are the pinned homes the plan already holds; a kept unit displaces the least recently
+  homed one. Prefetches and landings never take bank slots and are unchanged.
+- **Counters.** `ss_dg_stats.bank_kept` (also in `bank_serves` and `disk_reads`; stats JSON `three_tier`, with
+  `bank_keep`).
+
 ## 4. Sources and the copy path
 
 ### 4.1 Pinned host tier

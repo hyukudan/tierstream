@@ -207,6 +207,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
     refuse(SS_E_INVALID, "dg_disk_queue must be 0..64 or SS_DG_DISK_QUEUE_AUTO");
   if (o.dg_no_admit > 1) refuse(SS_E_INVALID, "dg_no_admit must be 0 or 1");
   if (o.dg_clean_evict > 1) refuse(SS_E_INVALID, "dg_clean_evict must be 0 or 1");
+  if (o.dg_bank_keep > 1) refuse(SS_E_INVALID, "dg_bank_keep must be 0 or 1");
   if (o.dg_pf_revert_unused > 1) refuse(SS_E_INVALID, "dg_pf_revert_unused must be 0 or 1");
   if (o.dg_pf_strict_admit > 1) refuse(SS_E_INVALID, "dg_pf_strict_admit must be 0 or 1");
   if (o.dg_landing_blocks > 4096) refuse(SS_E_INVALID, "dg_landing_blocks must be 0..4096");

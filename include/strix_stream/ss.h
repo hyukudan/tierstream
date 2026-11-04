@@ -417,6 +417,16 @@ typedef struct ss_options {
    * no reader reserved). */
   uint32_t dg_landing_chunk;
   uint32_t reserved11; /* explicit padding (never read) */
+  /* appended, bank-served file reads kept in RAM (SS_DG_BANK_KEEP below): 1 = a demand miss of a file-homed unit
+   * served through a demand bank slot (no free slot for it) reads the unit into a pinned block instead of a staging
+   * buffer: a free block, else the least recently homed pinned unit's (that unit goes to its file, disk_drops). When
+   * the bank releases the slot (two gated layers later, or at the boundary) the unit's home is that block, at the head
+   * of the pinned recency list (as a pinned unit's bank serve), instead of its file. The same bytes, hash check and
+   * copy; no new memory (the existing pinned blocks). With no block free and no pinned unit to drop, a staging buffer as
+   * before. Counter: ss_dg_stats.bank_kept. 0 (default) = as before. No effect without dg_disk_tier or with
+   * dg_no_admit (its homes never change). */
+  uint32_t dg_bank_keep;
+  uint32_t reserved12; /* explicit padding (never read) */
 } ss_options;
 
 typedef enum ss_forward_mode { SS_FORWARD_HOST = 0, SS_FORWARD_DEVICE_GATED = 1 } ss_forward_mode;
@@ -855,6 +865,9 @@ typedef struct ss_dg_stats {
    * next chunk, counted in landing_expired_layer; or cancelled after a yield: landing_cancelled). landing_read_bytes
    * counts the bytes an aborted or part-way cancelled one read. */
   uint64_t landing_yields, landing_aborted_bytes;
+  /* appended (SS_DG_BANK_KEEP; 0 when off): bank_kept = demand file misses served through a bank slot read into a
+   * pinned block, each a pinned unit once the bank released it (also in bank_serves and disk_reads) */
+  uint64_t bank_kept;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1794,6 +1807,9 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
  * landing_aborted_bytes exist; with chunks (the default) at most dg_disk_queue - 1 landing reads run at once
  * (dg_landing_chunk 0xFFFFFFFF: the scheduler before). Placement and I/O order only. */
 #define SS_DG_LANDING_YIELD 1
+/* Bank-served file reads kept in RAM: ss_options.dg_bank_keep and ss_dg_stats.bank_kept exist. Opt-in, placement
+ * only: which pinned block holds a unit's bytes, never the bytes or the table protocol. */
+#define SS_DG_BANK_KEEP 1
 
 #ifdef __cplusplus
 }
