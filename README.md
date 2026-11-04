@@ -248,7 +248,9 @@ the unit is served through a short-lived bank slot. A unit that lived in its fil
 the next use read it from disk again, even when it was hot. With `dg_bank_keep = 1` the read goes into a pinned RAM
 block instead of a staging buffer (a free one, else the least recently homed RAM unit's), and the unit stays in RAM as
 the most recently homed one. The same bytes, hash check and copy; no extra memory. Counted in `ss_dg_stats.bank_kept`.
-No effect without `dg_disk_tier` or with `dg_no_admit`.
+No effect without `dg_disk_tier` or with `dg_no_admit`. `dg_bank_keep = 2` inserts the kept unit in the middle of the
+RAM recency order instead of at its head, so a unit read once no longer pushes out the units used most recently (a unit
+used again moves to the head as usual).
 
 **Predictions stay out of the demand's way.** A plain prediction for a layer the device already reached is skipped
 (`pred_skipped_ahead`); a layer's ready waits only for the prefetch reads of units it actually uses (a wrong file

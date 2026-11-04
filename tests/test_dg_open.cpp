@@ -484,6 +484,13 @@ TEST(dg_no_admit_and_rounds_abi_cpu) {
   CHECK_EQ(int(ss_dg_round_seed_counts(nullptr, &u, &one, 1)), int(SS_E_INVALID));
 }
 
+// dg_bank_keep: 0, 1 or 2 (2 = kept units at the middle of the pinned recency list); no effect without dg_disk_tier.
+TEST(dg_bank_keep_abi_cpu) {
+  DgModel m("open");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_bank_keep = 3; }), SS_E_INVALID, "dg_bank_keep must be 0, 1 or 2");
+  expect(try_open(m, [](B&, O& o, T&) { o.dg_bank_keep = 2; }), SS_E_UNSUPPORTED, "needs the CUDA backend");
+}
+
 // dg_disk_queue_adapt: 0 or 1, only with dg_disk_tier and dg_disk_queue = SS_DG_DISK_QUEUE_AUTO (an explicit depth
 // stays fixed); an older struct (without it) reads 0.
 TEST(dg_disk_queue_adapt_abi_cpu) {

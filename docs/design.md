@@ -698,6 +698,13 @@ at -13 % (plain) and -37..-42 % (self-speculative) modelled step time; the GPU A
   buffer and no staging wait). The block is the key's while it is banked (`Bank` with a block, as a pinned unit's bank
   serve), and at the release `to_lower` makes it a `Host` unit at the recency head. With no free block and no pinned
   unit, the read is staged as before. A failed read frees the block (the key back to its file).
+- **Insertion point (`dg_bank_keep = 2`).** At the head, a burst of one-off bank reads (a self-speculative pass right
+  after a plain pass of the same chat) pushes out the RAM set the plain pass built: measured on DeepSeek V4.1 RTX
+  24 + 32 GiB, plain then DSpark on one chat, DSpark -17 % tok/s with BK (file reads per commit 15.7 -> 30.8), while
+  fresh chats gained +14..+34 %. Mode 2 links the kept unit after the first half of the pinned recency list
+  (`hpush_mid`: after the on_host_ / 2 keys nearest the head; the boundary is kept on every push and unlink, O(1));
+  a later use moves it to the head as any pinned unit. Chosen on an offline residency replay over head, middle, tail
+  and free-blocks-only insertion; whether it removes the repeat-chat loss on the GPU is the A/B's to say.
 - **Memory.** None new: the blocks are the pinned homes the plan already holds; a kept unit displaces the least recently
   homed one. Prefetches and landings never take bank slots and are unchanged.
 - **Counters.** `ss_dg_stats.bank_kept` (also in `bank_serves` and `disk_reads`; stats JSON `three_tier`, with

@@ -545,7 +545,7 @@ struct Shape {
   // dg_pf_revert_unused at open; toggle_pf_revert: flipped between random tokens (set_pf_revert, its own random stream)
   bool pf_revert = false, toggle_pf_revert = false;
   bool pf_strict = false;  // dg_pf_strict_admit
-  bool bank_keep = false;  // dg_bank_keep
+  uint32_t bank_keep = 0;  // dg_bank_keep (0..2)
   // overlapped file reads: the core's queue depth (1 = synchronous), the transport's reads asynchronous (landing out
   // of order), an eager device (every operation runs at once: timing-free, for the depth comparisons)
   uint32_t queue = 16;
@@ -3840,9 +3840,10 @@ TEST(dg_three_tier_demand_only) {
 
 // dg_bank_keep: a demand file miss served through a bank slot (no free slot) is read into a pinned block, which is its
 // home after the boundary (a pinned unit at the recency head) instead of its file; off, it goes back to its file. With
-// no free block the least recently homed pinned unit is dropped to its file for it.
+// no free block the least recently homed pinned unit is dropped to its file for it. dg_bank_keep 2: the kept units enter
+// the pinned recency list at its middle (the rest keep their order).
 TEST(dg_bank_keep_scripted) {
-  for (int how = 0; how < 3; ++how) {  // 0 off, 1 on with free blocks, 2 on with none (a pinned unit dropped)
+  for (int how = 0; how < 4; ++how) {  // 0 off, 1 on with free blocks, 2 on with none (a pinned unit dropped), 3 mode 2
     Violation v;
     const uint32_t blocks = how == 2 ? 26 : 30;
     Scripted t(40, 12 + 2 * 4, blocks + 2, 2, 5, &v);
@@ -3856,7 +3857,7 @@ TEST(dg_bank_keep_scripted) {
     c.home_blocks = 26;
     c.disk_staging = 2;
     c.disk_queue = 4;
-    c.bank_keep = how != 0;
+    c.bank_keep = how == 0 ? 0u : how == 3 ? 2u : 1u;
     DgCore core(c, &t);
     std::vector<uint8_t> disk(40, 0);
     disk[25] = disk[26] = 1;  // gated layer 1, units 5 and 6
@@ -3886,7 +3887,14 @@ TEST(dg_bank_keep_scripted) {
       }
     }
     const std::vector<uint32_t> after = core.host_order();
-    if (how != 0) {  // the kept units at the head, the rest in their order (with no free block: the 2 coldest gone)
+    if (how == 3) {  // after the first half: 25 after 13 units (26 then after 13 of 27, ahead of 25), the rest in order
+      CHECK_EQ(after.size(), before.size() + 2u);
+      CHECK(after[13] == 26 && after[14] == 25);
+      std::vector<uint32_t> rest;
+      for (uint32_t k : after)
+        if (k != 25 && k != 26) rest.push_back(k);
+      CHECK(rest == before);
+    } else if (how != 0) {  // the kept units at the head, the rest in their order (with no free block: the 2 coldest gone)
       CHECK(after.size() == before.size() + (how == 2 ? 0u : 2u));
       CHECK((after[0] == 25 || after[0] == 26) && (after[1] == 25 || after[1] == 26) && after[0] != after[1]);
       CHECK(std::equal(after.begin() + 2, after.end(), before.begin()));
@@ -3916,15 +3924,16 @@ TEST(dg_bank_keep_scripted) {
   }
 }
 
-// The three-tier shapes with dg_bank_keep, each with the three read modes: every run exact (the oracle checks every
-// slot and pinned block's bytes), units kept.
+// The three-tier shapes with dg_bank_keep 1 and 2, each with the three read modes: every run exact (the oracle checks
+// every slot and pinned block's bytes), units kept.
 TEST(dg_bank_keep_runs) {
   uint64_t kept = 0, banks = 0;
+  for (uint32_t mode = 1; mode <= 2; ++mode)
   for (const Shape* base : kTierShapes)
     for (int how = 0; how < 3; ++how)
       for (uint64_t seed = 1; seed <= 12; ++seed) {
         Shape sh = with_reads(*base, how);
-        sh.bank_keep = true;
+        sh.bank_keep = mode;
         Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
         if (!o.violation.empty())
           std::printf("  seed %llu (reads %d): %s\n", (unsigned long long)seed, how, o.violation.c_str());
