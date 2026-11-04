@@ -187,6 +187,22 @@ bool DgCore::drop_host_lru(const std::vector<uint8_t>* skip, bool count) {
   return true;
 }
 
+// dg_bank_keep: the block a demand file miss served through a bank slot is read into, its RAM home once the bank
+// releases it (to_lower: the recency head). A free block, else the least recently homed pinned unit's (dropped to its
+// file, disk_drops); -1 (staged as before) when off, with dg_no_admit (homes never change there) or with neither.
+int32_t DgCore::keep_block() {
+  if (!c_.bank_keep || !c_.disk_tier || c_.no_admit) return -1;
+  if (free_blocks_.empty()) {
+    const uint32_t d = htail_;
+    if (!drop_host_lru()) return -1;
+    e_[d].keep_drop = st_.tokens + 1;
+    ++st_.bank_keep_drops;
+  }
+  const int32_t b = free_blocks_.back();
+  free_blocks_.pop_back();
+  return b;
+}
+
 // The next staging buffer of the file reads: its previous copy must have landed before the read overwrites it.
 // Drain point: a buffer whose read is still in flight has its copy enqueued first (its own record only). The wait that
 // follows is on that buffer's own last copy (recorded when its record was ended): no other read in flight holds the
@@ -227,9 +243,11 @@ void DgCore::copy_in(DgTransport::Stream s, uint32_t k, int32_t slot, int32_t sr
 void DgCore::finish_pending(const Pending& p) {
   Entry& x = e_[p.key];
   copy_in(p.s, p.key, p.slot, p.stage);
-  void*& ev = stage_ev_[uint32_t(p.stage) - c_.blocks];  // the staging buffer is reusable once this copy landed
-  if (!ev) ev = event();
-  t_->record(ev, p.s);
+  if (uint32_t(p.stage) >= c_.blocks) {  // (dg_bank_keep: a home block, held by its key until the bank releases it)
+    void*& ev = stage_ev_[uint32_t(p.stage) - c_.blocks];  // the staging buffer is reusable once this copy landed
+    if (!ev) ev = event();
+    t_->record(ev, p.s);
+  }
   if (p.prefetch) {
     x.pf_done = event();
     t_->record(x.pf_done, p.s);
@@ -248,6 +266,11 @@ void DgCore::undo_pending(const Pending& p) {
     banked_.erase(std::find(banked_.begin(), banked_.end(), p.key));
     --st_.bank_serves;
     --lc_[g].bank_serves;
+    if (x.block >= 0) {  // dg_bank_keep: its block was read into, never a home: free again
+      free_blocks_.push_back(x.block);
+      x.block = -1;
+      --st_.bank_kept;
+    }
   } else {
     unlink(p.key);
     --on_device_;
@@ -1209,7 +1232,8 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
         }
         if (pending_.size() >= depth) drain_pending(pending_.size() + 1 - depth);
       }
-      stage = take_stage();
+      stage = bank ? keep_block() : -1;  // dg_bank_keep: into its RAM home (no staging buffer), else staged
+      if (stage < 0) stage = take_stage();
       const auto t0 = std::chrono::steady_clock::now();
       h = t_->read_unit_begin(k, stage);
       st_.disk_read_ns += uint64_t(
@@ -1219,7 +1243,12 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
         free_slots_.push_back(slot);
         if (free_counted) --demand_free_used_;
       }
+      if (stage >= 0 && uint32_t(stage) < c_.blocks) free_blocks_.push_back(stage);  // (a kept block: free again)
       throw;
+    }
+    if (uint32_t(stage) < c_.blocks) {  // dg_bank_keep: the block is the unit's; to_lower makes it its RAM home
+      x.block = stage;
+      ++st_.bank_kept;
     }
     if (!pending_.empty()) ++st_.disk_overlapped;
     pending_.push_back({k, slot, stage, s, prefetch, bank, free_counted, h, entries_});
@@ -1246,6 +1275,10 @@ bool DgCore::fetch_impl(uint32_t g, uint32_t unit, bool prefetch, bool budgeted)
   }
   if (x.home == Home::Host) hunlink(k);
   else if (x.home == Home::File) --on_file_;
+  if (from_file && x.keep_drop) {  // dg_bank_keep churn: dropped for a kept read, read back within 8 tokens
+    if (st_.tokens + 1 - x.keep_drop <= 8) ++st_.bank_keep_rereads;
+    x.keep_drop = 0;
+  }
   x.slot = slot;
   x.via_prefetch = prefetch;
   x.used = false;
@@ -2839,7 +2872,7 @@ bool DgCore::same_open_state(const DgCore& b) const {
                     c.prefetch_reserve_auto, c.prefetch_per_layer, c.prefetch_per_token, c.wb_defer, c.wb_on_d2h,
                     c.wb_layer_bytes, c.wb_max_outstanding, c.disk_tier, c.disk_prefetch, c.home_blocks,
                     c.disk_staging, c.inclusive, c.disk_queue, c.clean_evict, c.pf_revert, c.pf_strict,
-                    c.pf_legacy, c.landing_blocks, c.landing_ttl);
+                    c.pf_legacy, c.landing_blocks, c.landing_ttl, c.bank_keep);
   };
   auto wp = [](const DgWinpf& w) {
     return std::tie(w.enable, w.prior_layers, w.prior_cap, w.prior_pmin, w.l1_cap, w.l1_min_votes, w.l1_pmin,
@@ -3219,10 +3252,12 @@ void DgCore::check() const {
   std::vector<uint8_t> stage_used(c_.disk_staging, 0);
   for (const Pending& p : pending_) {
     const Entry& x = e_[p.key];
-    if ((x.home != Home::Coming && x.home != Home::Bank) || x.slot != p.slot || x.block != -1 || x.pf_done ||
+    const bool kept_block = uint32_t(p.stage) < c_.blocks;  // dg_bank_keep: read into its own block
+    if ((x.home != Home::Coming && x.home != Home::Bank) || x.slot != p.slot || x.pf_done ||
+        x.block != (kept_block ? p.stage : -1) || (kept_block && (!c_.bank_keep || !p.bank)) ||
         table_[p.key] != p.slot || p.bank != (x.home == Home::Bank) || p.prefetch != x.via_prefetch)
       broken("a file read in flight does not match its key");
-    take(stage_used, int64_t(p.stage) - int64_t(c_.blocks), "a staging buffer with two reads in flight");
+    if (!kept_block) take(stage_used, int64_t(p.stage) - int64_t(c_.blocks), "a staging buffer with two reads in flight");
     // collect / force_free_slot / eviction never touch it: no write-back record of its key or slot (the slot itself is
     // held once: slot_used above), and a staging buffer is never in a free list
     if (x.wb_pending) broken("a key read from its file with a write-back record");

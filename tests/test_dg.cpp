@@ -545,6 +545,7 @@ struct Shape {
   // dg_pf_revert_unused at open; toggle_pf_revert: flipped between random tokens (set_pf_revert, its own random stream)
   bool pf_revert = false, toggle_pf_revert = false;
   bool pf_strict = false;  // dg_pf_strict_admit
+  bool bank_keep = false;  // dg_bank_keep
   // overlapped file reads: the core's queue depth (1 = synchronous), the transport's reads asynchronous (landing out
   // of order), an eager device (every operation runs at once: timing-free, for the depth comparisons)
   uint32_t queue = 16;
@@ -843,6 +844,7 @@ Outcome run(const Shape& sh, int tokens, uint64_t seed, int mutation, unsigned j
   c.clean_evict = sh.clean;
   c.pf_revert = sh.pf_revert;
   c.pf_strict = sh.pf_strict;
+  c.bank_keep = sh.bank_keep;
   c.spare_target = sh.spare;
   c.prefetch_reserve = std::min(24u, sh.spare / 4);
   c.prefetch_per_layer = sh.pf_layer;
@@ -3834,6 +3836,105 @@ TEST(dg_three_tier_demand_only) {
   CHECK(core.home(25) == DgCore::Home::Device && core.block_of(25) == -1);
   t.drain_all();
   CHECK(v.what.empty());
+}
+
+// dg_bank_keep: a demand file miss served through a bank slot (no free slot) is read into a pinned block, which is its
+// home after the boundary (a pinned unit at the recency head) instead of its file; off, it goes back to its file. With
+// no free block the least recently homed pinned unit is dropped to its file for it.
+TEST(dg_bank_keep_scripted) {
+  for (int how = 0; how < 3; ++how) {  // 0 off, 1 on with free blocks, 2 on with none (a pinned unit dropped)
+    Violation v;
+    const uint32_t blocks = how == 2 ? 26 : 30;
+    Scripted t(40, 12 + 2 * 4, blocks + 2, 2, 5, &v);
+    DgConfig c;
+    c.n_units = {20, 20};
+    c.persistent_slots = 12;
+    c.bank_slots = 4;
+    c.blocks = blocks;
+    c.spare_target = 0;  // every slot holds a unit: a demand miss takes a bank slot
+    c.disk_tier = true;
+    c.home_blocks = 26;
+    c.disk_staging = 2;
+    c.disk_queue = 4;
+    c.bank_keep = how != 0;
+    DgCore core(c, &t);
+    std::vector<uint8_t> disk(40, 0);
+    disk[25] = disk[26] = 1;  // gated layer 1, units 5 and 6
+    std::vector<uint32_t> order;
+    for (uint32_t k = 0; k < 40; ++k) order.push_back(k);
+    core.place(order, &disk);
+    CHECK_EQ(core.file_units(), 2u);
+    CHECK(core.home(25) == DgCore::Home::File && core.home(26) == DgCore::Home::File);
+    const std::vector<uint32_t> before = core.host_order();
+    core.begin_token(1);
+    const uint32_t ids[2] = {5, 6};
+    core.serve(1, ids, 2, 3);
+    core.check();
+    CHECK_EQ(core.stats().bank_serves, 2ull);
+    CHECK_EQ(core.stats().disk_reads, 2ull);
+    core.end_token({});
+    core.check();
+    CHECK_EQ(core.stats().bank_kept, how == 0 ? 0ull : 2ull);
+    CHECK_EQ(core.stats().disk_drops, how == 2 ? 2ull : 0ull);
+    CHECK_EQ(core.stats().bank_keep_drops, how == 2 ? 2ull : 0ull);
+    for (uint32_t k : {25u, 26u}) {
+      if (how == 0) {
+        CHECK(core.home(k) == DgCore::Home::File && core.block_of(k) == -1);
+      } else {
+        CHECK(core.home(k) == DgCore::Home::Host);
+        CHECK_EQ(t.block_holds(core.block_of(k)), int32_t(k));
+      }
+    }
+    const std::vector<uint32_t> after = core.host_order();
+    if (how != 0) {  // the kept units at the head, the rest in their order (with no free block: the 2 coldest gone)
+      CHECK(after.size() == before.size() + (how == 2 ? 0u : 2u));
+      CHECK((after[0] == 25 || after[0] == 26) && (after[1] == 25 || after[1] == 26) && after[0] != after[1]);
+      CHECK(std::equal(after.begin() + 2, after.end(), before.begin()));
+      if (how == 2)
+        for (size_t i = before.size() - 2; i < before.size(); ++i) CHECK(core.home(before[i]) == DgCore::Home::File);
+    } else {
+      CHECK(after == before);
+    }
+    // served again: from their pinned blocks (no file read), else from their files
+    core.begin_token(2);
+    core.serve(1, ids, 2, 3);
+    core.end_token({});
+    core.check();
+    CHECK_EQ(core.stats().disk_reads, how == 0 ? 4ull : 2ull);
+    if (how == 2) {  // a unit dropped for a kept read, read back two tokens later: churn
+      const uint32_t d = before.back(), du = d % 20;
+      core.begin_token(3);
+      core.serve(d / 20, &du, 1, 1);
+      core.end_token({});
+      core.check();
+      CHECK_EQ(core.stats().disk_reads, 3ull);
+      CHECK_EQ(core.stats().bank_keep_rereads, 1ull);
+    }
+    CHECK_EQ(core.stats().bank_keep_rereads, how == 2 ? 1ull : 0ull);
+    t.drain_all();
+    CHECK(v.what.empty());
+  }
+}
+
+// The three-tier shapes with dg_bank_keep, each with the three read modes: every run exact (the oracle checks every
+// slot and pinned block's bytes), units kept.
+TEST(dg_bank_keep_runs) {
+  uint64_t kept = 0, banks = 0;
+  for (const Shape* base : kTierShapes)
+    for (int how = 0; how < 3; ++how)
+      for (uint64_t seed = 1; seed <= 12; ++seed) {
+        Shape sh = with_reads(*base, how);
+        sh.bank_keep = true;
+        Outcome o = run(sh, 40, seed, DgCore::kNoMutation);
+        if (!o.violation.empty())
+          std::printf("  seed %llu (reads %d): %s\n", (unsigned long long)seed, how, o.violation.c_str());
+        CHECK(o.violation.empty());
+        CHECK(o.st.bank_kept <= o.st.bank_serves);
+        kept += o.st.bank_kept;
+        banks += o.st.bank_serves;
+      }
+  std::printf("  bank serves %llu, kept as pinned units %llu\n", (unsigned long long)banks, (unsigned long long)kept);
+  CHECK(kept > 0);
 }
 
 TEST(dg_three_tier_mutations_caught) {

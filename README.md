@@ -243,6 +243,13 @@ at the boundary like any other copy, so the boundary writes another device unit 
 or its file instead (no copy), and the boundary evicts nothing for it. Used and kept prefetches are admitted as before.
 Counted in `ss_dg_stats.pf_reverted` / `pf_revert_bytes`.
 
+**Bank-served file reads kept in RAM (`dg_bank_keep`, opt-in).** When a layer misses a unit and no device slot is free,
+the unit is served through a short-lived bank slot. A unit that lived in its file went back to its file afterwards, so
+the next use read it from disk again, even when it was hot. With `dg_bank_keep = 1` the read goes into a pinned RAM
+block instead of a staging buffer (a free one, else the least recently homed RAM unit's), and the unit stays in RAM as
+the most recently homed one. The same bytes, hash check and copy; no extra memory. Counted in `ss_dg_stats.bank_kept`.
+No effect without `dg_disk_tier` or with `dg_no_admit`.
+
 **Predictions stay out of the demand's way.** A plain prediction for a layer the device already reached is skipped
 (`pred_skipped_ahead`); a layer's ready waits only for the prefetch reads of units it actually uses (a wrong file
 prefetch keeps reading in the background; a later read that needs its queue place or staging buffer, or the token's

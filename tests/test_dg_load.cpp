@@ -1101,7 +1101,8 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK_EQ(offsetof(ss_dg_stats, landing_skipped_passed), offsetof(ss_dg_stats, landing_expired_layer) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, landing_yields), offsetof(ss_dg_stats, landing_skipped_passed) + 8);
   CHECK_EQ(offsetof(ss_dg_stats, landing_aborted_bytes), offsetof(ss_dg_stats, landing_yields) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, landing_aborted_bytes) + 8);
+  CHECK_EQ(offsetof(ss_dg_stats, bank_kept), offsetof(ss_dg_stats, landing_aborted_bytes) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, bank_kept) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

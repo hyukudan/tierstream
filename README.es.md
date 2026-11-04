@@ -272,6 +272,14 @@ entre tokens), esa unidad vuelve en su lugar a su bloque fijado o a su archivo (
 nada por ella. Las precargas usadas y mantenidas se admiten como antes. Se contabiliza en
 `ss_dg_stats.pf_reverted` / `pf_revert_bytes`.
 
+**Lecturas de archivo servidas por el banco que se quedan en RAM (`dg_bank_keep`, opcional).** Cuando una capa no
+encuentra una unidad y no hay ningún slot libre en el dispositivo, la unidad se sirve mediante un slot de banco de vida
+corta. Una unidad que vivía en su archivo volvía después a su archivo, de modo que el siguiente uso la leía de nuevo del
+disco, aunque estuviera caliente. Con `dg_bank_keep = 1` la lectura va a un bloque de RAM fijado en lugar de a un búfer
+de staging (uno libre o, si no lo hay, el de la unidad de RAM alojada hace más tiempo), y la unidad se queda en RAM como
+la alojada más recientemente. Mismos bytes, misma comprobación de hash y misma copia; sin memoria adicional. Se contabiliza en
+`ss_dg_stats.bank_kept`. No tiene efecto sin `dg_disk_tier` ni con `dg_no_admit`.
+
 **Las predicciones no estorban a la demanda.** Se omite una predicción ordinaria para una capa que el dispositivo ya
 alcanzó (`pred_skipped_ahead`); la señal de lista de una capa solo espera las lecturas de precarga de las unidades que
 realmente usa (una precarga de archivo errónea sigue leyéndose en segundo plano; una lectura posterior que necesite su

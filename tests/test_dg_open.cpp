@@ -596,10 +596,12 @@ TEST(dg_landing_abi_cpu) {
   static_assert(offsetof(ss_options, dg_landing_blocks) == offsetof(ss_options, reserved9) + 4, "appended");
   static_assert(offsetof(ss_options, dg_landing_ttl) == offsetof(ss_options, dg_landing_max_queued) + 4, "appended");
   static_assert(offsetof(ss_options, dg_landing_chunk) == offsetof(ss_options, reserved10) + 4, "appended");
-  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved11) + 4, "the struct's end");
+  static_assert(offsetof(ss_options, dg_bank_keep) == offsetof(ss_options, reserved11) + 4, "appended");
+  static_assert(sizeof(ss_options) == offsetof(ss_options, reserved12) + 4, "the struct's end");
   ss_options o;
   ss_options_defaults(&o);
   CHECK_EQ(o.dg_landing_blocks + o.dg_landing_max_queued + o.dg_landing_ttl + o.dg_landing_chunk, 0u);
+  CHECK_EQ(o.dg_bank_keep, 0u);
   expect(try_open(
              m,
              [&](B&, O& o, T& t) {
