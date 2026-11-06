@@ -21,6 +21,10 @@
 
 namespace ts {
 
+namespace adapt {
+class Usage;
+}
+
 struct RaEntry;
 
 struct Job {
@@ -86,6 +90,8 @@ class Ctx {
   ss_layer_stats total() const;
   void stats_reset();
   void set_hook(ss_stats_hook h, void* user) { hook_ = h; hook_user_ = user; }
+  // Adaptive memory plan (ts_adapt.h): the online usage table fed by this context's routes (nullptr = off).
+  void set_usage(adapt::Usage* u);
   int n_layers() const { return int(d_.layers.size()); }
   int layer_units(int layer) const { return d_.layers[size_t(layer)].n_units; }
   // After an allocation failure or an unexpected exception inside a call, the context's bookkeeping may be
@@ -312,6 +318,8 @@ class Ctx {
   std::vector<ss_layer_stats> stats_, fwd_stats_;
   ss_stats_hook hook_ = nullptr;
   void* hook_user_ = nullptr;
+  adapt::Usage* usage_ = nullptr;  // not owned
+  uint32_t fwd_rows_ = 1;          // rows of the open forward (usage ticks)
 };
 
 }  // namespace ts

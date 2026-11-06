@@ -12,6 +12,7 @@ option(TS_CUDA "Build the CUDA backend" OFF)
 option(TS_HIP "Build the HIP backend (Strix Halo, unified memory)" OFF)
 option(TS_TESTS "Build the tests" ON)
 option(TS_RENAME_GATES "Also build and run the pre-rename (4dc53b0) C++ tests unchanged (needs git)" OFF)
+option(TS_ADAPTIVE "Build the adaptive memory plan (usage table, tier solver; include/tierstream/ts_adapt.h, ts-adapt)" ON)
 option(TS_MUTATION_NO_SRC_WAIT "Test-only mutation: drop the exclusive same-forward source wait (must fail the CUDA test)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -65,7 +66,8 @@ add_library(tierstream STATIC
   src/dg_ctx.cpp
   src/stream_ctx.cpp
   src/capi.cpp
-  src/ts_api.cpp)
+  src/ts_api.cpp
+  src/adapt_usage.cpp)
 target_include_directories(tierstream PUBLIC include PRIVATE src)
 target_link_libraries(tierstream PUBLIC Threads::Threads)
 target_link_libraries(tierstream PUBLIC ${CMAKE_DL_LIBS})  # device profiles load HIP / CUDA / NVML at run time
@@ -165,6 +167,14 @@ if(TS_HIP)
   target_link_libraries(tierstream PUBLIC hip::host)
 endif()
 
+# Adaptive memory plan (additive: nothing runs unless called; the usage hook in the context is off until attached).
+if(TS_ADAPTIVE)
+  target_sources(tierstream PRIVATE src/adapt_sim.cpp src/adapt_solve.cpp src/adapt_capi.cpp)
+  add_executable(ts-adapt tools/ts_adapt.cpp)
+  target_include_directories(ts-adapt PRIVATE src)
+  target_link_libraries(ts-adapt PRIVATE tierstream)
+endif()
+
 # Tools: the new names, and the old ones (same sources, each printing its own name) for one release.
 foreach(name ts-plan ss-plan)
   add_executable(${name} tools/ts_plan.cpp)
@@ -216,6 +226,12 @@ if(TS_TESTS)
   target_link_libraries(ts-test-read-bench PRIVATE tierstream)
   add_test(NAME read-bench COMMAND ts-test-read-bench $<TARGET_FILE:ts-read-bench>)
   set_tests_properties(read-bench PROPERTIES TIMEOUT 60)
+  if(TS_ADAPTIVE)
+    add_executable(ts-test-adapt tests/test_adapt.cpp)
+    target_include_directories(ts-test-adapt PRIVATE src)
+    target_link_libraries(ts-test-adapt PRIVATE tierstream)
+    add_test(NAME adapt COMMAND ts-test-adapt WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  endif()
   foreach(t core runtime recipe exclusive readahead snapshot mfile source-file)
     string(REPLACE "-" "_" f ${t})
     add_executable(ts-test-${t} tests/test_${f}.cpp)
@@ -400,6 +416,11 @@ if(TS_TESTS)
     add_test(NAME dg-load-cuda COMMAND ts-test-dg-cuda --only dg_cuda_load_serial_pipeline)
     add_executable(ts-test-device tests/test_ts_device.cu)  # ts_dg_slot == ss_dg_slot in a kernel (GPU run)
     target_link_libraries(ts-test-device PRIVATE tierstream CUDA::cudart)
+    if(TS_ADAPTIVE)
+      add_executable(ts-bench-adapt tools/ts_bench_adapt.cu)
+      target_include_directories(ts-bench-adapt PRIVATE src)
+      target_link_libraries(ts-bench-adapt PRIVATE tierstream CUDA::cudart)
+    endif()
     add_executable(ts-test-cuda tests/test_cuda.cu)
     target_include_directories(ts-test-cuda PRIVATE src)
     target_link_libraries(ts-test-cuda PRIVATE tierstream CUDA::cudart)

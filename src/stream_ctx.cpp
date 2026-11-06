@@ -1,5 +1,7 @@
 #include "stream_ctx.hpp"
 
+#include "adapt_usage.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -1289,8 +1291,12 @@ void Ctx::begin(const uint32_t* rows, int n_layers_in) {
   require(!in_forward_, SS_E_INVALID, "begin: previous forward not ended");
   require(rows == nullptr || n_layers_in == n_layers(), SS_E_INVALID, "begin: rows_per_layer needs one per layer");
   open_forward();
+  fwd_rows_ = 1;
   if (rows)
-    for (size_t L = 0; L < L_.size(); ++L) L_[L].skip = rows[L] == 0;
+    for (size_t L = 0; L < L_.size(); ++L) {
+      L_[L].skip = rows[L] == 0;
+      fwd_rows_ = std::max(fwd_rows_, rows[L]);
+    }
   if (excl_) {
     uint64_t f = 0;
     for (const auto& v : free_blocks_) f += v.size();
@@ -1359,6 +1365,7 @@ void Ctx::routes(int layer, const int32_t* ids, int n) {
   require(in_forward_, SS_E_INVALID, "routes: outside a forward (call ss_begin)");
   require(n >= 0 && (ids || n == 0), SS_E_INVALID, "routes: bad ids");
   ingest_routes(layer, ids, n);
+  if (usage_) usage_->observe(layer, ids, n);
   ra_pump();
 }
 
@@ -1386,6 +1393,7 @@ void Ctx::ingest_dev_routes(int layer) {
   int n = s.ids_n;
   s.ids_n = -1;
   ingest_routes(layer, s.ids_host, n);
+  if (usage_) usage_->observe(layer, s.ids_host, n);
 }
 
 void Ctx::routes_all(int layer) {
@@ -1597,11 +1605,25 @@ void Ctx::wait_job_quiet(Job& j) {
   });
 }
 
+void Ctx::set_usage(adapt::Usage* u) {
+  // The table is not locked: it is only touched on the engine thread, between ss_begin and ss_end; attaching or
+  // detaching inside a forward would tick a forward it did not observe from the start.
+  require(!in_forward_, SS_E_INVALID, "usage attach: not inside a forward (between ss_begin and ss_end)");
+  if (u) {
+    require(u->n_layers() == n_layers(), SS_E_INVALID, "usage attach: the table's layer count differs from the descriptor");
+    for (int L = 0; L < n_layers(); ++L)
+      require(u->layer_units(L) == uint32_t(layer_units(L)), SS_E_INVALID,
+              "usage attach: layer " + std::to_string(L) + " has another unit count in the table");
+  }
+  usage_ = u;
+}
+
 void Ctx::end() {
   require(in_forward_, SS_E_INVALID, "end: no forward open");
   for (size_t L = 0; L < L_.size(); ++L)
     require(!L_[L].acquired || L_[L].released, SS_E_INVALID,
             "end: layer " + std::to_string(L) + " acquired but not released");
+  if (usage_) usage_->tick(fwd_rows_);
   // Read-ahead: no new request from here on; unused, waiting and unattached work is abandoned; producers are drained
   // (auxiliary: their failures are not this forward's).
   if (ra_on()) {
