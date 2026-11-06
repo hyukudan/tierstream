@@ -7,19 +7,6 @@
 
 namespace ts {
 
-// Incremental hashing for explicit full-content scans; memory use is independent of file size.
-class Sha256 {
- public:
-  void update(const void* data, size_t n);
-  std::string hex() const;
-
- private:
-  uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-  unsigned char tail_[64] = {};
-  uint64_t bytes_ = 0;
-  size_t used_ = 0;
-};
-
 std::string sha256_hex(const void* data, size_t n);
 
 // Incremental SHA-256 (multi-gigabyte files). On Windows the system provider (CNG) does the rounds.
