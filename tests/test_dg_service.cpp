@@ -1419,6 +1419,8 @@ TEST(dg_ctx_path_layer_tokens_make_resident) {
   CHECK_EQ(r.core->layer_token(), 0xffffffffu);
   for (const auto& kv : held0) CHECK(r.core->home(kv.first) == DgCore::Home::Device);
   CHECK_EQ(r.bad, 0ull);
+}
+
 // Capture is read-only: identical native tables/counters, even after overflow.
 TEST(dg_service_capture_routes_and_overflow) {
   std::vector<int32_t> reference;
