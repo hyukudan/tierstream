@@ -272,9 +272,19 @@ struct MFile::Impl {
   // under four times its size, more), so a primary-only sample taken alone is never held against split requests that
   // queued behind other reads.
   static constexpr uint64_t kSingleEvery = 16, kSplitOff = 64;
+  // Balanced routing: a stripe location whose rate was not sampled for kProbeAfter large requests or kProbeNs is offered
+  // at the best rate of the others again, so a drive measured slow once (busy for a moment, or the OS drive) is measured
+  // again instead of keeping a share too small to be given a piece; really slow, it measures slow and its share falls
+  // back. The time limit matters when no large request comes at all (decode reads one expert's parts, medium requests):
+  // the medium rule's slow-stripe guard reads these shares and would otherwise keep a rate learned at load for good.
+  static constexpr uint64_t kProbeAfter = 32;
+  static constexpr int64_t kProbeNs = int64_t(10) * 1000 * 1000 * 1000;
   static constexpr size_t kLoadClasses = 4;
   std::mutex share_mu, plan_mu;
   std::vector<double> rate;           // bytes per ns per location (EWMA)
+  std::vector<uint64_t> sampled;      // balanced routing: `large` at each location's last rate sample
+  std::vector<int64_t> sampled_ns;    // and its time (now_ns)
+  std::atomic<int64_t> probe_ns{kProbeNs};  // kProbeNs (test hook: shorter)
   double split_rate = 0, single_rate = 0;  // whole large requests, split / primary only (EWMA, bytes per ns)
   uint64_t large = 0, split_samples = 0, split_off_until = 0;
   struct LoadClass {
@@ -532,11 +542,23 @@ struct MFile::Impl {
   Route shares_locked() {
     Route r;
     if (rate.empty()) rate.assign(locs.size(), 6.0);  // 6 GB/s until measured
+    if (sampled.empty()) sampled.assign(locs.size(), 0);
+    if (sampled_ns.empty()) sampled_ns.assign(locs.size(), 0);
+    std::vector<double> eff = rate;
+    if (!legacy) {
+      double best = 0;
+      for (size_t l = 0; l < locs.size(); ++l)
+        if (locs[l]->enabled.load() || !l) best = std::max(best, rate[l]);
+      const int64_t now = now_ns();
+      for (size_t l = 1; l < locs.size(); ++l)
+        if (large - sampled[l] >= kProbeAfter || now - sampled_ns[l] >= probe_ns.load())
+          eff[l] = std::max(rate[l], best);  // re-probe a stale location
+    }
     double sum = 0;
-    for (size_t l = 0; l < locs.size(); ++l) sum += locs[l]->enabled.load() || !l ? rate[l] : 0.0;
+    for (size_t l = 0; l < locs.size(); ++l) sum += locs[l]->enabled.load() || !l ? eff[l] : 0.0;
     r.share.assign(locs.size(), 0.0);
     for (size_t l = 0; l < locs.size(); ++l)
-      if ((locs[l]->enabled.load() || !l) && sum > 0) r.share[l] = rate[l] / sum;
+      if ((locs[l]->enabled.load() || !l) && sum > 0) r.share[l] = eff[l] / sum;
     return r;
   }
 
@@ -555,7 +577,11 @@ struct MFile::Impl {
     std::lock_guard<std::mutex> lock(share_mu);
     auto ewma = [](double& v, double sample) { v = v > 0 ? v * 0.75 + sample * 0.25 : sample; };
     for (size_t l = 0; l < locs.size(); ++l)
-      if (loc_bytes[l] && loc_end[l] > t0) ewma(rate[l], double(loc_bytes[l]) / double(loc_end[l] - t0));
+      if (loc_bytes[l] && loc_end[l] > t0) {
+        ewma(rate[l], double(loc_bytes[l]) / double(loc_end[l] - t0));
+        if (l < sampled.size()) sampled[l] = large;
+        if (l < sampled_ns.size()) sampled_ns[l] = now_ns();
+      }
     double whole = double(bytes) / double(end - t0);
     if (!legacy) {
       LoadClass& c = classes[load];
@@ -1195,6 +1221,7 @@ void MFile::test_prefer_stripe(bool on) { impl_->prefer_stripe.store(on); }
 void MFile::test_delay(int loc, uint64_t microseconds) {
   impl_->locs.at(size_t(loc))->delay_us.store(microseconds);
 }
+void MFile::test_probe_ns(int64_t ns) { impl_->probe_ns.store(ns); }
 
 void MFile::test_inject(int loc, int kind, uint64_t after) {
   require(loc > 0 && size_t(loc) < impl_->locs.size() && kind >= 0 && kind <= 3, SS_E_INVALID, "invalid mfile injection");
