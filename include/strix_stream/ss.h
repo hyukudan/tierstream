@@ -890,9 +890,6 @@ typedef struct ss_dg_stats {
    * busy time and the last 16 decisions) */
   uint32_t disk_depth_active, disk_depth_adapt;
   uint64_t disk_depth_changes, disk_depth_calibrations;
-  /* appended, layer tokens (ss_dg_begin_layer): tokens and parts served; units of other gated layers written back
-   * inside a layer token for a demand that found neither a free nor a bank slot (synchronous, rare) */
-  uint64_t lm_tokens, lm_parts, lm_mid_evictions;
   /* appended, layer leases (SS_DG_LAYER_LEASE): rings reserved, decode units their reservations evicted, rings
    * returned, ring slots reserved now (a gauge); leases, ids leased, read in place (on the device already), ring hits (a
    * released ring slot still holding the unit: no copy), ring misses (copied into a ring slot) and their bytes, of those

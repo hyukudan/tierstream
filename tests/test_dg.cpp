@@ -46,8 +46,7 @@ class Scripted final : public DgTransport {
   struct Ev {
     uint64_t recorded = 0, completed = 0;
   };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark, ReadyPart };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, LeaseMap, CRead };
+  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark, ReadyPart, LeaseMap, CRead };
   static constexpr int kConsumer = 3;  // a foreign (engine) stream: layer leases' consumers
   struct Op {
     Kind kind;
@@ -519,9 +518,8 @@ class Scripted final : public DgTransport {
     }
   }
 
-  std::deque<Op> q_[3];
-  std::vector<std::pair<uint32_t, uint32_t>> uploads_;
   std::deque<Op> q_[4];
+  std::vector<std::pair<uint32_t, uint32_t>> uploads_;
   std::vector<int32_t> lease_maps_[8];
   uint64_t creads_ = 0;
   std::vector<std::unique_ptr<Ev>> evs_;
@@ -6293,6 +6291,11 @@ std::vector<std::vector<uint32_t>> unused_preds(const ResRig& r, const std::vect
 uint64_t host_homes(const DgCore& core) {
   uint64_t n = 0;
   for (uint32_t k = 0; k < core.keys(); ++k) n += core.home(k) == DgCore::Home::Host;
+  return n;
+}
+
+}  // namespace
+
 // ---- layer leases (ss_dg_reserve_ring / ss_dg_lease_layer / ss_dg_release_layer / ss_dg_return_ring) ----
 namespace {
 
@@ -6344,12 +6347,6 @@ void check_lease(ResRig& r, const DgCore::LeaseResult& l, const std::vector<uint
     if (h == DgCore::Home::Device || h == DgCore::Home::Coming) CHECK_EQ(map[u], r.core->slot_of(k));
   }
   r.core->check();
-}
-
-size_t count_kind(const Scripted& t, Scripted::Kind kind) {
-  size_t n = 0;
-  for (auto k : t.issued()) n += k == kind ? 1 : 0;
-  return n;
 }
 
 }  // namespace
@@ -6642,6 +6639,70 @@ TEST(dg_pred_ahead_skipped) {
   r.core->end_token({});
   r.core->check();
   CHECK_EQ(r.core->stats().prefetch_used, 1u);
+}
+
+// A whole 384-expert layer (no 64-id limit): 200 units on the device read in place, 184 copied into the ring; a > 64-id
+// lease of another layer refused next to it; a cap; nothing of the decode cache changes; hits on a second lease.
+TEST(dg_lease_whole_layer) {
+  ResRig r({384, 128, 64}, 200, 300, 8);
+  r.core->check();
+  const auto before = placement(*r.core);
+  const auto dec0 = decode_counts(r.core->stats());
+  const DgCore::RingResult rr = r.core->reserve_ring(250, {});
+  CHECK_EQ(rr.slots, 250u);
+  CHECK_EQ(rr.evicted, 0u);  // 300 free slots: nothing evicted
+  CHECK_EQ(r.core->free_slots(), 50u);
+  CHECK(placement(*r.core) == before);
+  const DgCore::LeaseResult a = r.core->lease_layer(0, {}, true, 0);
+  CHECK_EQ(a.leased, 384u);
+  CHECK_EQ(a.resident, 200u);
+  CHECK_EQ(a.misses, 184u);
+  CHECK_EQ(a.hits, 0u);
+  check_lease(r, a, iota_ids(0, 384));
+  CHECK_EQ(r.core->ring_free(), 66u);
+  // 100 ids of layer 1 (> 64) do not fit next to the active lease: refused, nothing changed
+  const auto mid = placement(*r.core);
+  r.t->clear_issued();
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 100), false, 0); })), int(SS_E_CAPACITY));
+  CHECK(r.t->issued().empty());
+  CHECK_EQ(r.core->leases_active(), 1u);
+  // a cap below the need: refused
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 60), false, 10); })), int(SS_E_CAPACITY));
+  const DgCore::LeaseResult b = r.core->lease_layer(1, iota_ids(0, 60), false, 60);
+  CHECK_EQ(b.misses, 60u);
+  check_lease(r, b, iota_ids(0, 60));
+  r.core->release_layer(a.index, nullptr);
+  const DgCore::LeaseResult c = r.core->lease_layer(2, iota_ids(0, 64), false, 0);  // 6 free + 58 of layer 0's slots
+  CHECK_EQ(c.misses, 64u);
+  check_lease(r, c, iota_ids(0, 64));
+  r.core->release_layer(b.index, nullptr);
+  r.core->release_layer(c.index, nullptr);
+  // layer 0 again: 126 of its 184 ring units are still in their slots (hits, no copy), 58 were overwritten by layer 2
+  r.t->clear_issued();
+  const DgCore::LeaseResult a2 = r.core->lease_layer(0, {}, true, 0);
+  CHECK_EQ(a2.hits, 126u);
+  CHECK_EQ(a2.misses, 58u);
+  CHECK_EQ(count_kind(*r.t, Scripted::H2D), size_t(58));
+  check_lease(r, a2, iota_ids(0, 384));
+  r.core->release_layer(a2.index, nullptr);
+  CHECK(placement(*r.core) == mid);
+  r.core->return_ring();
+  CHECK_EQ(r.core->free_slots(), 300u);
+  CHECK(placement(*r.core) == before);
+  CHECK(decode_counts(r.core->stats()) == dec0);
+  const ts::DgStats& s = r.core->stats();
+  CHECK_EQ(s.lease_reserves, uint64_t(1));
+  CHECK_EQ(s.lease_returns, uint64_t(1));
+  CHECK_EQ(s.leases, uint64_t(4));
+  CHECK_EQ(s.lease_units, uint64_t(384 + 60 + 64 + 384));
+  CHECK_EQ(s.lease_resident, uint64_t(400));
+  CHECK_EQ(s.lease_ring_hits, uint64_t(126));
+  CHECK_EQ(s.lease_ring_misses, uint64_t(184 + 60 + 64 + 58));
+  CHECK_EQ(s.lease_bytes, s.lease_ring_misses * (2048 + 2048 + 4096));
+  CHECK_EQ(s.lease_ring_waits, uint64_t(0));  // every release had no stream
+  CHECK_EQ(s.lease_disk_reads, uint64_t(0));
+  // decode after the return: tokens read the right bytes
+  for (int tok = 0; tok < 4; ++tok) r.token(r.routes(6), all_run(3), {});
   r.verify();
   CHECK(r.v.what.empty());
 }
@@ -7181,68 +7242,6 @@ TEST(dg_landing_make_resident) {
   r.core->end_token({r.core->key(1, 5), r.core->key(1, 2)});
   CHECK_EQ(s.landing_expired, 1u);  // 6, its second boundary
   CHECK_EQ(r.core->landing_free(), 2u);
-// A whole 384-expert layer (no 64-id limit): 200 units on the device read in place, 184 copied into the ring; a > 64-id
-// lease of another layer refused next to it; a cap; nothing of the decode cache changes; hits on a second lease.
-TEST(dg_lease_whole_layer) {
-  ResRig r({384, 128, 64}, 200, 300, 8);
-  r.core->check();
-  const auto before = placement(*r.core);
-  const auto dec0 = decode_counts(r.core->stats());
-  const DgCore::RingResult rr = r.core->reserve_ring(250, {});
-  CHECK_EQ(rr.slots, 250u);
-  CHECK_EQ(rr.evicted, 0u);  // 300 free slots: nothing evicted
-  CHECK_EQ(r.core->free_slots(), 50u);
-  CHECK(placement(*r.core) == before);
-  const DgCore::LeaseResult a = r.core->lease_layer(0, {}, true, 0);
-  CHECK_EQ(a.leased, 384u);
-  CHECK_EQ(a.resident, 200u);
-  CHECK_EQ(a.misses, 184u);
-  CHECK_EQ(a.hits, 0u);
-  check_lease(r, a, iota_ids(0, 384));
-  CHECK_EQ(r.core->ring_free(), 66u);
-  // 100 ids of layer 1 (> 64) do not fit next to the active lease: refused, nothing changed
-  const auto mid = placement(*r.core);
-  r.t->clear_issued();
-  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 100), false, 0); })), int(SS_E_CAPACITY));
-  CHECK(r.t->issued().empty());
-  CHECK_EQ(r.core->leases_active(), 1u);
-  // a cap below the need: refused
-  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 60), false, 10); })), int(SS_E_CAPACITY));
-  const DgCore::LeaseResult b = r.core->lease_layer(1, iota_ids(0, 60), false, 60);
-  CHECK_EQ(b.misses, 60u);
-  check_lease(r, b, iota_ids(0, 60));
-  r.core->release_layer(a.index, nullptr);
-  const DgCore::LeaseResult c = r.core->lease_layer(2, iota_ids(0, 64), false, 0);  // 6 free + 58 of layer 0's slots
-  CHECK_EQ(c.misses, 64u);
-  check_lease(r, c, iota_ids(0, 64));
-  r.core->release_layer(b.index, nullptr);
-  r.core->release_layer(c.index, nullptr);
-  // layer 0 again: 126 of its 184 ring units are still in their slots (hits, no copy), 58 were overwritten by layer 2
-  r.t->clear_issued();
-  const DgCore::LeaseResult a2 = r.core->lease_layer(0, {}, true, 0);
-  CHECK_EQ(a2.hits, 126u);
-  CHECK_EQ(a2.misses, 58u);
-  CHECK_EQ(count_kind(*r.t, Scripted::H2D), size_t(58));
-  check_lease(r, a2, iota_ids(0, 384));
-  r.core->release_layer(a2.index, nullptr);
-  CHECK(placement(*r.core) == mid);
-  r.core->return_ring();
-  CHECK_EQ(r.core->free_slots(), 300u);
-  CHECK(placement(*r.core) == before);
-  CHECK(decode_counts(r.core->stats()) == dec0);
-  const ts::DgStats& s = r.core->stats();
-  CHECK_EQ(s.lease_reserves, uint64_t(1));
-  CHECK_EQ(s.lease_returns, uint64_t(1));
-  CHECK_EQ(s.leases, uint64_t(4));
-  CHECK_EQ(s.lease_units, uint64_t(384 + 60 + 64 + 384));
-  CHECK_EQ(s.lease_resident, uint64_t(400));
-  CHECK_EQ(s.lease_ring_hits, uint64_t(126));
-  CHECK_EQ(s.lease_ring_misses, uint64_t(184 + 60 + 64 + 58));
-  CHECK_EQ(s.lease_bytes, s.lease_ring_misses * (2048 + 2048 + 4096));
-  CHECK_EQ(s.lease_ring_waits, uint64_t(0));  // every release had no stream
-  CHECK_EQ(s.lease_disk_reads, uint64_t(0));
-  // decode after the return: tokens read the right bytes
-  for (int tok = 0; tok < 4; ++tok) r.token(r.routes(6), all_run(3), {});
   r.verify();
   CHECK(r.v.what.empty());
 }
@@ -7675,6 +7674,7 @@ TEST(dg_landing_layer_expiry_aborts_running_chunked_read) {
     CHECK(r.v.what.empty());
   }
 }
+
 // Ring exhaustion with wait, and the release ordering against the consumers: lease A fills the ring, its consumer (a
 // held foreign stream) reads every slot after A's ready; A is released on that stream; lease B finds only A's slots:
 // each copy waits (device-side) for A's release, so the consumer still reads A's bytes; a full ring with A active

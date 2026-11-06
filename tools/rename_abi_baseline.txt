@@ -220,5 +220,5 @@ ss.h-sha256 8727329f8a7c06a737efe01bd93e28684b66ca2d7312f2062ff44135ce26a515
 # bank keep at the middle (additive: dg_bank_keep accepts 2, appended SS_DG_BANK_KEEP_MID; comment)
 ss.h-sha256 5536549c4636372cdfc59d7aa687984f824a3081e16e61a6ba834febb0ad27e2
 
-# layer leases (additive: ss_dg_reserve_ring / return_ring / lease_layer_sized / enqueue_lease_wait / release_layer / ring_plan_sized, ss_dg_lease / ss_dg_ring_sizing, SS_DG_LAYER_LEASE / SS_DG_MAX_LEASES / SS_DG_LEASE_ALL; ss_dg_stats lease_* appended after lm_*, read through ss_stats_dg_sized)
-ss.h-sha256 cfade1702c7bf43104d38e7b669a6261fb2aa734473a0acf96b133b0c4e30325
+# layer leases (additive: ss_dg_reserve_ring / return_ring / lease_layer_sized / enqueue_lease_wait / release_layer / ring_plan_sized, ss_dg_lease / ss_dg_ring_sizing, SS_DG_LAYER_LEASE / SS_DG_MAX_LEASES / SS_DG_LEASE_ALL; ss_dg_stats lease_* appended after the disk_depth_* fields, read through ss_stats_dg_sized)
+ss.h-sha256 65e78c9bd807ba3666172ba99c7c233bcc17fd4f32dfa71d10ffb59b530ffba6

@@ -297,6 +297,14 @@ struct DgStats {
   // pinned units dropped to their file for one, and those read back from their file within 8 tokens (churn: stats
   // JSON only)
   uint64_t bank_kept = 0, bank_keep_drops = 0, bank_keep_rereads = 0;
+  // layer leases (ss_dg_reserve_ring / ss_dg_lease_layer): rings reserved, decode units the reservations evicted, rings
+  // returned; leases, the ids they leased, read in place (on the device already), ring hits (a released ring slot still
+  // holding the unit: no copy), ring misses (copied into a ring slot) and their bytes, of those read from their file
+  // (three-tier) and their bytes; ring-slot reuses whose copy waited (device-side) for an earlier lease's release; the
+  // host's waits for the releases at the ring's return; the lease calls' host time. Counted nowhere else.
+  uint64_t lease_reserves = 0, lease_reserve_evicted = 0, lease_returns = 0, leases = 0, lease_units = 0;
+  uint64_t lease_resident = 0, lease_ring_hits = 0, lease_ring_misses = 0, lease_bytes = 0, lease_disk_reads = 0;
+  uint64_t lease_disk_bytes = 0, lease_ring_waits = 0, lease_return_wait_ns = 0, lease_ns = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -317,14 +325,6 @@ struct DgRoundOut {
   uint32_t promoted_to_device = 0, promoted_to_pinned = 0, demoted_from_device = 0, dropped_to_file = 0;
   uint32_t cancelled = 0;
   uint64_t bytes_read = 0, bytes_h2d = 0, bytes_written_back = 0, ns = 0;
-  // layer leases (ss_dg_reserve_ring / ss_dg_lease_layer): rings reserved, decode units the reservations evicted, rings
-  // returned; leases, the ids they leased, read in place (on the device already), ring hits (a released ring slot still
-  // holding the unit: no copy), ring misses (copied into a ring slot) and their bytes, of those read from their file
-  // (three-tier) and their bytes; ring-slot reuses whose copy waited (device-side) for an earlier lease's release; the
-  // host's waits for the releases at the ring's return; the lease calls' host time. Counted nowhere else.
-  uint64_t lease_reserves = 0, lease_reserve_evicted = 0, lease_returns = 0, leases = 0, lease_units = 0;
-  uint64_t lease_resident = 0, lease_ring_hits = 0, lease_ring_misses = 0, lease_bytes = 0, lease_disk_reads = 0;
-  uint64_t lease_disk_bytes = 0, lease_ring_waits = 0, lease_return_wait_ns = 0, lease_ns = 0;
 };
 
 // Window prefetch (winpf, opt-in). Off = today's behaviour byte for byte.
