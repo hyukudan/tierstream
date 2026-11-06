@@ -215,45 +215,48 @@ __global__ void spin_kernel(unsigned long long ns) {
   }
 }
 
-int last() { return int(cudaGetLastError()); }
+template <class T>
+struct same {
+  using type = T;
+};
+// One block of `threads` on stream s: the status of this launch alone. A triple-chevron launch reports through
+// cudaGetLastError, which also returns an error some earlier, unrelated call left pending (the engine's, say) and
+// would poison the context for it; cudaLaunchKernel returns its own status and leaves that error to its owner.
+template <class... A>
+int launch(void (*k)(A...), unsigned threads, void* s, typename same<A>::type... a) {
+  void* args[] = {static_cast<void*>(&a)...};
+  return int(cudaLaunchKernel(reinterpret_cast<const void*>(k), dim3(1), dim3(threads), args, 0,
+                              static_cast<cudaStream_t>(s)));
+}
 
 }  // namespace
 
 int launch_begin(const Dev& d, void* s) {
-  begin_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(d);
-  return last();
+  return launch(begin_kernel, 1, s, d);
 }
 int launch_export(const Dev& d, uint32_t g, const int32_t* ids, uint32_t n, uint32_t n_pred, void* s) {
-  export_kernel<<<1, 64, 0, static_cast<cudaStream_t>(s)>>>(d, g, ids, n, n_pred);
-  return last();
+  return launch(export_kernel, 64, s, d, g, ids, n, n_pred);
 }
 int launch_predict(const Dev& d, uint32_t g, const int32_t* ids, uint32_t n, void* s) {
-  predict_kernel<<<1, 64, 0, static_cast<cudaStream_t>(s)>>>(d, g, ids, n);
-  return last();
+  return launch(predict_kernel, 64, s, d, g, ids, n);
 }
 int launch_wait(const Dev& d, uint32_t g, void* s) {
-  wait_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(d, g);
-  return last();
+  return launch(wait_kernel, 1, s, d, g);
 }
 int launch_end(const Dev& d, void* s) {
-  end_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(d);
-  return last();
+  return launch(end_kernel, 1, s, d);
 }
 int launch_export_part(const Dev& d, uint32_t g, uint32_t part, const int32_t* ids, uint32_t n, void* s) {
-  export_part_kernel<<<1, 64, 0, static_cast<cudaStream_t>(s)>>>(d, g, part, ids, n);
-  return last();
+  return launch(export_part_kernel, 64, s, d, g, part, ids, n);
 }
 int launch_wait_part(const Dev& d, uint32_t part, void* s) {
-  wait_part_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(d, part);
-  return last();
+  return launch(wait_part_kernel, 1, s, d, part);
 }
 int launch_end_layer(const Dev& d, void* s) {
-  end_layer_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(d);
-  return last();
+  return launch(end_layer_kernel, 1, s, d);
 }
 int launch_spin(unsigned long long ns, void* s) {
-  spin_kernel<<<1, 1, 0, static_cast<cudaStream_t>(s)>>>(ns);
-  return last();
+  return launch(spin_kernel, 1, s, ns);
 }
 
 int preload() {

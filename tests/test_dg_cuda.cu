@@ -2031,6 +2031,8 @@ TEST(dg_cuda_disk_queue_auto) {
           },
           nullptr, false, 64, [](std::vector<uint8_t>& t) { sstest::dg_production_tiers(t); });
     if (!r.c) return;
+    r.capture(false);  // the graphs the tokens launch
+    r.capture(true);
     Tally k;
     for (int i = 0; i < 40; ++i) k.add(r.token(true, i % 2 == 0));
     CHECK_EQ(k.wrong + k.failed, 0);
@@ -2048,6 +2050,24 @@ TEST(dg_cuda_disk_queue_auto) {
     CHECK(j.find(automatic ? "\"disk_locations\":1" : "\"disk_locations\":0") != std::string::npos);
     CHECK(j.find("\"staging\":8") != std::string::npos);
   }
+}
+
+// An error some other call left pending (non-sticky: cudaMemcpy with a null destination) is not the cache's: tokens
+// run exact with it pending, and it stays for its owner to read (the launches report only their own status).
+TEST(dg_cuda_stale_error_left_to_owner) {
+  Rig r("stale", 8, 4, 8);
+  if (!r.c) return;
+  r.capture(false);  // the graph the even tokens launch
+  Tally k;
+  k.add(r.token(false, false));
+  (void)cudaGetLastError();
+  int x = 0;
+  CHECK(cudaMemcpy(nullptr, &x, 4, cudaMemcpyHostToDevice) != cudaSuccess);  // pending from here on
+  for (int t = 0; t < 4; ++t) k.add(r.token(t % 2 == 0, false));
+  CHECK_EQ(k.failed, 0);
+  CHECK_EQ(k.wrong, 0);
+  CHECK(cudaGetLastError() != cudaSuccess);  // still there for its owner
+  CHECK_OK(ss_test_dg_check(r.c));
 }
 
 TEST(dg_cuda_make_resident_prefill) { make_resident_prefill("mkres", false); }
