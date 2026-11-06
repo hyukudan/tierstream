@@ -2452,8 +2452,8 @@ TEST(content_header_bounded_reads) {
 TEST(content_streaming_sha256_vectors) {
   Sha256 hash;
   hash.update("a", 1); hash.update("bc", 2);
-  CHECK_EQ(hash.hex(), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
-  CHECK_EQ(hash.hex(), sha256_hex("abc", 3));
+  CHECK_EQ(hash.hex(), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));  // hex() finishes
+  CHECK_EQ(sha256_hex("abc", 3), std::string("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
   const std::string chunk(1000, 'a');
   Sha256 million;
   for (int i = 0; i < 1000; ++i) million.update(chunk.data(), chunk.size());
