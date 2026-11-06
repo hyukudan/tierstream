@@ -890,6 +890,15 @@ typedef struct ss_dg_stats {
    * busy time and the last 16 decisions) */
   uint32_t disk_depth_active, disk_depth_adapt;
   uint64_t disk_depth_changes, disk_depth_calibrations;
+  /* appended, layer leases (SS_DG_LAYER_LEASE): rings reserved, decode units their reservations evicted, rings
+   * returned, ring slots reserved now (a gauge); leases, ids leased, read in place (on the device already), ring hits (a
+   * released ring slot still holding the unit: no copy), ring misses (copied into a ring slot) and their bytes, of those
+   * read from their file (three-tier) and their bytes, ring-slot copies that waited (device-side) for an earlier
+   * lease's release event; the host's waits for the release events at ss_dg_return_ring; the lease calls' host time.
+   * Counted nowhere else (not misses, fetches, evictions, write-backs or file reads). */
+  uint64_t lease_reserves, lease_reserve_evicted, lease_returns, lease_ring_slots;
+  uint64_t leases, lease_units, lease_resident, lease_ring_hits, lease_ring_misses, lease_bytes;
+  uint64_t lease_disk_reads, lease_disk_bytes, lease_ring_waits, lease_return_wait_ns, lease_ns;
 } ss_dg_stats;
 SS_API ss_status ss_stats_dg_sized(const ss_ctx* c, ss_dg_stats* out, uint32_t size);
 static inline ss_status ss_stats_dg(const ss_ctx* c, ss_dg_stats* out) {
@@ -1837,6 +1846,82 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
 #define SS_DG_DISK_QUEUE_ADAPT 1
 /* ss_options.dg_bank_keep = 2 is accepted (kept units inserted at the middle of the pinned recency list). */
 #define SS_DG_BANK_KEEP_MID 1
+
+/* Layer leases (opt-in; large-piece prefill over the device-gated arena). Engine thread, between tokens, with the state
+   rules of ss_dg_make_resident. A many-row consumer (e.g. a grouped MoE kernel over a whole layer) reads every expert
+   it needs of gated layer g at parts[p].base + slot * parts[p].stride (ss_dg_device_view) for slot = map[unit], and no
+   decode unit moves for it.
+   - ss_dg_reserve_ring(n): borrows n persistent slots as the prefill ring, once per prefill: takes the free slots
+     first and evicts device units (the policy's order, never a ss_dg_keep / make_resident unit, the boundary's
+     lower-tier rules: a clean copy back to its block, a write-back into a free pinned block, three-tier: a pinned unit
+     dropped to its file for that block, else the victim to its file) only for the rest; *evicted (may be NULL) = how
+     many. The decode residency lost is at most n. SS_E_CAPACITY (nothing changed) when the free slots, the write-backs
+     in flight and the evictable units cannot make n, or (two-tier) the dirty victims need more free pinned blocks than
+     exist. Size n with ss_dg_ring_plan (a lease of whole layers never needs more slots than those layers' units).
+   - ss_dg_lease_layer(g, ids, n, ring_slots, out): ids[0..n) distinct units of g, or n = SS_DG_LEASE_ALL (ids
+     ignored) for every unit of g (no SS_DG_MAX_IDS limit: a whole layer of any size). A unit on the device stays where
+     it is and is read in place; a released ring slot still holding the unit is reused (a ring hit, no copy); every
+     other one is copied into a ring slot no active lease holds (from its pinned block; three-tier: its file through the
+     staging buffers, as a demand miss), untagged slots first, then the least recently released. A slot an earlier
+     lease's consumer may still read (its release event not complete) is overwritten only after that event (the copy
+     stream waits on it, device-side; counted in lease_ring_waits). out->map_dev (device, out->n_units int32: the slot,
+     -1 = not leased) and every copy are complete at out->ready_event (a cudaEvent_t: cudaStreamWaitEvent on it, or
+     ss_dg_enqueue_lease_wait); both stay valid until the release, as map_host (the same map on the host). ring_slots >
+     0 caps the ring slots this lease may hold (hits + misses), 0 = the whole ring. No decode table entry, recency,
+     score or decode counter changes. Refused with nothing changed: no ring reserved, g already leased,
+     SS_DG_MAX_LEASES leases active, bad ids (SS_E_INVALID); more ring slots needed than no active lease holds, or than
+     ring_slots (SS_E_CAPACITY: release a lease, or reserve a larger ring). Several layers may be leased at once (copy
+     layer L + 1's experts while layer L computes).
+   - ss_dg_release_layer(lease, stream): records an event on `stream` after the lease's last consumer (NULL: the caller
+     has synchronized its consumers) and gives the lease's ring slots back to the ring, still holding their units (no
+     write-back: weights are immutable); their next overwrite waits for that event. The lease id is free again.
+   - ss_dg_return_ring: every lease released (SS_E_INVALID otherwise); the host waits for every release event and the
+     lease copies, then the ring slots are free decode slots again (re-warmed by the next tokens' misses).
+   While a ring is reserved, ss_begin, ss_dg_begin_layer, ss_dg_keep, ss_dg_make_resident, ss_seed, ss_dg_reset_open,
+   ss_dg_set_policy and ss_dg_window_hint are refused with SS_E_INVALID (no decode unit moves: the leases read them in
+   place); a ring cannot be reserved inside a token. A held ss_dg_make_resident set is read in place like any device
+   unit. A device failure poisons the context; a file read failure (SS_E_IO) leaves the ring and the cache consistent
+   (the lease is not created). */
+#define SS_DG_LAYER_LEASE 1
+#define SS_DG_MAX_LEASES 8
+#define SS_DG_LEASE_ALL (-1)
+typedef struct ss_dg_lease {
+  uint32_t struct_size;
+  int32_t id;               /* 0..SS_DG_MAX_LEASES-1: ss_dg_enqueue_lease_wait / ss_dg_release_layer */
+  int32_t gated;            /* g */
+  uint32_t n_units;         /* map entries: the units of g */
+  const int32_t* map_dev;   /* device: the slot of unit u, -1 = not leased */
+  const int32_t* map_host;  /* the same map on the host */
+  void* ready_event;        /* every copy and map_dev complete */
+  uint32_t leased, resident, ring_hits, ring_misses;  /* ids; read in place; reused ring slots; copied */
+  uint32_t ring_waits;      /* copies into a slot that waited for an earlier lease's release */
+  uint32_t reserved0;
+} ss_dg_lease;
+typedef struct ss_dg_ring_sizing {
+  uint32_t struct_size;
+  uint32_t persistent_slots; /* residents + billed spares (the slots a ring may come from) */
+  uint64_t slot_bytes;       /* bytes per slot, every part: a borrow budget of B bytes = B / slot_bytes slots */
+  uint32_t reservable;       /* ring slots ss_dg_reserve_ring could take now */
+  uint32_t free_slots;       /* free decode slots now */
+  uint32_t max_layer_units;  /* the largest gated layer */
+  uint32_t max_layer_need;   /* the most units of one gated layer not on the device now */
+  uint32_t plan;             /* the most units not on the device over `depth` consecutive gated layers (whole layers) */
+  uint32_t ring_slots;       /* reserved now (0 = no ring) */
+} ss_dg_ring_sizing;
+SS_API ss_status ss_dg_ring_plan_sized(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out, uint32_t size);
+static inline ss_status ss_dg_ring_plan(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out) {
+  return ss_dg_ring_plan_sized(c, depth, out, (uint32_t)sizeof *out);
+}
+SS_API ss_status ss_dg_reserve_ring(ss_ctx* c, uint32_t n, uint32_t* evicted);
+SS_API ss_status ss_dg_return_ring(ss_ctx* c);
+SS_API ss_status ss_dg_lease_layer_sized(ss_ctx* c, int g, const int32_t* ids, int n, uint32_t ring_slots,
+                                         ss_dg_lease* out, uint32_t size);
+static inline ss_status ss_dg_lease_layer(ss_ctx* c, int g, const int32_t* ids, int n, uint32_t ring_slots,
+                                          ss_dg_lease* out) {
+  return ss_dg_lease_layer_sized(c, g, ids, n, ring_slots, out, (uint32_t)sizeof *out);
+}
+SS_API ss_status ss_dg_enqueue_lease_wait(ss_ctx* c, int lease, void* stream);
+SS_API ss_status ss_dg_release_layer(ss_ctx* c, int lease, void* stream);
 
 #ifdef __cplusplus
 }

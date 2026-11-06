@@ -1281,7 +1281,7 @@ TEST(dg_failure_report_and_module_loading) {
   CHECK_EQ(offsetof(ss_dg_stats, disk_depth_adapt), offsetof(ss_dg_stats, disk_depth_active) + 4);
   CHECK_EQ(offsetof(ss_dg_stats, disk_depth_changes), offsetof(ss_dg_stats, disk_depth_adapt) + 4);
   CHECK_EQ(offsetof(ss_dg_stats, disk_depth_calibrations), offsetof(ss_dg_stats, disk_depth_changes) + 8);
-  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, disk_depth_calibrations) + 8);
+  CHECK_EQ(sizeof(ss_dg_stats), offsetof(ss_dg_stats, lease_ns) + 8);
   ss_dg_stats z{};
   CHECK_EQ(z.cuda_module_loading, 0u);  // 0 = unknown (a non-CUDA context, or a driver that does not say)
 }

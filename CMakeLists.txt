@@ -57,6 +57,7 @@ add_library(tierstream STATIC
   src/pack_capi.cpp
   src/backend_cpu.cpp
   src/dg_core.cpp
+  src/dg_lease.cpp
   src/dg_prior.cpp
   src/dg_score.cpp
   src/dg_service.cpp

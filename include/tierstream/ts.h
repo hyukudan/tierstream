@@ -35,7 +35,9 @@ typedef ss_devprof_topology_out ts_devprof_topology_out;
 typedef ss_dg_boundary_timeline ts_dg_boundary_timeline;
 typedef ss_dg_device_view ts_dg_device_view;
 typedef ss_dg_layer_timeline ts_dg_layer_timeline;
+typedef ss_dg_lease ts_dg_lease;
 typedef ss_dg_part ts_dg_part;
+typedef ss_dg_ring_sizing ts_dg_ring_sizing;
 typedef ss_dg_round_params ts_dg_round_params;
 typedef ss_dg_round_result ts_dg_round_result;
 typedef ss_dg_stats ts_dg_stats;
@@ -142,10 +144,13 @@ typedef ss_tier_mode ts_tier_mode;
 #define TS_DG_DISK_TIER SS_DG_DISK_TIER
 #define TS_DG_LANDING SS_DG_LANDING
 #define TS_DG_LANDING_YIELD SS_DG_LANDING_YIELD
+#define TS_DG_LAYER_LEASE SS_DG_LAYER_LEASE
 #define TS_DG_LAYER_TOKEN SS_DG_LAYER_TOKEN
+#define TS_DG_LEASE_ALL SS_DG_LEASE_ALL
 #define TS_DG_MAKE_RESIDENT SS_DG_MAKE_RESIDENT
 #define TS_DG_MAX_IDS SS_DG_MAX_IDS
 #define TS_DG_MAX_LAYER_PARTS SS_DG_MAX_LAYER_PARTS
+#define TS_DG_MAX_LEASES SS_DG_MAX_LEASES
 #define TS_DG_MAX_PARTS SS_DG_MAX_PARTS
 #define TS_DG_MKRES_STATS SS_DG_MKRES_STATS
 #define TS_DG_PF_ADMIT SS_DG_PF_ADMIT
@@ -327,6 +332,12 @@ TS_API ss_status ts_dg_enqueue_wait_part(ss_ctx* c, int g, int part, void* strea
 TS_API ss_status ts_dg_enqueue_end_layer(ss_ctx* c, void* stream);
 TS_API ss_status ts_dg_set_pf_revert_unused(ss_ctx* c, uint32_t on);
 TS_API ss_status ts_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, const ss_options* o);
+TS_API ss_status ts_dg_ring_plan_sized(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out, uint32_t size);
+TS_API ss_status ts_dg_reserve_ring(ss_ctx* c, uint32_t n, uint32_t* evicted);
+TS_API ss_status ts_dg_return_ring(ss_ctx* c);
+TS_API ss_status ts_dg_lease_layer_sized(ss_ctx* c, int g, const int32_t* ids, int n, uint32_t ring_slots, ss_dg_lease* out, uint32_t size);
+TS_API ss_status ts_dg_enqueue_lease_wait(ss_ctx* c, int lease, void* stream);
+TS_API ss_status ts_dg_release_layer(ss_ctx* c, int lease, void* stream);
 
 static inline void ts_budget_defaults(ss_budget* b) { ss_budget_defaults(b); }
 static inline void ts_options_defaults(ss_options* o) { ss_options_defaults(o); }
@@ -348,6 +359,7 @@ static inline void ts_devprof_topology_in_defaults(ss_devprof_topology_in* in) {
 static inline void ts_devprof_piece_in_defaults(ss_devprof_piece_in* in) { ss_devprof_piece_in_defaults(in); }
 static inline void ts_pack_options_defaults(ss_pack_options* o) { ss_pack_options_defaults(o); }
 static inline ss_status ts_pack_find(const ss_pack* p, int layer, int expert, const char* name, ss_pack_entry* out) { return ss_pack_find(p, layer, expert, name, out); }
+static inline ss_status ts_dg_ring_plan(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out) { return ss_dg_ring_plan(c, depth, out); }
 
 #ifdef __cplusplus
 }

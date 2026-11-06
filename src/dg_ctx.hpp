@@ -41,6 +41,13 @@ class DgCtx {
   virtual const DgRoundOut& last_round() const = 0;  // the last round's result (also after a failure)
   virtual void round_cancel() = 0;
   virtual void round_seed_counts(const ss_dg_unit* units, const float* counts, uint32_t n) = 0;
+  // Layer leases (ss_dg_reserve_ring / ss_dg_lease_layer / ss_dg_release_layer / ss_dg_return_ring), between tokens.
+  virtual void ring_plan(uint32_t depth, ss_dg_ring_sizing* out) = 0;
+  virtual uint32_t reserve_ring(uint32_t n) = 0;  // returns the units it evicted
+  virtual void return_ring() = 0;
+  virtual void lease_layer(int g, const int32_t* ids, int n, uint32_t ring_slots, ss_dg_lease* out) = 0;
+  virtual void enqueue_lease_wait(int lease, void* stream) = 0;
+  virtual void release_layer(int lease, void* stream) = 0;
   virtual void check_unit(int layer, int unit) = 0;
 
   // Device side: kernel launchers on the engine's stream (capturable).

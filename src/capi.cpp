@@ -1012,6 +1012,41 @@ ss_status ss_dg_round_seed_counts(ss_ctx* c, const ss_dg_unit* units, const floa
     dg_ctx(c, "ss_dg_round_seed_counts").round_seed_counts(units, counts, n);
   });
 }
+// Layer leases (dg_lease.cpp).
+ss_status ss_dg_ring_plan_sized(ss_ctx* c, uint32_t depth, ss_dg_ring_sizing* out, uint32_t size) {
+  return ctx_guard(c, [&] {
+    need(out && size >= sizeof(uint32_t), "ss_dg_ring_plan: bad argument");
+    ss_dg_ring_sizing r;
+    dg_ctx(c, "ss_dg_ring_plan").ring_plan(depth, &r);
+    r.struct_size = std::min<uint32_t>(size, uint32_t(sizeof r));
+    std::memcpy(static_cast<void*>(out), &r, r.struct_size);
+  });
+}
+ss_status ss_dg_reserve_ring(ss_ctx* c, uint32_t n, uint32_t* evicted) {
+  return ctx_guard(c, [&] {
+    const uint32_t e = dg_ctx(c, "ss_dg_reserve_ring").reserve_ring(n);
+    if (evicted) *evicted = e;
+  });
+}
+ss_status ss_dg_return_ring(ss_ctx* c) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_return_ring").return_ring(); });
+}
+ss_status ss_dg_lease_layer_sized(ss_ctx* c, int g, const int32_t* ids, int n, uint32_t ring_slots, ss_dg_lease* out,
+                                  uint32_t size) {
+  return ctx_guard(c, [&] {
+    need(out && size >= sizeof(uint32_t), "ss_dg_lease_layer: bad argument");
+    ss_dg_lease l;
+    dg_ctx(c, "ss_dg_lease_layer").lease_layer(g, ids, n, ring_slots, &l);
+    l.struct_size = std::min<uint32_t>(size, uint32_t(sizeof l));
+    std::memcpy(static_cast<void*>(out), &l, l.struct_size);
+  });
+}
+ss_status ss_dg_enqueue_lease_wait(ss_ctx* c, int lease, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_enqueue_lease_wait").enqueue_lease_wait(lease, stream); });
+}
+ss_status ss_dg_release_layer(ss_ctx* c, int lease, void* stream) {
+  return ctx_guard(c, [&] { dg_ctx(c, "ss_dg_release_layer").release_layer(lease, stream); });
+}
 ss_status ss_dg_residency(ss_ctx* c, ss_dg_unit* out, uint32_t cap, uint32_t* total) {
   return ctx_guard(c, [&] {
     need(total != nullptr && (cap == 0 || out != nullptr), "ss_dg_residency: bad arguments");

@@ -46,7 +46,8 @@ class Scripted final : public DgTransport {
   struct Ev {
     uint64_t recorded = 0, completed = 0;
   };
-  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark, ReadyPart };
+  enum Kind { H2D, D2H, Entry, Ready, Record, Wait, Upload, D2HPart, D2D, H2H, Read, Mark, ReadyPart, LeaseMap, CRead };
+  static constexpr int kConsumer = 3;  // a foreign (engine) stream: layer leases' consumers
   struct Op {
     Kind kind;
     int32_t a = 0, b = 0;
@@ -215,6 +216,32 @@ class Scripted final : public DgTransport {
   void signal_ready(uint32_t g, uint32_t seq) override { push(kDem, {Ready, int32_t(g), int32_t(seq)}); }
   // layer tokens: a part's ready word (ready_part)
   void signal_ready_part(uint32_t part, uint32_t seq) override { push(kDem, {ReadyPart, int32_t(part), int32_t(seq)}); }
+  // layer leases: a release recorded on the consumer stream; a lease map copied on kDem
+  void record_on(void* ev, void* stream) override {
+    if (stream != reinterpret_cast<void*>(uintptr_t(0xC0))) v_->set("a release recorded on an unknown stream");
+    Ev* e = static_cast<Ev*>(ev);
+    Op o{Record};
+    o.ev = e;
+    o.target = ++e->recorded;
+    push(Stream(kConsumer), std::move(o));
+  }
+  void upload_lease_map(uint32_t index, const int32_t* map, uint32_t n) override {
+    Op o{LeaseMap, int32_t(index)};
+    o.table.assign(map, map + n);
+    push(kDem, std::move(o));
+  }
+  // the consumer: waits for an event (a lease's ready), then reads (slot, the unit it must hold)
+  void consumer_wait(void* ev) {
+    Ev* e = static_cast<Ev*>(ev);
+    Op o{Wait};
+    o.ev = e;
+    o.target = e->recorded;
+    push(Stream(kConsumer), std::move(o));
+  }
+  void consumer_read(int32_t slot, int32_t key) { push(Stream(kConsumer), {CRead, slot, key}); }
+  const std::vector<int32_t>& lease_map(uint32_t index) { return lease_maps_[index]; }
+  uint64_t consumer_reads() const { return creads_; }
+  static void* consumer_stream() { return reinterpret_cast<void*>(uintptr_t(0xC0)); }
   void* event_create() override {
     fault("event_create");
     evs_.push_back(std::make_unique<Ev>());
@@ -293,8 +320,8 @@ class Scripted final : public DgTransport {
   // Completes one runnable operation of a random stream; false if none can run.
   bool step() {
     land_some();
-    int cand[3], n = 0;
-    for (int s = 0; s < 3; ++s)
+    int cand[4], n = 0;
+    for (int s = 0; s < 4; ++s)
       if (runnable(s)) cand[n++] = s;
     if (!n) return false;
     if (eager_) {
@@ -479,11 +506,22 @@ class Scripted final : public DgTransport {
       case Read:
       case Mark:  // (traced only, never queued)
         break;
+      case LeaseMap:
+        lease_maps_[size_t(o.a)] = o.table;
+        break;
+      case CRead:
+        ++creads_;
+        if (slot_[size_t(o.a)] != o.b)
+          v_->set("a lease consumer read slot " + std::to_string(o.a) + " holding " +
+                  std::to_string(slot_[size_t(o.a)]) + ", not unit " + std::to_string(o.b));
+        break;
     }
   }
 
-  std::deque<Op> q_[3];
+  std::deque<Op> q_[4];
   std::vector<std::pair<uint32_t, uint32_t>> uploads_;
+  std::vector<int32_t> lease_maps_[8];
+  uint64_t creads_ = 0;
   std::vector<std::unique_ptr<Ev>> evs_;
   std::vector<int32_t> table_, slot_, block_;
   std::vector<uint32_t> ready_, lm_ready_ = std::vector<uint32_t>(32, 0);
@@ -493,7 +531,7 @@ class Scripted final : public DgTransport {
   std::vector<std::vector<int64_t>> trace_;
   std::vector<int32_t> wb_slots_;
   bool slow_d2h_ = false;
-  bool held_[3] = {false, false, false};
+  bool held_[4] = {false, false, false, false};
   bool move_faults_ = false;
   int fail_at_ = 0;
   uint64_t reads_ = 0;
@@ -6258,6 +6296,61 @@ uint64_t host_homes(const DgCore& core) {
 
 }  // namespace
 
+// ---- layer leases (ss_dg_reserve_ring / ss_dg_lease_layer / ss_dg_release_layer / ss_dg_return_ring) ----
+namespace {
+
+// Every key's placement (home, slot, block, recency) and the mirror table: what a lease must never change.
+std::vector<int64_t> placement(const DgCore& c) {
+  std::vector<int64_t> s;
+  for (uint32_t k = 0; k < c.keys(); ++k)
+    s.insert(s.end(), {int64_t(c.home(k)), c.slot_of(k), c.block_of(k), int64_t(c.lru_stamp(k)), int64_t(c.backed(k))});
+  s.insert(s.end(), c.table().begin(), c.table().end());
+  return s;
+}
+
+std::vector<uint32_t> iota_ids(uint32_t from, uint32_t n) {
+  std::vector<uint32_t> v;
+  for (uint32_t i = 0; i < n; ++i) v.push_back(from + i);
+  return v;
+}
+
+ss_status status_of(const std::function<void()>& f) {
+  try {
+    f();
+  } catch (const ts::Error& e) {
+    return e.status();
+  }
+  return SS_OK;
+}
+
+// After the device ran everything runnable: the lease's map was uploaded, every leased unit's slot holds its bytes,
+// a resident's slot is its own, the other units are -1.
+void check_lease(ResRig& r, const DgCore::LeaseResult& l, const std::vector<uint32_t>& ids) {
+  r.t->drain_all();
+  const uint32_t n = r.core->units(l.g);
+  const std::vector<int32_t> map(l.map, l.map + n);
+  CHECK(r.t->lease_map(l.index) == map);
+  std::vector<uint8_t> want(n, 0);
+  for (uint32_t u : ids) want[u] = 1;
+  std::set<int32_t> slots;
+  for (uint32_t u = 0; u < n; ++u) {
+    const uint32_t k = r.core->key(l.g, u);
+    if (!want[u]) {
+      CHECK_EQ(map[u], -1);
+      continue;
+    }
+    CHECK(map[u] >= 0);
+    if (map[u] < 0) continue;
+    CHECK(slots.insert(map[u]).second);  // one slot per unit
+    CHECK_EQ(r.t->slot_holds(map[u]), int32_t(k));
+    const DgCore::Home h = r.core->home(k);
+    if (h == DgCore::Home::Device || h == DgCore::Home::Coming) CHECK_EQ(map[u], r.core->slot_of(k));
+  }
+  r.core->check();
+}
+
+}  // namespace
+
 // The randomized model with the setting on (and flipped between tokens on even seeds): predictions, window prefetches
 // (with and without winpf's own revert), pressure, deferred write-backs, and every three-tier shape with synchronous,
 // overlapped and depth-1 reads (file prefetches among them), some with clean eviction. Every read exact, every
@@ -6546,6 +6639,70 @@ TEST(dg_pred_ahead_skipped) {
   r.core->end_token({});
   r.core->check();
   CHECK_EQ(r.core->stats().prefetch_used, 1u);
+}
+
+// A whole 384-expert layer (no 64-id limit): 200 units on the device read in place, 184 copied into the ring; a > 64-id
+// lease of another layer refused next to it; a cap; nothing of the decode cache changes; hits on a second lease.
+TEST(dg_lease_whole_layer) {
+  ResRig r({384, 128, 64}, 200, 300, 8);
+  r.core->check();
+  const auto before = placement(*r.core);
+  const auto dec0 = decode_counts(r.core->stats());
+  const DgCore::RingResult rr = r.core->reserve_ring(250, {});
+  CHECK_EQ(rr.slots, 250u);
+  CHECK_EQ(rr.evicted, 0u);  // 300 free slots: nothing evicted
+  CHECK_EQ(r.core->free_slots(), 50u);
+  CHECK(placement(*r.core) == before);
+  const DgCore::LeaseResult a = r.core->lease_layer(0, {}, true, 0);
+  CHECK_EQ(a.leased, 384u);
+  CHECK_EQ(a.resident, 200u);
+  CHECK_EQ(a.misses, 184u);
+  CHECK_EQ(a.hits, 0u);
+  check_lease(r, a, iota_ids(0, 384));
+  CHECK_EQ(r.core->ring_free(), 66u);
+  // 100 ids of layer 1 (> 64) do not fit next to the active lease: refused, nothing changed
+  const auto mid = placement(*r.core);
+  r.t->clear_issued();
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 100), false, 0); })), int(SS_E_CAPACITY));
+  CHECK(r.t->issued().empty());
+  CHECK_EQ(r.core->leases_active(), 1u);
+  // a cap below the need: refused
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, iota_ids(0, 60), false, 10); })), int(SS_E_CAPACITY));
+  const DgCore::LeaseResult b = r.core->lease_layer(1, iota_ids(0, 60), false, 60);
+  CHECK_EQ(b.misses, 60u);
+  check_lease(r, b, iota_ids(0, 60));
+  r.core->release_layer(a.index, nullptr);
+  const DgCore::LeaseResult c = r.core->lease_layer(2, iota_ids(0, 64), false, 0);  // 6 free + 58 of layer 0's slots
+  CHECK_EQ(c.misses, 64u);
+  check_lease(r, c, iota_ids(0, 64));
+  r.core->release_layer(b.index, nullptr);
+  r.core->release_layer(c.index, nullptr);
+  // layer 0 again: 126 of its 184 ring units are still in their slots (hits, no copy), 58 were overwritten by layer 2
+  r.t->clear_issued();
+  const DgCore::LeaseResult a2 = r.core->lease_layer(0, {}, true, 0);
+  CHECK_EQ(a2.hits, 126u);
+  CHECK_EQ(a2.misses, 58u);
+  CHECK_EQ(count_kind(*r.t, Scripted::H2D), size_t(58));
+  check_lease(r, a2, iota_ids(0, 384));
+  r.core->release_layer(a2.index, nullptr);
+  CHECK(placement(*r.core) == mid);
+  r.core->return_ring();
+  CHECK_EQ(r.core->free_slots(), 300u);
+  CHECK(placement(*r.core) == before);
+  CHECK(decode_counts(r.core->stats()) == dec0);
+  const ts::DgStats& s = r.core->stats();
+  CHECK_EQ(s.lease_reserves, uint64_t(1));
+  CHECK_EQ(s.lease_returns, uint64_t(1));
+  CHECK_EQ(s.leases, uint64_t(4));
+  CHECK_EQ(s.lease_units, uint64_t(384 + 60 + 64 + 384));
+  CHECK_EQ(s.lease_resident, uint64_t(400));
+  CHECK_EQ(s.lease_ring_hits, uint64_t(126));
+  CHECK_EQ(s.lease_ring_misses, uint64_t(184 + 60 + 64 + 58));
+  CHECK_EQ(s.lease_bytes, s.lease_ring_misses * (2048 + 2048 + 4096));
+  CHECK_EQ(s.lease_ring_waits, uint64_t(0));  // every release had no stream
+  CHECK_EQ(s.lease_disk_reads, uint64_t(0));
+  // decode after the return: tokens read the right bytes
+  for (int tok = 0; tok < 4; ++tok) r.token(r.routes(6), all_run(3), {});
   r.verify();
   CHECK(r.v.what.empty());
 }
@@ -7516,4 +7673,246 @@ TEST(dg_landing_layer_expiry_aborts_running_chunked_read) {
     r.verify();
     CHECK(r.v.what.empty());
   }
+}
+
+// Ring exhaustion with wait, and the release ordering against the consumers: lease A fills the ring, its consumer (a
+// held foreign stream) reads every slot after A's ready; A is released on that stream; lease B finds only A's slots:
+// each copy waits (device-side) for A's release, so the consumer still reads A's bytes; a full ring with A active
+// refuses B.
+TEST(dg_lease_ring_wait_release_order) {
+  for (uint64_t seed = 1; seed <= 6; ++seed) {
+    ResRig r({64, 128, 128}, 64, 120, 8, false, nullptr, 0, seed);
+    r.rng.seed(seed);
+    for (int tok = 0; tok < 3; ++tok) r.token(r.routes(4), all_run(3), {});
+    r.verify();
+    r.core->reserve_ring(100, {});
+    const auto before = placement(*r.core);
+    std::vector<uint32_t> a_ids, b_ids;
+    for (uint32_t u = 0; u < 128 && a_ids.size() < 100; ++u)
+      if (r.core->home(r.core->key(1, u)) == DgCore::Home::Host) a_ids.push_back(u);
+    for (uint32_t u = 0; u < 128 && b_ids.size() < 90; ++u)
+      if (r.core->home(r.core->key(2, u)) == DgCore::Home::Host) b_ids.push_back(u);
+    CHECK_EQ(a_ids.size(), size_t(100));
+    CHECK_EQ(b_ids.size(), size_t(90));
+    r.t->hold(Scripted::kConsumer, true);
+    const DgCore::LeaseResult a = r.core->lease_layer(1, a_ids, false, 0);
+    CHECK_EQ(a.misses, 100u);
+    CHECK_EQ(r.core->ring_free(), 0u);
+    CHECK_EQ(int(status_of([&] { r.core->lease_layer(2, b_ids, false, 0); })), int(SS_E_CAPACITY));  // exhausted
+    r.t->consumer_wait(a.ready);
+    for (uint32_t u : a_ids) r.t->consumer_read(a.map[u], int32_t(r.core->key(1, u)));
+    r.core->release_layer(a.index, Scripted::consumer_stream());
+    const DgCore::LeaseResult b = r.core->lease_layer(2, b_ids, false, 0);
+    CHECK_EQ(b.misses, 90u);
+    CHECK_EQ(b.waits, 90u);  // every slot B took was A's, its consumer not finished
+    r.t->steps(64);          // the copy stream is blocked behind the release (the consumer is held)
+    r.t->hold(Scripted::kConsumer, false);
+    r.t->drain_all();
+    CHECK_EQ(r.t->consumer_reads(), uint64_t(100));
+    check_lease(r, b, b_ids);
+    // B's consumer, then a release that has completed: the next lease waits for nothing
+    r.t->consumer_wait(b.ready);
+    for (uint32_t u : b_ids) r.t->consumer_read(b.map[u], int32_t(r.core->key(2, u)));
+    r.core->release_layer(b.index, Scripted::consumer_stream());
+    r.t->drain_all();
+    const DgCore::LeaseResult a2 = r.core->lease_layer(1, a_ids, false, 0);
+    CHECK_EQ(a2.waits, 0u);
+    CHECK_EQ(a2.hits, 10u);  // 10 of A's slots were not taken by B
+    check_lease(r, a2, a_ids);
+    // released with its consumer still to run: return_ring waits for it on the host
+    r.t->consumer_wait(a2.ready);
+    for (uint32_t u : a_ids) r.t->consumer_read(a2.map[u], int32_t(r.core->key(1, u)));
+    r.core->release_layer(a2.index, Scripted::consumer_stream());
+    r.core->return_ring();
+    CHECK_EQ(r.t->consumer_reads(), uint64_t(100 + 90 + 100));
+    CHECK_EQ(r.core->stats().lease_ring_waits, uint64_t(90));
+    CHECK(placement(*r.core) == before);
+    r.verify();
+    for (int tok = 0; tok < 3; ++tok) r.token(r.routes(4), all_run(3), {});
+    r.verify();
+    if (!r.v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r.v.what.c_str());
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The reservation evicts decode units ONCE, at most n, never a kept or held (make_resident) unit; the leases evict
+// nothing (every placement unchanged from the reservation to the return), under the two-tier and three-tier
+// placements (file units read through the staging buffers into the ring, synchronous and overlapped reads).
+TEST(dg_lease_no_foreign_evictions) {
+  uint64_t disk_reads = 0, evicted = 0;
+  for (uint64_t seed = 1; seed <= 8; ++seed) {
+    const bool three = seed % 2 == 0;
+    std::vector<uint8_t> disk(224, 0);
+    for (uint32_t k = 150; k < 224; ++k) disk[k] = 1;
+    ResRig r({32, 160, 32}, 120, 16, three ? 2 : 100, seed % 4 == 1, three ? &disk : nullptr, three ? 30 : 0, seed);
+    if (three) r.t->set_async_reads(seed % 3 != 0, seed);
+    r.rng.seed(seed);
+    for (int tok = 0; tok < 5; ++tok) r.token(r.routes(4), all_run(3), {});
+    r.verify();
+    // a keep of 8 units of layer 0 (where they are on the device) and a held make_resident set of layer 2
+    std::vector<uint32_t> kept;
+    for (uint32_t u = 0; u < 32 && kept.size() < 8; ++u)
+      if (r.core->home(r.core->key(0, u)) == DgCore::Home::Device) kept.push_back(r.core->key(0, u));
+    const std::vector<uint32_t> held_ids = iota_ids(0, 16);
+    r.core->make_resident(2, held_ids, kept);
+    std::vector<uint32_t> protect = kept;
+    for (uint32_t u : held_ids) protect.push_back(r.core->key(2, u));
+    std::vector<int32_t> pslots;
+    for (uint32_t k : protect) pslots.push_back(r.core->slot_of(k));
+    const uint32_t free0 = r.core->free_slots(), dev0 = r.core->on_device();
+    const auto dec0 = decode_counts(r.core->stats());
+    const DgCore::RingResult rr = r.core->reserve_ring(100, protect);
+    CHECK(rr.evicted <= 100u - std::min(100u, free0));  // (write-backs in flight free their slots too)
+    CHECK_EQ(r.core->on_device(), dev0 - rr.evicted);
+    CHECK_EQ(r.core->stats().lease_reserve_evicted, uint64_t(rr.evicted));
+    evicted += rr.evicted;
+    for (size_t i = 0; i < protect.size(); ++i) {
+      CHECK(r.core->home(protect[i]) == DgCore::Home::Device);
+      CHECK_EQ(r.core->slot_of(protect[i]), pslots[i]);
+    }
+    r.verify();
+    const auto after_reserve = placement(*r.core);
+    // a 90-id (> 64) lease of layer 1, the held layer 2 (read in place), layer 0 with its kept units
+    const std::vector<uint32_t> ids1 = iota_ids(0, 90);
+    const DgCore::LeaseResult l1 = r.core->lease_layer(1, ids1, false, 0);
+    check_lease(r, l1, ids1);
+    const DgCore::LeaseResult l2 = r.core->lease_layer(2, held_ids, false, 0);
+    CHECK_EQ(l2.resident, 16u);
+    CHECK_EQ(l2.misses, 0u);
+    check_lease(r, l2, held_ids);
+    r.core->release_layer(l1.index, nullptr);
+    const DgCore::LeaseResult l0 = r.core->lease_layer(0, {}, true, 0);
+    check_lease(r, l0, iota_ids(0, 32));
+    r.core->release_layer(l2.index, nullptr);
+    r.core->release_layer(l0.index, nullptr);
+    CHECK(placement(*r.core) == after_reserve);
+    r.core->return_ring();
+    CHECK(placement(*r.core) == after_reserve);
+    CHECK(decode_counts(r.core->stats()) == dec0);
+    if (three) CHECK(r.core->stats().lease_disk_reads > 0);
+    disk_reads += r.core->stats().lease_disk_reads;
+    CHECK_EQ(r.core->stats().lease_disk_bytes, r.core->stats().lease_disk_reads * (2048 + 2048 + 4096));
+    r.verify();
+    std::vector<uint32_t> held_keys;
+    for (uint32_t u : held_ids) held_keys.push_back(r.core->key(2, u));
+    r.token(r.routes(3), {1, 1, 0}, protect, held_keys);  // the held layer read through the table, not exported
+    r.verify();
+    if (!r.v.what.empty()) std::printf("  seed %llu: %s\n", (unsigned long long)seed, r.v.what.c_str());
+    CHECK(r.v.what.empty());
+  }
+  std::printf("  reservation victims %llu, lease file reads %llu\n", (unsigned long long)evicted,
+              (unsigned long long)disk_reads);
+  CHECK(evicted > 0);
+  CHECK(disk_reads > 0);
+}
+
+// Refusals (nothing changed): no ring, a second ring, every decode-side call while the ring is reserved, bad ids,
+// a layer leased twice, more than kMaxLeases, a return with an active lease, an unknown release, a reservation
+// above what can be freed (and, two-tier, above the free blocks for the write-backs).
+TEST(dg_lease_refusals) {
+  ResRig r({64, 64, 64}, 64, 40, 8);
+  for (int tok = 0; tok < 3; ++tok) r.token(r.routes(4), all_run(3), {});
+  r.verify();
+  auto st0 = placement(*r.core);
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(0, {}, true, 0); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->return_ring(); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->reserve_ring(105, {}); })), int(SS_E_CAPACITY));  // 104 persistent slots
+  CHECK(placement(*r.core) == st0);
+  CHECK_EQ(int(status_of([&] { r.core->reserve_ring(100, {}); })), int(SS_E_CAPACITY));  // two-tier: few free blocks
+  st0 = placement(*r.core);  // (that refusal came after the drain: write-backs in flight were collected)
+  CHECK_EQ(int(status_of([&] { r.core->reserve_ring(100, {}); })), int(SS_E_CAPACITY));
+  CHECK(placement(*r.core) == st0);
+  CHECK(!r.core->ring_on());
+  r.core->reserve_ring(r.core->free_slots(), {});
+  CHECK_EQ(int(status_of([&] { r.core->reserve_ring(1, {}); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->begin_token(99, nullptr); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->set_layer_token(0); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->make_resident(0, {0, 1}, {}); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->seed({70}); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->reset_open(); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->set_policy(0); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->window_hint(nullptr, nullptr, 0); })), int(SS_E_INVALID));
+  CHECK(!r.core->poisoned());
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(3, {}, true, 0); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(0, {64}, false, 0); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(0, {1, 2, 1}, false, 0); })), int(SS_E_INVALID));
+  const DgCore::LeaseResult a = r.core->lease_layer(0, {0, 1, 2}, false, 0);
+  CHECK_EQ(int(status_of([&] { r.core->lease_layer(0, {5}, false, 0); })), int(SS_E_INVALID));  // leased already
+  CHECK_EQ(int(status_of([&] { r.core->return_ring(); })), int(SS_E_INVALID));
+  CHECK_EQ(int(status_of([&] { r.core->release_layer(a.index + 1, nullptr); })), int(SS_E_INVALID));
+  r.core->release_layer(a.index, nullptr);
+  CHECK_EQ(int(status_of([&] { r.core->release_layer(a.index, nullptr); })), int(SS_E_INVALID));
+  r.core->return_ring();
+  CHECK(placement(*r.core) == st0);
+  r.verify();
+  // kMaxLeases (8) active leases (9 gated layers, all resident; an empty ring: nothing to copy)
+  ResRig m({8, 8, 8, 8, 8, 8, 8, 8, 8}, 72, 8, 4);
+  m.core->reserve_ring(0, {});
+  std::vector<uint32_t> idx;
+  for (uint32_t g = 0; g < 8; ++g) idx.push_back(m.core->lease_layer(g, {}, true, 0).index);
+  CHECK_EQ(int(status_of([&] { m.core->lease_layer(8, {}, true, 0); })), int(SS_E_INVALID));
+  m.core->release_layer(idx[3], nullptr);
+  const DgCore::LeaseResult l8 = m.core->lease_layer(8, {}, true, 0);
+  CHECK_EQ(l8.index, idx[3]);
+  CHECK_EQ(l8.resident, 8u);
+  for (uint32_t i = 0; i < 8; ++i)
+    if (m.core->lease_active(i)) m.core->release_layer(i, nullptr);
+  m.core->return_ring();
+  m.verify();
+  CHECK(r.v.what.empty());
+  CHECK(m.v.what.empty());
+}
+
+// A read failure inside a lease (three-tier): SS_E_IO, the lease not created, the ring and the cache consistent, the
+// next lease succeeds; a device failure poisons the core.
+TEST(dg_lease_failures) {
+  for (uint64_t seed = 1; seed <= 4; ++seed) {
+    std::vector<uint8_t> disk(96, 0);
+    for (uint32_t k = 40; k < 96; ++k) disk[k] = 1;
+    ResRig r({32, 32, 32}, 32, 40, 1, false, &disk, 8, seed);
+    r.t->set_async_reads(seed % 2 == 0, seed);
+    r.core->reserve_ring(40, {});
+    const auto st = placement(*r.core);
+    r.t->fail_read(3);
+    CHECK_EQ(int(status_of([&] { r.core->lease_layer(2, {}, true, 0); })), int(SS_E_IO));
+    CHECK(!r.core->poisoned());
+    CHECK_EQ(r.core->leases_active(), 0u);
+    CHECK_EQ(r.core->ring_free(), 40u);
+    r.core->check();
+    CHECK(placement(*r.core) == st);
+    r.t->fail_read(0);
+    const DgCore::LeaseResult l = r.core->lease_layer(2, {}, true, 0);
+    check_lease(r, l, iota_ids(0, 32));
+    r.core->release_layer(l.index, nullptr);
+    r.t->fail_kind(Scripted::kFH2D, 2);
+    CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, {}, true, 0); })), int(SS_E_BACKEND));
+    CHECK(r.core->poisoned());
+    r.t->fail_kind(Scripted::kFH2D, 0);
+    CHECK_EQ(int(status_of([&] { r.core->lease_layer(1, {}, true, 0); })), int(SS_E_BACKEND));
+    r.core->check();
+    CHECK(r.v.what.empty());
+  }
+}
+
+// The sizing helper: free slots, what a reservation could take (two-tier: bounded by the free blocks), the largest
+// layer, the most units of one layer off the device, the plan over consecutive layers.
+TEST(dg_lease_sizing) {
+  ResRig r({64, 100, 64}, 64, 40, 8);  // layer 0 resident, layers 1 and 2 on their blocks
+  const DgCore::RingSizing z = r.core->ring_sizing(2, {});
+  CHECK_EQ(z.free_slots, 40u);
+  CHECK_EQ(z.reservable, 40u + 8u);  // 64 dirty victims, 8 free blocks
+  CHECK_EQ(z.max_layer_units, 100u);
+  CHECK_EQ(z.max_layer_need, 100u);
+  CHECK_EQ(z.plan, 164u);
+  CHECK_EQ(r.core->ring_sizing(1, {}).plan, 100u);
+  CHECK_EQ(r.core->ring_sizing(9, {}).plan, 164u);  // depth clamped to the 3 gated layers
+  CHECK_EQ(r.core->ring_sizing(1, iota_ids(0, 60)).reservable, 40u + 4u);
+  const DgCore::RingResult rr = r.core->reserve_ring(z.reservable, {});
+  CHECK_EQ(rr.evicted, 8u);
+  CHECK_EQ(r.core->stats().lease_reserve_evicted, uint64_t(8));
+  CHECK_EQ(r.core->ring_size(), 48u);
+  r.core->return_ring();
+  CHECK_EQ(r.core->free_slots(), 48u);
+  r.verify();
+  CHECK(r.v.what.empty());
 }

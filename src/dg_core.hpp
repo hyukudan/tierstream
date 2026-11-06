@@ -120,6 +120,11 @@ class DgTransport {
   // A landing read the core drops while it runs (its layer passed) stops at its next chunk (the transport may also
   // let it run to its end); still ended as usual (read_landing_end: aborted). Never throws. Default: nothing.
   virtual void read_landing_abort(void* handle) noexcept { (void)handle; }
+  // Layer leases (ss_dg_lease_layer): record ev on a foreign (engine) stream, after everything enqueued on it so far;
+  // copy a lease's id -> slot map (n int32) into device map buffer `index` on kDem, ordered after the stream's earlier
+  // work (the transport keeps its host staging valid until that copy landed). Default: not supported.
+  virtual void record_on(void* ev, void* stream);
+  virtual void upload_lease_map(uint32_t index, const int32_t* map, uint32_t n);
 };
 
 // dg_diag: the host time of the last boundary's phases (end_token), microseconds.
@@ -292,6 +297,14 @@ struct DgStats {
   // pinned units dropped to their file for one, and those read back from their file within 8 tokens (churn: stats
   // JSON only)
   uint64_t bank_kept = 0, bank_keep_drops = 0, bank_keep_rereads = 0;
+  // layer leases (ss_dg_reserve_ring / ss_dg_lease_layer): rings reserved, decode units the reservations evicted, rings
+  // returned; leases, the ids they leased, read in place (on the device already), ring hits (a released ring slot still
+  // holding the unit: no copy), ring misses (copied into a ring slot) and their bytes, of those read from their file
+  // (three-tier) and their bytes; ring-slot reuses whose copy waited (device-side) for an earlier lease's release; the
+  // host's waits for the releases at the ring's return; the lease calls' host time. Counted nowhere else.
+  uint64_t lease_reserves = 0, lease_reserve_evicted = 0, lease_returns = 0, leases = 0, lease_units = 0;
+  uint64_t lease_resident = 0, lease_ring_hits = 0, lease_ring_misses = 0, lease_bytes = 0, lease_disk_reads = 0;
+  uint64_t lease_disk_bytes = 0, lease_ring_waits = 0, lease_return_wait_ns = 0, lease_ns = 0;
 };
 
 // The exclusive cache's write-backs (ss_exclusive_stats, ss_snapshot_info and the stats JSON): evictions that copied a
@@ -527,6 +540,57 @@ class DgCore {
   void set_round_probe(std::function<void(uint32_t)> f) { round_probe_ = std::move(f); }
   // Between tokens: every deferred write-back submitted, then every stream synchronized (landing reads ended first:
   // landed, or back to their file on a failure; every landing block a copy read is free again).
+  // ---- layer leases (ss_dg_reserve_ring / ss_dg_lease_layer / ss_dg_release_layer / ss_dg_return_ring) ----
+  // Between tokens, engine thread. A large-piece prefill borrows n persistent slots as a prefill ring: reserve_ring
+  // drains, then takes n slots out of the free list, evicting device units ONCE (only if the free slots are fewer
+  // than n; never a key in `kept`; the policy's order, make_resident's lower-tier rules; counted in
+  // lease_reserve_evicted only). While a ring is reserved no token, layer token, make_resident, seed, reset, policy
+  // change or window hint runs (SS_E_INVALID): nothing moves a device unit, so every lease reads residents in place.
+  // lease_layer(g, ids | all, cap): every requested unit of g readable on the device: one already there (Device, or a
+  // landed prior prefetch) at its slot (no copy), a released ring slot still holding it at that slot (a ring hit, no
+  // copy), any other one copied into a ring slot not held by an active lease (pinned block -> slot; three-tier: file ->
+  // staging buffer -> slot, as a demand miss), untagged and least recently released slots first; a slot whose earlier
+  // lease's consumer may still read it is written only after that release's event (kDem waits on it, device-side).
+  // No table entry, home, recency or score changes: the decode cache never sees the ring. The map (one int32 per unit
+  // of g: a slot, -1 = not leased) is uploaded into map buffer `index`, then `ready` is recorded on kDem. Refused before
+  // anything changes: no ring (SS_E_INVALID), g already leased or kMaxLeases active (SS_E_INVALID), more ring slots
+  // than are not held by active leases or than cap (> 0) allows (SS_E_CAPACITY). release_layer(index, stream): the
+  // lease's ring slots go back to the ring (tagged with their units, for hits), each to be overwritten only after an
+  // event recorded on `stream` now (nullptr: the caller's consumers are finished); no write-back (weights are
+  // immutable). return_ring: every lease released (else SS_E_INVALID), the host waits for every release event and kDem,
+  // the ring slots become free slots again (the decode residency lost is at most n, re-warmed by later misses).
+  static constexpr uint32_t kMaxLeases = 8;
+  struct RingResult {
+    uint32_t slots = 0, evicted = 0;
+  };
+  RingResult reserve_ring(uint32_t n, const std::vector<uint32_t>& kept);
+  void return_ring();
+  struct LeaseResult {
+    uint32_t index = 0, g = 0, leased = 0, resident = 0, hits = 0, misses = 0, waits = 0;
+    void* ready = nullptr;
+    const int32_t* map = nullptr;  // units(g) entries, valid until the release
+  };
+  LeaseResult lease_layer(uint32_t g, const std::vector<uint32_t>& ids, bool all, uint32_t cap);
+  void release_layer(uint32_t index, void* stream);
+  // Sizing (no change): the slots a ring could take now (free + write-backs in flight + evictable units not in kept;
+  // two-tier: the dirty victims bounded by the free blocks), the free slots, the largest gated layer, the most units
+  // of one gated layer not on the device now, and the most over `depth` consecutive gated layers (whole layers).
+  struct RingSizing {
+    uint32_t reservable = 0, free_slots = 0, max_layer_units = 0, max_layer_need = 0, plan = 0;
+  };
+  RingSizing ring_sizing(uint32_t depth, const std::vector<uint32_t>& kept) const;
+  bool ring_on() const { return ring_on_; }
+  uint32_t ring_size() const { return uint32_t(ring_.size()); }
+  uint32_t ring_free() const;     // ring slots no active lease holds
+  uint32_t leases_active() const;
+  int32_t ring_slot(uint32_t i) const { return ring_[i].slot; }  // test hooks
+  uint32_t ring_key(uint32_t i) const { return ring_[i].key; }
+  const std::vector<int32_t>& lease_map(uint32_t index) const { return leases_[index].map; }
+  bool lease_active(uint32_t index) const { return index < kMaxLeases && leases_[index].active; }
+  uint32_t lease_layer_of(uint32_t index) const { return leases_[index].g; }
+  void* lease_ready(uint32_t index) const { return leases_[index].ready; }
+
+  // Between tokens: every deferred write-back submitted, then every stream synchronized.
   void drain();
   // Between tokens, with exclusive ownership. Restore the immutable place() blueprint; copies only misplaced units.
   // Counters remain lifetime counters. A failed reset poisons the core; the owning context must also be poisoned.
@@ -906,6 +970,31 @@ class DgCore {
   std::vector<uint32_t> heap_, heap_pos_;
   std::vector<ScoreCand> select_heap_;  // at most the needed victims, ordered by the public total order
   std::function<void()> probe_;
+  // layer leases: the ring's slots (each: the unit it holds or kNone, the active lease holding it or kNone, its release
+  // order, the release events its last readers recorded), per key its ring index (-1), the leases, the release events
+  // not known complete (each once; the slots' and leases' lists only point at them)
+  struct RingSlot {
+    int32_t slot = -1;
+    uint32_t key = kNone, lease = kNone;
+    uint64_t age = 0;
+    std::vector<void*> rel;
+  };
+  struct LeaseRec {
+    bool active = false;
+    uint32_t g = kNone;
+    std::vector<int32_t> map;
+    std::vector<uint32_t> ring;  // ring indices held
+    void* ready = nullptr;       // recorded on kDem at each lease of this index
+    std::vector<void*> rel;      // the map buffer's last readers
+  };
+  bool ring_on_ = false;
+  std::vector<RingSlot> ring_;
+  std::vector<int32_t> ring_of_;
+  LeaseRec leases_[kMaxLeases];
+  std::vector<void*> releases_;
+  uint64_t ring_age_ = 0;
+  void prune_releases();
+  void no_ring(const char* what) const;
 };
 
 }  // namespace ts
