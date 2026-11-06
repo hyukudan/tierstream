@@ -1420,3 +1420,100 @@ TEST(dg_ctx_path_layer_tokens_make_resident) {
   for (const auto& kv : held0) CHECK(r.core->home(kv.first) == DgCore::Home::Device);
   CHECK_EQ(r.bad, 0ull);
 }
+
+// Capture is read-only: identical native tables/counters, even after overflow.
+TEST(dg_service_capture_routes_and_overflow) {
+  std::vector<int32_t> reference;
+  uint64_t ref_fetch = 0, ref_miss = 0;
+  for (int mode = 0; mode < 3; ++mode) {
+    Rig r(std::chrono::milliseconds(2000), 12, true, false);
+    std::vector<ss_dg_capture_event> records(mode == 1 ? 8192 : 1);
+    ss_dg_capture_sink sink{};
+    sink.struct_size = sizeof(sink); sink.event_size = sizeof(ss_dg_capture_event);
+    sink.records = records.data(); sink.capacity = records.size();
+    r.core->capture_bind(mode ? &sink : nullptr);
+    uint64_t expected_exports = 0;
+    for (uint32_t tok = 1; tok <= 12; ++tok) {
+      r.seq = tok; r.svc->begin(tok); ts::dg_store_release(&r.began, tok);
+      for (uint32_t g = 0; g < Rig::G; ++g) {
+        const std::vector<uint32_t> ids{tok % 32, 7, 3, 7, 0, g, 1, 3, 9, 2, 2, 1};
+        const uint64_t mask = r.do_export(g, ids, 0, tok);
+        if (mask) CHECK(r.do_wait(g));
+        CHECK(r.do_read(g, ids));
+        ++expected_exports;
+      }
+      CHECK_EQ(int(r.svc->wait_terminal(tok, std::chrono::milliseconds(5000))), int(DgService::kServed));
+      r.core->end_token({});
+    }
+    if (mode == 0) {
+      reference = r.core->table(); ref_fetch = r.core->stats().fetched; ref_miss = r.core->stats().misses;
+    } else {
+      CHECK(reference == r.core->table());
+      CHECK_EQ(ref_fetch, r.core->stats().fetched); CHECK_EQ(ref_miss, r.core->stats().misses);
+      if (mode == 1) {
+        CHECK_EQ(sink.incomplete, 0u); CHECK_EQ(sink.lost, 0u);
+        uint64_t exports = 0;
+        for (uint64_t i = 0; i < sink.count; ++i) if (records[size_t(i)].kind == 1) {
+          const auto& e = records[size_t(i)]; ++exports;
+          CHECK_EQ(e.n_ids, 12u); CHECK_EQ(e.ids[1], 7u); CHECK_EQ(e.ids[3], 7u);
+          CHECK_EQ(e.ids[9], 2u); CHECK_EQ(e.ids[10], 2u);
+          CHECK_EQ((e.mask >> 1) & 1u, (e.mask >> 3) & 1u);
+        }
+        CHECK_EQ(exports, expected_exports);
+      } else {
+        CHECK_EQ(sink.incomplete, 1u); CHECK(sink.lost > 0); CHECK_EQ(sink.count, 1u);
+      }
+    }
+  }
+  CHECK(ss_dg_capture_reserve(nullptr) == nullptr);
+}
+
+// Mirror replica ownership: capture owner precedes the context that joins service.
+// A step throws with an open token; terminal detach is deliberately unavailable.
+TEST(dg_service_capture_exception_lifetime) {
+  bool stopped = false, destroyed = false;
+  struct GuardedCapture {
+    bool& stopped;
+    bool& destroyed;
+    std::vector<ss_dg_capture_event> records{256};
+    ss_dg_capture_sink sink{};
+    GuardedCapture(bool& s, bool& d) : stopped(s), destroyed(d) {
+      sink.records = records.data(); sink.capacity = records.size();
+      sink.struct_size = sizeof(sink); sink.event_size = sizeof(ss_dg_capture_event);
+    }
+    ~GuardedCapture() {
+      CHECK(stopped);  // fail before releasing/poisoning any capture storage
+      std::memset(records.data(), 0xdd, records.size() * sizeof(records[0]));
+      destroyed = true;
+    }
+  };
+  struct Context {
+    GuardedCapture& capture;
+    Rig rig{std::chrono::milliseconds(60000)};
+    explicit Context(GuardedCapture& c) : capture(c) { rig.core->capture_bind(&c.sink); }
+    ~Context() {
+      CHECK(!capture.destroyed);
+      CHECK(rig.core->capture_sink() == &capture.sink);
+      rig.svc->stop_join();
+      CHECK(!rig.svc->running());
+      CHECK(capture.sink.count > 0);
+      CHECK_EQ(capture.sink.incomplete, 0u);
+      capture.stopped = true;
+      rig.core->capture_bind(nullptr);  // only after service shutdown
+    }
+  };
+  try {
+    GuardedCapture capture(stopped, destroyed);
+    Context tier(capture);
+    auto& r = tier.rig;
+    uint32_t miss = 0;
+    while (r.core->table()[r.core->key(0, miss)] >= 0) ++miss;
+    r.seq = 1; r.svc->begin(1);
+    r.do_export(0, {miss, miss}, 1, 1);  // leave service waiting for prediction
+    // Acquire ready guarantees the raw export was written; service may still
+    // be finishing decision capture when the exceptional step begins unwinding.
+    CHECK(r.do_wait(0));
+    throw std::runtime_error("exceptional step");
+  } catch (const std::runtime_error&) {}
+  CHECK(stopped); CHECK(destroyed);
+}
