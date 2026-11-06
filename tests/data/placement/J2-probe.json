@@ -1,0 +1,19 @@
+{
+ "devices": [
+  {
+   "arch": "sm_120",
+   "driver": "617.14",
+   "host": "pc",
+   "host_ram_gib": 127.8,
+   "id": "GPU-6d2f0000-0000-0000-0000-000000000001",
+   "kind": "cuda",
+   "memory_gib": 95.57,
+   "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "ordinal": 0,
+   "pci": "0000:01:00.0",
+   "platform": "windows-wddm",
+   "uuid": "GPU-6d2f0000-0000-0000-0000-000000000001"
+  }
+ ],
+ "links": []
+}

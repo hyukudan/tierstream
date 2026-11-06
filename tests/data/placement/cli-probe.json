@@ -1,0 +1,36 @@
+{
+ "devices": [
+  {
+   "arch": "sm_120",
+   "driver": "617.14",
+   "host": "pc",
+   "host_ram_gib": 127.7,
+   "id": "GPU-11111111-2222-3333-4444-555555555555",
+   "kind": "cuda",
+   "memory_bytes": 102641664000,
+   "memory_gib": 95.59,
+   "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "ordinal": 0,
+   "pci": "0000:01:00.0",
+   "platform": "windows-wddm",
+   "uuid": "GPU-11111111-2222-3333-4444-555555555555"
+  },
+  {
+   "arch": "sm_89",
+   "driver": "617.14",
+   "host": "pc",
+   "host_ram_gib": 127.7,
+   "id": "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+   "kind": "cuda",
+   "memory_bytes": 25757220864,
+   "memory_gib": 23.99,
+   "name": "NVIDIA GeForce RTX 4090",
+   "ordinal": 1,
+   "pci": "0000:05:00.0",
+   "platform": "windows-wddm",
+   "uuid": "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+  }
+ ],
+ "engine": "strix-cuda-ds41-replica",
+ "model": "DeepSeek-V4.1-Flash"
+}

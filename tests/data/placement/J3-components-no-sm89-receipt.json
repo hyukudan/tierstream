@@ -1,0 +1,494 @@
+{
+ "arithmetic": {
+  "dispatch": {
+   "sm_120": [],
+   "sm_89": []
+  },
+  "options": {
+   "fuse_hc": true,
+   "fuse_shared": true
+  }
+ },
+ "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "capabilities": [
+  "multi_device"
+ ],
+ "components": [
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 8033731008,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "dense"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 2027110400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "head"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 177167400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "buffers"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 199286620,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "state"
+  },
+  {
+   "charges": [
+    {
+     "allocs": 0,
+     "at": "device",
+     "bytes": 726589440,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 61440,
+     "name": "dg.slot_table",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 348,
+     "name": "dg.controls",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "window"
+  },
+  {
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 1073741824,
+     "kind": "driver",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "graphs"
+  },
+  {
+   "id": "drafter",
+   "qualified": [
+    {
+     "arch": "sm_120",
+     "arithmetic_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+     "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+     "content_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+     "receipt_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+     "variants": [
+      "eager",
+      "graph"
+     ]
+    }
+   ],
+   "requires": {
+    "relay": true
+   },
+   "variants": {
+    "anchor": [
+     {
+      "at": "device",
+      "bytes": 8053063680,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ],
+    "assist": [
+     {
+      "at": "device",
+      "bytes": 10593557320,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 64424509,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 23040,
+     "name": "dg.mapped",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 16777216,
+     "name": "dg.bounce",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 9953280,
+     "name": "dg.staging",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 61440,
+     "name": "dg.table_pin",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "staging"
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 1048576,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "id": "relay"
+  }
+ ],
+ "config": {
+  "cache": "tierstream",
+  "cache_config": {
+   "host_spares": 96,
+   "policy": "lru",
+   "prefetch": "off",
+   "spare_billing": "global",
+   "spares": 96,
+   "wait_timeout_ms": 2000
+  },
+  "limits": {
+   "dev_runtime_pending": 0,
+   "malloc_heap": 0,
+   "printf_fifo": 0,
+   "stack_bytes": 1024
+  },
+  "max_context_tokens": 131072,
+  "max_rows": 6,
+  "max_sequences": 1,
+  "shapes": [
+   {
+    "phase": "decode",
+    "rows": 1
+   },
+   {
+    "phase": "spec",
+    "rows": 2
+   },
+   {
+    "phase": "spec",
+    "rows": 3
+   },
+   {
+    "phase": "spec",
+    "rows": 4
+   },
+   {
+    "phase": "spec",
+    "rows": 5
+   },
+   {
+    "phase": "spec",
+    "rows": 6
+   },
+   {
+    "bucket": 256,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 512,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 1024,
+    "phase": "prefill"
+   }
+  ],
+  "window": {
+   "dg_max_ids": 36,
+   "slots": 73
+  }
+ },
+ "content": {
+  "draft_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "overlays": [],
+  "vocabulary_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+ },
+ "context": {
+  "sm_120": 644245094,
+  "sm_89": 644245094
+ },
+ "context_growth": {
+  "sm_120": 67108864,
+  "sm_89": 67108864
+ },
+ "context_receipts": [
+  {
+   "alloc_granularity_bytes": 2097152,
+   "allowance_bytes": 644245094,
+   "arch": "sm_120",
+   "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "device_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "driver": "617.14",
+   "envelope_sha256": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
+   "host_alloc_granularity_bytes": 4096,
+   "max_growth_bytes": 0,
+   "max_observed_bytes": 590000000,
+   "method": "pdh-process-dedicated",
+   "platform": "windows-wddm",
+   "receipt_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+   "runs": 5,
+   "signature": "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad",
+   "warm_bytes": {
+    "graphs": 1073741824
+   }
+  },
+  {
+   "alloc_granularity_bytes": 2097152,
+   "allowance_bytes": 644245094,
+   "arch": "sm_89",
+   "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "device_name": "NVIDIA GeForce RTX 4090",
+   "driver": "617.14",
+   "envelope_sha256": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
+   "host_alloc_granularity_bytes": 4096,
+   "max_growth_bytes": 0,
+   "max_observed_bytes": 590000000,
+   "method": "pdh-process-dedicated",
+   "platform": "windows-wddm",
+   "receipt_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+   "runs": 5,
+   "signature": "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54",
+   "warm_bytes": {
+    "drafter": 134217728
+   }
+  }
+ ],
+ "desc_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "elastic": {
+  "host_spares": 96,
+  "per_layer_units": 384,
+  "slot_allocs": 3,
+  "spare_billing": "global",
+  "spares": 96,
+  "unit_bytes": 9953280,
+  "units_total": 15360
+ },
+ "engine": "strix-cuda-ds41-replica",
+ "envelope": {
+  "allocator": {
+   "alloc_granularity": 2097152,
+   "api": "cudaMalloc"
+  },
+  "cache_config": {
+   "host_spares": 96,
+   "policy": "lru",
+   "prefetch": "off",
+   "spare_billing": "global",
+   "spares": 96,
+   "wait_timeout_ms": 2000
+  },
+  "dispatch": {
+   "sm_120": [],
+   "sm_89": []
+  },
+  "limits": {
+   "dev_runtime_pending": 0,
+   "malloc_heap": 0,
+   "printf_fifo": 0,
+   "stack_bytes": 1024
+  },
+  "pools": {
+   "events": 64,
+   "streams": 4
+  },
+  "shapes": [
+   {
+    "phase": "decode",
+    "rows": 1
+   },
+   {
+    "phase": "spec",
+    "rows": 2
+   },
+   {
+    "phase": "spec",
+    "rows": 3
+   },
+   {
+    "phase": "spec",
+    "rows": 4
+   },
+   {
+    "phase": "spec",
+    "rows": 5
+   },
+   {
+    "phase": "spec",
+    "rows": 6
+   },
+   {
+    "bucket": 256,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 512,
+    "phase": "prefill"
+   },
+   {
+    "bucket": 1024,
+    "phase": "prefill"
+   }
+  ]
+ },
+ "model_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "schema": "tierstream/components-v1",
+ "stack": {
+  "dynamic_stack": false,
+  "stack_bytes": 1024
+ }
+}

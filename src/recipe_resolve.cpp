@@ -147,8 +147,28 @@ void check_path(const Recipe& r, const std::string& path, bool allow_prefix) {
     const RRoute* rt = r.route(s[1]);
     if (!rt) bad("unknown route \"" + s[1] + "\"");
     if (end_here(2, false)) return;
-    if (s[2] == "fallback" || s[2] == "enabled") {
+    if (s[2] == "fallback" || s[2] == "enabled" || s[2] == "max_rows" || s[2] == "max_sequences") {
       end_here(3, true);
+      return;
+    }
+    // Placement mode (docs/recipes.md §5.4): an assist table may be created by a layer; validation of the result
+    // (an assist is not one of the route's devices, ...) is the recipe's.
+    if (s[2] == "assist") {
+      if (end_here(3, false)) return;
+      if (!r.device(s[3])) bad("unknown device set \"" + s[3] + "\"");
+      if (std::find(rt->devices.begin(), rt->devices.end(), s[3]) != rt->devices.end())
+        bad("\"" + s[3] + "\" executes the route; an assist is another set");
+      if (end_here(4, false)) return;
+      if (!one_of(s[4], {"device_gib", "margin_gib", "margin_fraction"})) bad("unknown assist field \"" + s[4] + "\"");
+      end_here(5, true);
+      return;
+    }
+    if (s[2] == "components") {
+      if (end_here(3, false)) return;
+      if (!component_priority(s[3])) bad("unknown component \"" + s[3] + "\"");
+      if (end_here(4, false)) return;
+      if (!one_of(s[4], {"device", "gib", "units"})) bad("\"" + s[4] + "\" is not a settable component field");
+      end_here(5, true);
       return;
     }
     if (s[2] == "when") {
@@ -188,6 +208,10 @@ void set_path(Json& doc, const std::string& path, const Json& value) {
   s.pop_back();
   Json* parent = walk(doc, s, true);
   require(parent && parent->is_object(), SS_E_RECIPE, "path \"" + path + "\": not found in the recipe");
+  // A later exact quota replaces an earlier GiB quota (and vice versa), including one written in the base recipe.
+  // A single layer specifying both is rejected by read_layer, just as a recipe specifying both is rejected.
+  if (s.size() == 4 && s[0] == "routes" && s[2] == "components" && (leaf == "units" || leaf == "gib"))
+    parent->obj.erase(leaf == "units" ? "gib" : "units");
   (*parent)[leaf] = value;
 }
 
@@ -307,7 +331,29 @@ RecipeLayer RecipeStack::read_layer(const std::string& text, const std::string& 
     for (const Json* t : {&kdev, &kdrv, &kdesc, &pr})
       for (const auto& kv : t->obj)
         if (kv.first.rfind("x-", 0) != 0 && !eff_.device(kv.first)) bad("unknown device set \"" + kv.first + "\"");
+    // An unbound optional set is keyed {"unbound": true} in key.devices / key.drivers / probe (key.descriptors: that
+    // or absent); a profile tuned with the set bound never matches a run without it, and vice versa.
+    auto unbound_key = [](const Json* v) {
+      if (!v || !v->is_object()) return false;
+      const Json* u = v->find("unbound");
+      return u && u->kind == Json::Kind::Bool && u->b && v->obj.size() == 1;
+    };
     for (const auto& set : b.sets) {
+      const bool unbound = set.second.empty();
+      for (const Json* t : {&kdev, &kdrv, &pr}) {
+        const Json* v = t->find(set.first);
+        if (unbound && !unbound_key(v))
+          stale("the optional set \"" + set.first + "\" is unbound now; the profile was tuned with it bound "
+                "(drop the profile or retune)");
+        if (!unbound && unbound_key(v))
+          stale("the optional set \"" + set.first + "\" is bound now; the profile was tuned without it "
+                "(drop the profile or retune)");
+      }
+      if (unbound) {
+        const Json* v = kdesc.find(set.first);
+        if (v && !unbound_key(v)) stale("key.descriptors." + set.first + " names descriptors of an unbound set");
+        continue;
+      }
       const RDevice* dev = eff_.device(set.first);
       const std::vector<BoundMember>& mem = set.second;
       std::string got;
@@ -368,6 +414,12 @@ RecipeLayer RecipeStack::read_layer(const std::string& text, const std::string& 
     } catch (const Error& e) {
       fail(e.status(), with_origin(origin, e));
     }
+    const std::vector<std::string> path = split(kv.first);
+    if (path.size() == 5 && path[0] == "routes" && path[2] == "components" &&
+        (path[4] == "units" || path[4] == "gib")) {
+      const std::string other = kv.first.substr(0, kv.first.rfind('.') + 1) + (path[4] == "units" ? "gib" : "units");
+      if (set.find(other)) bad("PL_E_SCHEMA gib and units are exclusive in one override layer");
+    }
     L.set.push_back({kv.first, kv.second});
   }
   return L;
@@ -382,13 +434,20 @@ void RecipeStack::rebuild(const std::vector<RecipeLayer>& layers) {
   for (const auto& L : layers)
     if (L.kind == RecipeLayer::Override) order.push_back(&L);
   // A profile is tuned for its budgets: no override may change a budget of a placement it tunes, or the hardware match.
-  std::vector<std::string> tuned;
+  // Placement mode extends the tuned scopes (docs/recipes.md §6.1): a profile that writes a route's assist,
+  // components, max_rows or max_sequences tunes that route's whole memory layout, so no override may change any of
+  // them, nor a budget of any of the route's placements.
+  auto layout_scope = [](const std::vector<std::string>& s) {
+    return s.size() >= 3 && s[0] == "routes" && one_of(s[2], {"assist", "components", "max_rows", "max_sequences"});
+  };
+  std::vector<std::string> tuned, tuned_routes;
   for (const RecipeLayer* L : order)
     if (L->kind == RecipeLayer::Profile)
       for (const auto& e : L->set) {
         const std::vector<std::string> s = split(e.first);
         if (s.size() >= 4 && s[0] == "routes" && s[2] == "placement")
           tuned.push_back(s[0] + "." + s[1] + ".placement." + s[3]);
+        if (layout_scope(s)) tuned_routes.push_back(s[1]);
       }
   bool has_profile = order.size() && order[0]->kind == RecipeLayer::Profile;
   for (const RecipeLayer* L : order) {
@@ -399,9 +458,16 @@ void RecipeStack::rebuild(const std::vector<RecipeLayer>& layers) {
                     one_of(s[4], {"device_gib", "host_pinned_gib", "workspace_gib", "max_context_tokens", "max_batch",
                                   "margin_gib", "margin_fraction", "dynamic_slots_per_layer", "ring_slots",
                                   "pinned_backing", "host_spare_units", "staging_buffers", "staging_mib",
-                                  "tier_mode", "readahead_units"});
+                                  "tier_mode", "readahead_units", "host_pageable_gib", "host_available_floor_gib"});
       bool hit = s[0] == "match";
       for (const auto& t : tuned) hit = hit || (budget && pin_covers(t, e.first));
+      // A route whose layout the profile tunes: every layout scope and every placement budget of the route.
+      const bool route_tuned =
+          s.size() >= 2 && s[0] == "routes" && std::find(tuned_routes.begin(), tuned_routes.end(), s[1]) != tuned_routes.end();
+      if (route_tuned && (layout_scope(s) || (budget && s[2] == "placement"))) hit = true;
+      // A route whose placement the profile tunes: its layout scopes too.
+      if (layout_scope(s))
+        for (const auto& t : tuned) hit = hit || t.rfind("routes." + s[1] + ".placement.", 0) == 0;
       require(!hit, SS_E_RECIPE,
               L->origin + ": " + e.first + " changes what the profile " + order[0]->origin +
                   " was tuned with; drop the profile (run untuned) or retune");

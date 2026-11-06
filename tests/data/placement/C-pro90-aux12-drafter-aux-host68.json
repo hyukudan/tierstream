@@ -1,0 +1,382 @@
+{
+ "alloc_granularity": {
+  "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad": 2097152,
+  "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54": 2097152
+ },
+ "anchor": "rtx",
+ "build_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "capabilities": [
+  "multi_device"
+ ],
+ "components": [
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 8033731008,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "dense"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 2027110400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "head"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 177167400,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "buffers"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 199286620,
+     "phases": [
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "state"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "allocs": 0,
+     "at": "device",
+     "bytes": 726589440,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 61440,
+     "name": "dg.slot_table",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "device",
+     "bytes": 348,
+     "name": "dg.controls",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "window"
+  },
+  {
+   "anchored": true,
+   "charges": [
+    {
+     "at": "device",
+     "bytes": 1073741824,
+     "kind": "driver",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "anchor",
+   "id": "graphs"
+  },
+  {
+   "default": "anchor",
+   "id": "drafter",
+   "qualified": [
+    "sm_120",
+    "sm_89"
+   ],
+   "variants": {
+    "anchor": [
+     {
+      "at": "device",
+      "bytes": 8053063680,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ],
+    "assist": [
+     {
+      "at": "device",
+      "bytes": 10593557320,
+      "peak_extra": 268435456,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "device",
+      "bytes": 134217728,
+      "kind": "driver",
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     },
+     {
+      "at": "host_pinned",
+      "bytes": 16777216,
+      "phases": [
+       "load",
+       "prefill",
+       "decode",
+       "spec"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 64424509,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 23040,
+     "name": "dg.mapped",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 16777216,
+     "name": "dg.bounce",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 9953280,
+     "name": "dg.staging",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    },
+    {
+     "at": "host_pinned",
+     "bytes": 61440,
+     "name": "dg.table_pin",
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "host_pinned",
+   "id": "staging"
+  },
+  {
+   "charges": [
+    {
+     "at": "host_pinned",
+     "bytes": 1048576,
+     "phases": [
+      "load",
+      "prefill",
+      "decode",
+      "spec"
+     ]
+    }
+   ],
+   "default": "host_pinned",
+   "id": "relay"
+  }
+ ],
+ "context": {
+  "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad": 644245094,
+  "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54": 644245094
+ },
+ "context_growth": {
+  "sm_120": 67108864,
+  "sm_89": 67108864
+ },
+ "context_receipts": [
+  [
+   "sm_120",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "617.14",
+   "windows-wddm",
+   "0000000000000000000000000000000000000000000000000000000000000000",
+   "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad"
+  ],
+  [
+   "sm_89",
+   "NVIDIA GeForce RTX 4090",
+   "617.14",
+   "windows-wddm",
+   "0000000000000000000000000000000000000000000000000000000000000000",
+   "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54"
+  ]
+ ],
+ "devices": [
+  {
+   "arch": "sm_120",
+   "bound": true,
+   "budget_gib": 90.0,
+   "driver": "617.14",
+   "margin_frac_ppm": 0,
+   "margin_gib": 0.6,
+   "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+   "platform": "windows-wddm",
+   "set": "rtx"
+  },
+  {
+   "arch": "sm_89",
+   "bound": true,
+   "budget_gib": 12.0,
+   "driver": "617.14",
+   "margin_frac_ppm": 30000,
+   "margin_gib": 0.5,
+   "name": "NVIDIA GeForce RTX 4090",
+   "platform": "windows-wddm",
+   "set": "aux"
+  }
+ ],
+ "envelope_sha256": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
+ "explicit": {
+  "drafter": "aux"
+ },
+ "host_alloc_granularity": 4096,
+ "host_chunk_bytes": 1073741824,
+ "host_pinned_gib": 68.0,
+ "host_spare_units": 96,
+ "priority": [
+  "dense",
+  "head",
+  "buffers",
+  "state",
+  "window",
+  "graphs",
+  "drafter",
+  "relay",
+  "staging",
+  "expert_file"
+ ],
+ "receipt_envelope": {
+  "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0",
+  "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54": "c7b4e753371d55c5864394eec4161c6d348e08039490f82b03fd59df30498bd0"
+ },
+ "receipt_max_growth": {
+  "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad": 0,
+  "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54": 0
+ },
+ "receipt_warm_bytes": {
+  "5164f127aeda73f90b8c6aac51d621d5a892362eb85baceaec2d21cead0234ad": {
+   "graphs": 1073741824
+  },
+  "7eb3fa7c6037b9cc907aefbcd582c2ae3c81ea365ff0e960c145c2d8d867ce54": {
+   "drafter": 134217728
+  }
+ },
+ "slot_allocs": 3,
+ "spares_units": 96,
+ "total_units": 15360,
+ "unit_bytes": 9953280
+}

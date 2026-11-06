@@ -153,6 +153,9 @@ def generate():
     h.append("}")
     h.append("#endif")
     h.append("")
+    h.append("/* Functions added after the rename exist only under tierstream names (ss.h is frozen): placement. */")
+    h.append('#include "ts_place.h"')
+    h.append("")
     h.append("#endif /* TIERSTREAM_TS_H */")
     header = "\n".join(h) + "\n"
 

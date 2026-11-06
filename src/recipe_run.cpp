@@ -42,6 +42,11 @@ struct ProbeDev {
   std::string id, kind, name, host, driver;
   double memory_gib = 0, host_ram_gib = -1, disk = -1, h2d = -1;
   int64_t ordinal = -1;
+  bool present = true;  // placement probe: configured device absent at probe time when false
+  // Placement identity (all optional in the report): normalized uuid / pci, arch (sm_XY / gfxNNNN), exact bytes.
+  std::string uuid, pci, arch, phys, platform;
+  int64_t memory_bytes = -1;
+  int64_t index = -1;  // position among the host's devices of the same kind in PCI order
 };
 struct ProbeLink {
   std::string kind, a, b;
@@ -85,6 +90,13 @@ int64_t pint(const Json& o, const char* k, const std::string& w, bool required, 
   return std::strtoll(t.c_str(), nullptr, 10);
 }
 
+bool pbool(const Json& o, const char* k, const std::string& w, bool dflt) {
+  const Json* v = field(o, k);
+  if (!v) return dflt;
+  require(v->kind == Json::Kind::Bool, SS_E_RECIPE, w + "." + k + ": expected a boolean");
+  return v->b;
+}
+
 bool kind_ok(const std::string& want, const std::string& got) { return want == "other" || want == got; }
 
 const char* backend_word(ss_backend_kind k) {
@@ -99,7 +111,62 @@ bool hosts_linked(const std::vector<ProbeLink>& links, const std::string& a, con
   return false;
 }
 
-// ---- tiering (docs/recipes.md §5.2) ------------------------------------------------------------------------------
+// PCI order of probed devices: by PCI address, devices without one after, by physical key.
+bool pci_order(const ProbeDev& a, const ProbeDev& b) {
+  if (a.pci.empty() != b.pci.empty()) return !a.pci.empty();
+  return a.pci != b.pci ? a.pci < b.pci : a.phys < b.phys;
+}
+
+// Rows that share a PCI address or a UUID are one physical device (alias rows, e.g. one row per runtime): merged
+// into the row with the smallest id; rows that disagree on what they describe are refused (PL_E_DUPLICATE_DEVICE).
+// phys = PCI address if any row has one, else UUID, else the probe id.
+std::vector<ProbeDev> merge_aliases(std::vector<ProbeDev> devs) {
+  const size_t n = devs.size();
+  std::vector<size_t> parent(n);
+  for (size_t i = 0; i < n; ++i) parent[i] = i;
+  std::function<size_t(size_t)> root = [&](size_t i) { return parent[i] == i ? i : (parent[i] = root(parent[i])); };
+  for (size_t i = 0; i < n; ++i)
+    for (size_t j = i + 1; j < n; ++j)
+      if ((!devs[i].pci.empty() && devs[i].pci == devs[j].pci) || (!devs[i].uuid.empty() && devs[i].uuid == devs[j].uuid))
+        parent[root(j)] = root(i);
+  std::vector<ProbeDev> out;
+  for (size_t i = 0; i < n; ++i) {
+    if (root(i) != i) continue;
+    std::vector<size_t> g;
+    for (size_t j = 0; j < n; ++j)
+      if (root(j) == i) g.push_back(j);
+    std::sort(g.begin(), g.end(), [&](size_t a, size_t b) { return devs[a].id < devs[b].id; });
+    ProbeDev m = devs[g[0]];
+    for (size_t k = 1; k < g.size(); ++k) {
+      const ProbeDev& y = devs[g[k]];
+      auto same = [&](const std::string& a, const std::string& b) { return a.empty() || b.empty() || a == b; };
+      std::string bad;
+      if (y.kind != m.kind) bad = "kind";
+      else if (y.present != m.present) bad = "present";
+      else if (y.host != m.host) bad = "host";
+      else if (y.name != m.name) bad = "name";
+      else if (y.memory_gib != m.memory_gib) bad = "memory_gib";
+      else if (!same(y.uuid, m.uuid)) bad = "uuid";
+      else if (!same(y.pci, m.pci)) bad = "pci";
+      else if (!same(y.arch, m.arch)) bad = "arch";
+      require(bad.empty(), SS_E_RECIPE,
+              "probe: PL_E_DUPLICATE_DEVICE rows \"" + m.id + "\" and \"" + y.id +
+                  "\" name the same physical device but differ in " + bad);
+      for (auto f : {&ProbeDev::uuid, &ProbeDev::pci, &ProbeDev::arch, &ProbeDev::driver, &ProbeDev::platform})
+        if ((m.*f).empty()) m.*f = y.*f;
+      if (m.ordinal < 0) m.ordinal = y.ordinal;
+      if (m.memory_bytes < 0) m.memory_bytes = y.memory_bytes;
+      if (m.host_ram_gib < 0) m.host_ram_gib = y.host_ram_gib;
+      if (m.disk < 0) m.disk = y.disk;
+      if (m.h2d < 0) m.h2d = y.h2d;
+    }
+    m.phys = !m.pci.empty() ? m.pci : !m.uuid.empty() ? m.uuid : m.id;
+    out.push_back(m);
+  }
+  return out;
+}
+
+// ---- tiering (docs/recipes.md §5.2)------------------------------------------------------------------------------
 struct UnitRef {
   int64_t g;
   int layer, unit;
@@ -533,6 +600,10 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
     const std::string s = pstr(probe, "engine", "probe", false);
     if (s != r.engine) errors.push_back("match.engine: recipe is for \"" + r.engine + "\", probed \"" + s + "\"");
   }
+  // Binding mode is per recipe (contract §2.1): placement-mode binding (alias merge, strict probe identities) iff a
+  // route of the recipe is in placement mode; any other recipe binds exactly as today.
+  bool placement = false;
+  for (const auto& rt : r.routes) placement = placement || rt.placement_mode();
   std::vector<ProbeDev> devs;
   const Json* pd = field(probe, "devices");
   require(pd && pd->is_array(), SS_E_RECIPE, "probe: \"devices\" must be an array");
@@ -540,7 +611,9 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   for (size_t i = 0; i < pd->arr.size(); ++i) {
     const Json& e = pd->arr[i];
     const std::string w = "probe.devices[" + std::to_string(i) + "]";
+    if (placement && pbool(e, "excluded", w, false)) continue;
     ProbeDev x;
+    if (placement) x.present = pbool(e, "present", w, true);
     x.id = pstr(e, "id", w, true);
     require(seen.insert(x.id).second, SS_E_RECIPE, w + ": duplicate id \"" + x.id + "\"");
     x.kind = pstr(e, "kind", w, true);
@@ -552,9 +625,40 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
     x.disk = pnum(e, "disk_read_gbytes_ps", w, false);
     x.h2d = pnum(e, "h2d_gbytes_ps", w, false);
     x.ordinal = pint(e, "ordinal", w, false);
+    const std::string uuid = pstr(e, "uuid", w, false), pci = pstr(e, "pci", w, false);
+    x.uuid = uuid.empty() ? "" : normalize_uuid(uuid);
+    x.pci = pci.empty() ? "" : normalize_pci(pci);
+    require(!placement || pci.empty() || !x.pci.empty(), SS_E_RECIPE,
+            w + ".pci: \"" + pci + "\" is not a PCI address dddd:bb:dd.f");
+    x.arch = pstr(e, "arch", w, false);
+    x.platform = pstr(e, "platform", w, false);
+    if (x.platform.empty()) x.platform = pstr(probe, "platform", "probe", false);
+    require(!placement || x.platform.empty() || x.platform == "linux" || x.platform == "windows-wddm" ||
+                x.platform == "windows-tcc",
+            SS_E_RECIPE, w + ".platform: PL_E_SCHEMA \"" + x.platform + "\" is not linux | windows-wddm | windows-tcc");
+    x.memory_bytes = pint(e, "memory_bytes", w, false);
     devs.push_back(x);
   }
+  // Placement mode only (contract §2.1): alias rows merge into one physical device. A legacy recipe keeps today's
+  // binding exactly (one probe row = one device, phys = its id).
+  if (placement)
+    devs = merge_aliases(std::move(devs));
+  else
+    for (auto& x : devs) x.phys = x.id;
   std::sort(devs.begin(), devs.end(), [](const ProbeDev& a, const ProbeDev& b) { return a.id < b.id; });
+  // index selector: position among the same host's devices of the same kind, in PCI order (never a runtime ordinal).
+  for (auto& x : devs) {
+    x.index = 0;
+    for (const auto& y : devs)
+      if (&y != &x && y.host == x.host && y.kind == x.kind && (!placement || y.present) && pci_order(y, x)) ++x.index;
+  }
+  // index needs every candidate's PCI address (CUDA's enumeration order is never an index).
+  for (const auto& d : r.devices)
+    if (d.index >= 0)
+      for (const auto& x : devs)
+        require((placement && !x.present) || x.kind != backend_word(d.kind) || !x.pci.empty(), SS_E_RECIPE,
+                "match.devices." + d.id + ".index: PL_E_SCHEMA the probe has no PCI address for \"" + x.id +
+                    "\" (index counts devices in PCI order)");
   std::vector<ProbeLink> links;
   if (const Json* pl = field(probe, "links")) {
     require(pl->is_array(), SS_E_RECIPE, "probe: \"links\" must be an array");
@@ -578,6 +682,7 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   for (size_t s = 0; s < r.devices.size(); ++s) {
     const RDevice& rd = r.devices[s];
     std::string why;
+    bool configured_absent = false;
     for (size_t i = 0; i < devs.size(); ++i) {
       const ProbeDev& x = devs[i];
       std::string miss;
@@ -596,12 +701,26 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
         miss = x.disk < 0 ? "disk bandwidth not probed" : "disk " + fmtg(x.disk) + " GB/s";
       if (miss.empty() && rd.h2d_gbytes_ps_min > 0 && x.h2d < rd.h2d_gbytes_ps_min)
         miss = x.h2d < 0 ? "H2D bandwidth not probed" : "H2D " + fmtg(x.h2d) + " GB/s";
+      if (miss.empty() && !rd.uuid.empty() && x.uuid != rd.uuid) miss = x.uuid.empty() ? "uuid not probed" : "uuid";
+      if (miss.empty() && !rd.pci.empty() && x.pci != rd.pci) miss = x.pci.empty() ? "pci not probed" : "pci " + x.pci;
+      if (miss.empty() && rd.index >= 0 && x.index != rd.index) miss = "index " + std::to_string(x.index);
+      if (placement && !x.present) {
+        if (miss.empty() && rd.index < 0) configured_absent = true;
+        continue;
+      }
       if (miss.empty())
         elig[s].push_back(i);
       else
         why += (why.empty() ? "" : ", ") + x.name + " (" + x.id + "): " + miss;
     }
-    if (elig[s].size() < size_t(rd.count)) {
+    if (placement) {
+      const std::string w = "match.devices." + rd.id + ": PL_E_UNKNOWN_DEVICE ";
+      require(rd.name.empty() || elig[s].size() <= 1, SS_E_RECIPE, w + "name matches more than one candidate");
+      require(!elig[s].empty() || (rd.optional && configured_absent) ||
+                  (rd.uuid.empty() && rd.pci.empty() && rd.index < 0 && rd.name.empty() && !rd.optional),
+              SS_E_RECIPE, w + "selector matches no probed non-excluded device");
+    }
+    if (!rd.optional && elig[s].size() < size_t(rd.count)) {
       std::string need = "match.devices." + rd.id + ": needs " + std::to_string(rd.count) + " " +
                          backend_word(rd.kind) + " device(s)" + (rd.name.empty() ? "" : " named \"" + rd.name + "\"") +
                          " with >= " + fmtg(rd.memory_min_gib) + " GiB";
@@ -647,6 +766,7 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
   };
   std::function<bool(size_t)> go = [&](size_t s) -> bool {
     if (s == r.devices.size()) return true;
+    if (r.devices[s].optional) return go(s + 1);  // bound afterwards, below
     if (int(pick[s].size()) == r.devices[s].count) {
       if (!set_ok(s)) return false;
       return go(s + 1);
@@ -675,12 +795,50 @@ Binding recipe_bind(const Recipe& r, const Json& probe) {
     m += "\n  (a set whose members land on two or more hosts needs an internal_link)";
     fail(SS_E_RECIPE, m);
   }
+  // Optional sets (placement assists), after the others and never changing their assignment: in set-id order (r's
+  // optional sets are sorted so), each takes the first free eligible device in physical order on its anchor's host:
+  // the host of the first route that lists it as an assist, else of the first set. None: unbound (no members).
+  auto set_index = [&](const std::string& id) {
+    for (size_t k = 0; k < r.devices.size(); ++k)
+      if (r.devices[k].id == id) return k;
+    return r.devices.size();
+  };
+  for (size_t s = 0; s < r.devices.size(); ++s) {
+    if (!r.devices[s].optional) continue;
+    size_t anchor = 0;
+    while (anchor < r.devices.size() && pick[anchor].empty()) ++anchor;
+    for (const auto& rt : r.routes)
+      if (rt.assist(r.devices[s].id)) {
+        anchor = set_index(rt.devices[0]);
+        break;
+      }
+    if (anchor >= r.devices.size() || pick[anchor].empty()) continue;
+    const std::string& host = devs[pick[anchor][0]].host;
+    std::vector<size_t> cand;
+    for (size_t i : elig[s])
+      if (!used[i] && devs[i].host == host) cand.push_back(i);
+    if (cand.empty()) continue;
+    const size_t i = *std::min_element(cand.begin(), cand.end(),
+                                       [&](size_t a, size_t c) { return devs[a].phys < devs[c].phys; });
+    used[i] = 1;
+    pick[s].push_back(i);
+  }
   Binding b;
   for (size_t s = 0; s < r.devices.size(); ++s) {
     std::vector<BoundMember> mem;
     for (size_t i : pick[s]) {
       const ProbeDev& x = devs[i];
-      mem.push_back({x.id, x.host, x.driver, x.ordinal, x.disk, x.h2d});
+      BoundMember bm{x.id, x.host, x.driver, x.ordinal, x.disk, x.h2d};
+      bm.kind = x.kind;
+      bm.name = x.name;
+      bm.uuid = x.uuid;
+      bm.pci = x.pci;
+      bm.phys = x.phys;
+      bm.arch = x.arch;
+      bm.platform = x.platform;
+      bm.memory_gib = x.memory_gib;
+      bm.memory_bytes = x.memory_bytes;
+      mem.push_back(bm);
     }
     b.sets.push_back({r.devices[s].id, mem});
   }

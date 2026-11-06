@@ -353,4 +353,7 @@ static inline ss_status ts_pack_find(const ss_pack* p, int layer, int expert, co
 }
 #endif
 
+/* Functions added after the rename exist only under tierstream names (ss.h is frozen): placement. */
+#include "ts_place.h"
+
 #endif /* TIERSTREAM_TS_H */

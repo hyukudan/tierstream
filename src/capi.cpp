@@ -20,6 +20,11 @@
 #include "stream_ctx.hpp"
 #include "strix_stream/ss.h"
 #include "strix_stream/ss_test.h"
+#include "components.hpp"
+#include "place.hpp"
+#include "sha256.hpp"
+#include "solve.hpp"
+#include "tierstream/ts_place.h"
 
 struct ss_desc {
   ts::Desc d;
@@ -248,6 +253,32 @@ namespace ts {
 ss_status capi_guard(const std::function<void()>& f) { return guard(f); }
 ss_status capi_give_text(const std::string& s, char** out, size_t* len) { return give_text(s, out, len); }
 }  // namespace ts
+// Placement refusals / outputs (ts_place, ts_place_from_flags).
+namespace {
+
+// A refusal: every PL_E_* line of the failing phase, one per line, as the message.
+void refuse_place(const ts::PlaceResult& r) {
+  std::string m;
+  for (const auto& e : r.errors) m += (m.empty() ? "" : "\n") + e;
+  ts::fail(SS_E_RECIPE, m);
+}
+
+ss_status give_place(const ts::PlaceResult& r, char** out_json, size_t* out_len, char** explain, size_t* explain_len) {
+  char* doc = nullptr;
+  ss_status st = give_text(ts::json_write(r.doc), &doc, out_len);
+  if (st != SS_OK) return st;
+  if (explain) {
+    st = give_text(r.explain, explain, explain_len);
+    if (st != SS_OK) {
+      std::free(doc);
+      return st;
+    }
+  }
+  *out_json = doc;
+  return SS_OK;
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -1362,5 +1393,175 @@ ss_status ss_devprof_piece_rows(const ss_devprof* p, const ss_devprof_piece_in* 
   });
 }
 
+
+// ---- placement (tierstream/ts_place.h) ---------------------------------------------------------------------------
+ss_status ts_place(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                   const char* components_json, size_t components_len, const ss_desc* desc, const char* usage_json,
+                   size_t usage_len, const char* context_json, size_t context_len, char** out_json, size_t* out_len,
+                   char** explain, size_t* explain_len) {
+  ts::PlaceResult res;
+  ss_status st = guard([&] {
+    need(r && route && probe_json && out_json, "ts_place: null argument");
+    ts::Binding b = ts::recipe_bind(r->s.effective(), parse_input(probe_json, probe_len, "probe"));
+    ts::Components c;
+    ts::PlaceInput in;
+    if (components_json) {
+      c = ts::components_from_json(parse_input(components_json, components_len, "components"));
+      in.components = &c;
+    }
+    if (desc) in.desc = &desc->d;
+    ts::UsageDoc usage;
+    if (usage_json) {
+      usage = ts::usage_from_json(parse_input(usage_json, usage_len, "usage"));
+      in.usage = &usage;
+    }
+    ts::ContextDoc context;
+    if (context_json) {
+      context = ts::context_from_json(parse_input(context_json, context_len, "context"));
+      in.context = &context;
+    }
+    in.recipe = &r->s.effective();
+    in.effective_sha256 = r->s.effective_sha256();
+    in.route = route;
+    in.binding = &b;
+    res = ts::place(in);
+    if (!res.errors.empty()) refuse_place(res);
+  });
+  return st != SS_OK ? st : give_place(res, out_json, out_len, explain, explain_len);
+}
+
+ss_status ts_placement_verify(const ss_recipe* r, const char* route,
+                                const char* placement_json, size_t placement_len,
+                                const char* probe_json, size_t probe_len,
+                                const char* components_json, size_t components_len, const ss_desc* desc,
+                                const char* usage_json, size_t usage_len,
+                                const char* context_json, size_t context_len, char** out_json, size_t* out_len) {
+  ts::Json stored;
+  ss_status st = guard([&] {
+    need(r && route && probe_json && components_json && placement_json && out_json,
+         "ts_placement_verify: null argument");
+    stored = ts::placement_from_json(parse_input(placement_json, placement_len, "placement"));
+    auto identity = [&](const std::string& field, const std::string& value, bool present = true) {
+      const ts::Json* saved = stored.find(field);
+      ts::require(present ? saved && saved->is_string() && saved->text == value : !saved, SS_E_RECIPE,
+                  "PL_E_STALE " + field + ": input differs from saved placement");
+    };
+    // Check identities before feasibility: an updated build/recipe/probe may no longer admit the old workload.
+    identity("effective_sha256", r->s.effective_sha256());
+    identity("route", route);
+    const ts::Components c = ts::components_from_json(parse_input(components_json, components_len, "components"));
+    identity("engine", c.engine);
+    identity("build_sha256", c.build_sha256);
+    identity("model_sha256", c.model_sha256);
+    identity("desc_sha256", c.desc_sha256);
+    identity("receipts_sha256", c.receipts_sha256, !c.receipts_sha256.empty());
+    identity("components_sha256", c.sha256);
+    if (desc) {
+      const std::string text = ts::json_write(ts::desc_to_json(desc->d));
+      identity("desc_sha256", ts::sha256_hex(text.data(), text.size()));
+    }
+    identity("usage_sha256", usage_json ? ts::usage_from_json(parse_input(usage_json, usage_len, "usage")).sha256 : "",
+             usage_json != nullptr);
+    identity("context_sha256", context_json ? ts::context_from_json(parse_input(context_json, context_len, "context")).sha256 : "",
+             context_json != nullptr);
+    ts::Binding binding;
+    try {
+      binding = ts::recipe_bind(r->s.effective(), parse_input(probe_json, probe_len, "probe"));
+    } catch (const ts::Error& e) {
+      ts::fail(SS_E_RECIPE, std::string("PL_E_STALE devices: probe binding differs: ") + e.what());
+    }
+    const ts::Json* devices = stored.find("devices");
+    ts::require(devices && devices->is_array(), SS_E_RECIPE, "PL_E_STALE devices: missing array");
+    for (size_t i = 0; i < devices->arr.size(); ++i) {
+      const ts::Json& device = devices->arr[i];
+      const std::string prefix = "devices[" + std::to_string(i) + "]";
+      const ts::Json* set = device.find("set");
+      ts::require(set && set->is_string(), SS_E_RECIPE, "PL_E_STALE " + prefix + ".set");
+      const auto* members = binding.of(set->text);
+      ts::require(members && members->size() == 1, SS_E_RECIPE, "PL_E_STALE " + prefix + ".set");
+      const auto& member = (*members)[0];
+      for (const auto& kv : std::vector<std::pair<std::string, std::string>>{
+               {"kind", member.kind}, {"phys", member.phys}, {"uuid", member.uuid}, {"pci", member.pci},
+               {"name", member.name}, {"host", member.host}, {"arch", member.arch},
+               {"driver", member.driver}, {"platform", member.platform}}) {
+        const ts::Json* saved = device.find(kv.first);
+        ts::require(saved ? saved->is_string() && saved->text == kv.second : kv.second.empty(), SS_E_RECIPE,
+                    "PL_E_STALE " + prefix + "." + kv.first + ": probe identity differs");
+      }
+    }
+  });
+  if (st != SS_OK) return st;
+  char* planned = nullptr;
+  st = ts_place(r, route, probe_json, probe_len, components_json, components_len, desc,
+                usage_json, usage_len, context_json, context_len, &planned, nullptr, nullptr, nullptr);
+  if (st != SS_OK) return st;
+  std::string canonical;
+  st = guard([&] {
+    ts::placement_verify(stored, ts::json_parse(planned));
+    canonical = ts::json_write(stored);
+  });
+  ss_free(planned);
+  return st != SS_OK ? st : give_text(canonical, out_json, out_len);
+}
+
+ss_status ts_solve(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                   const char* inputs_json, size_t inputs_len, char** out_json, size_t* out_len, char** table,
+                   size_t* table_len) {
+  return ts_solve_pick(r, route, probe_json, probe_len, inputs_json, inputs_len, nullptr, nullptr, nullptr,
+                        out_json, out_len, table, table_len);
+}
+
+ss_status ts_solve_pick(const ss_recipe* r, const char* route, const char* probe_json, size_t probe_len,
+                        const char* inputs_json, size_t inputs_len, const char* row_id, char** overrides,
+                        size_t* overrides_len, char** out_json, size_t* out_len, char** table, size_t* table_len) {
+  std::string doc, tab, ov;
+  ss_status st = guard([&] {
+    need(r && route && probe_json && inputs_json && out_json, "ts_solve: null argument");
+    need(!row_id || (*row_id && overrides), "ts_solve_pick: needs row_id and overrides output");
+    const ts::Json sv = ts::solve(r->s, route, parse_input(probe_json, probe_len, "probe"),
+                                  parse_input(inputs_json, inputs_len, "solver inputs"), row_id ? row_id : "",
+                                  row_id ? &ov : nullptr);
+    doc = ts::json_write(sv);
+    if (table) tab = ts::solve_table(sv);
+  });
+  if (st != SS_OK) return st;
+  char *d = nullptr, *t = nullptr, *o = nullptr;
+  size_t dl = 0, tl = 0, ol = 0;
+  st = give_text(doc, &d, &dl);
+  if (st == SS_OK && table) st = give_text(tab, &t, &tl);
+  if (st == SS_OK && row_id) st = give_text(ov, &o, &ol);
+  if (st != SS_OK) {
+    std::free(d);
+    std::free(t);
+    std::free(o);
+    return st;
+  }
+  *out_json = d;
+  if (out_len) *out_len = dl;
+  if (table) {
+    *table = t;
+    if (table_len) *table_len = tl;
+  }
+  if (row_id) {
+    *overrides = o;
+    if (overrides_len) *overrides_len = ol;
+  }
+  return SS_OK;
+}
+
+ss_status ts_place_from_flags(const char* probe_json, size_t probe_len, const char* components_json,
+                              size_t components_len, int argc, const char* const* argv, char** out_json,
+                              size_t* out_len, char** explain, size_t* explain_len) {
+  ts::PlaceResult res;
+  ss_status st = guard([&] {
+    need(probe_json && components_json && out_json && (argc == 0 || argv), "ts_place_from_flags: null argument");
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; ++i) args.push_back(argv[i] ? argv[i] : "");
+    const ts::Components c = ts::components_from_json(parse_input(components_json, components_len, "components"));
+    res = ts::place_from_flags(parse_input(probe_json, probe_len, "probe"), c, args, nullptr);
+    if (!res.errors.empty()) refuse_place(res);
+  });
+  return st != SS_OK ? st : give_place(res, out_json, out_len, explain, explain_len);
+}
 
 }  // extern "C"

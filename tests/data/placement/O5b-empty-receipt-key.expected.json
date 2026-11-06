@@ -1,0 +1,1 @@
+{"errors":["PL_E_SCHEMA context receipt key []: needs [arch, device_name, driver, platform, build_sha256, signature]"]}
