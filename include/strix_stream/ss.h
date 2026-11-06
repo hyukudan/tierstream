@@ -1808,10 +1808,9 @@ SS_API ss_status ss_budget_in_dg_library(ss_budget_in* in, const ss_desc* d, con
  * wrong prediction's read moves off the layer's ready, it does not disappear); a full read queue ends the completed
  * reads, then the oldest demand reads, and only then the oldest prefetch reads; ss_options.dg_pf_strict_admit keeps
  * prefetches above the spare target (ss_dg_stats.pf_strict_refused). The environment switch DG_PF_LEGACY (read at
- * ss_open; 0 / false / off or 1 / true / on, anything else refuses the open; DEFAULT 1 until the new admission is
- * measured not slower on the GPU) keeps the behaviour before these: no ahead skip for plain predictions, every
- * prefetch read of a layer ended before its ready, a full queue ending the oldest reads. DG_PF_LEGACY=0 selects the
- * admission described above. */
+ * ss_open; 0 / false / off or 1 / true / on, anything else refuses the open; default 0 = the admission described
+ * above, measured exact and not slower on the GPU) = 1 keeps the behaviour before these: no ahead skip for plain
+ * predictions, every prefetch read of a layer ended before its ready, a full queue ending the oldest reads. */
 #define SS_DG_PF_ADMIT 1
 /* ss_dg_stats.pred_shadow_file_* exist (the prediction shadow tally of the file tier) */
 #define SS_DG_PRED_SHADOW 1

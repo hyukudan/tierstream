@@ -567,9 +567,9 @@ A prediction is advice: it must never delay a layer or take what a demand needs.
   still ends it. A full queue ends the completed reads, then the oldest demand reads, and only then the oldest
   prefetch reads.
 - **Legacy.** `DG_PF_LEGACY` (read at open; 0 / false / off or 1 / true / on, anything else refuses the open;
-  default 1 until the new admission is measured not slower on the GPU) keeps the admission before these exactly
-  (`DG_PF_LEGACY=0` selects the new one): plain predictions served when the device is ahead, every prefetch
-  read of a layer ended before its ready, a full queue ending the oldest reads.
+  default 0 = the admission above, measured exact and not slower on the GPU) = 1 keeps the admission before these
+  exactly: plain predictions served when the device is ahead, every prefetch read of a layer ended before its ready,
+  a full queue ending the oldest reads.
 - **Strict admission.** `ss_options.dg_pf_strict_admit = 1` (default 0): a prefetch takes a free slot only while more
   are free than the boundary's spare target (at least `dg_prefetch_reserve`), so it never takes a spare slot this
   token's demand misses need; prefetches run in the slots beyond the target (`ss_dg_set_budgets` with a target below

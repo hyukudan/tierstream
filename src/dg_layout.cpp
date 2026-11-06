@@ -403,7 +403,7 @@ DgLayout dg_layout(const Desc& d, const Plan& p, const ss_options& o) {
   x.bounce_readers = hb.bounce_readers;
   const uint64_t bounce_total = hb.bounce_total();
   x.load_serial = env_flag("DG_LOAD_SERIAL", false);
-  x.pf_legacy = env_flag("DG_PF_LEGACY", true);  // the previous admission until measured
+  x.pf_legacy = env_flag("DG_PF_LEGACY", false);  // the new admission (measured not slower); 1 = the previous one
   x.staging_bytes = hb.staging;
   x.mapped_bytes = hb.mapped;
   const uint64_t host_extra = hb.total();
