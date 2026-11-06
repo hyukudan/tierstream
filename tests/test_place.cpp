@@ -1,4 +1,4 @@
-// CPU tests of placement mode (wave4/placement/contract.md rev 4): the recipe-v1 placement keys (written only when
+// CPU tests of placement mode (the placement contract rev 4): the recipe-v1 placement keys (written only when
 // set, strict refusals, settable paths, profile guard), optional device binding, the components-v1 reader, the
 // planner against the frozen G4 fixtures of golden/place_ref.py (tests/data/placement), G5 determinism.
 #include <algorithm>

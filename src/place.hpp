@@ -1,4 +1,4 @@
-// Per-GPU placement planner (wave4/placement contract rev 4, §3): placement-mode routes only. Legacy routes keep
+// Per-GPU placement planner (placement contract rev 4, §3): placement-mode routes only. Legacy routes keep
 // recipe_plan / budget_for / tier_units unchanged and never come here.
 //
 // Inputs: the effective recipe + route, the binding of a probe report, the engine's components-v1 (and optionally

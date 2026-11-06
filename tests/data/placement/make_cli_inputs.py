@@ -3,8 +3,9 @@ replica, drafter variants anchor/assist with receipts for sm_89 and sm_120; cont
 driver, platform, build, signature), rev 21; config.cache_config) and a probe of the PC (PRO + 4090, with driver / platform)."""
 import hashlib
 import json
+import os
 
-D = 'D:/tmp/ts-placement/tests/data/placement/'
+D = os.path.dirname(os.path.abspath(__file__)) + '/'
 fx = json.load(open(D + 'C-pro90-aux12-drafter-aux-host68.json'))
 envelope = json.load(open(D + 'J-components.json'))['envelope']  # rev 18: the fixtures' envelope
 env_sha = hashlib.sha256(json.dumps(envelope, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

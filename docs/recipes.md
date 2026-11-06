@@ -413,7 +413,7 @@ fetches them).
 
 A route is in **placement mode** when it has an `assist` or a `components` table (or the engine is started with
 `--placement` / its sugar flags). Such a route plans through the placement planner (`ts_place`,
-wave4/placement/contract.md) instead of `ss_recipe_plan`; legacy routes are untouched. Placement mode needs
+the placement contract) instead of `ss_recipe_plan`; legacy routes are untouched. Placement mode needs
 `execute = "single"` (one anchor: the route's set) and refuses set ids equal to the reserved destination words
 `auto`, `host_pinned`, `host_pageable`, `file`.
 

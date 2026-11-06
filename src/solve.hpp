@@ -1,4 +1,4 @@
-// Budget solver (wave4/placement contract rev 7 §3.9): an operator trade-off report. Per choice (mode / max_rows,
+// Budget solver (placement contract rev 7 §3.9): an operator trade-off report. Per choice (mode / max_rows,
 // context, sequences) the route is planned by place() with the engine's components-v1 for exactly that
 // configuration (S0-S5, S3e spill included) and its tok/s is predicted from measured inputs with integer arithmetic
 // (reference golden/solver_ref.py, golden SV1). Rows keep the order of the choices; nothing is ranked or picked.

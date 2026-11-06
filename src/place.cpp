@@ -1,4 +1,4 @@
-// Placement planner S0-S5 (wave4/placement contract rev 4 §3.2), integer bytes only. The arithmetic is the one of
+// Placement planner S0-S5 (placement contract rev 4 §3.2), integer bytes only. The arithmetic is the one of
 // golden/place_ref.py: margins = max(gib_bytes(margin_gib), budget x frac_ppm / 10^6), context (+ growth) charged
 // once per touched device, phase peaks over allocation lifetimes, device spares on the anchor, arena active =
 // min(room / unit, units left), exclusive host homes = total - active - assist - file + host spares, other pinned

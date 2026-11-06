@@ -1,4 +1,4 @@
-// tierstream/components-v1 (wave4/placement contract §2.4): the engine's own account of every memory consumer for the
+// tierstream/components-v1 (placement contract §2.4): the engine's own account of every memory consumer for the
 // configuration it was asked about, written by `<engine> --describe-components <flags>`. Separate from desc-v1, so
 // descriptor hashes and plan ids never change. Integer bytes only; the planner never extrapolates from it.
 #pragma once
